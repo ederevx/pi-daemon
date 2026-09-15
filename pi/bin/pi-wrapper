@@ -6,7 +6,8 @@
 # terminal exit, SSH logout, and reboot. Everything else — any explicit
 # arguments or flags, non-tty stdin, invocations already inside tmux
 # (hosted sessions, subagent workers) — execs the real pi untouched. If the
-# service helper is missing, the wrapper degrades to the real pi.
+# service helper or tmux itself is missing, the wrapper degrades to the
+# real pi so a bare start always works (unhosted; /bg then reports it).
 #
 # REAL_PI is rewritten to the actual pi binary at install time.
 set -euo pipefail
@@ -14,7 +15,7 @@ set -euo pipefail
 REAL_PI="@REAL_PI@"
 PI_RC="$HOME/.local/bin/pi-rc"
 
-if [[ $# -eq 0 && -t 0 && -z "${TMUX:-}" && -x "$PI_RC" ]]; then
+if [[ $# -eq 0 && -t 0 && -z "${TMUX:-}" && -x "$PI_RC" ]] && command -v tmux >/dev/null 2>&1; then
 	exec "$PI_RC" attach
 fi
 
