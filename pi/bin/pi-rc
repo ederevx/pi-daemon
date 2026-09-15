@@ -1,14 +1,18 @@
-#!/usr/bin/env bash
-# pi-rc — launcher for the pi-background-service.
+#!/usr/bin/env python3
+# pi-rc — client for the pi-background-service PTY host daemon.
 #
-# The systemd user service owns a persistent tmux server (socket "pi-rc")
-# that hosts live pi TUI sessions. Inside a hosted pi, /bg (handled by the
-# rc-background pi extension) detaches the client: pi keeps running
-# hosted until it exits or its session is deleted through pi's own session
-# manager. If the hosted pi is ever gone (reboot, server restart), the next
-# attach/start recreates it and resumes the latest pi session from disk. A
-# pi started outside tmux (non-wrapped) hands its saved session over to
-# the service through /bg instead of being left behind.
+# The systemd user service runs pi-ptyd, a persistent host for live pi TUI
+# sessions, each on its own PTY. This client talks JSON lines over the
+# daemon's unix control socket: start/stop sessions, list them, detach and
+# resize them, and attach, which switches the connection into a raw byte
+# bridge with the session's PTY (one client per session; a new attach
+# steals it). Inside a hosted pi, /bg (the rc-background extension)
+# detaches the client: pi keeps running headless until it exits or its
+# session is deleted through pi's own session manager. If the hosted pi is
+# ever gone (reboot, daemon restart), the next attach recreates it and
+# resumes the latest pi session from disk. A pi started outside the daemon
+# (non-wrapped) hands its saved session over through "handover" instead of
+# being left behind.
 #
 # Usage:
 #   pi-rc start [name] [dir] [--fresh]  create a detached pi session
@@ -16,236 +20,602 @@
 #                                       command resumes the latest pi session,
 #                                       --fresh starts an empty one)
 #   pi-rc attach [name] [dir]           attach, recreating + resuming if gone
-#   pi-rc handover <file> [dir]         host a specific pi session file in a
-#                                       new detached session; used by /bg
-#                                       outside tmux to hand a live
-#                                       conversation to the persistent
-#                                       service (--check <file> [dir] only
-#                                       reports the hosting verdict)
+#   pi-rc detach <name>                 detach a client; the session lives on
 #   pi-rc ls                            list hosted sessions
 #   pi-rc stop <name>                   kill one session (ends that pi)
-#   pi-rc daemon-start                  ensure the persistent server is running
-#   pi-rc daemon-stop                   stop the server and every hosted session
-set -euo pipefail
+#   pi-rc handover <file> [dir]         host a specific pi session file in a
+#                                       new detached session; used by /bg
+#                                       outside the host to hand a live
+#                                       conversation to the persistent
+#                                       service (--check only reports the
+#                                       hosting verdict)
+#   pi-rc daemon-start                  ensure the host daemon is running
+#   pi-rc daemon-stop                   stop the daemon and every hosted
+#                                       session
 
-# Quote a value for the shell tmux uses to run pane commands.
-shquote() {
-	local s="${1//\'/\'\\\'\'}"
-	printf "'%s'" "$s"
-}
+import atexit
+import hashlib
+import json
+import os
+import select
+import signal
+import socket
+import subprocess
+import sys
+import termios
+import time
 
-SOCKET_NAME="pi-rc"
-CONF="${HOME}/.config/pi-background-service/tmux.conf"
+UID = os.getuid()
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % UID
+SOCK_PATH = os.path.join(RUNTIME_DIR, "pi-pty-host.sock")
+STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+LOG_PATH = os.path.join(STATE_HOME, "pi-pty-host", "daemon.log")
 
-_tmux() {
-	tmux -L "$SOCKET_NAME" -f "$CONF" "$@"
-}
+DEFAULT_COLS = 120
+DEFAULT_ROWS = 40
+CONTROL_TIMEOUT = 5.0    # seconds per control round-trip; never hang
+DAEMON_START_WAIT = 2.0  # seconds to wait for the socket after spawning
+MAX_BUF = 1 << 20        # per-direction bridge buffer bound (backpressure)
 
-server_running() {
-	_tmux has-session -t _host 2>/dev/null
-}
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_HOSTED = 3          # handover: the session is already hosted
+EXIT_NO_DAEMON = 4       # control socket unreachable
 
-session_name() {
-	local name="${1:-}"
-	if [[ -z "$name" ]]; then
-		name="$(basename "$(pwd)")"
-	fi
-	# tmux targets treat ':' and a leading '=' specially.
-	name="${name//:/_}"
-	name="${name#=}"
-	printf 'pi-%s' "$name"
-}
+USAGE_LINE = "usage: pi-rc <command> [args]; run 'pi-rc help' for details"
 
-# Resolve the session for a directory. An explicit name is used verbatim;
-# otherwise the directory basename is used, disambiguated with a path-derived
-# suffix when the basename is already hosted from a different directory.
-# Every created session records its directory in the @dir session option.
-session_for() {
-	local explicit="$1" dir="$2" base cand existing
-	if [[ -n "$explicit" ]]; then
-		session_name "$explicit"
+
+def die(msg, code=EXIT_USAGE):
+	sys.stderr.write("pi-rc: %s\n" % msg)
+	sys.exit(code)
+
+
+def usage_error(hint):
+	if hint:
+		die("%s\n%s" % (hint, USAGE_LINE))
+	die(USAGE_LINE)
+
+
+def short_name(full):
+	# strip the "pi-" prefix for user-facing attach hints
+	return full[3:] if full.startswith("pi-") else full
+
+
+def session_base(name):
+	# tmux-era target naming: ':' is special, a leading '=' is special
+	name = name.replace(":", "_")
+	if name.startswith("="):
+		name = name[1:]
+	return name
+
+
+def session_name(name):
+	# an explicit name is normalized exactly like a dir-basename one
+	return "pi-" + session_base(name)
+
+
+def session_for(explicit, dir_):
+	if explicit:
+		return session_name(explicit)
+	return "pi-" + session_base(os.path.basename(dir_))
+
+
+def resolve_dir(dir_arg):
+	dir_ = dir_arg or os.getcwd()
+	if not os.path.isdir(dir_):
+		die("not a directory: %s" % dir_arg)
+	return os.path.realpath(dir_)
+
+
+def tty_size(fd=0):
+	# size of the controlling tty; callers without one get the default
+	try:
+		sz = os.get_terminal_size(fd)
+		return sz.columns, sz.lines
+	except OSError:
+		return DEFAULT_COLS, DEFAULT_ROWS
+
+
+def same_dir(a, b):
+	try:
+		return os.path.realpath(a) == os.path.realpath(b)
+	except OSError:
+		return a == b
+
+
+# ---------------------------------------------------------------- protocol
+
+def send_json(sock, obj):
+	sock.sendall(json.dumps(obj).encode() + b"\n")
+
+
+def read_json_line(sock):
+	# one response line; returns (obj, unconsumed bytes after the line)
+	buf = b""
+	while b"\n" not in buf:
+		try:
+			data = sock.recv(65536)
+		except OSError:
+			return None, buf
+		if not data:
+			return None, buf
+		buf += data
+	line, rest = buf.split(b"\n", 1)
+	try:
+		obj = json.loads(line.decode())
+	except (ValueError, UnicodeDecodeError):
+		obj = None
+	return obj, rest
+
+
+def connect_daemon(timeout=CONTROL_TIMEOUT):
+	sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	sock.settimeout(timeout)
+	try:
+		sock.connect(SOCK_PATH)
+	except OSError:
+		sock.close()
+		die("background service is not running "
+			"(systemctl --user start pi-background-service)", EXIT_NO_DAEMON)
+	return sock
+
+
+def control(req):
+	# one JSON-line round-trip on a short-lived control connection
+	sock = connect_daemon()
+	try:
+		send_json(sock, req)
+		resp, _ = read_json_line(sock)
+	except OSError as exc:
+		die("control connection failed: %s" % exc)
+	finally:
+		sock.close()
+	if resp is None:
+		die("daemon closed the connection without a response")
+	return resp
+
+
+# ----------------------------------------------------------------- daemon
+
+def find_daemon():
+	here = os.path.dirname(os.path.realpath(__file__))
+	cand = os.path.join(here, "pi-ptyd")
+	if os.path.isfile(cand):
+		return cand
+	# fallback: repo layout <repo>/pi/bin/pi-rc -> <repo>/pi/ptyd/pi-ptyd
+	cand = os.path.join(os.path.dirname(here), "ptyd", "pi-ptyd")
+	if os.path.isfile(cand):
+		return cand
+	return None
+
+
+def daemon_alive():
+	probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	try:
+		probe.connect(SOCK_PATH)
+		return True
+	except OSError:
+		return False
+	finally:
+		probe.close()
+
+
+def cmd_daemon_start(_args):
+	# already up: done silently
+	if daemon_alive():
 		return
-	fi
-	base="$(basename "$dir")"
-	base="${base//:/_}"
-	base="${base#=}"
-	cand="pi-$base"
-	if _tmux has-session -t "$cand" 2>/dev/null; then
-		existing="$(_tmux show-options -qv -t "$cand" '@dir' 2>/dev/null || true)"
-		if [[ "$existing" != "$dir" ]]; then
-			cand="pi-$base-$(printf '%s' "$dir" | sha256sum | cut -c1-6)"
-		fi
-	fi
-	printf '%s' "$cand"
-}
+	daemon = find_daemon()
+	if daemon is None:
+		die("cannot find the pi-ptyd daemon script next to %s"
+			% os.path.realpath(__file__))
+	os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+	logf = open(LOG_PATH, "ab")
+	try:
+		# detach fully: own session, output only to the daemon log
+		subprocess.Popen(
+			["python3", daemon],
+			stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
+			start_new_session=True)
+	finally:
+		logf.close()
+	deadline = time.time() + DAEMON_START_WAIT
+	while time.time() < deadline:
+		if daemon_alive():
+			return
+		time.sleep(0.05)
+	die("background daemon did not come up (see %s)" % LOG_PATH,
+		EXIT_NO_DAEMON)
 
-resolve_dir() {
-	local dir="${1:-$PWD}"
-	if [[ ! -d "$dir" ]]; then
-		echo "pi-rc: not a directory: $dir" >&2
-		exit 1
-	fi
-	readlink -f "$dir"
-}
 
-cmd_daemon_start() {
-	if server_running; then
-		return 0
-	fi
-	# The host session keeps the server alive; it runs no pi instance.
-	_tmux new-session -d -s _host -c "$HOME" "sleep infinity"
-	# The host session is never attached; hide its status bar.
-	_tmux set-option -t _host status off
-}
+def cmd_daemon_stop(_args):
+	# best-effort: a missing daemon is already the desired state
+	try:
+		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		sock.settimeout(CONTROL_TIMEOUT)
+		sock.connect(SOCK_PATH)
+		send_json(sock, {"cmd": "shutdown"})
+		read_json_line(sock)
+		sock.close()
+	except OSError:
+		pass
 
-cmd_daemon_stop() {
-	if _tmux has-session -t _host 2>/dev/null || _tmux list-sessions &>/dev/null; then
-		_tmux kill-server 2>/dev/null || true
-	fi
-}
 
-cmd_start() {
-	local name="" dir="" fresh=0
-	while [[ $# -gt 0 ]]; do
-		case "$1" in
-		--fresh) fresh=1; shift ;;
-		*) if [[ -z "$name" ]]; then name="$1"; else dir="$1"; fi; shift ;;
-		esac
-	done
-	local session
-	dir="$(resolve_dir "${dir:-$PWD}")"
-	session="$(session_for "$name" "$dir")"
-	cmd_daemon_start
-	if _tmux has-session -t "$session" 2>/dev/null; then
-		echo "pi-rc: session '$session' already exists (attach with: pi-rc attach ${session#pi-})"
-		return 0
-	fi
-	if [[ "$fresh" -eq 1 ]]; then
-		_tmux new-session -d -s "$session" -c "$dir" "pi"
-	else
-		# Resume the latest pi session on disk so conversations survive the
-		# hosted process dying; fall back to a fresh pi when none exists.
-		_tmux new-session -d -s "$session" -c "$dir" "sh -c 'pi -c || exec pi'"
-	fi
-	_tmux set-option -t "$session" '@dir' "$dir"
-	echo "pi-rc: started '$session' in $dir (attach: pi-rc attach ${session#pi-}; background: /bg)"
-}
+# -------------------------------------------------------------- commands
 
-cmd_attach() {
-	local name="" dir=""
-	while [[ $# -gt 0 ]]; do
-		case "$1" in
-		--fresh) echo "pi-rc: --fresh is a 'start' option" >&2; exit 2 ;;
-		*) if [[ -z "$name" ]]; then name="$1"; else dir="$1"; fi; shift ;;
-		esac
-	done
-	local session
-	session="$(session_for "$name" "$(resolve_dir "${dir:-$PWD}")")"
-	cmd_daemon_start
-	if ! _tmux has-session -t "$session" 2>/dev/null; then
-		dir="$(resolve_dir "${dir:-$PWD}")"
-		_tmux new-session -d -s "$session" -c "$dir" "sh -c 'pi -c || exec pi'"
-		_tmux set-option -t "$session" '@dir' "$dir"
-		echo "pi-rc: recreated '$session' in $dir (resuming latest session)"
-	fi
-	# Exec replaces the shell so a /bg detach returns cleanly to it.
-	exec _tmux attach-session -t "$session"
-}
+def cmd_start(args):
+	name = None
+	dir_arg = None
+	fresh = False
+	for arg in args:
+		if arg == "--fresh":
+			fresh = True
+		elif name is None:
+			name = arg
+		elif dir_arg is None:
+			dir_arg = arg
+		else:
+			usage_error("too many arguments for 'start'")
+	dir_ = resolve_dir(dir_arg)
+	session = session_for(name, dir_)
+	# default command resumes the latest pi session on disk so
+	# conversations survive the hosted process dying; --fresh starts empty
+	argv = ["pi"] if fresh else ["sh", "-c", "pi -c || exec pi"]
+	cols, rows = tty_size(0)
+	resp = control({"cmd": "start", "name": session, "dir": dir_,
+					"argv": argv, "cols": cols, "rows": rows})
+	if not resp.get("ok"):
+		die("start failed: %s" % resp.get("error"))
+	if not resp.get("created", True):
+		print("pi-rc: session '%s' already exists (attach: pi-rc attach %s)"
+			  % (session, short_name(session)))
+		return
+	print("pi-rc: started '%s' in %s (attach: pi-rc attach %s; background: /bg)"
+		  % (session, dir_, short_name(session)))
 
-# Choose the hosted session name for a handover. The directory's primary
-# name is used when free; when it is taken by another conversation, a
-# distinct name derived from the session file lets a second conversation
-# in the same directory be hosted too. Prints "target:<name>" when the
-# caller should host under <name>, or "hosted:<name>" when a hosted pane
-# already resumes this exact session file (attach, do not duplicate).
-handover_name() {
-	local dir="$1" file="$2" primary base cand
-	primary="$(session_for "" "$dir")"
-	if ! _tmux has-session -t "$primary" 2>/dev/null; then
-		printf 'target:%s\n' "$primary"
-		return 0
-	fi
-	base="$(basename "$dir")"
-	base="${base//:/_}"
-	base="${base#=}"
-	cand="$(printf 'pi-%s-%s' "$base" "$(printf '%s' "$file" | sha256sum | cut -c1-6)")"
-	if _tmux has-session -t "$cand" 2>/dev/null; then
-		printf 'hosted:%s\n' "$cand"
-	else
-		printf 'target:%s\n' "$cand"
-	fi
-}
 
-cmd_handover() {
-	local check=0 file="" dir="" pid="" verdict session
-	while [[ $# -gt 0 ]]; do
-		case "$1" in
-		--check) check=1; shift ;;
-		--after-exit)
-			pid="${2:?usage: pi-rc handover <file> [dir] [--after-exit <pid>]}"
-			shift 2
-			;;
-		*) if [[ -z "$file" ]]; then file="$1"; elif [[ -z "$dir" ]]; then dir="$1"; fi; shift ;;
-		esac
-	done
-	dir="$(resolve_dir "${dir:-$PWD}")"
-	verdict="$(handover_name "$dir" "$file")"
-	session="${verdict#*:}"
-	if [[ "$check" -eq 1 ]]; then
-		# Read-only preflight used by the rc-background extension.
-		printf '%s\n' "$verdict"
-		return 0
-	fi
-	if [[ ! -f "$file" ]]; then
-		echo "pi-rc: session file not found: $file" >&2
-		exit 1
-	fi
-	if [[ -n "$pid" ]]; then
-		# The handing-over pi asked us to wait: hold off until it exits so
-		# the two processes never share the session file, then give it a
-		# moment to finish flushing.
-		while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
-		sleep 0.5
-	fi
-	cmd_daemon_start
-	if [[ "$verdict" == hosted:* ]]; then
-		echo "pi-rc: '$session' already hosts this session (attach: pi-rc attach ${session#pi-})" >&2
-		exit 3
-	fi
-	_tmux new-session -d -s "$session" -c "$dir" "pi --session $(shquote "$file")"
-	_tmux set-option -t "$session" '@dir' "$dir"
-	echo "pi-rc: hosting '$session' resumed from $(basename "$file") (attach: pi-rc attach ${session#pi-}; background: /bg)"
-}
+def cmd_detach(args):
+	if len(args) != 1:
+		usage_error("detach takes exactly one session name")
+	session = session_name(args[0])
+	resp = control({"cmd": "detach", "name": session})
+	if not resp.get("ok"):
+		die("detach failed: %s" % resp.get("error"))
+	print("pi-rc: detached '%s'" % session)
 
-cmd_ls() {
-	if ! _tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -v '^_host$'; then
-		echo "pi-rc: no hosted sessions"
-	fi
-}
 
-cmd_stop() {
-	local session
-	session="$(session_name "${1:?usage: pi-rc stop <name>}")"
-	_tmux kill-session -t "$session"
-	echo "pi-rc: stopped '$session'"
-}
+def cmd_ls(_args):
+	resp = control({"cmd": "list"})
+	sessions = resp.get("sessions") or []
+	if not sessions:
+		print("pi-rc: no hosted sessions")
+		return
+	for s in sessions:
+		marker = "attached" if s.get("attached") else "detached"
+		print("%s\t%s\tpid %d\t%s"
+			  % (short_name(s.get("name", "")), s.get("dir", ""),
+				 s.get("pid", 0), marker))
 
-# Every command except help drives the tmux server; fail with a clear
-# message instead of a bare "command not found" deep inside a helper.
-if [[ -n "${1:-}" && "${1:-}" != "help" ]] && ! command -v tmux >/dev/null 2>&1; then
-	echo "pi-rc: tmux not found on PATH; install tmux to host pi sessions" >&2
-	exit 127
-fi
 
-case "${1:-help}" in
-start) shift; cmd_start "$@" ;;
-attach) shift; cmd_attach "$@" ;;
-handover) shift; cmd_handover "$@" ;;
-ls|list) cmd_ls ;;
-stop) shift; cmd_stop "$@" ;;
-daemon-start) cmd_daemon_start ;;
-daemon-stop) cmd_daemon_stop ;;
-help|*)
-	sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
-	;;
-esac
+def cmd_stop(args):
+	if len(args) != 1:
+		usage_error("stop takes exactly one session name")
+	session = session_name(args[0])
+	resp = control({"cmd": "stop", "name": session})
+	if not resp.get("ok"):
+		die("stop failed: %s" % resp.get("error"))
+	print("pi-rc: stopped '%s'" % session)
+
+
+def handover_check(dir_, file):
+	# client-side preflight mirroring the daemon's target logic: the
+	# directory's primary name when free or held from the same directory,
+	# otherwise a hash-suffixed name derived from the session file
+	resp = control({"cmd": "list"})
+	live = {s.get("name"): s for s in (resp.get("sessions") or [])}
+	base = session_base(os.path.basename(dir_))
+	primary = "pi-" + base
+	holder = live.get(primary)
+	if holder is None or same_dir(holder.get("dir"), dir_):
+		return "target:%s" % primary
+	digest = hashlib.sha256(file.encode()).hexdigest()[:6]
+	hashed = "pi-%s-%s" % (base, digest)
+	if hashed in live:
+		return "hosted:%s" % hashed
+	return "target:%s" % hashed
+
+
+def cmd_handover(args):
+	check = False
+	file = None
+	dir_arg = None
+	after_pid = None
+	hint = "usage: pi-rc handover <file> [dir] [--check] [--after-exit <pid>]"
+	i = 0
+	while i < len(args):
+		arg = args[i]
+		if arg == "--check":
+			check = True
+		elif arg == "--after-exit":
+			i += 1
+			if i >= len(args):
+				usage_error(hint)
+			try:
+				after_pid = int(args[i])
+			except ValueError:
+				usage_error("--after-exit expects a pid")
+		elif file is None:
+			file = arg
+		elif dir_arg is None:
+			dir_arg = arg
+		else:
+			usage_error("too many arguments for 'handover'")
+		i += 1
+	if file is None:
+		usage_error(hint)
+	dir_ = resolve_dir(dir_arg)
+	if check:
+		# read-only preflight used by the rc-background extension
+		print(handover_check(dir_, file))
+		return
+	if not os.path.isfile(file):
+		die("session file not found: %s" % file)
+	req = {"cmd": "handover", "file": file, "dir": dir_}
+	if after_pid is not None:
+		req["afterPid"] = after_pid
+	resp = control(req)
+	if not resp.get("ok"):
+		die("handover failed: %s" % resp.get("error"))
+	verdict = resp.get("verdict") or ""
+	kind, _, session = verdict.partition(":")
+	if kind == "hosted":
+		sys.stderr.write(
+			"pi-rc: '%s' already hosts this session "
+			"(attach: pi-rc attach %s)\n" % (session, short_name(session)))
+		sys.exit(EXIT_HOSTED)
+	if kind != "target":
+		die("unexpected handover verdict: %s" % verdict)
+	print("pi-rc: hosting '%s' resumed from %s (attach: pi-rc attach %s; "
+		  "background: /bg)"
+		  % (session, os.path.basename(file), short_name(session)))
+
+
+# ---------------------------------------------------------------- attach
+
+def send_resize(session):
+	# the bridge connection is raw bytes; resize rides a second
+	# short-lived control connection
+	try:
+		cols, rows = tty_size(0)
+		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		sock.settimeout(CONTROL_TIMEOUT)
+		sock.connect(SOCK_PATH)
+		send_json(sock, {"cmd": "resize", "name": session,
+						 "cols": cols, "rows": rows})
+		read_json_line(sock)
+		sock.close()
+	except OSError:
+		pass
+
+
+def restore_tty(saved):
+	try:
+		termios.tcsetattr(0, termios.TCSADRAIN, saved)
+	except termios.error:
+		pass
+
+
+def bridge(sock, session, initial=b""):
+	# raw byte relay between our tty and the daemon bridge; this is the
+	# only unbounded phase, and the tty is restored on every exit path
+	saved = termios.tcgetattr(0)
+	atexit.register(restore_tty, saved)
+	wake_r, wake_w = os.pipe()
+	winch = [False]
+	prev_winch = signal.getsignal(signal.SIGWINCH)
+
+	def on_winch(_signum, _frame):
+		# only flag it here; all daemon work happens in the main loop
+		winch[0] = True
+		try:
+			os.write(wake_w, b"x")
+		except OSError:
+			pass
+
+	def on_term(_signum, _frame):
+		# turn lethal signals into a normal unwind so the tty is restored
+		raise SystemExit(0)
+
+	signal.signal(signal.SIGWINCH, on_winch)
+	signal.signal(signal.SIGTERM, on_term)
+	signal.signal(signal.SIGHUP, on_term)
+	os.set_blocking(0, False)
+	os.set_blocking(1, False)
+	sock.setblocking(False)
+	try:
+		attrs = termios.tcgetattr(0)
+		attrs[0] &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK
+					  | termios.ISTRIP | termios.IXON)
+		attrs[1] &= ~termios.OPOST
+		attrs[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG
+					  | termios.IEXTEN)
+		attrs[6][termios.VMIN] = 1
+		attrs[6][termios.VTIME] = 0
+		termios.tcsetattr(0, termios.TCSANOW, attrs)
+		to_sock = bytearray()
+		to_tty = bytearray(initial)
+		while True:
+			if winch[0]:
+				winch[0] = False
+				send_resize(session)
+			rlist = [wake_r]
+			if len(to_sock) < MAX_BUF:
+				rlist.append(0)
+			if len(to_tty) < MAX_BUF:
+				rlist.append(sock)
+			wlist = []
+			if to_sock:
+				wlist.append(sock)
+			if to_tty:
+				wlist.append(1)
+			try:
+				rl, wl, _ = select.select(rlist, wlist, [])
+			except OSError:
+				# a polled fd vanished; nothing left to relay
+				return
+			if wake_r in rl:
+				try:
+					os.read(wake_r, 4096)
+				except OSError:
+					pass
+			if 0 in rl:
+				try:
+					data = os.read(0, 65536)
+				except (BlockingIOError, InterruptedError):
+					data = None
+				except OSError:
+					return
+				if data == b"":
+					# EOF on stdin: detach; the session keeps running
+					return
+				if data:
+					to_sock += data
+			if sock in rl:
+				try:
+					data = sock.recv(65536)
+				except (BlockingIOError, InterruptedError):
+					data = None
+				except OSError:
+					return
+				if data == b"":
+					# bridge closed: child exited or another attach stole it
+					return
+				if data:
+					to_tty += data
+					if len(to_tty) > MAX_BUF:
+						del to_tty[:len(to_tty) - MAX_BUF]
+			if sock in wl:
+				try:
+					sent = sock.send(to_sock[:65536])
+					del to_sock[:sent]
+				except (BlockingIOError, InterruptedError):
+					pass
+				except OSError:
+					return
+			if 1 in wl:
+				try:
+					sent = os.write(1, to_tty[:65536])
+					del to_tty[:sent]
+				except (BlockingIOError, InterruptedError):
+					pass
+				except OSError:
+					return
+	finally:
+		restore_tty(saved)
+		signal.signal(signal.SIGWINCH, prev_winch)
+		os.close(wake_r)
+		os.close(wake_w)
+		sock.close()
+
+
+def cmd_attach(args):
+	name = None
+	dir_arg = None
+	for arg in args:
+		if arg == "--fresh":
+			die("--fresh is a 'start' option")
+		elif name is None:
+			name = arg
+		elif dir_arg is None:
+			dir_arg = arg
+		else:
+			usage_error("too many arguments for 'attach'")
+	if not os.isatty(0):
+		die("attach requires a terminal on stdin; run 'pi-rc attach' "
+			"inside a tty (see pi-rc help)")
+	dir_ = resolve_dir(dir_arg)
+	session = session_for(name, dir_)
+	cols, rows = tty_size(0)
+	sock = connect_daemon()
+	try:
+		send_json(sock, {"cmd": "attach", "name": session,
+						 "cols": cols, "rows": rows})
+		resp, rest = read_json_line(sock)
+		if resp is None or not resp.get("ok"):
+			error = (resp or {}).get("error") if resp else "no response"
+			if error == "no-session":
+				# recreate + resume, then attach the same connection
+				argv = ["sh", "-c", "pi -c || exec pi"]
+				send_json(sock, {"cmd": "start", "name": session,
+								 "dir": dir_, "argv": argv,
+								 "cols": cols, "rows": rows})
+				start_resp, _ = read_json_line(sock)
+				if start_resp is None or not start_resp.get("ok"):
+					die("attach failed: start failed: %s"
+						% (start_resp or {}).get("error", "no response"))
+				print("pi-rc: recreated '%s' in %s (resuming latest session)"
+					  % (session, dir_))
+				send_json(sock, {"cmd": "attach", "name": session,
+								 "cols": cols, "rows": rows})
+				resp, rest = read_json_line(sock)
+				if resp is None or not resp.get("ok"):
+					error = (resp or {}).get("error") if resp else "no response"
+					die("attach failed: %s" % error)
+			else:
+				die("attach failed: %s" % error)
+	except OSError as exc:
+		die("control connection failed: %s" % exc)
+	bridge(sock, session, rest)
+
+
+# ------------------------------------------------------------------ help
+
+def print_help():
+	# print this file's leading comment banner as the help text
+	try:
+		with open(os.path.realpath(__file__)) as f:
+			lines = f.read().splitlines()
+	except OSError:
+		lines = []
+	out = []
+	for line in lines[1:]:
+		if not line.startswith("#"):
+			break
+		out.append(line[2:] if line.startswith("# ") else "#")
+	print("\n".join(out))
+
+
+# ------------------------------------------------------------------ main
+
+def main():
+	argv = sys.argv[1:]
+	cmd = argv[0] if argv else "help"
+	rest = argv[1:]
+	if cmd in ("ls", "list"):
+		cmd_ls(rest)
+	elif cmd == "start":
+		cmd_start(rest)
+	elif cmd == "attach":
+		cmd_attach(rest)
+	elif cmd == "detach":
+		cmd_detach(rest)
+	elif cmd == "stop":
+		cmd_stop(rest)
+	elif cmd == "handover":
+		cmd_handover(rest)
+	elif cmd == "daemon-start":
+		cmd_daemon_start(rest)
+	elif cmd == "daemon-stop":
+		cmd_daemon_stop(rest)
+	elif cmd == "help":
+		print_help()
+	else:
+		usage_error("unknown command: %s" % cmd)
+
+
+if __name__ == "__main__":
+	try:
+		main()
+	except KeyboardInterrupt:
+		# the bridge tty restore already ran in its finally block
+		sys.exit(EXIT_OK)
+	sys.exit(EXIT_OK)
