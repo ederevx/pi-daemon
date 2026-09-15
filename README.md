@@ -7,6 +7,11 @@ them, and can uninstall exactly what it installed.
 
 ## What it provides
 
+- **Auto-hosting wrapper** (`pi`): a bare interactive `pi` start is routed
+  through `pi-rc attach`, so every plain start is hosted automatically.
+  Any explicit arguments or flags, non-tty stdin, and subagent workers exec
+  the real pi untouched. The wrapper resolves the real binary at install
+  time and is manifest-owned.
 - **Hosted pi sessions** (`pi-rc`): a systemd user service owns a persistent
   tmux server that hosts detached pi TUI sessions. Detaching (`/bg` inside a
   hosted pi) backgrounds the session; the pi process keeps
