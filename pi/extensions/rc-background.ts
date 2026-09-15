@@ -64,9 +64,12 @@ export default function (pi: ExtensionAPI) {
 		// idling. deliverAs "followUp" queues behind an in-flight turn
 		// and triggers a fresh turn when idle. A pending message already
 		// covering the continuation (e.g. a repeated /bg) skips the kick.
+		// Note: sendUserMessage lives on the extension API (pi), not on
+		// command contexts; it is fire-and-forget — errors surface through
+		// the runner's error event, so failure here cannot wedge /bg.
 		try {
 			if (!ctx?.hasPendingMessages?.()) {
-				await ctx.sendUserMessage(KICKOFF, { deliverAs: "followUp" });
+			pi.sendUserMessage(KICKOFF, { deliverAs: "followUp" });
 			}
 		} catch (err) {
 			ctx?.ui?.notify?.(
