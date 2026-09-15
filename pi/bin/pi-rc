@@ -42,6 +42,29 @@ session_name() {
 	printf 'pi-%s' "$name"
 }
 
+# Resolve the session for a directory. An explicit name is used verbatim;
+# otherwise the directory basename is used, disambiguated with a path-derived
+# suffix when the basename is already hosted from a different directory.
+# Every created session records its directory in the @dir session option.
+session_for() {
+	local explicit="$1" dir="$2" base cand existing
+	if [[ -n "$explicit" ]]; then
+		session_name "$explicit"
+		return
+	fi
+	base="$(basename "$dir")"
+	base="${base//:/_}"
+	base="${base#=}"
+	cand="pi-$base"
+	if _tmux has-session -t "$cand" 2>/dev/null; then
+		existing="$(_tmux show-options -qv -t "$cand" '@dir' 2>/dev/null || true)"
+		if [[ "$existing" != "$dir" ]]; then
+			cand="pi-$base-$(printf '%s' "$dir" | sha256sum | cut -c1-6)"
+		fi
+	fi
+	printf '%s' "$cand"
+}
+
 resolve_dir() {
 	local dir="${1:-$PWD}"
 	if [[ ! -d "$dir" ]]; then
@@ -77,7 +100,7 @@ cmd_start() {
 	done
 	local session
 	dir="$(resolve_dir "${dir:-$PWD}")"
-	session="$(session_name "$name")"
+	session="$(session_for "$name" "$dir")"
 	cmd_daemon_start
 	if _tmux has-session -t "$session" 2>/dev/null; then
 		echo "pi-rc: session '$session' already exists (attach with: pi-rc attach ${session#pi-})"
@@ -90,6 +113,7 @@ cmd_start() {
 		# hosted process dying; fall back to a fresh pi when none exists.
 		_tmux new-session -d -s "$session" -c "$dir" "sh -c 'pi -c || exec pi'"
 	fi
+	_tmux set-option -t "$session" '@dir' "$dir"
 	echo "pi-rc: started '$session' in $dir (attach: pi-rc attach ${session#pi-}; background: /bg)"
 }
 
@@ -102,11 +126,12 @@ cmd_attach() {
 		esac
 	done
 	local session
-	session="$(session_name "$name")"
+	session="$(session_for "$name" "$(resolve_dir "${dir:-$PWD}")")"
 	cmd_daemon_start
 	if ! _tmux has-session -t "$session" 2>/dev/null; then
 		dir="$(resolve_dir "${dir:-$PWD}")"
 		_tmux new-session -d -s "$session" -c "$dir" "sh -c 'pi -c || exec pi'"
+		_tmux set-option -t "$session" '@dir' "$dir"
 		echo "pi-rc: recreated '$session' in $dir (resuming latest session)"
 	fi
 	# Exec replaces the shell so a /bg detach returns cleanly to it.

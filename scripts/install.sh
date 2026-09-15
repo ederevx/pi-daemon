@@ -22,6 +22,7 @@ dest_extension="$pi_home/extensions/rc-background.ts"
 dest_helper="$local_bin/pi-rc"
 dest_conf="$config_dir/tmux.conf"
 dest_unit="$systemd_dir/pi-background-service.service"
+dest_wrapper="$local_bin/pi"
 
 mkdir -p "$pi_home/extensions" "$local_bin" "$config_dir" "$systemd_dir" "$state_dir"
 
@@ -30,7 +31,24 @@ install -m 755 "$repo_root/pi/bin/pi-rc" "$dest_helper"
 install -m 644 "$repo_root/pi/tmux/pi-rc.conf" "$dest_conf"
 install -m 644 "$repo_root/pi/systemd/pi-background-service.service" "$dest_unit"
 
-owned=("$dest_extension" "$dest_helper" "$dest_conf" "$dest_unit")
+# The pi wrapper must point at the real pi binary. Resolve it by scanning
+# PATH while skipping the wrapper's own directory, so an already-installed
+# wrapper can never be mistaken for the real binary.
+real_pi=""
+old_ifs="$IFS"; IFS=:
+for dir in $PATH; do
+  [[ "$dir" == "$local_bin" ]] && continue
+  if [[ -x "$dir/pi" ]]; then real_pi="$dir/pi"; break; fi
+done
+IFS="$old_ifs"
+[[ -n "$real_pi" ]] || {
+  echo "install: cannot resolve the real pi binary for the wrapper" >&2
+  exit 1
+}
+sed "s|@REAL_PI@|$real_pi|" "$repo_root/pi/bin/pi-wrapper" > "$dest_wrapper"
+chmod 755 "$dest_wrapper"
+
+owned=("$dest_extension" "$dest_helper" "$dest_conf" "$dest_unit" "$dest_wrapper")
 {
   printf '{\n'
   printf '  "version": 1,\n'
@@ -59,6 +77,7 @@ systemctl --user enable --now pi-background-service.service
 echo "install: ok"
 echo "  extension: $dest_extension"
 echo "  launcher:  $dest_helper"
+echo "  pi wrap:   $dest_wrapper"
 echo "  tmux conf: $dest_conf"
 echo "  unit:      $dest_unit"
 echo "  manifest:  $manifest"
