@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+# pi-ptyd — PTY host daemon for detached pi TUI sessions.
+#
+# The systemd user service runs this daemon as a persistent host for live
+# pi TUI sessions, each on its own PTY (replacing the tmux server used by
+# pi-rc). Clients talk JSON lines over a unix control socket; attach
+# switches the connection into a raw byte bridge with the PTY. Sessions
+# are recorded in a registry file so they survive a daemon restart; every
+# recorded session is respawned at startup. A pi started outside the
+# daemon hands its saved session over through the handover request, the
+# equivalent of "pi-rc handover".
+#
+# The daemon holds no terminal history: a detached session keeps running
+# headless and an attach re-wires the bridge, sizing the PTY for the new
+# client. One client per session; a new attach steals the connection.
+#
+# Wire protocol (JSON lines; one request line -> one response line,
+# except attach which switches to the raw bridge):
+#   ping                                  liveness check
+#   start {name,dir,argv[,cols,rows]}     spawn a session (idempotent)
+#   attach {name[,cols,rows]}             raw bridge; steals the session
+#   detach {name}                         close the bridge, session lives on
+#   resize {name,cols,rows}               winsize + SIGWINCH
+#   list                                  live sessions
+#   stop {name}                           TERM the process group, KILL
+#                                         after a 2s grace, drop entry
+#   handover {file,dir,afterPid}          host a pi session file once the
+#                                         owning process exits
+#   shutdown                              stop everything and exit
+#
+# Env: XDG_RUNTIME_DIR (control socket), XDG_STATE_HOME (registry).
+
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import resource
+import select
+import signal
+import socket
+import struct
+import sys
+import threading
+import time
+import termios
+
+UID = os.getuid()
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % UID
+STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+SOCK_PATH = os.path.join(RUNTIME_DIR, "pi-pty-host.sock")
+REG_DIR = os.path.join(STATE_HOME, "pi-pty-host")
+REG_PATH = os.path.join(REG_DIR, "sessions.json")
+
+DEFAULT_COLS = 120
+DEFAULT_ROWS = 40
+MAX_BUF = 1 << 20  # per-direction bridge buffer bound (backpressure)
+KILL_GRACE = 2.0
+REAP_TICK = 0.5
+
+SESSIONS = {}  # name -> session dict
+SESS_LOCK = threading.Lock()
+REG_LOCK = threading.Lock()
+LOG_LOCK = threading.Lock()
+SHUTDOWN = threading.Event()
+
+
+def log(msg):
+	# Daemon output goes to stderr (the journal); stdout is never used.
+	with LOG_LOCK:
+		sys.stderr.write("ptyd: %s\n" % msg)
+		sys.stderr.flush()
+
+
+# ---------------------------------------------------------------- registry
+
+def registry_load():
+	try:
+		with open(REG_PATH) as f:
+			data = json.load(f)
+		return data if isinstance(data, dict) else {}
+	except (OSError, ValueError):
+		return {}
+
+
+def registry_write(data):
+	# Atomic replacement so readers never see a partial file.
+	with REG_LOCK:
+		os.makedirs(REG_DIR, exist_ok=True)
+		tmp = REG_PATH + ".tmp"
+		with open(tmp, "w") as f:
+			json.dump(data, f)
+			f.write("\n")
+			f.flush()
+			os.fsync(f.fileno())
+		os.replace(tmp, REG_PATH)
+
+
+def registry_add(name, dir_, argv):
+	data = registry_load()
+	data[name] = {"dir": dir_, "argv": list(argv)}
+	registry_write(data)
+
+
+def registry_drop(name):
+	data = registry_load()
+	if name in data:
+		del data[name]
+		registry_write(data)
+
+
+# ------------------------------------------------------------- child spawn
+
+def set_winsize(fd, cols, rows):
+	fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+def child_sigwinch(pid):
+	try:
+		os.killpg(pid, signal.SIGWINCH)
+	except OSError:
+		pass
+
+
+def spawn_session(name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS, verb="start"):
+	master, slave = os.openpty()
+	set_winsize(slave, cols, rows)
+	pid = os.fork()
+	if pid == 0:
+		try:
+			os.setsid()
+			fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+			os.dup2(slave, 0)
+			os.dup2(slave, 1)
+			os.dup2(slave, 2)
+			# the session's directory is the child's working directory,
+			# like the tmux era's new-session -c <dir>
+			os.chdir(dir_)
+			maxfd = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+			if maxfd == resource.RLIM_INFINITY or maxfd > 65536:
+				maxfd = 65536
+			os.closerange(3, maxfd)
+			env = os.environ.copy()
+			env.update({
+				"TERM": "xterm-256color",
+				"COLORTERM": "truecolor",
+				"COLUMNS": str(cols),
+				"LINES": str(rows),
+				"PI_HOSTED": "1",
+				"PI_HOSTED_SESSION": name,
+			})
+			os.execvpe(argv[0], argv, env)
+		except Exception as exc:
+			try:
+				sys.stderr.write("ptyd: exec failed for %s: %s\n" % (name, exc))
+			except Exception:
+				pass
+			os._exit(127)
+	os.close(slave)
+	sess = {
+		"name": name,
+		"dir": dir_,
+		"argv": list(argv),
+		"pid": pid,
+		"master_fd": master,
+		"client": None,
+		"lock": threading.Lock(),
+	}
+	with SESS_LOCK:
+		SESSIONS[name] = sess
+	registry_add(name, dir_, argv)
+	log("%s '%s' pid %d in %s" % (verb, name, pid, dir_))
+	t = threading.Thread(target=session_loop, args=(sess,), daemon=True)
+	t.start()
+	return sess
+
+
+def get_client(sess):
+	with sess["lock"]:
+		return sess["client"]
+
+
+def set_client(sess, client):
+	with sess["lock"]:
+		old = sess["client"]
+		sess["client"] = client
+	return old
+
+
+def close_client(sess):
+	with sess["lock"]:
+		c = sess["client"]
+		sess["client"] = None
+	if c is not None:
+		try:
+			c.close()
+		except OSError:
+			pass
+
+
+# ----------------------------------------------------------- session loop
+
+def drop_session(sess, code):
+	name = sess["name"]
+	close_client(sess)
+	try:
+		os.close(sess["master_fd"])
+	except OSError:
+		pass
+	with SESS_LOCK:
+		if SESSIONS.get(name) is sess:
+			del SESSIONS[name]
+	registry_drop(name)
+	log("child-exit '%s' pid %d status %s" % (name, sess["pid"], code))
+
+
+def close_bridge(sess, to_client):
+	# Send whatever is still buffered, then drop the client.
+	c = get_client(sess)
+	if c is None:
+		return
+	try:
+		while to_client:
+			sent = c.send(bytes(to_client[:65536]))
+			del to_client[:sent]
+	except OSError:
+		pass
+	close_client(sess)
+
+
+def session_loop(sess):
+	# Owns the master fd: bridge relay plus child reaping.
+	master = sess["master_fd"]
+	pid = sess["pid"]
+	name = sess["name"]
+	to_client = bytearray()
+	to_master = bytearray()
+	dead_input = False
+	while True:
+		try:
+			reaped = os.waitpid(pid, os.WNOHANG)
+		except ChildProcessError:
+			reaped = (pid, 0)
+		if reaped[0] == pid:
+			break
+		client = get_client(sess)
+		rlist = []
+		wlist = []
+		if client is not None:
+			rlist.append(client)
+			if to_client:
+				wlist.append(client)
+			if not dead_input and len(to_client) < MAX_BUF:
+				rlist.append(master)
+			if to_master:
+				wlist.append(master)
+		try:
+			r, w, _ = select.select(rlist, wlist, [], REAP_TICK)
+		except OSError:
+			# A polled fd vanished; the next iteration re-evaluates.
+			continue
+		if client in r:
+			try:
+				data = client.recv(65536)
+			except OSError:
+				data = b""
+			if data:
+				to_master += data
+				if len(to_master) > MAX_BUF:
+					del to_master[: len(to_master) - MAX_BUF]
+			else:
+				log("detach '%s'" % name)
+				close_client(sess)
+				client = None
+		if master in r:
+			try:
+				data = os.read(master, 65536)
+			except OSError as exc:
+				# EIO is the normal PTY read failure after child exit.
+				if exc.errno == errno.EIO:
+					data = b""
+				else:
+					data = b""
+			if data:
+				to_client += data
+				if len(to_client) > MAX_BUF:
+					del to_client[: len(to_client) - MAX_BUF]
+			else:
+				dead_input = True
+				if get_client(sess) is not None and not to_client:
+					close_bridge(sess, to_client)
+		if master in w:
+			try:
+				sent = os.write(master, bytes(to_master[:65536]))
+				del to_master[:sent]
+			except OSError:
+				del to_master[:]
+				close_bridge(sess, to_client)
+		if client in w:
+			try:
+				sent = client.send(bytes(to_client[:65536]))
+				del to_client[:sent]
+			except OSError:
+				del to_client[:]
+				close_client(sess)
+	if get_client(sess) is not None:
+		close_bridge(sess, to_client)
+	drop_session(sess, reaped[1])
+
+
+# ----------------------------------------------------------------- control
+
+def bad_request():
+	return {"ok": False, "error": "bad-request"}
+
+
+def err(error):
+	return {"ok": False, "error": error}
+
+
+def cmd_ping(_req):
+	return {"ok": True}
+
+
+def cmd_start(req):
+	name = req.get("name")
+	dir_ = req.get("dir")
+	argv = req.get("argv")
+	try:
+		cols = int(req.get("cols", DEFAULT_COLS))
+		rows = int(req.get("rows", DEFAULT_ROWS))
+	except (TypeError, ValueError):
+		return bad_request()
+	if not (isinstance(name, str) and name and isinstance(dir_, str)
+			and isinstance(argv, list) and argv
+			and all(isinstance(a, str) for a in argv)):
+		return bad_request()
+	if not os.path.isdir(dir_):
+		return err("no-dir")
+	with SESS_LOCK:
+		existing = SESSIONS.get(name)
+	if existing is not None:
+		return {"ok": True, "name": name, "created": False}
+	try:
+		spawn_session(name, dir_, argv, cols, rows)
+	except OSError as exc:
+		log("start '%s' failed: %s" % (name, exc))
+		return err("spawn-failed")
+	return {"ok": True, "name": name, "created": True}
+
+
+def cmd_attach(req, conn):
+	name = req.get("name")
+	try:
+		cols = int(req.get("cols", DEFAULT_COLS))
+		rows = int(req.get("rows", DEFAULT_ROWS))
+	except (TypeError, ValueError):
+		return bad_request(), False
+	if not (isinstance(name, str) and name):
+		return bad_request(), False
+	with SESS_LOCK:
+		sess = SESSIONS.get(name)
+	if sess is None:
+		return err("no-session"), False
+	try:
+		set_winsize(sess["master_fd"], cols, rows)
+	except OSError:
+		pass
+	child_sigwinch(sess["pid"])
+	conn.setblocking(False)
+	old = set_client(sess, conn)
+	if old is not None:
+		log("steal '%s'" % name)
+		try:
+			old.close()
+		except OSError:
+			pass
+	log("attach '%s' %dx%d" % (name, cols, rows))
+	return {"ok": True, "name": name}, True
+
+
+def cmd_detach(req):
+	name = req.get("name")
+	if not isinstance(name, str):
+		return bad_request()
+	with SESS_LOCK:
+		sess = SESSIONS.get(name)
+	if sess is not None and get_client(sess) is not None:
+		log("detach '%s'" % name)
+		close_client(sess)
+	return {"ok": True}
+
+
+def cmd_resize(req):
+	name = req.get("name")
+	try:
+		cols = int(req.get("cols"))
+		rows = int(req.get("rows"))
+	except (TypeError, ValueError):
+		return bad_request()
+	if not isinstance(name, str):
+		return bad_request()
+	with SESS_LOCK:
+		sess = SESSIONS.get(name)
+	if sess is None:
+		return err("no-session")
+	try:
+		set_winsize(sess["master_fd"], cols, rows)
+		child_sigwinch(sess["pid"])
+	except OSError:
+		pass
+	return {"ok": True}
+
+
+def cmd_list(_req):
+	out = []
+	with SESS_LOCK:
+		sessions = list(SESSIONS.values())
+	for sess in sessions:
+		out.append({
+			"name": sess["name"],
+			"dir": sess["dir"],
+			"pid": sess["pid"],
+			"attached": get_client(sess) is not None,
+			"argv": sess["argv"],
+		})
+	return {"ok": True, "sessions": out}
+
+
+def kill_and_wait(pid, grace):
+	try:
+		os.killpg(pid, signal.SIGTERM)
+	except OSError:
+		pass
+	deadline = time.time() + grace
+	while time.time() < deadline:
+		try:
+			if os.waitpid(pid, os.WNOHANG)[0] == pid:
+				return
+		except ChildProcessError:
+			return
+		time.sleep(0.1)
+	try:
+		os.killpg(pid, signal.SIGKILL)
+	except OSError:
+		pass
+
+
+def stop_session(sess):
+	kill_and_wait(sess["pid"], KILL_GRACE)
+
+
+def cmd_stop(req):
+	name = req.get("name")
+	if not isinstance(name, str):
+		return bad_request()
+	with SESS_LOCK:
+		sess = SESSIONS.get(name)
+	if sess is not None:
+		t = threading.Thread(target=stop_session, args=(sess,), daemon=True)
+		t.start()
+	# The session thread drops the entry once the reap lands.
+	return {"ok": True}
+
+
+def session_holds(sess, dir_):
+	try:
+		return os.path.realpath(sess["dir"]) == os.path.realpath(dir_)
+	except OSError:
+		return sess["dir"] == dir_
+
+
+def handover_target(dir_, file):
+	# Mirrors pi-rc's session_for/handover_name target logic.
+	base = os.path.basename(dir_)
+	base = base.replace(":", "_")
+	if base.startswith("="):
+		base = base[1:]
+	primary = "pi-" + base
+	with SESS_LOCK:
+		holder = SESSIONS.get(primary)
+	if holder is None or session_holds(holder, dir_):
+		return primary
+	hx = hashlib.sha256(file.encode()).hexdigest()[:6]
+	return "pi-%s-%s" % (base, hx)
+
+
+def handover_thread(target, dir_, file, after_pid):
+	# Wait for the handing-over pi to exit, then host its session file.
+	if after_pid:
+		while not SHUTDOWN.is_set():
+			try:
+				os.kill(after_pid, 0)
+			except OSError:
+				break
+			time.sleep(0.2)
+		time.sleep(0.5)
+	if SHUTDOWN.is_set():
+		return
+	if not os.path.isfile(file):
+		log("handover '%s' skipped: session file gone: %s" % (target, file))
+		return
+	with SESS_LOCK:
+		free = SESSIONS.get(target) is None
+	if not free:
+		log("handover '%s' skipped: name already hosted" % target)
+		return
+	try:
+		spawn_session(target, dir_, ["pi", "--session", file], verb="handover")
+	except OSError as exc:
+		log("handover '%s' failed: %s" % (target, exc))
+
+
+def cmd_handover(req):
+	file = req.get("file")
+	dir_ = req.get("dir")
+	after_pid = req.get("afterPid")
+	if not (isinstance(file, str) and file and isinstance(dir_, str) and dir_):
+		return bad_request()
+	if after_pid is not None and not isinstance(after_pid, int):
+		return bad_request()
+	if not os.path.isdir(dir_):
+		return err("no-dir")
+	target = handover_target(dir_, file)
+	with SESS_LOCK:
+		holder = SESSIONS.get(target)
+	if holder is not None and not session_holds(holder, dir_):
+		# Held by a session resuming this exact file already.
+		log("handover '%s' already hosted" % target)
+		return {"ok": True, "verdict": "hosted:%s" % target}
+	t = threading.Thread(
+		target=handover_thread, args=(target, dir_, file, after_pid), daemon=True)
+	t.start()
+	return {"ok": True, "verdict": "target:%s" % target}
+
+
+def cmd_shutdown(_req):
+	t = threading.Thread(target=do_shutdown, daemon=True)
+	t.start()
+	return {"ok": True}
+
+
+def do_shutdown():
+	if SHUTDOWN.is_set():
+		return
+	SHUTDOWN.set()
+	log("shutdown")
+	with SESS_LOCK:
+		sessions = list(SESSIONS.values())
+	for sess in sessions:
+		try:
+			os.killpg(sess["pid"], signal.SIGTERM)
+		except OSError:
+			pass
+	deadline = time.time() + KILL_GRACE
+	while time.time() < deadline:
+		alive = False
+		for sess in sessions:
+			try:
+				if os.waitpid(sess["pid"], os.WNOHANG)[0] == 0:
+					alive = True
+			except ChildProcessError:
+				pass
+		if not alive:
+			break
+		time.sleep(0.1)
+	for sess in sessions:
+		try:
+			os.killpg(sess["pid"], signal.SIGKILL)
+		except OSError:
+			pass
+	for sess in sessions:
+		close_client(sess)
+		try:
+			os.close(sess["master_fd"])
+		except OSError:
+			pass
+	registry_write({})
+	try:
+		os.unlink(SOCK_PATH)
+	except OSError:
+		pass
+	os._exit(0)
+
+
+# ------------------------------------------------------------ socket layer
+
+class LineReader:
+	def __init__(self, sock):
+		self.sock = sock
+		self.buf = b""
+
+	def readline(self):
+		while b"\n" not in self.buf:
+			if len(self.buf) > MAX_BUF:
+				raise ValueError("line too long")
+			data = self.sock.recv(65536)
+			if not data:
+				if self.buf:
+					raise ValueError("truncated line")
+				return None
+			self.buf += data
+		line, self.buf = self.buf.split(b"\n", 1)
+		return line
+
+
+def send_json(sock, obj):
+	sock.sendall(json.dumps(obj).encode() + b"\n")
+
+
+def conn_thread(conn):
+	handed_off = False
+	try:
+		conn.settimeout(10)
+		reader = LineReader(conn)
+		while not SHUTDOWN.is_set():
+			try:
+				line = reader.readline()
+			except (ValueError, OSError):
+				break
+			if line is None:
+				break
+			if not line.strip():
+				continue
+			try:
+				req = json.loads(line.decode())
+			except (ValueError, UnicodeDecodeError):
+				send_json(conn, bad_request())
+				continue
+			if not isinstance(req, dict) or not isinstance(req.get("cmd"), str):
+				send_json(conn, bad_request())
+				continue
+			cmd = req["cmd"]
+			if cmd == "attach":
+				resp, handoff = cmd_attach(req, conn)
+				send_json(conn, resp)
+				if handoff:
+					handed_off = True
+					return
+			elif cmd == "ping":
+				send_json(conn, cmd_ping(req))
+			elif cmd == "start":
+				send_json(conn, cmd_start(req))
+			elif cmd == "detach":
+				send_json(conn, cmd_detach(req))
+			elif cmd == "resize":
+				send_json(conn, cmd_resize(req))
+			elif cmd == "list":
+				send_json(conn, cmd_list(req))
+			elif cmd == "stop":
+				send_json(conn, cmd_stop(req))
+			elif cmd == "handover":
+				send_json(conn, cmd_handover(req))
+			elif cmd == "shutdown":
+				send_json(conn, cmd_shutdown(req))
+			else:
+				send_json(conn, bad_request())
+	except Exception as exc:
+		if not handed_off:
+			log("control connection error: %r" % (exc,))
+	finally:
+		if not handed_off:
+			try:
+				conn.close()
+			except OSError:
+				pass
+
+
+def respawn_from_registry():
+	data = registry_load()
+	for name, rec in sorted(data.items()):
+		try:
+			dir_ = rec["dir"]
+			argv = rec["argv"]
+			if not (isinstance(dir_, str) and isinstance(argv, list) and argv):
+				raise ValueError("bad record")
+			spawn_session(name, dir_, argv, verb="respawn")
+		except Exception as exc:
+			log("respawn '%s' failed: %s" % (name, exc))
+			registry_drop(name)
+
+
+def on_signal(_signum, _frame):
+	raise SystemExit(0)
+
+
+def main():
+	if os.getuid() == 0:
+		log("refusing to run as root")
+		return 1
+	signal.signal(signal.SIGTERM, on_signal)
+	signal.signal(signal.SIGINT, on_signal)
+	try:
+		os.unlink(SOCK_PATH)
+	except FileNotFoundError:
+		pass
+	except OSError as exc:
+		log("cannot unlink stale socket %s: %s" % (SOCK_PATH, exc))
+		return 1
+	srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	try:
+		srv.bind(SOCK_PATH)
+		os.chmod(SOCK_PATH, 0o600)
+		srv.listen(16)
+	except OSError as exc:
+		log("cannot bind %s: %s" % (SOCK_PATH, exc))
+		return 1
+	log("listening on %s (registry %s)" % (SOCK_PATH, REG_PATH))
+	respawn_from_registry()
+	try:
+		while not SHUTDOWN.is_set():
+			try:
+				conn, _ = srv.accept()
+			except OSError as exc:
+				if SHUTDOWN.is_set():
+					break
+				log("accept error: %s" % exc)
+				time.sleep(0.1)
+				continue
+			t = threading.Thread(target=conn_thread, args=(conn,), daemon=True)
+			t.start()
+	except SystemExit:
+		pass
+	finally:
+		try:
+			srv.close()
+		except OSError:
+			pass
+	if not SHUTDOWN.is_set():
+		do_shutdown()
+	return 0
+
+
+if __name__ == "__main__":
+	sys.exit(main())
