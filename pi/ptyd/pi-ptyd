@@ -12,7 +12,9 @@
 #
 # The daemon holds no terminal history: a detached session keeps running
 # headless and an attach re-wires the bridge, sizing the PTY for the new
-# client. One client per session; a new attach steals the connection.
+# client. While detached, the master fd is drained and its output
+# discarded so a headless agent can keep producing output without ever
+# blocking on a full tty buffer. One client per session; a new attach steals the connection.
 #
 # Wire protocol (JSON lines; one request line -> one response line,
 # except attach which switches to the raw bridge):
@@ -24,8 +26,11 @@
 #   list                                  live sessions
 #   stop {name}                           TERM the process group, KILL
 #                                         after a 2s grace, drop entry
-#   handover {file,dir,afterPid}          host a pi session file once the
-#                                         owning process exits
+#   handover {file,dir,afterPid[,message]}
+#                                         host a pi session file once the
+#                                         owning process exits; with
+#                                         "message", the hosted pi starts
+#                                         with it as the initial prompt
 #   shutdown                              stop everything and exit
 #
 # Env: XDG_RUNTIME_DIR (control socket), XDG_STATE_HOME (registry).
@@ -56,6 +61,7 @@ REG_PATH = os.path.join(REG_DIR, "sessions.json")
 DEFAULT_COLS = 120
 DEFAULT_ROWS = 40
 MAX_BUF = 1 << 20  # per-direction bridge buffer bound (backpressure)
+MAX_MESSAGE = 8192  # handover kickoff message cap (chars)
 KILL_GRACE = 2.0
 REAP_TICK = 0.5
 
@@ -123,7 +129,8 @@ def child_sigwinch(pid):
 		pass
 
 
-def spawn_session(name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS, verb="start"):
+def spawn_session(name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS,
+			  verb="start", registry_argv=None, refuse_if_exists=False):
 	master, slave = os.openpty()
 	set_winsize(slave, cols, rows)
 	pid = os.fork()
@@ -168,8 +175,26 @@ def spawn_session(name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS, verb="
 		"lock": threading.Lock(),
 	}
 	with SESS_LOCK:
-		SESSIONS[name] = sess
-	registry_add(name, dir_, argv)
+		if refuse_if_exists and SESSIONS.get(name) is not None:
+			lost = True
+		else:
+			SESSIONS[name] = sess
+			lost = False
+	if lost:
+		# Lost a race for the name: kill and reap our child so nothing is
+		# left behind, and leave the existing session untouched.
+		try:
+			os.kill(pid, signal.SIGTERM)
+		except OSError:
+			pass
+		try:
+			os.waitpid(pid, 0)
+		except OSError:
+			pass
+		os.close(master)
+		log("%s '%s' skipped: name taken during spawn" % (verb, name))
+		return None
+	registry_add(name, dir_, list(registry_argv) if registry_argv else list(argv))
 	log("%s '%s' pid %d in %s" % (verb, name, pid, dir_))
 	t = threading.Thread(target=session_loop, args=(sess,), daemon=True)
 	t.start()
@@ -189,10 +214,41 @@ def set_client(sess, client):
 
 
 def close_client(sess):
+	# Detach the client and signal its socket, but do NOT close the fd
+	# here: control threads run concurrently with the session loop's
+	# select, and closing could let a freshly accepted connection recycle
+	# the fd number before the loop's next recv. The loop does the close
+	# once it observes the EOF/error. Returns the detached socket.
 	with sess["lock"]:
 		c = sess["client"]
 		sess["client"] = None
 	if c is not None:
+		try:
+			c.shutdown(socket.SHUT_RDWR)
+		except OSError:
+			pass
+	return c
+
+
+def discard_client(sess, c=None):
+	# Session-loop side: shut the socket down and actually close the fd.
+	# With an explicit socket (an EOF/error the loop observed itself), it
+	# is closed unconditionally but only clears the session slot when it
+	# is still that same client — a concurrent steal-attach may already
+	# have installed a newer one.
+	if c is None:
+		with sess["lock"]:
+			c = sess["client"]
+			sess["client"] = None
+	else:
+		with sess["lock"]:
+			if sess["client"] is c:
+				sess["client"] = None
+	if c is not None:
+		try:
+			c.shutdown(socket.SHUT_RDWR)
+		except OSError:
+			pass
 		try:
 			c.close()
 		except OSError:
@@ -203,7 +259,12 @@ def close_client(sess):
 
 def drop_session(sess, code):
 	name = sess["name"]
-	close_client(sess)
+	c = close_client(sess)
+	if c is not None:
+		try:
+			c.close()
+		except OSError:
+			pass
 	try:
 		os.close(sess["master_fd"])
 	except OSError:
@@ -216,7 +277,7 @@ def drop_session(sess, code):
 
 
 def close_bridge(sess, to_client):
-	# Send whatever is still buffered, then drop the client.
+	# Send whatever is still buffered, then drop and close the client.
 	c = get_client(sess)
 	if c is None:
 		return
@@ -226,7 +287,7 @@ def close_bridge(sess, to_client):
 			del to_client[:sent]
 	except OSError:
 		pass
-	close_client(sess)
+	discard_client(sess)
 
 
 def session_loop(sess):
@@ -255,6 +316,15 @@ def session_loop(sess):
 				rlist.append(master)
 			if to_master:
 				wlist.append(master)
+		else:
+			# Detached: keep draining the master so the headless child
+			# never blocks writing to a full tty buffer; output is
+			# discarded since the daemon holds no terminal history. Also
+			# flush any input buffered at detach time instead of letting
+			# it sit until a client reattaches.
+			rlist.append(master)
+			if to_master:
+				wlist.append(master)
 		try:
 			r, w, _ = select.select(rlist, wlist, [], REAP_TICK)
 		except OSError:
@@ -271,7 +341,7 @@ def session_loop(sess):
 					del to_master[: len(to_master) - MAX_BUF]
 			else:
 				log("detach '%s'" % name)
-				close_client(sess)
+				discard_client(sess, client)
 				client = None
 		if master in r:
 			try:
@@ -283,9 +353,11 @@ def session_loop(sess):
 				else:
 					data = b""
 			if data:
-				to_client += data
-				if len(to_client) > MAX_BUF:
-					del to_client[: len(to_client) - MAX_BUF]
+				if get_client(sess) is not None:
+					to_client += data
+					if len(to_client) > MAX_BUF:
+						del to_client[: len(to_client) - MAX_BUF]
+				# detached: discard; the daemon holds no terminal history
 			else:
 				dead_input = True
 				if get_client(sess) is not None and not to_client:
@@ -303,7 +375,8 @@ def session_loop(sess):
 				del to_client[:sent]
 			except OSError:
 				del to_client[:]
-				close_client(sess)
+				discard_client(sess, client)
+				client = None
 	if get_client(sess) is not None:
 		close_bridge(sess, to_client)
 	drop_session(sess, reaped[1])
@@ -385,8 +458,10 @@ def cmd_attach(req, conn):
 	old = set_client(sess, conn)
 	if old is not None:
 		log("steal '%s'" % name)
+		# Signal only; the session loop observes the EOF and closes the fd
+		# (closing here could race a recycled fd number into its select).
 		try:
-			old.close()
+			old.shutdown(socket.SHUT_RDWR)
 		except OSError:
 			pass
 	log("attach '%s' %dx%d" % (name, cols, rows))
@@ -499,7 +574,7 @@ def handover_target(dir_, file):
 	return "pi-%s-%s" % (base, hx)
 
 
-def handover_thread(target, dir_, file, after_pid):
+def handover_thread(target, dir_, file, after_pid, message=None):
 	# Wait for the handing-over pi to exit, then host its session file.
 	if after_pid:
 		while not SHUTDOWN.is_set():
@@ -519,19 +594,38 @@ def handover_thread(target, dir_, file, after_pid):
 	if not free:
 		log("handover '%s' skipped: name already hosted" % target)
 		return
+	argv = ["pi", "--session", file]
+	registry_argv = list(argv)
+	if message:
+		# Interactive pi takes positional messages as its initial prompt,
+		# so the hosted session resumes and immediately continues the
+		# handed-over work instead of idling. The message is deliberately
+		# kept out of the registry: a daemon restart must respawn the
+		# session idempotently, not re-inject a continuation prompt that
+		# may already have been processed.
+		argv.append(message)
 	try:
-		spawn_session(target, dir_, ["pi", "--session", file], verb="handover")
+		spawned = spawn_session(target, dir_, argv, verb="handover",
+								registry_argv=registry_argv,
+								refuse_if_exists=True)
 	except OSError as exc:
 		log("handover '%s' failed: %s" % (target, exc))
+		return
+	if spawned is None:
+		log("handover '%s' skipped: name taken during handover" % target)
 
 
 def cmd_handover(req):
 	file = req.get("file")
 	dir_ = req.get("dir")
 	after_pid = req.get("afterPid")
+	message = req.get("message")
 	if not (isinstance(file, str) and file and isinstance(dir_, str) and dir_):
 		return bad_request()
 	if after_pid is not None and not isinstance(after_pid, int):
+		return bad_request()
+	if message is not None and not (isinstance(message, str)
+								   and 0 < len(message) <= MAX_MESSAGE):
 		return bad_request()
 	if not os.path.isdir(dir_):
 		return err("no-dir")
@@ -543,7 +637,8 @@ def cmd_handover(req):
 		log("handover '%s' already hosted" % target)
 		return {"ok": True, "verdict": "hosted:%s" % target}
 	t = threading.Thread(
-		target=handover_thread, args=(target, dir_, file, after_pid), daemon=True)
+		target=handover_thread, args=(target, dir_, file, after_pid, message),
+		daemon=True)
 	t.start()
 	return {"ok": True, "verdict": "target:%s" % target}
 
