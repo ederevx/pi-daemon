@@ -21,6 +21,9 @@
 #                                       --fresh starts an empty one)
 #   pi-rc attach [name] [dir]           attach, recreating + resuming if gone
 #   pi-rc detach <name>                 detach a client; the session lives on
+#                                       (Ctrl-\ inside an attached session
+#                                       detaches your terminal the same way
+#                                       without touching the hosted pi)
 #   pi-rc ls                            list hosted sessions
 #   pi-rc stop <name>                   kill one session (ends that pi)
 #   pi-rc handover <file> [dir]         host a specific pi session file in a
@@ -175,6 +178,9 @@ def control(req):
 	if resp is None:
 		die("daemon closed the connection without a response")
 	return resp
+
+
+DETACH_KEY = b"\x1c"  # Ctrl-\: pop out of an attached session without exiting pi
 
 
 # ----------------------------------------------------------------- daemon
@@ -419,9 +425,12 @@ def restore_tty(saved):
 
 def bridge(sock, session, initial=b""):
 	# raw byte relay between our tty and the daemon bridge; this is the
-	# only unbounded phase, and the tty is restored on every exit path
+	# only unbounded phase, and the tty is restored on every exit path.
+	# Returns a short status word for cmd_attach to report after the tty
+	# is restored (the user must be able to tell they left the TUI).
 	saved = termios.tcgetattr(0)
 	atexit.register(restore_tty, saved)
+	status = "lost"
 	wake_r, wake_w = os.pipe()
 	winch = [False]
 	prev_winch = signal.getsignal(signal.SIGWINCH)
@@ -474,7 +483,7 @@ def bridge(sock, session, initial=b""):
 				rl, wl, _ = select.select(rlist, wlist, [])
 			except OSError:
 				# a polled fd vanished; nothing left to relay
-				return
+				break
 			if wake_r in rl:
 				try:
 					os.read(wake_r, 4096)
@@ -486,11 +495,19 @@ def bridge(sock, session, initial=b""):
 				except (BlockingIOError, InterruptedError):
 					data = None
 				except OSError:
-					return
+					status = "detached"
+					break
 				if data == b"":
 					# EOF on stdin: detach; the session keeps running
-					return
+					status = "detached"
+					break
 				if data:
+					# Ctrl-\ pops out: keep the hosted pi running, hand the
+					# terminal back, and never forward the key to the TUI
+					if DETACH_KEY in data:
+						to_sock += data[:data.index(DETACH_KEY)]
+						status = "detached"
+						break
 					to_sock += data
 			if sock in rl:
 				try:
@@ -498,10 +515,12 @@ def bridge(sock, session, initial=b""):
 				except (BlockingIOError, InterruptedError):
 					data = None
 				except OSError:
-					return
+					status = "lost"
+					break
 				if data == b"":
-					# bridge closed: child exited or another attach stole it
-					return
+					# bridge closed: detached, child exited, or stolen
+					status = "closed"
+					break
 				if data:
 					to_tty += data
 					if len(to_tty) > MAX_BUF:
@@ -513,7 +532,8 @@ def bridge(sock, session, initial=b""):
 				except (BlockingIOError, InterruptedError):
 					pass
 				except OSError:
-					return
+					status = "lost"
+					break
 			if 1 in wl:
 				try:
 					sent = os.write(1, to_tty[:65536])
@@ -521,13 +541,31 @@ def bridge(sock, session, initial=b""):
 				except (BlockingIOError, InterruptedError):
 					pass
 				except OSError:
-					return
+					status = "lost"
+					break
+		if to_tty:
+			# flush whatever the child produced before the bridge ended so
+			# the final frame is not dropped
+			try:
+				sock.setblocking(True)
+			except OSError:
+				pass
+			deadline = time.monotonic() + 2.0
+			while to_tty and time.monotonic() < deadline:
+				try:
+					sent = os.write(1, to_tty[:65536])
+					del to_tty[:sent]
+				except (BlockingIOError, InterruptedError):
+					time.sleep(0.05)
+				except OSError:
+					break
 	finally:
 		restore_tty(saved)
 		signal.signal(signal.SIGWINCH, prev_winch)
 		os.close(wake_r)
 		os.close(wake_w)
 		sock.close()
+	return status
 
 
 def cmd_attach(args):
@@ -577,7 +615,26 @@ def cmd_attach(args):
 				die("attach failed: %s" % error)
 	except OSError as exc:
 		die("control connection failed: %s" % exc)
-	bridge(sock, session, rest)
+	status = bridge(sock, session, rest)
+	# Make the drop unmistakable: wipe the frozen TUI frame and state
+	# where the session went — this is the exact gap that made a detached
+	# session look like a stuck TUI.
+	print("\x1b[H\x1b[2J\x1b[m", end="")
+	if status in ("detached", "closed"):
+		note = "session keeps running in the background"
+		if status == "closed":
+			# daemon closed our bridge: a /bg detach, a steal, or the child
+			# exiting — ask the daemon which one it was
+			try:
+				live = {s.get("name")
+						for s in control({"cmd": "list"}).get("sessions") or []}
+				note = (note if session in live else "session ended")
+			except SystemExit:
+				note = "session state unknown (daemon unreachable)"
+		print("pi-rc: detached '%s' (%s; return with: pi-rc attach %s)"
+			  % (session, note, short_name(session)))
+	elif status == "lost":
+		print("pi-rc: connection to '%s' lost" % session)
 
 
 # ------------------------------------------------------------------ help
