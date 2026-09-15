@@ -6,17 +6,27 @@
  * detach: it asks the daemon to drop the client bridge (pi-rc detach).
  * The pi process keeps running headless in the daemon until the user exits
  * it or deletes the session through pi's own session manager; reattach
- * with `pi-rc attach`. The control round-trip is milliseconds.
+ * with `pi-rc attach`. Extension commands execute immediately, even while
+ * the agent is mid-turn, so the detach happens the moment /bg is entered.
+ * After a successful detach the extension queues a continuation prompt
+ * (follow-up when the agent is mid-turn) so the session keeps working on
+ * its tasks headless instead of idling at the next stop; the daemon
+ * drains the detached PTY so that output never stalls the child.
  *
  * Outside hosting (non-wrapped starts: pi launched with arguments or
  * anything that bypassed the auto-hosting wrapper), /bg hands the session
  * over to the service: `pi-rc handover --check` asks the daemon for a
  * verdict ("target:<name>" = will host under that name; "hosted:<name>"
- * = already hosted, attach instead), then `pi-rc handover --after-exit`
- * makes the daemon background its own wait-for-exit-then-host thread and
- * reply immediately — no detached helper needed — and pi shuts down
- * gracefully. Reattach later with `pi-rc attach`. Ephemeral sessions
- * (--no-session) cannot be handed over.
+ * = already hosted, attach instead), then `pi-rc handover --after-exit
+ * --message <text>` makes the daemon background its own
+ * wait-for-exit-then-host thread and reply immediately — no detached
+ * helper needed. If the agent is mid-turn, the turn is aborted only
+ * after the handover is accepted, so a failed request never interrupts
+ * the running turn; pi then shuts down gracefully. The daemon hosts the
+ * session as `pi --session <file> <message>`, resuming with the
+ * continuation prompt as the initial input. Reattach
+ * later with `pi-rc attach`. Ephemeral sessions (--no-session) cannot be
+ * handed over.
  *
  * Ctrl+D cannot be used for this: pi refuses extension shortcuts that
  * conflict with a built-in binding (app.exit is Ctrl+D) — registration is
@@ -26,21 +36,46 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+// Sent after every successful backgrounding: as a queued follow-up (or
+// the handover session's initial prompt) it keeps the agent working on
+// its in-flight tasks while no user is attached.
+const KICKOFF =
+	"[backgrounded] The user detached this session; no one is watching the " +
+	"terminal. Continue the tasks you were working on until they are fully " +
+	"complete. Do not stop to wait for input: when you would normally ask " +
+	"the user a question, pick the most reasonable option, proceed, and " +
+	"record the decision. Persist or commit completed work as you go.";
+
 export default function (pi: ExtensionAPI) {
 	async function detach(ctx: any) {
 		const session = process.env.PI_HOSTED_SESSION || "";
 		const piRc = `${process.env.HOME || "."}/.local/bin/pi-rc`;
 		// The daemon closes this session's client bridge; the session and
-		// its pi process stay alive in the daemon (milliseconds round-trip).
+		// its pi process stay alive hosted (milliseconds round-trip).
 		const result = await pi.exec(piRc, ["detach", session]);
 		if (result.code !== 0 && !result.killed) {
 			ctx?.ui?.notify?.(
 				`Detach failed: ${(result.stderr || result.stdout || "").trim() || `exit ${result.code}`}`,
 				"warning",
 			);
+			return;
 		}
-		// On success this pi keeps running hosted, unhosted-by-client; the
-		// user reattaches with: pi-rc attach <name>.
+		// Kick the headless agent so it continues its tasks instead of
+		// idling. deliverAs "followUp" queues behind an in-flight turn
+		// and triggers a fresh turn when idle. A pending message already
+		// covering the continuation (e.g. a repeated /bg) skips the kick.
+		try {
+			if (!ctx?.hasPendingMessages?.()) {
+				await ctx.sendUserMessage(KICKOFF, { deliverAs: "followUp" });
+			}
+		} catch (err) {
+			ctx?.ui?.notify?.(
+				`Detached, but the continuation prompt failed: ${err instanceof Error ? err.message : String(err)}`,
+				"warning",
+			);
+			return;
+		}
+		// The user reattaches with: pi-rc attach <name>.
 	}
 
 	async function handover(ctx: any) {
@@ -84,13 +119,17 @@ export default function (pi: ExtensionAPI) {
 
 		// The daemon replies immediately with the verdict and backgrounds
 		// its own wait-for-exit-then-host thread: once this pi exits, it
-		// hosts the exact session file. No setsid helper is needed anymore.
+		// hosts the exact session file as `pi --session <file> <message>`,
+		// so the hosted session starts by continuing the tasks. No setsid
+		// helper is needed.
 		const spawn = await pi.exec(piRc, [
 			"handover",
 			sessionFile,
 			dir,
 			"--after-exit",
 			String(process.pid),
+			"--message",
+			KICKOFF,
 		]);
 		if (spawn.code !== 0) {
 			ctx?.ui?.notify?.(
@@ -100,13 +139,24 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		// Abort an in-flight turn only after the handover is accepted:
+		// ctx.shutdown() defers until the agent is idle, and without this
+		// a mid-turn /bg would wait for the whole turn to finish before
+		// pi ever exits. Aborting before a failed request would kill the
+		// turn with nothing handed over; the daemon resumes the session
+		// with the continuation prompt, so the work continues there.
+		if (!ctx?.isIdle?.()) {
+			ctx.abort?.();
+		}
+
 		ctx?.ui?.notify?.(
-			`Handing this session to the background service as ${name}; pi will exit. Reattach later with: pi-rc attach ${name.replace(/^pi-/, "")}`,
+			`Handing this session to the background service as ${name}; pi will exit and the work continues there. Reattach later with: pi-rc attach ${name.replace(/^pi-/, "")}`,
 			"info",
 		);
-		// Graceful: deferred until the agent is idle and flushes the session
-		// before the process goes away; the daemon starts the hosted session
-		// only after this process is gone.
+		// Graceful: deferred until the agent is idle (immediately after
+		// the abort above settles) and flushes the session before the
+		// process goes away; the daemon starts the hosted session only
+		// after this process is gone.
 		ctx.shutdown();
 	}
 
