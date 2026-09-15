@@ -20,8 +20,8 @@
 #                                       new detached session; used by /bg
 #                                       outside tmux to hand a live
 #                                       conversation to the persistent
-#                                       service (--check [dir] only reports
-#                                       the hosted name or "none")
+#                                       service (--check <file> [dir] only
+#                                       reports the hosting verdict)
 #   pi-rc ls                            list hosted sessions
 #   pi-rc stop <name>                   kill one session (ends that pi)
 #   pi-rc daemon-start                  ensure the persistent server is running
@@ -152,8 +152,32 @@ cmd_attach() {
 	exec _tmux attach-session -t "$session"
 }
 
+# Choose the hosted session name for a handover. The directory's primary
+# name is used when free; when it is taken by another conversation, a
+# distinct name derived from the session file lets a second conversation
+# in the same directory be hosted too. Prints "target:<name>" when the
+# caller should host under <name>, or "hosted:<name>" when a hosted pane
+# already resumes this exact session file (attach, do not duplicate).
+handover_name() {
+	local dir="$1" file="$2" primary base cand
+	primary="$(session_for "" "$dir")"
+	if ! _tmux has-session -t "$primary" 2>/dev/null; then
+		printf 'target:%s\n' "$primary"
+		return 0
+	fi
+	base="$(basename "$dir")"
+	base="${base//:/_}"
+	base="${base#=}"
+	cand="$(printf 'pi-%s-%s' "$base" "$(printf '%s' "$file" | sha256sum | cut -c1-6)")"
+	if _tmux has-session -t "$cand" 2>/dev/null; then
+		printf 'hosted:%s\n' "$cand"
+	else
+		printf 'target:%s\n' "$cand"
+	fi
+}
+
 cmd_handover() {
-	local check=0 file="" dir="" pid=""
+	local check=0 file="" dir="" pid="" verdict session
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--check) check=1; shift ;;
@@ -165,16 +189,11 @@ cmd_handover() {
 		esac
 	done
 	dir="$(resolve_dir "${dir:-$PWD}")"
-	local session
-	session="$(session_for "" "$dir")"
+	verdict="$(handover_name "$dir" "$file")"
+	session="${verdict#*:}"
 	if [[ "$check" -eq 1 ]]; then
-		# Read-only preflight used by the rc-background extension: report the
-		# hosted session name for this directory, or "none".
-		if _tmux has-session -t "$session" 2>/dev/null; then
-			printf '%s\n' "$session"
-		else
-			printf 'none\n'
-		fi
+		# Read-only preflight used by the rc-background extension.
+		printf '%s\n' "$verdict"
 		return 0
 	fi
 	if [[ ! -f "$file" ]]; then
@@ -189,8 +208,8 @@ cmd_handover() {
 		sleep 0.5
 	fi
 	cmd_daemon_start
-	if _tmux has-session -t "$session" 2>/dev/null; then
-		echo "pi-rc: '$session' is already hosted (attach: pi-rc attach ${session#pi-})" >&2
+	if [[ "$verdict" == hosted:* ]]; then
+		echo "pi-rc: '$session' already hosts this session (attach: pi-rc attach ${session#pi-})" >&2
 		exit 3
 	fi
 	_tmux new-session -d -s "$session" -c "$dir" "pi --session $(shquote "$file")"
