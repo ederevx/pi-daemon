@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# pi-rc — launcher for the pi-background-service.
+#
+# The systemd user service owns a persistent tmux server (socket "pi-rc")
+# that hosts live pi TUI sessions. Inside a hosted pi, /bg (handled by the
+# rc-background pi extension) detaches the client: pi keeps running
+# hosted until it exits or its session is deleted through pi's own session
+# manager. If the hosted pi is ever gone (reboot, server restart), the next
+# attach/start recreates it and resumes the latest pi session from disk.
+#
+# Usage:
+#   pi-rc start [name] [dir] [--fresh]  create a detached pi session
+#                                       (default name: dir basename; default
+#                                       command resumes the latest pi session,
+#                                       --fresh starts an empty one)
+#   pi-rc attach [name] [dir]           attach, recreating + resuming if gone
+#   pi-rc ls                            list hosted sessions
+#   pi-rc stop <name>                   kill one session (ends that pi)
+#   pi-rc daemon-start                  ensure the persistent server is running
+#   pi-rc daemon-stop                   stop the server and every hosted session
+set -euo pipefail
+
+SOCKET_NAME="pi-rc"
+CONF="${HOME}/.config/pi-background-service/tmux.conf"
+
+_tmux() {
+	tmux -L "$SOCKET_NAME" -f "$CONF" "$@"
+}
+
+server_running() {
+	_tmux has-session -t _host 2>/dev/null
+}
+
+session_name() {
+	local name="${1:-}"
+	if [[ -z "$name" ]]; then
+		name="$(basename "$(pwd)")"
+	fi
+	# tmux targets treat ':' and a leading '=' specially.
+	name="${name//:/_}"
+	name="${name#=}"
+	printf 'pi-%s' "$name"
+}
+
+resolve_dir() {
+	local dir="${1:-$PWD}"
+	if [[ ! -d "$dir" ]]; then
+		echo "pi-rc: not a directory: $dir" >&2
+		exit 1
+	fi
+	readlink -f "$dir"
+}
+
+cmd_daemon_start() {
+	if server_running; then
+		return 0
+	fi
+	# The host session keeps the server alive; it runs no pi instance.
+	_tmux new-session -d -s _host -c "$HOME" "sleep infinity"
+	# The host session is never attached; hide its status bar.
+	_tmux set-option -t _host status off
+}
+
+cmd_daemon_stop() {
+	if _tmux has-session -t _host 2>/dev/null || _tmux list-sessions &>/dev/null; then
+		_tmux kill-server 2>/dev/null || true
+	fi
+}
+
+cmd_start() {
+	local name="" dir="" fresh=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--fresh) fresh=1; shift ;;
+		*) if [[ -z "$name" ]]; then name="$1"; else dir="$1"; fi; shift ;;
+		esac
+	done
+	local session
+	dir="$(resolve_dir "${dir:-$PWD}")"
+	session="$(session_name "$name")"
+	cmd_daemon_start
+	if _tmux has-session -t "$session" 2>/dev/null; then
+		echo "pi-rc: session '$session' already exists (attach with: pi-rc attach ${session#pi-})"
+		return 0
+	fi
+	if [[ "$fresh" -eq 1 ]]; then
+		_tmux new-session -d -s "$session" -c "$dir" "pi"
+	else
+		# Resume the latest pi session on disk so conversations survive the
+		# hosted process dying; fall back to a fresh pi when none exists.
+		_tmux new-session -d -s "$session" -c "$dir" "sh -c 'pi -c || exec pi'"
+	fi
+	echo "pi-rc: started '$session' in $dir (attach: pi-rc attach ${session#pi-}; background: /bg)"
+}
+
+cmd_attach() {
+	local name="" dir=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--fresh) echo "pi-rc: --fresh is a 'start' option" >&2; exit 2 ;;
+		*) if [[ -z "$name" ]]; then name="$1"; else dir="$1"; fi; shift ;;
+		esac
+	done
+	local session
+	session="$(session_name "$name")"
+	cmd_daemon_start
+	if ! _tmux has-session -t "$session" 2>/dev/null; then
+		dir="$(resolve_dir "${dir:-$PWD}")"
+		_tmux new-session -d -s "$session" -c "$dir" "sh -c 'pi -c || exec pi'"
+		echo "pi-rc: recreated '$session' in $dir (resuming latest session)"
+	fi
+	# Exec replaces the shell so a /bg detach returns cleanly to it.
+	exec _tmux attach-session -t "$session"
+}
+
+cmd_ls() {
+	if ! _tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -v '^_host$'; then
+		echo "pi-rc: no hosted sessions"
+	fi
+}
+
+cmd_stop() {
+	local session
+	session="$(session_name "${1:?usage: pi-rc stop <name>}")"
+	_tmux kill-session -t "$session"
+	echo "pi-rc: stopped '$session'"
+}
+
+case "${1:-help}" in
+start) shift; cmd_start "$@" ;;
+attach) shift; cmd_attach "$@" ;;
+ls|list) cmd_ls ;;
+stop) shift; cmd_stop "$@" ;;
+daemon-start) cmd_daemon_start ;;
+daemon-stop) cmd_daemon_stop ;;
+help|*)
+	sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+	;;
+esac
