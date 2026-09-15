@@ -43,6 +43,7 @@ import struct
 import sys
 import threading
 import time
+import time
 import termios
 
 UID = os.getuid()
@@ -362,6 +363,19 @@ def cmd_attach(req, conn):
 		sess = SESSIONS.get(name)
 	if sess is None:
 		return err("no-session"), False
+	try:
+		# pi's TUI only repaints when the winsize actually changes (Node
+		# fires the resize event on a change), so a reattach at the same
+		# size would stay silent until the user types or resizes. Nudge the
+		# size by one line first so the final size is always seen as a
+		# change and the child redraws its whole frame.
+		if rows > 1:
+			set_winsize(sess["master_fd"], cols, rows - 1)
+		else:
+			set_winsize(sess["master_fd"], max(cols - 1, 1), rows)
+		time.sleep(0.05)
+	except OSError:
+		pass
 	try:
 		set_winsize(sess["master_fd"], cols, rows)
 	except OSError:
