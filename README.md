@@ -11,16 +11,21 @@ them, and can uninstall exactly what it installed.
   through `pi-rc attach`, so every plain start is hosted automatically.
   Any explicit arguments or flags, non-tty stdin, and subagent workers exec
   the real pi untouched. The wrapper resolves the real binary at install
-  time and is manifest-owned.
+  time and is manifest-owned. If the helper or tmux itself is missing, the
+  wrapper degrades to the real pi so a bare start always works.
 - **Hosted pi sessions** (`pi-rc`): a systemd user service owns a persistent
   tmux server that hosts detached pi TUI sessions. Detaching (`/bg` inside a
   hosted pi) backgrounds the session; the pi process keeps
   running until it exits or its session is deleted through pi's own session
   manager. Survives terminal exit, SSH logout, and reboot (user linger).
 - **`rc-background` pi extension**: the `/bg` command detaches the tmux
-  client when pi runs hosted. (Ctrl+D cannot be rebound: pi refuses
-  extension shortcuts that conflict with its built-in `app.exit` Ctrl+D
-  binding.)
+  client when pi runs hosted; outside tmux (non-wrapped starts) it hands
+  the session over to the service: a detached helper waits for the current
+  pi to exit, then hosts a pane resuming the exact session file
+  (`pi-rc handover`), and pi shuts down gracefully. Ephemeral
+  (`--no-session`) sessions are refused. (Ctrl+D cannot be rebound: pi
+  refuses extension shortcuts that conflict with its built-in `app.exit`
+  Ctrl+D binding.)
 - **Session survival**: pi sessions live on disk regardless of processes.
   When a hosted pi is gone (reboot, server restart), the next `pi-rc attach`
   or `pi-rc start` recreates it and resumes the latest session for that
