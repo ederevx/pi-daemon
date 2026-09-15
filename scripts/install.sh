@@ -38,11 +38,11 @@ mkdir -p "$pi_home/extensions" "$local_bin" "$systemd_dir" "$state_dir"
 install -m 644 "$repo_root/pi/extensions/rc-background.ts" "$dest_extension"
 install -m 755 "$repo_root/pi/bin/pi-rc" "$dest_helper"
 install -m 755 "$repo_root/pi/ptyd/pi-ptyd" "$dest_daemon"
-install -m 644 "$repo_root/pi/systemd/pi-background-service.service" "$dest_unit"
 
-# The pi wrapper must point at the real pi binary. Resolve it by scanning
-# PATH while skipping the wrapper's own directory, so an already-installed
-# wrapper can never be mistaken for the real binary.
+# The real pi binary must be resolved by PATH while skipping the
+# wrapper's own directory, so an already-installed wrapper can never be
+# mistaken for the real binary. Its bin dir is substituted into both the
+# wrapper (REAL_PI) and the unit (hosted children's PATH).
 real_pi=""
 old_ifs="$IFS"; IFS=:
 for dir in $PATH; do
@@ -54,6 +54,8 @@ IFS="$old_ifs"
   echo "install: cannot resolve the real pi binary for the wrapper" >&2
   exit 1
 }
+sed "s|@REAL_PI@|$real_pi|;s|@PI_BIN_DIR@|$(dirname "$real_pi")|" \
+  "$repo_root/pi/systemd/pi-background-service.service" > "$dest_unit"
 sed "s|@REAL_PI@|$real_pi|" "$repo_root/pi/bin/pi-wrapper" > "$dest_wrapper"
 chmod 755 "$dest_wrapper"
 
