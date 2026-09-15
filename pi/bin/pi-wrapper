@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # pi — auto-hosting wrapper installed by pi-background-service.
 #
-# A bare interactive `pi` start runs inside the persistent hosted tmux
-# server (see pi-rc), so /bg works from any pi and hosted sessions survive
-# terminal exit, SSH logout, and reboot. Everything else — any explicit
-# arguments or flags, non-tty stdin, invocations already inside tmux
-# (hosted sessions, subagent workers) — execs the real pi untouched. If the
-# service helper or tmux itself is missing, the wrapper degrades to the
-# real pi so a bare start always works (unhosted; /bg then reports it).
+# A bare interactive `pi` start attaches to the persistent PTY host daemon
+# through pi-rc, so /bg works from any pi and hosted sessions survive
+# terminal exit, SSH logout, and reboot. The PI_HOSTED guard keeps hosted
+# subagent/worker sessions and nested starts out of the way: anything
+# running inside the daemon already carries PI_HOSTED and execs the real
+# pi untouched. Everything else — any explicit arguments or flags,
+# non-tty stdin, or invocations with PI_HOSTED set — also passes through.
+# If pi-rc is missing or the service is not running (attach exits
+# nonzero), the wrapper degrades to the real pi so a bare start always
+# works (unhosted; /bg then offers a handover).
 #
 # REAL_PI is rewritten to the actual pi binary at install time.
 set -euo pipefail
@@ -15,8 +18,11 @@ set -euo pipefail
 REAL_PI="@REAL_PI@"
 PI_RC="$HOME/.local/bin/pi-rc"
 
-if [[ $# -eq 0 && -t 0 && -z "${TMUX:-}" && -x "$PI_RC" ]] && command -v tmux >/dev/null 2>&1; then
-	exec "$PI_RC" attach
+if [[ $# -eq 0 && -t 0 && -z "${PI_HOSTED:-}" && -x "$PI_RC" ]]; then
+	"$PI_RC" attach && exit 0
+	# Attach failed (service down, or the bridge refused): degrade to the
+	# real pi so a bare start always works.
+	exec "$REAL_PI" "$@"
 fi
 
 exec "$REAL_PI" "$@"
