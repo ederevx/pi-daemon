@@ -6,6 +6,10 @@ StartLimitIntervalSec=0
 Type=simple
 WorkingDirectory=%h
 Environment=HOME=%h
+# Hosted children exec pi by name; the user manager's default PATH
+# carries neither ~/.local/bin nor the node bin dir, so the real pi's
+# directory is substituted at install time (@PI_BIN_DIR@).
+Environment=PATH=@PI_BIN_DIR@:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=%h/.local/bin/pi-ptyd
 ExecStop=%h/.local/bin/pi-rc daemon-stop
 Restart=on-failure
