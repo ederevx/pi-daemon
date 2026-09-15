@@ -54,21 +54,25 @@ export default function (pi: ExtensionAPI) {
 		const piRc = `${process.env.HOME || "."}/.local/bin/pi-rc`;
 		const dir = process.cwd();
 
-		// Preflight: is a hosted session already live for this directory?
-		// pi-rc hosts one session per directory, so a second handover would
-		// fail after this pi is gone; surface it while we can still abort.
-		const check = await pi.exec(piRc, ["handover", "--check", dir]);
-		const hosted = (check.stdout || "").trim();
-		if (check.code !== 0) {
+		// Preflight: pi-rc hosts one session per directory name, so ask it
+		// for the verdict for this exact session file: "target:<name>" means
+		// host under that name (distinct name when the directory's primary
+		// is taken by another conversation); "hosted:<name>" means this
+		// session is already hosted — attach instead of duplicating it.
+		const check = await pi.exec(piRc, ["handover", "--check", sessionFile, dir]);
+		const verdict = (check.stdout || "").trim();
+		const match = /^(target|hosted):(.+)$/.exec(verdict);
+		if (check.code !== 0 || !match) {
 			ctx?.ui?.notify?.(
 				`Handover unavailable: ${(check.stderr || check.stdout || "").trim() || `exit ${check.code}`}`,
 				"warning",
 			);
 			return;
 		}
-		if (hosted && hosted !== "none") {
+		const name = match[2];
+		if (match[1] === "hosted") {
 			ctx?.ui?.notify?.(
-				`A hosted session for this directory already exists (${hosted}); attach with: pi-rc attach ${hosted.replace(/^pi-/, "")}`,
+				`This session is already hosted (${name}); attach with: pi-rc attach ${name.replace(/^pi-/, "")}`,
 				"warning",
 			);
 			return;
@@ -91,7 +95,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		ctx?.ui?.notify?.(
-			"Handing this session to the background service; pi will exit. Reattach later with: pi-rc attach",
+			`Handing this session to the background service as ${name}; pi will exit. Reattach later with: pi-rc attach ${name.replace(/^pi-/, "")}`,
 			"info",
 		);
 		// Graceful: deferred until the agent is idle and flushes the session
