@@ -15,30 +15,40 @@ them, and can uninstall exactly what it installed.
   drains the PTY and discards output, so a headless agent can keep
   working without ever blocking on a full tty buffer. This replaces tmux
   hosting entirely — there is no tmux anywhere.
-- **Auto-hosting wrapper** (`pi`): a bare interactive `pi` start (no
-  args, tty stdin, `PI_HOSTED` unset) is routed through `pi-rc attach`,
-  so every plain start is hosted automatically. The `PI_HOSTED` guard
-  keeps hosted subagent/worker sessions and nested starts out of the
-  way: anything already inside the daemon execs the real pi untouched,
-  as do any explicit arguments or flags and non-tty stdin. The wrapper
-  resolves the real binary at install time and is manifest-owned. If
-  `pi-rc` is missing, the wrapper degrades to the real pi so a bare
-  start always works.
+- **Auto-hosting wrapper** (`pi`): every interactive `pi` call creates its
+  OWN new hosted session through `pi-rc attach --new` — a fresh
+  conversation under a unique session name, attached to the terminal.
+  Nothing is resumed implicitly; pass `--resume` / `--continue` to pi
+  explicitly when an old conversation is wanted (they ride along into the
+  hosted session). One-shot invocations (`-p`/`--print`, `--no-session`),
+  help/version, and non-tty stdin stay direct. The `PI_HOSTED` guard
+  keeps hosted subagent/worker sessions and nested starts out of the way:
+  anything already inside the daemon execs the real pi untouched. The
+  wrapper resolves the real binary at install time and is manifest-owned.
+  If `pi-rc` is missing or the service is down, the wrapper degrades to
+  the real pi so a start always works.
 - **`rc-background` pi extension**: `/bg` runs the moment it is entered,
   even while the agent is mid-turn (pi executes extension commands
   immediately). Inside a hosted session it is an instantaneous detach
   (`pi-rc detach`): the daemon drops the client bridge in milliseconds —
   zero process churn — and the pi keeps running headless until
-  reattached. After detaching, the extension queues a continuation
-  prompt (a follow-up when the agent is mid-turn) so the session keeps
-  working on its tasks instead of idling. Outside hosting, `/bg` hands
+  reattached; no continuation prompt is sent, so a backgrounded session
+  idles once its in-flight work settles. Outside hosting, `/bg` hands
   the session over to the service (`pi-rc handover`): an in-flight turn
   is aborted so the handover is not deferred behind it, the daemon waits
-  for the current pi to exit and hosts it as
-  `pi --session <file> <continuation prompt>`, while pi shuts down
-  gracefully. Ephemeral (`--no-session`) sessions are refused. (Ctrl+D
-  cannot be rebound: pi refuses extension shortcuts that conflict with
-  its built-in `app.exit` Ctrl+D binding.)
+  for the current pi to exit and hosts it as `pi --session <file>`,
+  while pi shuts down gracefully. Ephemeral (`--no-session`) sessions
+  are refused. (Ctrl+D cannot be rebound: pi refuses extension shortcuts
+  that conflict with its built-in `app.exit` Ctrl+D binding.) The
+  extension also announces each session's file to the daemon so abnormal
+  deaths can be revived from the same conversation.
+- **Always backgrounded**: a hosted session never dies silently. When
+  its pi process dies abnormally (crash, SIGKILL, OOM), the daemon
+  revives it headless as `pi --session <file>` under the same name. Only
+  a clean quit (Ctrl+D or `/exit`), an explicit `pi-rc stop`, a daemon
+  shutdown, or a deleted session file ends one for good, and a revived
+  pi that dies again within 30 seconds is left dead so a crash loop
+  cannot spin the daemon.
 - **Session survival**: pi sessions live on disk regardless of
   processes. When a hosted pi is gone (reboot, daemon restart), the
   daemon respawns it from its registry, and `pi-rc attach` or
@@ -70,7 +80,7 @@ bash scripts/uninstall.sh
 ```
 pi/
   extensions/rc-background.ts       # /bg: instant detach when hosted, handover otherwise
-  bin/pi-rc                         # client: start/attach/detach/ls/stop/handover
+  bin/pi-rc                         # client: start/attach/detach/announce/ls/stop/handover
   ptyd/pi-ptyd                      # stdlib Python PTY host daemon
   systemd/pi-background-service.service
   install-subagent.sh               # official subagent extension installer
