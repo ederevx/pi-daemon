@@ -474,7 +474,12 @@ def cmd_detach(req):
 		return bad_request()
 	with SESS_LOCK:
 		sess = SESSIONS.get(name)
-	if sess is not None and get_client(sess) is not None:
+	if sess is None:
+		# A detach of an unknown session must not report ok: callers use
+		# the response to decide whether the user's terminal was handed
+		# back, and a silent ok hid a name-mangling bug for a day.
+		return err("no-session")
+	if get_client(sess) is not None:
 		log("detach '%s'" % name)
 		close_client(sess)
 	return {"ok": True}

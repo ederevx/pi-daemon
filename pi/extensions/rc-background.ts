@@ -48,7 +48,13 @@ const KICKOFF =
 
 export default function (pi: ExtensionAPI) {
 	async function detach(ctx: any) {
-		const session = process.env.PI_HOSTED_SESSION || "";
+		// PI_HOSTED_SESSION is the full daemon name ("pi-<base>") but pi-rc's
+		// detach expects the short name and prepends "pi-" itself — passing
+		// the full name detached "pi-pi-<base>" (a session that does not
+		// exist), the daemon replied ok, and the user's terminal never left
+		// the TUI. Strip exactly one prefix so session_name() rebuilds the
+		// same name (correct even for "pi-pi-*" sessions from "pi-*" dirs).
+		const session = (process.env.PI_HOSTED_SESSION || "").replace(/^pi-/, "");
 		const piRc = `${process.env.HOME || "."}/.local/bin/pi-rc`;
 		// The daemon closes this session's client bridge; the session and
 		// its pi process stay alive hosted (milliseconds round-trip).
