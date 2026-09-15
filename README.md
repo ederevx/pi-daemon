@@ -11,8 +11,10 @@ them, and can uninstall exactly what it installed.
   systemd user service, that owns one PTY per hosted pi TUI session.
   Sessions survive client disconnect and a daemon restart (respawned from
   a state registry); every hosted child gets `PI_HOSTED` and
-  `PI_HOSTED_SESSION` in its env. This replaces tmux hosting entirely —
-  there is no tmux anywhere.
+  `PI_HOSTED_SESSION` in its env. While a session is detached, the daemon
+  drains the PTY and discards output, so a headless agent can keep
+  working without ever blocking on a full tty buffer. This replaces tmux
+  hosting entirely — there is no tmux anywhere.
 - **Auto-hosting wrapper** (`pi`): a bare interactive `pi` start (no
   args, tty stdin, `PI_HOSTED` unset) is routed through `pi-rc attach`,
   so every plain start is hosted automatically. The `PI_HOSTED` guard
@@ -22,15 +24,21 @@ them, and can uninstall exactly what it installed.
   resolves the real binary at install time and is manifest-owned. If
   `pi-rc` is missing, the wrapper degrades to the real pi so a bare
   start always works.
-- **`rc-background` pi extension**: `/bg` inside a hosted session is an
-  instantaneous detach (`pi-rc detach`): the daemon drops the client
-  bridge in milliseconds — zero process churn — and the pi keeps running
-  headless until reattached. Outside hosting, `/bg` hands the session
-  over to the service (`pi-rc handover`): the daemon waits for the
-  current pi to exit and hosts it as `pi --session <file>`, while pi
-  shuts down gracefully. Ephemeral (`--no-session`) sessions are
-  refused. (Ctrl+D cannot be rebound: pi refuses extension shortcuts
-  that conflict with its built-in `app.exit` Ctrl+D binding.)
+- **`rc-background` pi extension**: `/bg` runs the moment it is entered,
+  even while the agent is mid-turn (pi executes extension commands
+  immediately). Inside a hosted session it is an instantaneous detach
+  (`pi-rc detach`): the daemon drops the client bridge in milliseconds —
+  zero process churn — and the pi keeps running headless until
+  reattached. After detaching, the extension queues a continuation
+  prompt (a follow-up when the agent is mid-turn) so the session keeps
+  working on its tasks instead of idling. Outside hosting, `/bg` hands
+  the session over to the service (`pi-rc handover`): an in-flight turn
+  is aborted so the handover is not deferred behind it, the daemon waits
+  for the current pi to exit and hosts it as
+  `pi --session <file> <continuation prompt>`, while pi shuts down
+  gracefully. Ephemeral (`--no-session`) sessions are refused. (Ctrl+D
+  cannot be rebound: pi refuses extension shortcuts that conflict with
+  its built-in `app.exit` Ctrl+D binding.)
 - **Session survival**: pi sessions live on disk regardless of
   processes. When a hosted pi is gone (reboot, daemon restart), the
   daemon respawns it from its registry, and `pi-rc attach` or
