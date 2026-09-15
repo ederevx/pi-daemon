@@ -6,7 +6,9 @@
 # rc-background pi extension) detaches the client: pi keeps running
 # hosted until it exits or its session is deleted through pi's own session
 # manager. If the hosted pi is ever gone (reboot, server restart), the next
-# attach/start recreates it and resumes the latest pi session from disk.
+# attach/start recreates it and resumes the latest pi session from disk. A
+# pi started outside tmux (non-wrapped) hands its saved session over to
+# the service through /bg instead of being left behind.
 #
 # Usage:
 #   pi-rc start [name] [dir] [--fresh]  create a detached pi session
@@ -14,11 +16,23 @@
 #                                       command resumes the latest pi session,
 #                                       --fresh starts an empty one)
 #   pi-rc attach [name] [dir]           attach, recreating + resuming if gone
+#   pi-rc handover <file> [dir]         host a specific pi session file in a
+#                                       new detached session; used by /bg
+#                                       outside tmux to hand a live
+#                                       conversation to the persistent
+#                                       service (--check [dir] only reports
+#                                       the hosted name or "none")
 #   pi-rc ls                            list hosted sessions
 #   pi-rc stop <name>                   kill one session (ends that pi)
 #   pi-rc daemon-start                  ensure the persistent server is running
 #   pi-rc daemon-stop                   stop the server and every hosted session
 set -euo pipefail
+
+# Quote a value for the shell tmux uses to run pane commands.
+shquote() {
+	local s="${1//\'/\'\\\'\'}"
+	printf "'%s'" "$s"
+}
 
 SOCKET_NAME="pi-rc"
 CONF="${HOME}/.config/pi-background-service/tmux.conf"
@@ -138,6 +152,52 @@ cmd_attach() {
 	exec _tmux attach-session -t "$session"
 }
 
+cmd_handover() {
+	local check=0 file="" dir="" pid=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--check) check=1; shift ;;
+		--after-exit)
+			pid="${2:?usage: pi-rc handover <file> [dir] [--after-exit <pid>]}"
+			shift 2
+			;;
+		*) if [[ -z "$file" ]]; then file="$1"; elif [[ -z "$dir" ]]; then dir="$1"; fi; shift ;;
+		esac
+	done
+	dir="$(resolve_dir "${dir:-$PWD}")"
+	local session
+	session="$(session_for "" "$dir")"
+	if [[ "$check" -eq 1 ]]; then
+		# Read-only preflight used by the rc-background extension: report the
+		# hosted session name for this directory, or "none".
+		if _tmux has-session -t "$session" 2>/dev/null; then
+			printf '%s\n' "$session"
+		else
+			printf 'none\n'
+		fi
+		return 0
+	fi
+	if [[ ! -f "$file" ]]; then
+		echo "pi-rc: session file not found: $file" >&2
+		exit 1
+	fi
+	if [[ -n "$pid" ]]; then
+		# The handing-over pi asked us to wait: hold off until it exits so
+		# the two processes never share the session file, then give it a
+		# moment to finish flushing.
+		while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+		sleep 0.5
+	fi
+	cmd_daemon_start
+	if _tmux has-session -t "$session" 2>/dev/null; then
+		echo "pi-rc: '$session' is already hosted (attach: pi-rc attach ${session#pi-})" >&2
+		exit 3
+	fi
+	_tmux new-session -d -s "$session" -c "$dir" "pi --session $(shquote "$file")"
+	_tmux set-option -t "$session" '@dir' "$dir"
+	echo "pi-rc: hosting '$session' resumed from $(basename "$file") (attach: pi-rc attach ${session#pi-}; background: /bg)"
+}
+
 cmd_ls() {
 	if ! _tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -v '^_host$'; then
 		echo "pi-rc: no hosted sessions"
@@ -151,14 +211,22 @@ cmd_stop() {
 	echo "pi-rc: stopped '$session'"
 }
 
+# Every command except help drives the tmux server; fail with a clear
+# message instead of a bare "command not found" deep inside a helper.
+if [[ -n "${1:-}" && "${1:-}" != "help" ]] && ! command -v tmux >/dev/null 2>&1; then
+	echo "pi-rc: tmux not found on PATH; install tmux to host pi sessions" >&2
+	exit 127
+fi
+
 case "${1:-help}" in
 start) shift; cmd_start "$@" ;;
 attach) shift; cmd_attach "$@" ;;
+handover) shift; cmd_handover "$@" ;;
 ls|list) cmd_ls ;;
 stop) shift; cmd_stop "$@" ;;
 daemon-start) cmd_daemon_start ;;
 daemon-stop) cmd_daemon_stop ;;
 help|*)
-	sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
 	;;
 esac
