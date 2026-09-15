@@ -8,25 +8,31 @@
  * it or deletes the session through pi's own session manager; reattach
  * with `pi-rc attach`. Extension commands execute immediately, even while
  * the agent is mid-turn, so the detach happens the moment /bg is entered.
- * After a successful detach the extension queues a continuation prompt
- * (follow-up when the agent is mid-turn) so the session keeps working on
- * its tasks headless instead of idling at the next stop; the daemon
- * drains the detached PTY so that output never stalls the child.
+ * The daemon drains the detached PTY so that output never stalls the
+ * child. No continuation prompt is sent: a backgrounded session simply
+ * idles once its in-flight work settles, and the user resumes it by
+ * reattaching or starting a fresh `pi`.
  *
  * Outside hosting (non-wrapped starts: pi launched with arguments or
  * anything that bypassed the auto-hosting wrapper), /bg hands the session
  * over to the service: `pi-rc handover --check` asks the daemon for a
  * verdict ("target:<name>" = will host under that name; "hosted:<name>"
- * = already hosted, attach instead), then `pi-rc handover --after-exit
- * --message <text>` makes the daemon background its own
- * wait-for-exit-then-host thread and reply immediately — no detached
- * helper needed. If the agent is mid-turn, the turn is aborted only
- * after the handover is accepted, so a failed request never interrupts
- * the running turn; pi then shuts down gracefully. The daemon hosts the
- * session as `pi --session <file> <message>`, resuming with the
- * continuation prompt as the initial input. Reattach
- * later with `pi-rc attach`. Ephemeral sessions (--no-session) cannot be
- * handed over.
+ * = already hosted, attach instead), then `pi-rc handover --after-exit`
+ * makes the daemon background its own wait-for-exit-then-host thread and
+ * reply immediately — no detached helper needed. If the agent is
+ * mid-turn, the turn is aborted only after the handover is accepted, so
+ * a failed request never interrupts the running turn; pi then shuts down
+ * gracefully and the daemon hosts the session as `pi --session <file>`.
+ * Reattach later with `pi-rc attach`. Ephemeral sessions (--no-session)
+ * cannot be handed over.
+ *
+ * The extension also announces the session file to the daemon on every
+ * session start (and again if it changes): the daemon stores it per
+ * hosted session so that an abnormally dying pi (crash, SIGKILL, OOM)
+ * can be revived headless from the same conversation. Deliberate exits
+ * (clean quit such as Ctrl+D) and deleted session files are never
+ * revived. The announce is fire-and-forget; a missing or unreachable
+ * daemon only costs the crash-revive safety net.
  *
  * Ctrl+D cannot be used for this: pi refuses extension shortcuts that
  * conflict with a built-in binding (app.exit is Ctrl+D) — registration is
@@ -36,17 +42,33 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// Sent after every successful backgrounding: as a queued follow-up (or
-// the handover session's initial prompt) it keeps the agent working on
-// its in-flight tasks while no user is attached.
-const KICKOFF =
-	"[backgrounded] The user detached this session; no one is watching the " +
-	"terminal. Continue the tasks you were working on until they are fully " +
-	"complete. Do not stop to wait for input: when you would normally ask " +
-	"the user a question, pick the most reasonable option, proceed, and " +
-	"record the decision. Persist or commit completed work as you go.";
-
 export default function (pi: ExtensionAPI) {
+	// Session file already reported to the daemon for this extension
+	// instance; skipped announces keep the per-prompt hook free of execs.
+	let announced: string | null = null;
+
+	// Tell the daemon which session file backs this hosted pi so an
+	// abnormal death can be revived as `pi --session <file>`. The daemon
+	// also rewrites its registry argv with it, so a daemon restart
+	// respawns the same conversation instead of a blank one. No-op
+	// outside hosting and for ephemeral sessions; failures are ignored.
+	async function announce(ctx: any) {
+		const session = process.env.PI_HOSTED_SESSION;
+		if (!session) return;
+		const file: string | null | undefined =
+			ctx?.sessionManager?.getSessionFile?.();
+		if (!file || file === announced) return;
+		announced = file;
+		try {
+			await pi.exec(
+				`${process.env.HOME || "."}/.local/bin/pi-rc`,
+				["announce", session, file],
+			);
+		} catch {
+			// The daemon stores nothing: crash revival is simply unavailable.
+		}
+	}
+
 	async function detach(ctx: any) {
 		// PI_HOSTED_SESSION is the full daemon name ("pi-<base>") but pi-rc's
 		// detach expects the short name and prepends "pi-" itself — passing
@@ -62,24 +84,6 @@ export default function (pi: ExtensionAPI) {
 		if (result.code !== 0 && !result.killed) {
 			ctx?.ui?.notify?.(
 				`Detach failed: ${(result.stderr || result.stdout || "").trim() || `exit ${result.code}`}`,
-				"warning",
-			);
-			return;
-		}
-		// Kick the headless agent so it continues its tasks instead of
-		// idling. deliverAs "followUp" queues behind an in-flight turn
-		// and triggers a fresh turn when idle. A pending message already
-		// covering the continuation (e.g. a repeated /bg) skips the kick.
-		// Note: sendUserMessage lives on the extension API (pi), not on
-		// command contexts; it is fire-and-forget — errors surface through
-		// the runner's error event, so failure here cannot wedge /bg.
-		try {
-			if (!ctx?.hasPendingMessages?.()) {
-			pi.sendUserMessage(KICKOFF, { deliverAs: "followUp" });
-			}
-		} catch (err) {
-			ctx?.ui?.notify?.(
-				`Detached, but the continuation prompt failed: ${err instanceof Error ? err.message : String(err)}`,
 				"warning",
 			);
 			return;
@@ -128,17 +132,14 @@ export default function (pi: ExtensionAPI) {
 
 		// The daemon replies immediately with the verdict and backgrounds
 		// its own wait-for-exit-then-host thread: once this pi exits, it
-		// hosts the exact session file as `pi --session <file> <message>`,
-		// so the hosted session starts by continuing the tasks. No setsid
-		// helper is needed.
+		// hosts the exact session file as `pi --session <file>`, resuming
+		// the conversation idle at the prompt. No setsid helper is needed.
 		const spawn = await pi.exec(piRc, [
 			"handover",
 			sessionFile,
 			dir,
 			"--after-exit",
 			String(process.pid),
-			"--message",
-			KICKOFF,
 		]);
 		if (spawn.code !== 0) {
 			ctx?.ui?.notify?.(
@@ -153,13 +154,13 @@ export default function (pi: ExtensionAPI) {
 		// a mid-turn /bg would wait for the whole turn to finish before
 		// pi ever exits. Aborting before a failed request would kill the
 		// turn with nothing handed over; the daemon resumes the session
-		// with the continuation prompt, so the work continues there.
+		// file, so the conversation continues there.
 		if (!ctx?.isIdle?.()) {
 			ctx.abort?.();
 		}
 
 		ctx?.ui?.notify?.(
-			`Handing this session to the background service as ${name}; pi will exit and the work continues there. Reattach later with: pi-rc attach ${name.replace(/^pi-/, "")}`,
+			`Handing this session to the background service as ${name}; pi will exit and the session lives on there. Reattach later with: pi-rc attach ${name.replace(/^pi-/, "")}`,
 			"info",
 		);
 		// Graceful: deferred until the agent is idle (immediately after
@@ -179,5 +180,16 @@ export default function (pi: ExtensionAPI) {
 				await handover(ctx);
 			}
 		},
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		await announce(ctx);
+	});
+
+	// A brand-new session may not have written its file when session_start
+	// fires; re-check on the first prompt (and after /fork etc., which fire
+	// their own session_start). The announced-file guard keeps repeats free.
+	pi.on("before_agent_start", async (_event, ctx) => {
+		await announce(ctx);
 	});
 }
