@@ -36,4 +36,6 @@ done
 
 rm -f "$manifest"
 rmdir "$pi_home/.pi-background-service" 2>/dev/null || true
+# Legacy: older installs owned a tmux.conf copy here.
+rmdir "$HOME/.config/pi-background-service" 2>/dev/null || true
 echo "uninstall: ok"

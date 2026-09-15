@@ -1,14 +1,15 @@
 [Unit]
-Description=Pi Background Service (persistent pi session host)
+Description=Persistent pi session host (PTY)
 StartLimitIntervalSec=0
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=/home/ederevx
-Environment=HOME=/home/ederevx
-ExecStart=/home/ederevx/.local/bin/pi-rc daemon-start
-ExecStop=/home/ederevx/.local/bin/pi-rc daemon-stop
+Type=simple
+WorkingDirectory=%h
+Environment=HOME=%h
+ExecStart=%h/.local/bin/pi-ptyd
+ExecStop=%h/.local/bin/pi-rc daemon-stop
+Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=default.target
