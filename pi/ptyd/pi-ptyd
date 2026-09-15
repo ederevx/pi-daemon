@@ -10,6 +10,15 @@
 # daemon hands its saved session over through the handover request, the
 # equivalent of "pi-rc handover".
 #
+# A hosted session must always end up backgrounded rather than lost: when
+# its pi child dies abnormally (crash, SIGKILL, OOM) and the session file
+# announced by the rc-background extension still exists, the daemon
+# revives the conversation headless as `pi --session <file>`. A clean
+# exit (a deliberate quit such as Ctrl+D), an explicit pi-rc stop, a
+# daemon shutdown, or a deleted session file are all final. A revived
+# child that dies again within MIN_REVIVE_LIFE seconds is left dead so a
+# crash loop cannot spin the daemon.
+#
 # The daemon holds no terminal history: a detached session keeps running
 # headless and an attach re-wires the bridge, sizing the PTY for the new
 # client. While detached, the master fd is drained and its output
@@ -26,11 +35,12 @@
 #   list                                  live sessions
 #   stop {name}                           TERM the process group, KILL
 #                                         after a 2s grace, drop entry
-#   handover {file,dir,afterPid[,message]}
-#                                         host a pi session file once the
-#                                         owning process exits; with
-#                                         "message", the hosted pi starts
-#                                         with it as the initial prompt
+#   handover {file,dir,afterPid}          host a pi session file once the
+#                                         owning process exits
+#   announce {name,file}                  record the pi session file that
+#                                         backs a hosted session (drives
+#                                         crash revival and the registry
+#                                         resume argv)
 #   shutdown                              stop everything and exit
 #
 # Env: XDG_RUNTIME_DIR (control socket), XDG_STATE_HOME (registry).
@@ -61,9 +71,12 @@ REG_PATH = os.path.join(REG_DIR, "sessions.json")
 DEFAULT_COLS = 120
 DEFAULT_ROWS = 40
 MAX_BUF = 1 << 20  # per-direction bridge buffer bound (backpressure)
-MAX_MESSAGE = 8192  # handover kickoff message cap (chars)
 KILL_GRACE = 2.0
 REAP_TICK = 0.5
+# A pi that lived shorter than this never gets revived: its death is
+# treated as a crash-loop symptom rather than a lost background session.
+# Overridable for isolated tests (PI_PTYD_MIN_REVIVE_LIFE=0).
+MIN_REVIVE_LIFE = float(os.environ.get("PI_PTYD_MIN_REVIVE_LIFE", "30"))
 
 SESSIONS = {}  # name -> session dict
 SESS_LOCK = threading.Lock()
@@ -113,6 +126,15 @@ def registry_drop(name):
 	data = registry_load()
 	if name in data:
 		del data[name]
+		registry_write(data)
+
+
+def registry_set_argv(name, argv):
+	# An announced session file rewrites the resume argv so a daemon
+	# restart respawns the same conversation instead of a blank one.
+	data = registry_load()
+	if name in data:
+		data[name]["argv"] = list(argv)
 		registry_write(data)
 
 
@@ -173,6 +195,9 @@ def spawn_session(name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS,
 		"master_fd": master,
 		"client": None,
 		"lock": threading.Lock(),
+		"file": None,       # announced pi session file, for revival
+		"stopping": False,  # set by an explicit stop: never revive
+		"spawned_at": time.time(),
 	}
 	with SESS_LOCK:
 		if refuse_if_exists and SESSIONS.get(name) is not None:
@@ -274,6 +299,47 @@ def drop_session(sess, code):
 			del SESSIONS[name]
 	registry_drop(name)
 	log("child-exit '%s' pid %d status %s" % (name, sess["pid"], code))
+
+
+def exit_abnormal(status):
+	# waitpid status of an abnormally dying child (signal or nonzero code);
+	# a clean exit is a deliberate quit (Ctrl+D, /exit) and is final.
+	if status and os.WIFSIGNALED(status):
+		return True
+	if status and os.WIFEXITED(status):
+		return os.WEXITSTATUS(status) != 0
+	return False
+
+
+def revive_session(sess, status):
+	# Backgrounding must always happen unless the user ended the session
+	# themselves: re-host an abnormally dying pi from its announced session
+	# file under the same name. Deliberate quits, explicit stops, daemon
+	# shutdown, deleted files, and crash-loop-short lifetimes stay dead.
+	if SHUTDOWN.is_set() or sess.get("stopping"):
+		return
+	if not exit_abnormal(status):
+		return
+	if time.time() - sess.get("spawned_at", 0) < MIN_REVIVE_LIFE:
+		log("revive '%s' skipped: lived under %ss" % (sess["name"], MIN_REVIVE_LIFE))
+		return
+	file = sess.get("file")
+	if not file or not os.path.isfile(file):
+		log("revive '%s' skipped: no session file" % sess["name"])
+		return
+	with SESS_LOCK:
+		free = SESSIONS.get(sess["name"]) is None
+	if not free:
+		return
+	try:
+		spawned = spawn_session(sess["name"], sess["dir"],
+								["pi", "--session", file], verb="revive",
+								refuse_if_exists=True)
+	except OSError as exc:
+		log("revive '%s' failed: %s" % (sess["name"], exc))
+		return
+	if spawned is None:
+		log("revive '%s' skipped: name taken during revive" % sess["name"])
 
 
 def close_bridge(sess, to_client):
@@ -380,6 +446,7 @@ def session_loop(sess):
 	if get_client(sess) is not None:
 		close_bridge(sess, to_client)
 	drop_session(sess, reaped[1])
+	revive_session(sess, reaped[1])
 
 
 # ----------------------------------------------------------------- control
@@ -541,6 +608,9 @@ def kill_and_wait(pid, grace):
 
 
 def stop_session(sess):
+	# Mark before the first signal lands so the exit path never revives a
+	# session the user explicitly stopped.
+	sess["stopping"] = True
 	kill_and_wait(sess["pid"], KILL_GRACE)
 
 
@@ -602,12 +672,9 @@ def handover_thread(target, dir_, file, after_pid, message=None):
 	argv = ["pi", "--session", file]
 	registry_argv = list(argv)
 	if message:
-		# Interactive pi takes positional messages as its initial prompt,
-		# so the hosted session resumes and immediately continues the
-		# handed-over work instead of idling. The message is deliberately
-		# kept out of the registry: a daemon restart must respawn the
-		# session idempotently, not re-inject a continuation prompt that
-		# may already have been processed.
+		# Legacy hook kept for protocol compatibility; the rc-background
+		# extension no longer sends a continuation prompt, so hosted
+		# handovers start idle at the prompt.
 		argv.append(message)
 	try:
 		spawned = spawn_session(target, dir_, argv, verb="handover",
@@ -620,17 +687,33 @@ def handover_thread(target, dir_, file, after_pid, message=None):
 		log("handover '%s' skipped: name taken during handover" % target)
 
 
+def cmd_announce(req):
+	name = req.get("name")
+	file = req.get("file")
+	if not (isinstance(name, str) and name and isinstance(file, str)
+			and file and os.path.isabs(file)):
+		return bad_request()
+	with SESS_LOCK:
+		sess = SESSIONS.get(name)
+	if sess is None:
+		return err("no-session")
+	sess["file"] = file
+	registry_set_argv(name, ["pi", "--session", file])
+	log("announce '%s' -> %s" % (name, file))
+	return {"ok": True}
+
+
 def cmd_handover(req):
 	file = req.get("file")
 	dir_ = req.get("dir")
 	after_pid = req.get("afterPid")
-	message = req.get("message")
+	message = req.get("message")  # legacy; unused by the current client
 	if not (isinstance(file, str) and file and isinstance(dir_, str) and dir_):
 		return bad_request()
 	if after_pid is not None and not isinstance(after_pid, int):
 		return bad_request()
 	if message is not None and not (isinstance(message, str)
-								   and 0 < len(message) <= MAX_MESSAGE):
+								   and 0 < len(message) <= 8192):
 		return bad_request()
 	if not os.path.isdir(dir_):
 		return err("no-dir")
@@ -765,6 +848,8 @@ def conn_thread(conn):
 				send_json(conn, cmd_stop(req))
 			elif cmd == "handover":
 				send_json(conn, cmd_handover(req))
+			elif cmd == "announce":
+				send_json(conn, cmd_announce(req))
 			elif cmd == "shutdown":
 				send_json(conn, cmd_shutdown(req))
 			else:

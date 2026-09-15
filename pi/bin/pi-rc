@@ -7,12 +7,14 @@
 # resize them, and attach, which switches the connection into a raw byte
 # bridge with the session's PTY (one client per session; a new attach
 # steals it). Inside a hosted pi, /bg (the rc-background extension)
-# detaches the client: pi keeps running headless until it exits or its
-# session is deleted through pi's own session manager. If the hosted pi is
-# ever gone (reboot, daemon restart), the next attach recreates it and
-# resumes the latest pi session from disk. A pi started outside the daemon
-# (non-wrapped) hands its saved session over through "handover" instead of
-# being left behind.
+# detaches the client: pi keeps running headless until the user quits it
+# (Ctrl+D) or deletes the session through pi's own session manager. An
+# abnormally dying hosted pi (crash, SIGKILL, OOM) is revived headless
+# from its announced session file; clean exits and deleted files are
+# final. If the hosted pi is ever gone (reboot, daemon restart), the next
+# attach recreates it and resumes the latest pi session from disk. A pi
+# started outside the daemon (non-wrapped) hands its saved session over
+# through "handover" instead of being left behind.
 #
 # Usage:
 #   pi-rc start [name] [dir] [--fresh]  create a detached pi session
@@ -20,6 +22,15 @@
 #                                       command resumes the latest pi session,
 #                                       --fresh starts an empty one)
 #   pi-rc attach [name] [dir]           attach, recreating + resuming if gone
+#   pi-rc attach --new [-- <pi args...>]  start a NEW hosted pi session (unique
+#                                       name; fresh conversation unless the
+#                                       pi args explicitly resume one) and
+#                                       attach; used by the pi wrapper so
+#                                       every `pi` call gets its own session
+#   pi-rc announce <name> <file>        record the pi session file backing a
+#                                       hosted session (drives crash revival
+#                                       and daemon-restart respawning); used
+#                                       by the rc-background extension
 #   pi-rc detach <name>                 detach a client; the session lives on
 #                                       (Ctrl-\ inside an attached session
 #                                       detaches your terminal the same way
@@ -314,6 +325,18 @@ def cmd_stop(args):
 	print("pi-rc: stopped '%s'" % session)
 
 
+def cmd_announce(args):
+	if len(args) != 2:
+		usage_error("announce takes exactly a session name and a session file")
+	name, file = args
+	if not os.path.isabs(file):
+		die("announce expects an absolute session file path")
+	resp = control({"cmd": "announce", "name": session_name(name),
+					"file": file})
+	if not resp.get("ok"):
+		die("announce failed: %s" % resp.get("error"))
+
+
 def handover_check(dir_, file):
 	# client-side preflight mirroring the daemon's target logic: the
 	# directory's primary name when free or held from the same directory,
@@ -569,17 +592,29 @@ def bridge(sock, session, initial=b""):
 
 
 def cmd_attach(args):
+	fresh_new = False
+	pi_args = []
 	name = None
 	dir_arg = None
-	for arg in args:
-		if arg == "--fresh":
+	i = 0
+	while i < len(args):
+		arg = args[i]
+		if arg == "--new":
+			fresh_new = True
+		elif arg == "--fresh":
 			die("--fresh is a 'start' option")
+		elif arg == "--":
+			pi_args = list(args[i + 1:])
+			break
 		elif name is None:
 			name = arg
 		elif dir_arg is None:
 			dir_arg = arg
 		else:
 			usage_error("too many arguments for 'attach'")
+		i += 1
+	if fresh_new and (name is not None or dir_arg is not None):
+		usage_error("--new takes only [-- <pi args...>]")
 	if not os.isatty(0):
 		die("attach requires a terminal on stdin; run 'pi-rc attach' "
 			"inside a tty (see pi-rc help)")
@@ -588,12 +623,36 @@ def cmd_attach(args):
 	cols, rows = tty_size(0)
 	sock = connect_daemon()
 	try:
+		if fresh_new:
+			# Every call gets its own hosted session: a unique name per
+			# invocation and always a fresh conversation unless the caller
+			# passed pi's own resume flags through pi_args.
+			base = session_base(os.path.basename(dir_))
+			argv = ["pi"] + pi_args
+			for attempt in range(8):
+				suffix = hashlib.sha256(
+					("%d-%d-%d" % (time.time_ns(), os.getpid(), attempt)).encode()
+				).hexdigest()[:4]
+				session = "pi-%s-%s" % (base, suffix)
+				send_json(sock, {"cmd": "start", "name": session,
+									 "dir": dir_, "argv": argv,
+									 "cols": cols, "rows": rows})
+				resp, _ = read_json_line(sock)
+				if resp is None or not resp.get("ok"):
+					die("start failed: %s"
+						% (resp or {}).get("error", "no response"))
+				if resp.get("created", True):
+					break
+			else:
+				die("could not find a free session name")
+			print("pi-rc: started '%s' in %s (background: /bg)"
+				  % (session, dir_))
 		send_json(sock, {"cmd": "attach", "name": session,
 						 "cols": cols, "rows": rows})
 		resp, rest = read_json_line(sock)
 		if resp is None or not resp.get("ok"):
 			error = (resp or {}).get("error") if resp else "no response"
-			if error == "no-session":
+			if error == "no-session" and not fresh_new:
 				# recreate + resume, then attach the same connection
 				argv = ["sh", "-c", "pi -c || exec pi"]
 				send_json(sock, {"cmd": "start", "name": session,
@@ -666,6 +725,8 @@ def main():
 		cmd_start(rest)
 	elif cmd == "attach":
 		cmd_attach(rest)
+	elif cmd == "announce":
+		cmd_announce(rest)
 	elif cmd == "detach":
 		cmd_detach(rest)
 	elif cmd == "stop":
