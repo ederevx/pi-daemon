@@ -1,0 +1,14 @@
+[Unit]
+Description=Pi Background Service (persistent pi session host)
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/<user>
+Environment=HOME=/home/<user>
+ExecStart=/home/<user>/.local/bin/pi-rc daemon-start
+ExecStop=/home/<user>/.local/bin/pi-rc daemon-stop
+
+[Install]
+WantedBy=default.target
