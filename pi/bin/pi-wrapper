@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pi — auto-hosting wrapper installed by pi-background-service.
+# pi — auto-hosting wrapper installed by pi-daemon.
 #
 # Every interactive `pi` call creates its OWN new hosted session through
 # pi-rc (`attach --new`): a fresh conversation under a unique session

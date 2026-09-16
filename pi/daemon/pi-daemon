@@ -122,7 +122,7 @@ _WIRE_COMMANDS = ("ping", "start", "detach", "resize", "list", "which",
 def log(msg):
 	# Daemon output goes to stderr (the journal); stdout is never used.
 	with LOG_LOCK:
-		sys.stderr.write("ptyd: %s\n" % msg)
+		sys.stderr.write("pi-daemon: %s\n" % msg)
 		sys.stderr.flush()
 
 
@@ -730,7 +730,7 @@ class SessionSpawner:
 			os.execvpe(argv[0], argv, env)
 		except Exception as exc:
 			try:
-				sys.stderr.write("ptyd: exec failed for %s: %s\n" % (name, exc))
+				sys.stderr.write("pi-daemon: exec failed for %s: %s\n" % (name, exc))
 			except Exception:
 				pass
 			os._exit(127)

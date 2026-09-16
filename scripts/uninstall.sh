@@ -5,14 +5,14 @@
 set -euo pipefail
 
 pi_home="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
-manifest="$pi_home/.pi-background-service/manifest.json"
+manifest="$pi_home/.pi-daemon/manifest.json"
 
 if [[ ! -f "$manifest" ]]; then
   echo "uninstall: no manifest at $manifest — nothing installed by this repo" >&2
   exit 1
 fi
 
-systemctl --user disable --now pi-background-service.service 2>/dev/null || true
+systemctl --user disable --now pi-daemon.service 2>/dev/null || true
 systemctl --user daemon-reload
 
 mapfile -t owned < <(python3 - "$manifest" <<'EOF'
@@ -35,7 +35,7 @@ for path in "${owned[@]}"; do
 done
 
 rm -f "$manifest"
-rmdir "$pi_home/.pi-background-service" 2>/dev/null || true
+rmdir "$pi_home/.pi-daemon" 2>/dev/null || true
 # Legacy: older installs owned a tmux.conf copy here.
-rmdir "$HOME/.config/pi-background-service" 2>/dev/null || true
+rmdir "$HOME/.config/pi-daemon" 2>/dev/null || true
 echo "uninstall: ok"
