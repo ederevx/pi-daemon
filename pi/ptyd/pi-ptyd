@@ -21,9 +21,10 @@
 #
 # The daemon holds no terminal history: a detached session keeps running
 # headless and an attach re-wires the bridge, sizing the PTY for the new
-# client. While detached, the master fd is drained and its output
-# discarded so a headless agent can keep producing output without ever
-# blocking on a full tty buffer. One client per session; a new attach steals the connection.
+# client. Several viewers may share one session: they all see the same
+# output and any of their input reaches the child. While detached, the
+# master fd is drained and its output discarded so a headless agent can
+# keep producing output without ever blocking on a full tty buffer.
 #
 # Wire protocol (JSON lines; one request line -> one response line,
 # except attach which switches to the raw bridge):
@@ -107,16 +108,15 @@ MIN_REVIVE_LIFE = float(os.environ.get("PI_PTYD_MIN_REVIVE_LIFE", "30"))
 ABSORB_GUARD = 10.0
 ABSORB_SETTLE = 0.5
 
-SESSIONS = {}  # name -> session dict
-# Resume takeover: a duplicate holder of a live conversation announces
-# with takeover, hands its bridge viewers to a live holder, and shuts
-# down; HANDOFFS remembers where its viewers went so pi-rc attach can
-# follow, surviving until the target itself dies.
-HANDOFFS = {}  # announced name -> target name
-SESS_LOCK = threading.Lock()
-REG_LOCK = threading.Lock()
 LOG_LOCK = threading.Lock()
-SHUTDOWN = threading.Event()
+
+CLEAR_SEQ = b"\x1b[H\x1b[2J\x1b[m"
+
+# Wire commands served by Control (attach + shutdown are special-cased in
+# the connection loop).
+_WIRE_COMMANDS = ("ping", "start", "detach", "resize", "list", "which",
+				  "whichall", "state", "stop", "handover", "carry", "resume",
+				  "announce", "handoff-target")
 
 
 def log(msg):
@@ -126,69 +126,8 @@ def log(msg):
 		sys.stderr.flush()
 
 
-# ---------------------------------------------------------------- registry
-
-def registry_load():
-	try:
-		with open(REG_PATH) as f:
-			data = json.load(f)
-		return data if isinstance(data, dict) else {}
-	except (OSError, ValueError):
-		return {}
-
-
-def registry_write(data):
-	# Atomic replacement so readers never see a partial file.
-	with REG_LOCK:
-		os.makedirs(REG_DIR, exist_ok=True)
-		tmp = REG_PATH + ".tmp"
-		with open(tmp, "w") as f:
-			json.dump(data, f)
-			f.write("\n")
-			f.flush()
-			os.fsync(f.fileno())
-		os.replace(tmp, REG_PATH)
-
-
-def registry_add(name, dir_, argv):
-	data = registry_load()
-	data[name] = {"dir": dir_, "argv": list(argv)}
-	registry_write(data)
-
-
-def registry_drop(name):
-	data = registry_load()
-	if name in data:
-		del data[name]
-		registry_write(data)
-
-
-def registry_set_argv(name, argv):
-	# An announced session file rewrites the resume argv so a daemon
-	# restart respawns the same conversation instead of a blank one.
-	data = registry_load()
-	if name in data:
-		data[name]["argv"] = list(argv)
-		registry_write(data)
-
-
-# ------------------------------------------------------------- child spawn
-
 def set_winsize(fd, cols, rows):
 	fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-
-
-def sess_winsize(sess):
-	# Current PTY size of a session, or the defaults when unknown.
-	try:
-		pack = fcntl.ioctl(sess["master_fd"], termios.TIOCGWINSZ,
-						   struct.pack("HHHH", 0, 0, 0, 0))
-		rows, cols = struct.unpack("HHHH", pack)[:2]
-	except OSError:
-		rows, cols = 0, 0
-	if not (rows > 0 and cols > 0):
-		rows, cols = DEFAULT_ROWS, DEFAULT_COLS
-	return rows, cols
 
 
 def child_sigwinch(pid):
@@ -198,12 +137,574 @@ def child_sigwinch(pid):
 		pass
 
 
-def spawn_session(name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS,
+def kill_socket(client):
+	# Shut the socket down and pin its fd number to devnull before closing
+	# it: control threads and session loops run concurrently, so the moment
+	# the number is released a fresh connection could claim it and inherit
+	# a stray shutdown or close.
+	try:
+		client.shutdown(socket.SHUT_RDWR)
+	except OSError:
+		pass
+	try:
+		null = os.open(os.devnull, os.O_RDONLY)
+		try:
+			os.dup2(null, client.fileno())
+		finally:
+			os.close(null)
+	except OSError:
+		pass
+	try:
+		client.close()
+	except OSError:
+		pass
+
+
+def send_json(sock, obj):
+	sock.sendall(json.dumps(obj).encode() + b"\n")
+
+
+def bad_request():
+	return {"ok": False, "error": "bad-request"}
+
+
+def err(error):
+	return {"ok": False, "error": error}
+
+
+def _exit_abnormal(status):
+	# waitpid status of an abnormally dying child (signal or nonzero
+	# code); a clean exit is a deliberate quit (Ctrl+D, /exit) and is
+	# final.
+	if status and os.WIFSIGNALED(status):
+		return True
+	if status and os.WIFEXITED(status):
+		return os.WEXITSTATUS(status) != 0
+	return False
+
+
+def _on_signal(_signum, _frame):
+	raise SystemExit(0)
+
+
+class LineReader:
+	"""Incremental JSON-line reader over a control socket."""
+
+	def __init__(self, sock):
+		self.sock = sock
+		self.buf = b""
+
+	def readline(self):
+		while b"\n" not in self.buf:
+			if len(self.buf) > MAX_BUF:
+				raise ValueError("line too long")
+			data = self.sock.recv(65536)
+			if not data:
+				if self.buf:
+					raise ValueError("truncated line")
+				return None
+			self.buf += data
+		line, self.buf = self.buf.split(b"\n", 1)
+		return line
+
+
+class Registry:
+	"""The on-disk session registry: daemon-restart respawn state."""
+
+	def __init__(self, path):
+		self.path = path
+		self._lock = threading.Lock()
+
+	def load(self):
+		try:
+			with open(self.path) as f:
+				data = json.load(f)
+			return data if isinstance(data, dict) else {}
+		except (OSError, ValueError):
+			return {}
+
+	def write(self, data):
+		# Atomic replacement so readers never see a partial file.
+		with self._lock:
+			os.makedirs(os.path.dirname(self.path), exist_ok=True)
+			tmp = self.path + ".tmp"
+			with open(tmp, "w") as f:
+				json.dump(data, f)
+				f.write("\n")
+				f.flush()
+				os.fsync(f.fileno())
+			os.replace(tmp, self.path)
+
+	def add(self, name, dir_, argv):
+		data = self.load()
+		data[name] = {"dir": dir_, "argv": list(argv)}
+		self.write(data)
+
+	def drop(self, name):
+		data = self.load()
+		if name in data:
+			del data[name]
+			self.write(data)
+
+	def set_argv(self, name, argv):
+		# An announced session file rewrites the resume argv so a daemon
+		# restart respawns the same conversation instead of a blank one.
+		data = self.load()
+		if name in data:
+			data[name]["argv"] = list(argv)
+			self.write(data)
+
+
+class SessionTable:
+	"""Live sessions plus the single lock guarding them."""
+
+	def __init__(self):
+		self._sessions = {}
+		self.lock = threading.Lock()
+
+	def get(self, name):
+		return self._sessions.get(name)
+
+	def put(self, sess, refuse_if_exists=False):
+		# Returns False when a refuse_if_exists put lost a race for the
+		# name; the existing session is left untouched.
+		with self.lock:
+			if refuse_if_exists and self._sessions.get(sess.name) is not None:
+				return False
+			self._sessions[sess.name] = sess
+			return True
+
+	def remove_if(self, sess):
+		# Drop only when the live entry is this very session (a respawn
+		# may have taken the name). Returns the dropped name or None.
+		with self.lock:
+			if self._sessions.get(sess.name) is sess:
+				del self._sessions[sess.name]
+				return sess.name
+			return None
+
+	def snapshot(self):
+		with self.lock:
+			return list(self._sessions.values())
+
+	def holders_of(self, file):
+		# All live sessions backing this conversation file: the announced
+		# file first (the extension recorded it), then a --session argv
+		# match, which covers handover/revive spawns and announce-less
+		# spawns that resume the same file. Caller holds the table lock.
+		hits = []
+		for sess in self._sessions.values():
+			if sess.file == file:
+				hits.append(sess)
+		for sess in self._sessions.values():
+			if sess in hits:
+				continue
+			argv = sess.argv or []
+			for i, arg in enumerate(argv[:-1]):
+				if arg == "--session" and argv[i + 1] == file:
+					hits.append(sess)
+					break
+		return hits
+
+
+class HandoffLedger:
+	# Resume takeover: a duplicate holder of a live conversation announces
+	# with takeover, yields to a busy holder or absorbs idle holders, and
+	# shuts down; the ledger remembers where a shut-down duplicate's
+	# viewers went so pi-rc attach can follow, surviving until the target
+	# itself dies.
+
+	def __init__(self):
+		self._entries = {}
+
+	def record(self, source, target):
+		self._entries[source] = target
+
+	def pop(self, source):
+		self._entries.pop(source, None)
+
+	def pending(self, source):
+		return source in self._entries
+
+	def follow(self, source, table):
+		# The live holder a handed-off duplicate's viewers should follow,
+		# or None. A dead intermediate target re-points at its own handoff
+		# so a chain of simultaneous duplicates resolves to a live holder
+		# instead of ending the follow.
+		seen = set()
+		while True:
+			entry = self._entries.get(source)
+			if entry is None or entry in seen:
+				return None
+			seen.add(entry)
+			target = table.get(entry)
+			if target is not None:
+				return {"name": target.name, "state": target.state}
+			# The holder died before the viewers followed; follow its own
+			# handoff when it was itself a duplicate, else give up.
+			self._entries.pop(source, None)
+			source = entry
+
+	def repoint_on_drop(self, dropped):
+		# Handoff bookkeeping for a dead session: its own entry (as a
+		# duplicate) survives — late viewers still follow it after the
+		# duplicate shut down, and it dies with its target instead. But
+		# as a TARGET it can no longer take viewers: re-point handoffs
+		# through its own handoff when it was itself a duplicate, else
+		# clear them.
+		next_hop = self._entries.get(dropped)
+		for key, val in list(self._entries.items()):
+			if val == dropped:
+				if next_hop and next_hop != key:
+					self._entries[key] = next_hop
+				else:
+					self._entries.pop(key, None)
+
+
+class Session:
+	"""One hosted pi: its PTY, its bridge viewers, and the relay loop
+	that owns the master fd."""
+
+	def __init__(self, name, dir_, argv, pid, master_fd):
+		self.name = name
+		self.dir = dir_
+		self.argv = list(argv)
+		self.pid = pid
+		self.master_fd = master_fd
+		self.clients = {}      # bridge sockets -> per-client output buffer
+		self.lock = threading.Lock()
+		self.file = None       # announced pi session file, for revival
+		self.state = "idle"    # model run state, published by the extension
+		self.stopping = False  # set by an explicit stop: never revive
+		self.spawned_at = time.time()
+		self.carry_to = None   # live Session: viewers move there (loop-side)
+		self.absorbing_until = 0.0
+		self.yielded_to = None
+
+	# -- bridge viewers ----------------------------------------------------
+
+	def count_clients(self):
+		with self.lock:
+			return len(self.clients)
+
+	def install_client(self, client, initial=b""):
+		# Control-side: install a new bridge client. Returns the client
+		# count after the join.
+		with self.lock:
+			self.clients[client] = bytearray(initial)
+			return len(self.clients)
+
+	def take_clients(self):
+		# Move out every current viewer (carry): stale old-TUI buffers are
+		# dropped by the mover; returns [(socket, buffer)] pairs.
+		with self.lock:
+			moved = list(self.clients.items())
+			self.clients = {}
+		return moved
+
+	def drop_and_close(self, client):
+		# Session-loop side: drop a client after an EOF/error the loop
+		# itself observed; the pinned close happens here, never in the
+		# control thread. A carry may have moved this socket to another
+		# session: skip when the entry is already gone, so a stale loop
+		# snapshot never closes a live bridge owned elsewhere.
+		with self.lock:
+			if self.clients.pop(client, None) is None:
+				return
+		kill_socket(client)
+
+	def signal_closed(self):
+		# Control-side detach: signal every bridge socket without closing;
+		# the session loop observes the EOFs and does the pinned closes
+		# itself, so no recycled fd can be caught mid-flight.
+		with self.lock:
+			clients = list(self.clients)
+		for c in clients:
+			try:
+				c.shutdown(socket.SHUT_RDWR)
+			except OSError:
+				pass
+
+	def close_bridge(self):
+		# Child-side teardown: flush every client's remaining buffer, then
+		# drop and close all bridge sockets.
+		with self.lock:
+			clients = list(self.clients.items())
+			self.clients = {}
+		for c, buf in clients:
+			try:
+				while buf:
+					sent = c.send(bytes(buf[:65536]))
+					del buf[:sent]
+			except OSError:
+				pass
+			kill_socket(c)
+
+	# -- child process / PTY -------------------------------------------------
+
+	def winsize(self):
+		try:
+			pack = fcntl.ioctl(self.master_fd, termios.TIOCGWINSZ,
+							   struct.pack("HHHH", 0, 0, 0, 0))
+			rows, cols = struct.unpack("HHHH", pack)[:2]
+		except OSError:
+			rows, cols = 0, 0
+		if not (rows > 0 and cols > 0):
+			rows, cols = DEFAULT_ROWS, DEFAULT_COLS
+		return rows, cols
+
+	def resize(self, cols, rows):
+		set_winsize(self.master_fd, cols, rows)
+		child_sigwinch(self.pid)
+
+	def nudge_repaint(self, cols, rows):
+		# pi's TUI only repaints when the winsize actually changes (Node
+		# fires the resize event on a change), so a reattach at the same
+		# size would stay silent until the user types or resizes. Nudge the
+		# size by one line first so the final size is always seen as a
+		# change and the child redraws its whole frame. Callers must have
+		# installed the client first: the full-frame repaint pi produces
+		# from the resize is forwarded exclusively to installed clients.
+		try:
+			if rows > 1:
+				set_winsize(self.master_fd, cols, rows - 1)
+			else:
+				set_winsize(self.master_fd, max(cols - 1, 1), rows)
+			time.sleep(0.05)
+		except OSError:
+			pass
+		try:
+			set_winsize(self.master_fd, cols, rows)
+		except OSError:
+			pass
+		child_sigwinch(self.pid)
+
+	def kill_and_wait(self, grace):
+		try:
+			os.killpg(self.pid, signal.SIGTERM)
+		except OSError:
+			pass
+		deadline = time.time() + grace
+		while time.time() < deadline:
+			try:
+				if os.waitpid(self.pid, os.WNOHANG)[0] == self.pid:
+					return
+			except ChildProcessError:
+				return
+			time.sleep(0.1)
+		try:
+			os.killpg(self.pid, signal.SIGKILL)
+		except OSError:
+			pass
+
+	def terminate(self, grace=KILL_GRACE):
+		# Mark before the first signal lands so the exit path never
+		# revives a session the user explicitly stopped.
+		self.stopping = True
+		self.kill_and_wait(grace)
+
+	# -- projections ---------------------------------------------------------
+
+	def holds_dir(self, dir_):
+		try:
+			return os.path.realpath(self.dir) == os.path.realpath(dir_)
+		except OSError:
+			return self.dir == dir_
+
+	def view(self):
+		# Projection for the list command; caller holds no locks.
+		attached = self.count_clients()
+		return {
+			"name": self.name,
+			"dir": self.dir,
+			"pid": self.pid,
+			"attached": attached > 0,
+			"clients": attached,
+			"file": self.file,
+			"state": self.state,
+			"argv": self.argv,
+		}
+
+	# -- relay loop ------------------------------------------------------------
+
+	def relay_loop(self, daemon):
+		# Owns the master fd: bridge relay to every attached client plus
+		# child reaping. Clients share one view: all of them receive the
+		# child's output, and any client's input is forwarded to the child
+		# (interleaved, like a shared tmux pane). Per-client output buffers
+		# keep one slow viewer from stalling the others or the child; a
+		# client that falls too far behind loses its bridge instead.
+		master = self.master_fd
+		pid = self.pid
+		name = self.name
+		to_master = bytearray()
+		dead_input = False
+		while True:
+			carry_to = self.carry_to
+			if carry_to is not None:
+				self._transfer_viewers(carry_to)
+			try:
+				reaped = os.waitpid(pid, os.WNOHANG)
+			except ChildProcessError:
+				reaped = (pid, 0)
+			if reaped[0] == pid:
+				break
+			clients = self._snapshot()
+			rlist = []
+			wlist = []
+			if not dead_input:
+				rlist.append(master)
+			if to_master:
+				wlist.append(master)
+			for c, buf in clients.items():
+				rlist.append(c)
+				if buf:
+					wlist.append(c)
+			if not rlist and not wlist:
+				# Detached after the master hit EOF: nothing left to
+				# poll, so just wait for the child like the reap check
+				# above.
+				time.sleep(REAP_TICK)
+				continue
+			try:
+				r, w, _ = select.select(rlist, wlist, [], REAP_TICK)
+			except OSError:
+				# A polled fd vanished; the next iteration re-evaluates.
+				continue
+			to_master = self._relay_client_input(clients, r, to_master)
+			dead_input = self._relay_child_output(clients, r, dead_input)
+			if master in w:
+				try:
+					sent = os.write(master, bytes(to_master[:65536]))
+					del to_master[:sent]
+				except OSError:
+					del to_master[:]
+			self._flush_clients(clients, w)
+		# Child gone: flush whatever is still buffered per client, drop
+		# every bridge, then tear the session down and decide on revival.
+		self.close_bridge()
+		daemon.drop(self, reaped[1])
+		daemon.revive(self, reaped[1])
+
+	def _snapshot(self):
+		# Snapshot {socket: outbuf}; the session loop is the only writer
+		# of existing entries, control threads only add new ones.
+		with self.lock:
+			return dict(self.clients)
+
+	def _relay_client_input(self, clients, ready, to_master):
+		for c, _buf in clients.items():
+			if c not in ready:
+				continue
+			try:
+				data = c.recv(65536)
+			except OSError:
+				data = b""
+			if data:
+				to_master += data
+				if len(to_master) > MAX_BUF:
+					del to_master[: len(to_master) - MAX_BUF]
+			else:
+				log("client-exit '%s'" % self.name)
+				self.drop_and_close(c)
+		return to_master
+
+	def _relay_child_output(self, clients, ready, dead_input):
+		if self.master_fd not in ready:
+			return dead_input
+		try:
+			data = os.read(self.master_fd, 65536)
+		except OSError:
+			# EIO is the normal PTY read failure after child exit.
+			data = b""
+		if data:
+			stalled = []
+			with self.lock:
+				for c, buf in self.clients.items():
+					buf.extend(data)
+					if len(buf) > MAX_BUF:
+						stalled.append(c)
+			for c in stalled:
+				self.drop_and_close(c)
+				log("drop slow client '%s'" % self.name)
+		else:
+			dead_input = True
+			# The child closed its tty (or died without reaping yet);
+			# flush and drop the bridges like a single client did.
+			self.close_bridge()
+		return dead_input
+
+	def _flush_clients(self, clients, ready):
+		for c, buf in clients.items():
+			if c not in ready:
+				continue
+			try:
+				sent = c.send(bytes(buf[:65536]))
+				del buf[:sent]
+			except OSError:
+				self.drop_and_close(c)
+
+	def _transfer_viewers(self, carry_to):
+		# /new + /resume carry: move every bridge viewer to the target
+		# session here, between iterations, so exactly one loop ever
+		# recvs on a moved socket. Stale old-TUI buffers are dropped;
+		# each viewer gets a clear followed by the target TUI's full
+		# repaint (nudged below).
+		self.carry_to = None
+		moved = self.take_clients()
+		for client, _buf in moved:
+			with carry_to.lock:
+				carry_to.clients[client] = bytearray(CLEAR_SEQ)
+		rows, cols = self.winsize()
+		carry_to.nudge_repaint(cols, rows)
+		log("carried '%s' -> '%s' (%d viewers)"
+			% (self.name, carry_to.name, len(moved)))
+
+
+class SessionSpawner:
+	"""Fork/exec of hosted pi children onto fresh PTYs."""
+
+	def __init__(self, table, registry, owner=None):
+		self.table = table
+		self.registry = registry
+		# owner: the Daemon, injected after construction (the relay loop
+		# needs its drop/revive).
+		self.owner = owner
+
+	def spawn(self, name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS,
 			  verb="start", registry_argv=None, refuse_if_exists=False):
-	master, slave = os.openpty()
-	set_winsize(slave, cols, rows)
-	pid = os.fork()
-	if pid == 0:
+		master, slave = os.openpty()
+		set_winsize(slave, cols, rows)
+		pid = os.fork()
+		if pid == 0:
+			self._exec_child(name, dir_, argv, slave, cols, rows)
+		os.close(slave)
+		sess = Session(name, dir_, argv, pid, master)
+		if not self.table.put(sess, refuse_if_exists=refuse_if_exists):
+			# Lost a race for the name: kill and reap our child so
+			# nothing is left behind, and leave the existing session
+			# untouched.
+			try:
+				os.kill(pid, signal.SIGTERM)
+			except OSError:
+				pass
+			try:
+				os.waitpid(pid, 0)
+			except OSError:
+				pass
+			os.close(master)
+			log("%s '%s' skipped: name taken during spawn" % (verb, name))
+			return None
+		self.registry.add(name, dir_,
+						  list(registry_argv) if registry_argv else list(argv))
+		log("%s '%s' pid %d in %s" % (verb, name, pid, dir_))
+		t = threading.Thread(target=sess.relay_loop, args=(self.owner,),
+							 daemon=True)
+		t.start()
+		return sess
+
+	@staticmethod
+	def _exec_child(name, dir_, argv, slave, cols, rows):
 		try:
 			os.setsid()
 			fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
@@ -233,1177 +734,757 @@ def spawn_session(name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS,
 			except Exception:
 				pass
 			os._exit(127)
-	os.close(slave)
-	sess = {
-		"name": name,
-		"dir": dir_,
-		"argv": list(argv),
-		"pid": pid,
-		"master_fd": master,
-		"clients": {},       # bridge sockets -> per-client output buffer
-		"lock": threading.Lock(),
-		"file": None,       # announced pi session file, for revival
-		"state": "idle",    # model run state, published by the extension
-		"stopping": False,  # set by an explicit stop: never revive
-		"spawned_at": time.time(),
-	}
-	with SESS_LOCK:
-		if refuse_if_exists and SESSIONS.get(name) is not None:
-			lost = True
-		else:
-			SESSIONS[name] = sess
-			lost = False
-	if lost:
-		# Lost a race for the name: kill and reap our child so nothing is
-		# left behind, and leave the existing session untouched.
+
+
+class Daemon:
+	"""The PTY host: session table, takeover policy, control socket."""
+
+	def __init__(self, registry, sock_path=SOCK_PATH):
+		self.registry = registry
+		self.sock_path = sock_path
+		self.table = SessionTable()
+		self.ledger = HandoffLedger()
+		self.spawner = SessionSpawner(self.table, registry, owner=self)
+		self.control = Control(self)
+		self.shutdown_event = threading.Event()
+
+	# -- control socket ------------------------------------------------------
+
+	def serve(self):
+		if os.getuid() == 0:
+			log("refusing to run as root")
+			return 1
+		signal.signal(signal.SIGTERM, _on_signal)
+		signal.signal(signal.SIGINT, _on_signal)
 		try:
-			os.kill(pid, signal.SIGTERM)
-		except OSError:
+			os.unlink(self.sock_path)
+		except FileNotFoundError:
 			pass
+		except OSError as exc:
+			log("cannot unlink stale socket %s: %s" % (self.sock_path, exc))
+			return 1
+		srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 		try:
-			os.waitpid(pid, 0)
-		except OSError:
+			srv.bind(self.sock_path)
+			os.chmod(self.sock_path, 0o600)
+			srv.listen(16)
+		except OSError as exc:
+			log("cannot bind %s: %s" % (self.sock_path, exc))
+			return 1
+		log("listening on %s (registry %s)" % (self.sock_path,
+											   self.registry.path))
+		self.respawn_from_registry()
+		try:
+			self._accept_loop(srv)
+		except SystemExit:
 			pass
-		os.close(master)
-		log("%s '%s' skipped: name taken during spawn" % (verb, name))
-		return None
-	registry_add(name, dir_, list(registry_argv) if registry_argv else list(argv))
-	log("%s '%s' pid %d in %s" % (verb, name, pid, dir_))
-	t = threading.Thread(target=session_loop, args=(sess,), daemon=True)
-	t.start()
-	return sess
-
-
-def get_clients(sess):
-	# Snapshot {socket: outbuf}; the session loop is the only writer of
-	# existing entries, control threads only add new ones.
-	with sess["lock"]:
-		return dict(sess["clients"])
-
-
-def client_count(sess):
-	with sess["lock"]:
-		return len(sess["clients"])
-
-
-def file_holders(file):
-	# All live sessions backing this conversation file: the announced
-	# file first (the extension recorded it), then a --session argv
-	# match, which covers handover/revive spawns and announce-less
-	# spawns that resume the same file. Caller holds SESS_LOCK.
-	hits = []
-	for sess in SESSIONS.values():
-		if sess.get("file") == file:
-			hits.append(sess)
-	for sess in SESSIONS.values():
-		if sess in hits:
-			continue
-		argv = sess.get("argv") or []
-		for i, arg in enumerate(argv[:-1]):
-			if arg == "--session" and argv[i + 1] == file:
-				hits.append(sess)
-				break
-	return hits
-
-
-def kill_client(client):
-	# Shut the socket down and pin its fd number to devnull before closing
-	# it: control threads and session loops run concurrently, so the moment
-	# the number is released a fresh connection could claim it and inherit
-	# a stray shutdown or close.
-	try:
-		client.shutdown(socket.SHUT_RDWR)
-	except OSError:
-		pass
-	try:
-		null = os.open(os.devnull, os.O_RDONLY)
-		try:
-			os.dup2(null, client.fileno())
 		finally:
-			os.close(null)
-	except OSError:
-		pass
-	try:
-		client.close()
-	except OSError:
-		pass
-
-
-def add_client(sess, client):
-	# Control-side: install a new bridge client. Returns the client count.
-	with sess["lock"]:
-		sess["clients"][client] = bytearray()
-		return len(sess["clients"])
-
-
-def remove_client(sess, client):
-	# Session-loop side: drop a client after an EOF/error the loop itself
-	# observed; the pinned close happens here, never in the control thread.
-	# A carry may have moved this socket to another session: skip when the
-	# entry is already gone, so a stale loop snapshot never closes a live
-	# bridge owned elsewhere.
-	with sess["lock"]:
-		if sess["clients"].pop(client, None) is None:
-			return
-	kill_client(client)
-
-
-def close_all_clients(sess):
-	# Control-side detach (cmd_detach, shutdown): signal every bridge
-	# socket without closing; the session loop observes the EOFs and does
-	# the pinned closes itself, so no recycled fd can be caught mid-flight.
-	with sess["lock"]:
-		clients = list(sess["clients"])
-	for c in clients:
-		try:
-			c.shutdown(socket.SHUT_RDWR)
-		except OSError:
-			pass
-
-
-# ----------------------------------------------------------- session loop
-
-def drop_session(sess, code):
-	name = sess["name"]
-	sess["carry_to"] = None
-	close_all_clients(sess)
-	try:
-		os.close(sess["master_fd"])
-	except OSError:
-		pass
-	with SESS_LOCK:
-		if SESSIONS.get(name) is sess:
-			del SESSIONS[name]
-			# Handoff bookkeeping for the dead session: its own entry (as a
-			# duplicate) survives — late viewers still follow it after the
-			# duplicate shut down, and it dies with its target instead. But
-			# as a TARGET it can no longer take viewers: re-point handoffs
-			# through its own handoff when it was itself a duplicate, else
-			# clear them.
-			next_hop = HANDOFFS.get(name)
-			for key, val in list(HANDOFFS.items()):
-				if val == name:
-					if next_hop and next_hop != key:
-						HANDOFFS[key] = next_hop
-					else:
-						HANDOFFS.pop(key, None)
-	registry_drop(name)
-	log("child-exit '%s' pid %d status %s" % (name, sess["pid"], code))
-
-
-def exit_abnormal(status):
-	# waitpid status of an abnormally dying child (signal or nonzero code);
-	# a clean exit is a deliberate quit (Ctrl+D, /exit) and is final.
-	if status and os.WIFSIGNALED(status):
-		return True
-	if status and os.WIFEXITED(status):
-		return os.WEXITSTATUS(status) != 0
-	return False
-
-
-def revive_session(sess, status):
-	# Backgrounding must always happen unless the user ended the session
-	# themselves: re-host an abnormally dying pi from its announced session
-	# file under the same name. Deliberate quits, explicit stops, daemon
-	# shutdown, deleted files, and crash-loop-short lifetimes stay dead.
-	if SHUTDOWN.is_set() or sess.get("stopping"):
-		return
-	if not exit_abnormal(status):
-		return
-	if time.time() - sess.get("spawned_at", 0) < MIN_REVIVE_LIFE:
-		log("revive '%s' skipped: lived under %ss" % (sess["name"], MIN_REVIVE_LIFE))
-		return
-	file = sess.get("file")
-	if not file or not os.path.isfile(file):
-		log("revive '%s' skipped: no session file" % sess["name"])
-		return
-	with SESS_LOCK:
-		free = SESSIONS.get(sess["name"]) is None
-	if not free:
-		return
-	try:
-		spawned = spawn_session(sess["name"], sess["dir"],
-								["pi", "--session", file], verb="revive",
-								refuse_if_exists=True)
-	except OSError as exc:
-		log("revive '%s' failed: %s" % (sess["name"], exc))
-		return
-	if spawned is None:
-		log("revive '%s' skipped: name taken during revive" % sess["name"])
-
-
-def close_bridge(sess):
-	# Child-side teardown: flush every client's remaining buffer, then
-	# drop and close all bridge sockets.
-	with sess["lock"]:
-		clients = list(sess["clients"].items())
-		sess["clients"] = {}
-	for c, buf in clients:
-		try:
-			while buf:
-				sent = c.send(bytes(buf[:65536]))
-				del buf[:sent]
-		except OSError:
-			pass
-		kill_client(c)
-
-
-def session_loop(sess):
-	# Owns the master fd: bridge relay to every attached client plus
-	# child reaping. Clients share one view: all of them receive the
-	# child's output, and any client's input is forwarded to the child
-	# (interleaved, like a shared tmux pane). Per-client output buffers
-	# keep one slow viewer from stalling the others or the child; a
-	# client that falls too far behind loses its bridge instead.
-	master = sess["master_fd"]
-	pid = sess["pid"]
-	name = sess["name"]
-	to_master = bytearray()
-	dead_input = False
-	while True:
-		carry_to = sess.get("carry_to")
-		if carry_to is not None:
-			# /new carry: move every bridge viewer to the fresh session
-			# here, between iterations, so exactly one loop ever recvs on
-			# a moved socket. Stale old-TUI buffers are dropped; each
-			# viewer gets a clear followed by the fresh TUI's full
-			# repaint (nudged below).
-			sess["carry_to"] = None
-			with sess["lock"]:
-				moved = list(sess["clients"].items())
-				sess["clients"] = {}
-			for client, _buf in moved:
-				# Stale old-TUI buffers are dropped; a clear first, so no
-				# stale frame survives the fresh TUI's first full repaint.
-				with carry_to["lock"]:
-					carry_to["clients"][client] = bytearray(
-						b"\x1b[H\x1b[2J\x1b[m")
 			try:
-				size = fcntl.ioctl(master, termios.TIOCGWINSZ,
-								   struct.pack("HHHH", 0, 0, 0, 0))
-				trows, tcols = struct.unpack("HHHH", size)[:2]
-				if trows > 1:
-					set_winsize(carry_to["master_fd"], tcols, trows - 1)
-				else:
-					set_winsize(carry_to["master_fd"], max(tcols - 1, 1),
-								trows)
-				time.sleep(0.05)
-				set_winsize(carry_to["master_fd"], tcols, trows)
-				child_sigwinch(carry_to["pid"])
+				srv.close()
 			except OSError:
 				pass
-			log("carried '%s' -> '%s' (%d viewers)"
-				% (name, carry_to["name"], len(moved)))
-		try:
-			reaped = os.waitpid(pid, os.WNOHANG)
-		except ChildProcessError:
-			reaped = (pid, 0)
-		if reaped[0] == pid:
-			break
-		clients = get_clients(sess)
-		rlist = []
-		wlist = []
-		if not dead_input:
-			rlist.append(master)
-		if to_master:
-			wlist.append(master)
-		for c, buf in clients.items():
-			rlist.append(c)
-			if buf:
-				wlist.append(c)
-		if not rlist and not wlist:
-			# Detached after the master hit EOF: nothing left to poll, so
-			# just wait for the child like the reap check above.
-			time.sleep(REAP_TICK)
-			continue
-		try:
-			r, w, _ = select.select(rlist, wlist, [], REAP_TICK)
-		except OSError:
-			# A polled fd vanished; the next iteration re-evaluates.
-			continue
-		for c, buf in clients.items():
-			if c in r:
-				try:
-					data = c.recv(65536)
-				except OSError:
-					data = b""
-				if data:
-					to_master += data
-					if len(to_master) > MAX_BUF:
-						del to_master[: len(to_master) - MAX_BUF]
-				else:
-					log("client-exit '%s'" % name)
-					remove_client(sess, c)
-		if master in r:
-			try:
-				data = os.read(master, 65536)
-			except OSError:
-				# EIO is the normal PTY read failure after child exit.
-				data = b""
-			if data:
-				stalled = []
-				with sess["lock"]:
-					for c, buf in sess["clients"].items():
-						buf.extend(data)
-						if len(buf) > MAX_BUF:
-							stalled.append(c)
-				for c in stalled:
-					remove_client(sess, c)
-					log("drop slow client '%s'" % name)
-			else:
-				dead_input = True
-				# The child closed its tty (or died without reaping yet);
-				# flush and drop the bridges like a single client did.
-				close_bridge(sess)
-		if master in w:
-			try:
-				sent = os.write(master, bytes(to_master[:65536]))
-				del to_master[:sent]
-			except OSError:
-				del to_master[:]
-		for c, buf in clients.items():
-			if c in w:
-				try:
-					sent = c.send(bytes(buf[:65536]))
-					del buf[:sent]
-				except OSError:
-					remove_client(sess, c)
-	# Child gone: flush whatever is still buffered per client, drop every
-	# bridge, then tear the session down and decide on revival.
-	close_bridge(sess)
-	drop_session(sess, reaped[1])
-	revive_session(sess, reaped[1])
-
-
-# ----------------------------------------------------------------- control
-
-def bad_request():
-	return {"ok": False, "error": "bad-request"}
-
-
-def err(error):
-	return {"ok": False, "error": error}
-
-
-def cmd_ping(_req):
-	return {"ok": True}
-
-
-def cmd_start(req):
-	name = req.get("name")
-	dir_ = req.get("dir")
-	argv = req.get("argv")
-	try:
-		cols = int(req.get("cols", DEFAULT_COLS))
-		rows = int(req.get("rows", DEFAULT_ROWS))
-	except (TypeError, ValueError):
-		return bad_request()
-	if not (isinstance(name, str) and name and isinstance(dir_, str)
-			and isinstance(argv, list) and argv
-			and all(isinstance(a, str) for a in argv)):
-		return bad_request()
-	if not os.path.isdir(dir_):
-		return err("no-dir")
-	with SESS_LOCK:
-		existing = SESSIONS.get(name)
-	if existing is not None:
-		return {"ok": True, "name": name, "created": False}
-	try:
-		spawn_session(name, dir_, argv, cols, rows)
-	except OSError as exc:
-		log("start '%s' failed: %s" % (name, exc))
-		return err("spawn-failed")
-	return {"ok": True, "name": name, "created": True}
-
-
-def attach_handoff(name):
-	# The live holder a handed-off duplicate's viewers should follow, or
-	# None. Caller holds SESS_LOCK. A dead intermediate target re-points
-	# at its own handoff so a chain of simultaneous duplicates resolves
-	# to a live holder instead of ending the follow.
-	seen = set()
-	while True:
-		entry = HANDOFFS.get(name)
-		if entry is None or entry in seen:
-			return None
-		seen.add(entry)
-		target = SESSIONS.get(entry)
-		if target is not None:
-			return {"name": target["name"], "state": target.get("state", "idle")}
-		# The holder died before the viewers followed; follow its own
-		# handoff when it was itself a duplicate, else give up.
-		HANDOFFS.pop(name, None)
-		name = entry
-
-
-def cmd_attach(req, conn):
-	name = req.get("name")
-	try:
-		cols = int(req.get("cols", DEFAULT_COLS))
-		rows = int(req.get("rows", DEFAULT_ROWS))
-	except (TypeError, ValueError):
-		return bad_request(), False
-	if not (isinstance(name, str) and name):
-		return bad_request(), False
-	with SESS_LOCK:
-		sess = SESSIONS.get(name)
-		follow = attach_handoff(name)
-	if sess is None:
-		if follow is None:
-			return err("no-session"), False
-		# The duplicate already shut down, but its handoff survives: a
-		# late viewer follows it instead of recreating the duplicate.
-		send_json(conn, {"ok": True, "name": name, "state": follow["state"],
-						 "clients": 0, "handoff": follow})
-		log("attach '%s' -> handoff '%s' (session gone)"
-			% (name, follow["name"]))
-		return None, False
-	if follow is not None:
-		# This duplicate already handed its viewers to a live holder
-		# (resume takeover): reply with the handoff instead of installing
-		# a bridge that would die the moment the duplicate shuts down.
-		send_json(conn, {"ok": True, "name": name,
-						 "state": sess.get("state", "idle"),
-						 "clients": client_count(sess),
-						 "handoff": follow})
-		log("attach '%s' -> handoff '%s'" % (name, follow["name"]))
-		return None, False
-	# The attach response must reach the client BEFORE the connection
-	# becomes a live bridge: add_client() starts relaying pi's output
-	# on this socket immediately, and response bytes interleaved with
-	# stream output made pi-rc read a non-JSON line ("attach failed:
-	# no response"). Send the response first; the client then enters
-	# bridge mode, and only after that do we install the client and
-	# force the repaint.
-	with sess["lock"]:
-		# The count after this client joins; the response must reach the
-		# socket before add_client() starts relaying onto it.
-		nclients = len(sess["clients"]) + 1
-	send_json(conn, {"ok": True, "name": name, "state": sess.get("state", "idle"),
-					 "clients": nclients})
-	conn.setblocking(False)
-	add_client(sess, conn)
-	if nclients > 1:
-		# Multiple terminals share this session: every viewer sees the
-		# same output and any of them can type into the child.
-		log("attach '%s' %dx%d (%d clients)" % (name, cols, rows, nclients))
-	else:
-		log("attach '%s' %dx%d" % (name, cols, rows))
-	try:
-		# pi's TUI only repaints when the winsize actually changes (Node
-		# fires the resize event on a change), so a reattach at the same
-		# size would stay silent until the user types or resizes. Nudge the
-		# size by one line first so the final size is always seen as a
-		# change and the child redraws its whole frame. This must happen
-		# only after add_client(): the full-frame repaint pi produces from
-		# the resize is forwarded exclusively to the installed client, so
-		# resizing before the bridge exists made the drain loop discard it,
-		# and the trailing SIGWINCH carried no size change, so Node never
-		# fired resize again — a reattached client showed a stale frame.
-		if rows > 1:
-			set_winsize(sess["master_fd"], cols, rows - 1)
-		else:
-			set_winsize(sess["master_fd"], max(cols - 1, 1), rows)
-		time.sleep(0.05)
-	except OSError:
-		pass
-	try:
-		set_winsize(sess["master_fd"], cols, rows)
-	except OSError:
-		pass
-	child_sigwinch(sess["pid"])
-	# Response already sent above; tell conn_thread the connection is now
-	# the bridge and must not be read or written again.
-	return None, True
-
-
-def cmd_detach(req):
-	name = req.get("name")
-	if not isinstance(name, str):
-		return bad_request()
-	with SESS_LOCK:
-		sess = SESSIONS.get(name)
-	if sess is None:
-		# A detach of an unknown session must not report ok: callers use
-		# the response to decide whether the user's terminal was handed
-		# back, and a silent ok hid a name-mangling bug for a day.
-		return err("no-session")
-	if client_count(sess) > 0:
-		log("detach '%s'" % name)
-		close_all_clients(sess)
-	return {"ok": True}
-
-
-def cmd_resize(req):
-	name = req.get("name")
-	try:
-		cols = int(req.get("cols"))
-		rows = int(req.get("rows"))
-	except (TypeError, ValueError):
-		return bad_request()
-	if not isinstance(name, str):
-		return bad_request()
-	with SESS_LOCK:
-		sess = SESSIONS.get(name)
-	if sess is None:
-		return err("no-session")
-	try:
-		set_winsize(sess["master_fd"], cols, rows)
-		child_sigwinch(sess["pid"])
-	except OSError:
-		pass
-	return {"ok": True}
-
-
-def cmd_list(_req):
-	out = []
-	with SESS_LOCK:
-		sessions = list(SESSIONS.values())
-	for sess in sessions:
-		out.append({
-			"name": sess["name"],
-			"dir": sess["dir"],
-			"pid": sess["pid"],
-			"attached": client_count(sess) > 0,
-			"clients": client_count(sess),
-			"file": sess.get("file"),
-			"state": sess.get("state", "idle"),
-			"argv": sess["argv"],
-		})
-	return {"ok": True, "sessions": out}
-
-
-def cmd_which(req):
-	file = req.get("file")
-	if not (isinstance(file, str) and file):
-		return bad_request()
-	with SESS_LOCK:
-		holders = file_holders(file)
-	# First match, preserving the historical exact-pass-wins-then-argv
-	# order; pi-rc whichall exposes every holder.
-	return {"ok": True, "name": holders[0]["name"] if holders else None}
-
-
-def cmd_whichall(req):
-	file = req.get("file")
-	if not (isinstance(file, str) and file):
-		return bad_request()
-	with SESS_LOCK:
-		holders = file_holders(file)
-	return {"ok": True,
-			"names": [{"name": s["name"], "state": s.get("state", "idle")}
-					  for s in holders]}
-
-
-def cmd_state(req):
-	name = req.get("name")
-	state = req.get("state")
-	if not (isinstance(name, str) and name) or state not in ("busy", "idle"):
-		return bad_request()
-	with SESS_LOCK:
-		sess = SESSIONS.get(name)
-	if sess is None:
-		return err("no-session")
-	sess["state"] = state
-	return {"ok": True}
-
-
-def kill_and_wait(pid, grace):
-	try:
-		os.killpg(pid, signal.SIGTERM)
-	except OSError:
-		pass
-	deadline = time.time() + grace
-	while time.time() < deadline:
-		try:
-			if os.waitpid(pid, os.WNOHANG)[0] == pid:
-				return
-		except ChildProcessError:
-			return
-		time.sleep(0.1)
-	try:
-		os.killpg(pid, signal.SIGKILL)
-	except OSError:
-		pass
-
-
-def stop_session(sess):
-	# Mark before the first signal lands so the exit path never revives a
-	# session the user explicitly stopped.
-	sess["stopping"] = True
-	kill_and_wait(sess["pid"], KILL_GRACE)
-
-
-def absorb_session(holder, announcer):
-	# Kill an absorbed idle holder — but only after a short settle that
-	# rechecks the best-effort run state: a holder whose turn just started
-	# (state publish still in flight) must not be killed mid-turn.
-	time.sleep(ABSORB_SETTLE)
-	with SESS_LOCK:
-		if holder.get("state") != "busy":
-			stop_session(holder)
-			return
-		# The holder started working during the settle: it wins instead.
-		# Never kill a working agent — and never kill the announcer while
-		# it is working either; if both sides started within the window,
-		# sparing both leaves a divergence, but aborting a working agent
-		# is worse. One yield wins; later busy holders are only spared.
-		holder["stopping"] = False
-		HANDOFFS.pop(holder["name"], None)
-		sess = SESSIONS.get(announcer)
-		if sess is None:
-			return
-		sess["absorbing_until"] = 0
-		if sess.get("yielded_to") is not None:
-			log("absorb spare '%s': announcer '%s' already yielded"
-				% (holder["name"], announcer))
-			return
-		if sess.get("state") == "busy":
-			log("absorb aborted '%s' vs busy '%s': both working, left alone"
-				% (announcer, holder["name"]))
-			return
-		sess["yielded_to"] = holder["name"]
-		HANDOFFS[announcer] = holder["name"]
-		close_all_clients(sess)
-		log("absorb yield '%s' -> busy '%s'" % (announcer, holder["name"]))
-		threading.Thread(target=stop_session, args=(sess,),
-						 daemon=True).start()
-
-
-def cmd_stop(req):
-	name = req.get("name")
-	if not isinstance(name, str):
-		return bad_request()
-	with SESS_LOCK:
-		sess = SESSIONS.get(name)
-	if sess is not None:
-		t = threading.Thread(target=stop_session, args=(sess,), daemon=True)
-		t.start()
-	# The session thread drops the entry once the reap lands.
-	return {"ok": True}
-
-
-def session_holds(sess, dir_):
-	try:
-		return os.path.realpath(sess["dir"]) == os.path.realpath(dir_)
-	except OSError:
-		return sess["dir"] == dir_
-
-
-def handover_target(dir_, file):
-	# Mirrors pi-rc's session_for/handover_name target logic.
-	base = os.path.basename(dir_)
-	base = base.replace(":", "_")
-	if base.startswith("="):
-		base = base[1:]
-	primary = "pi-" + base
-	with SESS_LOCK:
-		holder = SESSIONS.get(primary)
-	if holder is None or session_holds(holder, dir_):
-		return primary
-	hx = hashlib.sha256(file.encode()).hexdigest()[:6]
-	return "pi-%s-%s" % (base, hx)
-
-
-def handover_thread(target, dir_, file, after_pid, message=None):
-	# Wait for the handing-over pi to exit, then host its session file.
-	if after_pid:
-		while not SHUTDOWN.is_set():
-			try:
-				os.kill(after_pid, 0)
-			except OSError:
-				break
-			time.sleep(0.2)
-		time.sleep(0.5)
-	if SHUTDOWN.is_set():
-		return
-	if not os.path.isfile(file):
-		log("handover '%s' skipped: session file gone: %s" % (target, file))
-		return
-	with SESS_LOCK:
-		free = SESSIONS.get(target) is None
-	if not free:
-		log("handover '%s' skipped: name already hosted" % target)
-		return
-	argv = ["pi", "--session", file]
-	registry_argv = list(argv)
-	if message:
-		# Legacy hook kept for protocol compatibility; the rc-background
-		# extension no longer sends a continuation prompt, so hosted
-		# handovers start idle at the prompt.
-		argv.append(message)
-	try:
-		spawned = spawn_session(target, dir_, argv, verb="handover",
-								registry_argv=registry_argv,
-								refuse_if_exists=True)
-	except OSError as exc:
-		log("handover '%s' failed: %s" % (target, exc))
-		return
-	if spawned is None:
-		log("handover '%s' skipped: name taken during handover" % target)
-
-
-def _carry_target_name(base, exclude):
-	# Unique carry/relay target name: "<base>-<hash>", collision-checked
-	# against live sessions (a refuse_if_exists backstop covers races).
-	for attempt in range(8):
-		suffix = hashlib.sha256(
-			("%d-%d-%d" % (time.time_ns(), os.getpid(), attempt)).encode()
-		).hexdigest()[:4]
-		candidate = "pi-%s-%s" % (base, suffix)
-		if candidate != exclude and SESSIONS.get(candidate) is None:
-			return candidate
-	return None
-
-
-def _move_viewers(sess, target, verb):
-	# Hand the viewers over on the source session loop (it performs the
-	# move at its next iteration boundary): two loops recv()ing on one
-	# socket would split the viewer's input between the two TUIs. The
-	# loop prepends a clear and repaints the target; errors there are
-	# its own. Returns False when the source died before the handoff
-	# could be recorded.
-	with SESS_LOCK:
-		if SESSIONS.get(sess["name"]) is not sess:
-			return False
-		sess["carry_to"] = target
-	return True
-
-
-def cmd_carry(req):
-	# /new without termination: spawn a fresh hosted session and move
-	# this session's bridge viewers onto it, leaving this pi running
-	# headless with its own conversation (the extension cancels pi's
-	# in-process switch, which would abort an in-flight turn). With "to",
-	# an existing session receives the viewers instead.
-	name = req.get("name")
-	if not isinstance(name, str) or not name:
-		return bad_request()
-	argv = req.get("argv")
-	if argv is not None and not (isinstance(argv, list) and argv
-								and all(isinstance(a, str) for a in argv)):
-		return bad_request()
-	to_name = req.get("to")
-	if to_name is not None and not isinstance(to_name, str):
-		return bad_request()
-	with SESS_LOCK:
-		sess = SESSIONS.get(name)
-		if sess is None:
-			return err("no-session")
-		dir_ = sess["dir"]
-		# Size a fresh session like the viewer's current view: the moved
-		# bridges keep their terminals, so inherit the source PTY size.
-		rows, cols = sess_winsize(sess)
-		if to_name is not None:
-			target = SESSIONS.get(to_name)
-			if to_name == name or target is None:
-				return err("no-session")
-		else:
-			base = os.path.basename(dir_).replace(":", "_")
-			if base.startswith("="):
-				base = base[1:]
-			new_name = _carry_target_name(base, name)
-			if new_name is None:
-				return err("no-free-name")
-			target = None
-	try:
-		if to_name is None:
-			spawned = spawn_session(new_name, dir_, argv or ["pi"], cols,
-									rows, verb="carry", refuse_if_exists=True)
-			if spawned is None:
-				return err("name-taken")
-			target = spawned
-		if _move_viewers(sess, target, "carry"):
-			log("carry '%s' -> '%s'" % (name, target["name"]))
-			return {"ok": True, "name": target["name"]}
-	except OSError as exc:
-		log("carry '%s' failed: %s" % (name, exc))
-		if to_name is None and target is not None:
-			threading.Thread(target=stop_session, args=(target,),
-							 daemon=True).start()
-		return err("spawn-failed")
-	# The source died between spawn and move: drop a freshly spawned
-	# session rather than leave an unviewed pi behind.
-	if to_name is None:
-		threading.Thread(target=stop_session, args=(target,),
-						 daemon=True).start()
-	return err("no-session")
-
-
-def cmd_resume(req):
-	# /resume without termination: resolve the picked conversation to its
-	# live holder when one exists (a busy one first — never touch a
-	# working agent, just move this terminal's viewers there), otherwise
-	# spawn a fresh session resuming the file, then move the viewers.
-	# The source session keeps running headless with its own
-	# conversation; the extension cancels pi's in-process switch.
-	name = req.get("name")
-	file = req.get("file")
-	if not (isinstance(name, str) and name and isinstance(file, str)
-			and file and os.path.isabs(file)):
-		return bad_request()
-	if not os.path.isfile(file):
-		return err("no-file")
-	with SESS_LOCK:
-		sess = SESSIONS.get(name)
-		if sess is None:
-			return err("no-session")
-		rows, cols = sess_winsize(sess)
-		holders = [s for s in file_holders(file)
-				   if s is not sess and s["name"] not in HANDOFFS]
-		target = None
-		new_name = None
-		if holders:
-			holders.sort(key=lambda s: (s.get("state") != "busy",
-										client_count(s) == 0))
-			target = holders[0]
-			to_name = target["name"]
-		else:
-			base = os.path.basename(sess["dir"]).replace(":", "_")
-			if base.startswith("="):
-				base = base[1:]
-			digest = hashlib.sha256(file.encode()).hexdigest()[:6]
-			new_name = _carry_target_name("%s-%s" % (base, digest), name)
-			if new_name is None:
-				return err("no-free-name")
-			to_name = None
-	try:
-		if target is None:
-			spawned = spawn_session(new_name, sess["dir"],
-									["pi", "--session", file], cols, rows,
-									verb="resume", refuse_if_exists=True)
-			if spawned is None:
-				return err("name-taken")
-			target = spawned
-		if _move_viewers(sess, target, "resume"):
-			log("resume '%s' -> '%s'" % (name, target["name"]))
-			return {"ok": True, "name": target["name"]}
-	except OSError as exc:
-		log("resume '%s' failed: %s" % (name, exc))
-		if target is not None and to_name is None:
-			threading.Thread(target=stop_session, args=(target,),
-							 daemon=True).start()
-		return err("spawn-failed")
-	if target is not None and to_name is None:
-		threading.Thread(target=stop_session, args=(target,),
-						 daemon=True).start()
-	return err("no-session")
-
-
-def cmd_announce(req):
-	name = req.get("name")
-	file = req.get("file")
-	if not (isinstance(name, str) and name and isinstance(file, str)
-			and file and os.path.isabs(file)):
-		return bad_request()
-	with SESS_LOCK:
-		sess = SESSIONS.get(name)
-		if sess is None:
-			return err("no-session")
-		sess["file"] = file
-		# Surface other live holders of the same conversation so the
-		# extension can warn about a picker-opened duplicate immediately.
-		others = [s for s in file_holders(file) if s is not sess]
-		also = [{"name": s["name"], "state": s.get("state", "idle")}
-				for s in others
-				if not (req.get("takeover") and s["name"] in HANDOFFS)]
-		handoff = None
-		took_over = []
-		if req.get("takeover") and others:
-			# A second live pi on one conversation can only diverge. The
-			# announcing session is the one the user is actively looking
-			# at, so it never shuts down while every holder is merely
-			# idle at the prompt: it absorbs them instead, and each of
-			# their viewers follows here. Only a busy holder wins —
-			# never touch a working agent; the announcer yields to it
-			# and shuts down. Holders already handing off are neither
-			# followed nor absorbed.
-			busy = [s for s in others
-					if (s.get("state") == "busy"
-						or s.get("absorbing_until", 0) > time.time())
-					and s["name"] not in HANDOFFS]
-			if busy:
-				busy.sort(key=lambda s: client_count(s) == 0)
-				target = busy[0]
-				HANDOFFS[name] = target["name"]
-				close_all_clients(sess)
-				log("handoff '%s' -> '%s'" % (name, target["name"]))
-				handoff = {"name": target["name"],
-						   "state": target.get("state", "idle")}
-			else:
-				# A concurrent announce must yield to an in-flight
-				# absorption instead of absorbing the absorber.
-				sess["absorbing_until"] = time.time() + ABSORB_GUARD
-				for holder in others:
-					if holder["name"] in HANDOFFS:
-						continue
-					# Record before the first signal so the holder's
-					# viewers follow here, a concurrent announce sees it
-					# as already absorbed, and an abnormal death in the
-					# settle window never revives it.
-					HANDOFFS[holder["name"]] = name
-					holder["stopping"] = True
-					took_over.append(holder["name"])
-					threading.Thread(target=absorb_session,
-									 args=(holder, name),
-									 daemon=True).start()
-					log("took-over '%s' <- '%s'"
-						% (holder["name"], name))
-	registry_set_argv(name, ["pi", "--session", file])
-	log("announce '%s' -> %s" % (name, file))
-	return {"ok": True, "alsoLive": also, "handoff": handoff,
-			"tookOver": took_over}
-
-
-def cmd_handoff_target(req):
-	name = req.get("name")
-	if not (isinstance(name, str) and name):
-		return bad_request()
-	with SESS_LOCK:
-		target = attach_handoff(name)
-	return {"ok": True, "target": target}
-
-
-def cmd_handover(req):
-	file = req.get("file")
-	dir_ = req.get("dir")
-	after_pid = req.get("afterPid")
-	message = req.get("message")  # legacy; unused by the current client
-	if not (isinstance(file, str) and file and isinstance(dir_, str) and dir_):
-		return bad_request()
-	if after_pid is not None and not isinstance(after_pid, int):
-		return bad_request()
-	if message is not None and not (isinstance(message, str)
-								   and 0 < len(message) <= 8192):
-		return bad_request()
-	if not os.path.isdir(dir_):
-		return err("no-dir")
-	target = handover_target(dir_, file)
-	with SESS_LOCK:
-		holder = SESSIONS.get(target)
-	if holder is not None and not session_holds(holder, dir_):
-		# Held by a session resuming this exact file already.
-		log("handover '%s' already hosted" % target)
-		return {"ok": True, "verdict": "hosted:%s" % target}
-	t = threading.Thread(
-		target=handover_thread, args=(target, dir_, file, after_pid, message),
-		daemon=True)
-	t.start()
-	return {"ok": True, "verdict": "target:%s" % target}
-
-
-def cmd_shutdown(_req):
-	t = threading.Thread(target=do_shutdown, daemon=True)
-	t.start()
-	return {"ok": True}
-
-
-def do_shutdown():
-	if SHUTDOWN.is_set():
-		return
-	SHUTDOWN.set()
-	log("shutdown")
-	with SESS_LOCK:
-		sessions = list(SESSIONS.values())
-	for sess in sessions:
-		try:
-			os.killpg(sess["pid"], signal.SIGTERM)
-		except OSError:
-			pass
-	deadline = time.time() + KILL_GRACE
-	while time.time() < deadline:
-		alive = False
-		for sess in sessions:
-			try:
-				if os.waitpid(sess["pid"], os.WNOHANG)[0] == 0:
-					alive = True
-			except ChildProcessError:
-				pass
-		if not alive:
-			break
-		time.sleep(0.1)
-	for sess in sessions:
-		try:
-			os.killpg(sess["pid"], signal.SIGKILL)
-		except OSError:
-			pass
-	for sess in sessions:
-		close_all_clients(sess)
-		try:
-			os.close(sess["master_fd"])
-		except OSError:
-			pass
-	registry_write({})
-	try:
-		os.unlink(SOCK_PATH)
-	except OSError:
-		pass
-	os._exit(0)
-
-
-# ------------------------------------------------------------ socket layer
-
-class LineReader:
-	def __init__(self, sock):
-		self.sock = sock
-		self.buf = b""
-
-	def readline(self):
-		while b"\n" not in self.buf:
-			if len(self.buf) > MAX_BUF:
-				raise ValueError("line too long")
-			data = self.sock.recv(65536)
-			if not data:
-				if self.buf:
-					raise ValueError("truncated line")
-				return None
-			self.buf += data
-		line, self.buf = self.buf.split(b"\n", 1)
-		return line
-
-
-def send_json(sock, obj):
-	sock.sendall(json.dumps(obj).encode() + b"\n")
-
-
-def conn_thread(conn):
-	handed_off = False
-	try:
-		conn.settimeout(10)
-		reader = LineReader(conn)
-		while not SHUTDOWN.is_set():
-			try:
-				line = reader.readline()
-			except (ValueError, OSError):
-				break
-			if line is None:
-				break
-			if not line.strip():
-				continue
-			try:
-				req = json.loads(line.decode())
-			except (ValueError, UnicodeDecodeError):
-				send_json(conn, bad_request())
-				continue
-			if not isinstance(req, dict) or not isinstance(req.get("cmd"), str):
-				send_json(conn, bad_request())
-				continue
-			cmd = req["cmd"]
-			if cmd == "attach":
-				resp, became_bridge = cmd_attach(req, conn)
-				# cmd_attach may have already delivered the response itself
-				# before installing the client bridge (see cmd_attach).
-				if resp is not None:
-					send_json(conn, resp)
-				if became_bridge:
-					handed_off = True
-					return
-			elif cmd == "ping":
-				send_json(conn, cmd_ping(req))
-			elif cmd == "start":
-				send_json(conn, cmd_start(req))
-			elif cmd == "detach":
-				send_json(conn, cmd_detach(req))
-			elif cmd == "resize":
-				send_json(conn, cmd_resize(req))
-			elif cmd == "list":
-				send_json(conn, cmd_list(req))
-			elif cmd == "which":
-				send_json(conn, cmd_which(req))
-			elif cmd == "whichall":
-				send_json(conn, cmd_whichall(req))
-			elif cmd == "state":
-				send_json(conn, cmd_state(req))
-			elif cmd == "stop":
-				send_json(conn, cmd_stop(req))
-			elif cmd == "handover":
-				send_json(conn, cmd_handover(req))
-			elif cmd == "carry":
-				send_json(conn, cmd_carry(req))
-			elif cmd == "resume":
-				send_json(conn, cmd_resume(req))
-			elif cmd == "announce":
-				send_json(conn, cmd_announce(req))
-			elif cmd == "handoff-target":
-				send_json(conn, cmd_handoff_target(req))
-			elif cmd == "shutdown":
-				send_json(conn, cmd_shutdown(req))
-			else:
-				send_json(conn, bad_request())
-	except Exception as exc:
-		if not handed_off:
-			log("control connection error: %r" % (exc,))
-	finally:
-		if not handed_off:
-			try:
-				conn.close()
-			except OSError:
-				pass
-
-
-def respawn_from_registry():
-	data = registry_load()
-	for name, rec in sorted(data.items()):
-		try:
-			dir_ = rec["dir"]
-			argv = rec["argv"]
-			if not (isinstance(dir_, str) and isinstance(argv, list) and argv):
-				raise ValueError("bad record")
-			spawn_session(name, dir_, argv, verb="respawn")
-		except Exception as exc:
-			log("respawn '%s' failed: %s" % (name, exc))
-			registry_drop(name)
-
-
-def on_signal(_signum, _frame):
-	raise SystemExit(0)
-
-
-def main():
-	if os.getuid() == 0:
-		log("refusing to run as root")
-		return 1
-	signal.signal(signal.SIGTERM, on_signal)
-	signal.signal(signal.SIGINT, on_signal)
-	try:
-		os.unlink(SOCK_PATH)
-	except FileNotFoundError:
-		pass
-	except OSError as exc:
-		log("cannot unlink stale socket %s: %s" % (SOCK_PATH, exc))
-		return 1
-	srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-	try:
-		srv.bind(SOCK_PATH)
-		os.chmod(SOCK_PATH, 0o600)
-		srv.listen(16)
-	except OSError as exc:
-		log("cannot bind %s: %s" % (SOCK_PATH, exc))
-		return 1
-	log("listening on %s (registry %s)" % (SOCK_PATH, REG_PATH))
-	respawn_from_registry()
-	try:
-		while not SHUTDOWN.is_set():
+		if not self.shutdown_event.is_set():
+			self.shutdown()
+		return 0
+
+	def _accept_loop(self, srv):
+		while not self.shutdown_event.is_set():
 			try:
 				conn, _ = srv.accept()
 			except OSError as exc:
-				if SHUTDOWN.is_set():
+				if self.shutdown_event.is_set():
 					break
 				log("accept error: %s" % exc)
 				time.sleep(0.1)
 				continue
-			t = threading.Thread(target=conn_thread, args=(conn,), daemon=True)
+			t = threading.Thread(target=self._conn_thread, args=(conn,),
+								 daemon=True)
 			t.start()
-	except SystemExit:
-		pass
-	finally:
+
+	def _conn_thread(self, conn):
+		handed_off = False
 		try:
-			srv.close()
+			conn.settimeout(10)
+			reader = LineReader(conn)
+			while not self.shutdown_event.is_set():
+				try:
+					line = reader.readline()
+				except (ValueError, OSError):
+					break
+				if line is None:
+					break
+				if not line.strip():
+					continue
+				try:
+					req = json.loads(line.decode())
+				except (ValueError, UnicodeDecodeError):
+					send_json(conn, bad_request())
+					continue
+				resp = self._dispatch(conn, req)
+				if resp is _BRIDGE_HANDOFF:
+					handed_off = True
+					return
+				if resp is not None:
+					send_json(conn, resp)
+		except Exception as exc:
+			if not handed_off:
+				log("control connection error: %r" % (exc,))
+		finally:
+			if not handed_off:
+				try:
+					conn.close()
+				except OSError:
+					pass
+
+	def _dispatch(self, conn, req):
+		cmd = req.get("cmd")
+		if not isinstance(cmd, str):
+			return bad_request()
+		if cmd == "attach":
+			# attach may have already delivered the response itself before
+			# installing the client bridge; its second return value says
+			# the connection is now the bridge and must not be read or
+			# written again.
+			resp, became_bridge = self.control.attach(req, conn)
+			if resp is not None:
+				send_json(conn, resp)
+			if became_bridge:
+				return _BRIDGE_HANDOFF
+			return None
+		if cmd == "shutdown":
+			return self.control.shutdown(req)
+		if cmd in _WIRE_COMMANDS:
+			# wire names use dashes; methods use underscores
+			return getattr(self.control, cmd.replace("-", "_"))(req)
+		return bad_request()
+
+	def shutdown(self):
+		if self.shutdown_event.is_set():
+			return
+		self.shutdown_event.set()
+		log("shutdown")
+		sessions = self.table.snapshot()
+		for sess in sessions:
+			try:
+				os.killpg(sess.pid, signal.SIGTERM)
+			except OSError:
+				pass
+		deadline = time.time() + KILL_GRACE
+		while time.time() < deadline:
+			alive = False
+			for sess in sessions:
+				try:
+					if os.waitpid(sess.pid, os.WNOHANG)[0] == 0:
+						alive = True
+				except ChildProcessError:
+					pass
+			if not alive:
+				break
+			time.sleep(0.1)
+		for sess in sessions:
+			try:
+				os.killpg(sess.pid, signal.SIGKILL)
+			except OSError:
+				pass
+		for sess in sessions:
+			sess.signal_closed()
+			try:
+				os.close(sess.master_fd)
+			except OSError:
+				pass
+		self.registry.write({})
+		try:
+			os.unlink(self.sock_path)
 		except OSError:
 			pass
-	if not SHUTDOWN.is_set():
-		do_shutdown()
-	return 0
+		os._exit(0)
+
+	# -- session lifecycle -----------------------------------------------------
+
+	def spawn(self, name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS,
+			  verb="start", registry_argv=None, refuse_if_exists=False):
+		return self.spawner.spawn(name, dir_, argv, cols, rows, verb,
+								  registry_argv, refuse_if_exists)
+
+	def drop(self, sess, code):
+		sess.carry_to = None
+		sess.signal_closed()
+		try:
+			os.close(sess.master_fd)
+		except OSError:
+			pass
+		dropped = self.table.remove_if(sess)
+		if dropped is not None:
+			self.ledger.repoint_on_drop(dropped)
+		self.registry.drop(sess.name)
+		log("child-exit '%s' pid %d status %s" % (sess.name, sess.pid, code))
+
+	def revive(self, sess, status):
+		# Backgrounding must always happen unless the user ended the
+		# session themselves: re-host an abnormally dying pi from its
+		# announced session file under the same name. Deliberate quits,
+		# explicit stops, daemon shutdown, deleted files, and
+		# crash-loop-short lifetimes stay dead.
+		if self.shutdown_event.is_set() or sess.stopping:
+			return
+		if not _exit_abnormal(status):
+			return
+		if time.time() - sess.spawned_at < MIN_REVIVE_LIFE:
+			log("revive '%s' skipped: lived under %ss"
+				% (sess.name, MIN_REVIVE_LIFE))
+			return
+		file = sess.file
+		if not file or not os.path.isfile(file):
+			log("revive '%s' skipped: no session file" % sess.name)
+			return
+		if self.table.get(sess.name) is not None:
+			return
+		try:
+			spawned = self.spawn(sess.name, sess.dir,
+								 ["pi", "--session", file], verb="revive",
+								 refuse_if_exists=True)
+		except OSError as exc:
+			log("revive '%s' failed: %s" % (sess.name, exc))
+			return
+		if spawned is None:
+			log("revive '%s' skipped: name taken during revive" % sess.name)
+
+	def respawn_from_registry(self):
+		data = self.registry.load()
+		for name, rec in sorted(data.items()):
+			try:
+				dir_ = rec["dir"]
+				argv = rec["argv"]
+				if not (isinstance(dir_, str) and isinstance(argv, list)
+						and argv):
+					raise ValueError("bad record")
+				self.spawn(name, dir_, argv, verb="respawn")
+			except Exception as exc:
+				log("respawn '%s' failed: %s" % (name, exc))
+				self.registry.drop(name)
+
+	# -- takeover + carry policy -----------------------------------------------
+
+	def carry_target_name(self, base, exclude):
+		# Unique carry/relay target name: "<base>-<hash>", collision-
+		# checked against live sessions (a refuse_if_exists backstop
+		# covers races).
+		for attempt in range(8):
+			suffix = hashlib.sha256(
+				("%d-%d-%d" % (time.time_ns(), os.getpid(), attempt)).encode()
+			).hexdigest()[:4]
+			candidate = "pi-%s-%s" % (base, suffix)
+			if candidate != exclude and self.table.get(candidate) is None:
+				return candidate
+		return None
+
+	def begin_carry(self, sess, target, verb):
+		# Record the viewer handoff on the source session loop (it
+		# performs the move at its next iteration boundary): two loops
+		# recv()ing on one socket would split the viewer's input between
+		# the two TUIs. Returns False when the source died before the
+		# handoff could be recorded.
+		with self.table.lock:
+			if self.table.get(sess.name) is not sess:
+				return False
+			sess.carry_to = target
+		log("%s '%s' -> '%s'" % (verb, sess.name, target.name))
+		return True
+
+	def handover_target(self, dir_, file):
+		# Mirrors pi-rc's session_for/handover_name target logic.
+		base = os.path.basename(dir_)
+		base = base.replace(":", "_")
+		if base.startswith("="):
+			base = base[1:]
+		primary = "pi-" + base
+		holder = self.table.get(primary)
+		if holder is None or holder.holds_dir(dir_):
+			return primary
+		digest = hashlib.sha256(file.encode()).hexdigest()[:6]
+		return "pi-%s-%s" % (base, digest)
+
+	def handover_thread(self, target, dir_, file, after_pid, message=None):
+		# Wait for the handing-over pi to exit, then host its session file.
+		if after_pid:
+			while not self.shutdown_event.is_set():
+				try:
+					os.kill(after_pid, 0)
+				except OSError:
+					break
+				time.sleep(0.2)
+			time.sleep(0.5)
+		if self.shutdown_event.is_set():
+			return
+		if not os.path.isfile(file):
+			log("handover '%s' skipped: session file gone: %s" % (target, file))
+			return
+		if self.table.get(target) is not None:
+			log("handover '%s' skipped: name already hosted" % target)
+			return
+		argv = ["pi", "--session", file]
+		registry_argv = list(argv)
+		if message:
+			# Legacy hook kept for protocol compatibility; the
+			# rc-background extension no longer sends a continuation
+			# prompt, so hosted handovers start idle at the prompt.
+			argv.append(message)
+		try:
+			spawned = self.spawn(target, dir_, argv, verb="handover",
+								 registry_argv=registry_argv,
+								 refuse_if_exists=True)
+		except OSError as exc:
+			log("handover '%s' failed: %s" % (target, exc))
+			return
+		if spawned is None:
+			log("handover '%s' skipped: name taken during handover" % target)
+
+	def resolve_takeover(self, sess, others):
+		# A second live pi on one conversation can only diverge. The
+		# announcing session is the one the user is actively looking at,
+		# so it never shuts down while every holder is merely idle at the
+		# prompt: it absorbs them instead, and each of their viewers
+		# follows here. Only a busy holder wins — never touch a working
+		# agent; the announcer yields to it and shuts down. Holders
+		# already handing off are neither followed nor absorbed. Returns
+		# (handoff, took_over names).
+		busy = [s for s in others
+				if (s.state == "busy" or s.absorbing_until > time.time())
+				and not self.ledger.pending(s.name)]
+		if busy:
+			busy.sort(key=lambda s: s.count_clients() == 0)
+			target = busy[0]
+			self.ledger.record(sess.name, target.name)
+			sess.signal_closed()
+			log("handoff '%s' -> '%s'" % (sess.name, target.name))
+			return {"name": target.name, "state": target.state}, []
+		# A concurrent announce must yield to an in-flight absorption
+		# instead of absorbing the absorber.
+		sess.absorbing_until = time.time() + ABSORB_GUARD
+		took_over = []
+		for holder in others:
+			if self.ledger.pending(holder.name):
+				continue
+			# Record before the first signal so the holder's viewers
+			# follow here, a concurrent announce sees it as already
+			# absorbed, and an abnormal death in the settle window never
+			# revives it.
+			self.ledger.record(holder.name, sess.name)
+			holder.stopping = True
+			took_over.append(holder.name)
+			threading.Thread(target=self.absorb_session,
+							 args=(holder, sess.name), daemon=True).start()
+			log("took-over '%s' <- '%s'" % (holder.name, sess.name))
+		return None, took_over
+
+	def absorb_session(self, holder, announcer):
+		# Kill an absorbed idle holder — but only after a short settle
+		# that rechecks the best-effort run state: a holder whose turn
+		# just started (state publish still in flight) must not be killed
+		# mid-turn.
+		time.sleep(ABSORB_SETTLE)
+		with self.table.lock:
+			if holder.state != "busy":
+				holder.terminate()
+				return
+			# The holder started working during the settle: it wins
+			# instead. Never kill a working agent — and never kill the
+			# announcer while it is working either; if both sides started
+			# within the window, sparing both leaves a divergence, but
+			# aborting a working agent is worse. One yield wins; later
+			# busy holders are only spared.
+			holder.stopping = False
+			self.ledger.pop(holder.name)
+			sess = self.table.get(announcer)
+			if sess is None:
+				return
+			sess.absorbing_until = 0
+			if sess.yielded_to is not None:
+				log("absorb spare '%s': announcer '%s' already yielded"
+					% (holder.name, announcer))
+				return
+			if sess.state == "busy":
+				log("absorb aborted '%s' vs busy '%s': both working, left alone"
+					% (announcer, holder.name))
+				return
+			sess.yielded_to = holder.name
+			self.ledger.record(announcer, holder.name)
+			sess.signal_closed()
+			log("absorb yield '%s' -> busy '%s'" % (announcer, holder.name))
+			threading.Thread(target=sess.terminate, daemon=True).start()
+
+
+class Control:
+	"""One method per wire command; every handler returns the response
+	dict, except attach which may hand the connection to the bridge."""
+
+	def __init__(self, daemon):
+		self.daemon = daemon
+
+	def ping(self, _req):
+		return {"ok": True}
+
+	def start(self, req):
+		name = req.get("name")
+		dir_ = req.get("dir")
+		argv = req.get("argv")
+		try:
+			cols = int(req.get("cols", DEFAULT_COLS))
+			rows = int(req.get("rows", DEFAULT_ROWS))
+		except (TypeError, ValueError):
+			return bad_request()
+		if not (isinstance(name, str) and name and isinstance(dir_, str)
+				and isinstance(argv, list) and argv
+				and all(isinstance(a, str) for a in argv)):
+			return bad_request()
+		if not os.path.isdir(dir_):
+			return err("no-dir")
+		if self.daemon.table.get(name) is not None:
+			return {"ok": True, "name": name, "created": False}
+		try:
+			self.daemon.spawn(name, dir_, argv, cols, rows)
+		except OSError as exc:
+			log("start '%s' failed: %s" % (name, exc))
+			return err("spawn-failed")
+		return {"ok": True, "name": name, "created": True}
+
+	def attach(self, req, conn):
+		name = req.get("name")
+		try:
+			cols = int(req.get("cols", DEFAULT_COLS))
+			rows = int(req.get("rows", DEFAULT_ROWS))
+		except (TypeError, ValueError):
+			return bad_request(), False
+		if not (isinstance(name, str) and name):
+			return bad_request(), False
+		table = self.daemon.table
+		with table.lock:
+			sess = table.get(name)
+			follow = self.daemon.ledger.follow(name, table)
+		if sess is None:
+			if follow is None:
+				return err("no-session"), False
+			# The duplicate already shut down, but its handoff survives: a
+			# late viewer follows it instead of recreating the duplicate.
+			send_json(conn, {"ok": True, "name": name, "state": follow["state"],
+							 "clients": 0, "handoff": follow})
+			log("attach '%s' -> handoff '%s' (session gone)"
+				% (name, follow["name"]))
+			return None, False
+		if follow is not None:
+			# This duplicate already handed its viewers to a live holder
+			# (resume takeover): reply with the handoff instead of
+			# installing a bridge that would die the moment the duplicate
+			# shuts down.
+			send_json(conn, {"ok": True, "name": name,
+							 "state": sess.state,
+							 "clients": sess.count_clients(),
+							 "handoff": follow})
+			log("attach '%s' -> handoff '%s'" % (name, follow["name"]))
+			return None, False
+		# The attach response must reach the client BEFORE the connection
+		# becomes a live bridge: install_client() starts relaying pi's
+		# output on this socket immediately, and response bytes
+		# interleaved with stream output made pi-rc read a non-JSON line
+		# ("attach failed: no response"). Send the response first; the
+		# client then enters bridge mode, and only after that do we
+		# install the client and force the repaint.
+		nclients = sess.count_clients() + 1
+		send_json(conn, {"ok": True, "name": name, "state": sess.state,
+						 "clients": nclients})
+		conn.setblocking(False)
+		sess.install_client(conn)
+		if nclients > 1:
+			# Multiple terminals share this session: every viewer sees the
+			# same output and any of them can type into the child.
+			log("attach '%s' %dx%d (%d clients)" % (name, cols, rows, nclients))
+		else:
+			log("attach '%s' %dx%d" % (name, cols, rows))
+		sess.nudge_repaint(cols, rows)
+		# Response already sent above; tell conn_thread the connection is
+		# now the bridge and must not be read or written again.
+		return None, True
+
+	def detach(self, req):
+		name = req.get("name")
+		if not isinstance(name, str):
+			return bad_request()
+		sess = self.daemon.table.get(name)
+		if sess is None:
+			# A detach of an unknown session must not report ok: callers
+			# use the response to decide whether the user's terminal was
+			# handed back, and a silent ok hid a name-mangling bug for a
+			# day.
+			return err("no-session")
+		if sess.count_clients() > 0:
+			log("detach '%s'" % name)
+			sess.signal_closed()
+		return {"ok": True}
+
+	def resize(self, req):
+		name = req.get("name")
+		try:
+			cols = int(req.get("cols"))
+			rows = int(req.get("rows"))
+		except (TypeError, ValueError):
+			return bad_request()
+		if not isinstance(name, str):
+			return bad_request()
+		sess = self.daemon.table.get(name)
+		if sess is None:
+			return err("no-session")
+		try:
+			sess.resize(cols, rows)
+		except OSError:
+			pass
+		return {"ok": True}
+
+	def list(self, _req):
+		sessions = [s.view() for s in self.daemon.table.snapshot()]
+		return {"ok": True, "sessions": sessions}
+
+	def which(self, req):
+		file = req.get("file")
+		if not (isinstance(file, str) and file):
+			return bad_request()
+		with self.daemon.table.lock:
+			holders = self.daemon.table.holders_of(file)
+		# First match, preserving the historical exact-pass-wins-then-argv
+		# order; pi-rc whichall exposes every holder.
+		return {"ok": True, "name": holders[0].name if holders else None}
+
+	def whichall(self, req):
+		file = req.get("file")
+		if not (isinstance(file, str) and file):
+			return bad_request()
+		with self.daemon.table.lock:
+			holders = self.daemon.table.holders_of(file)
+		return {"ok": True,
+				"names": [{"name": s.name, "state": s.state}
+						  for s in holders]}
+
+	def state(self, req):
+		name = req.get("name")
+		state = req.get("state")
+		if not (isinstance(name, str) and name) or state not in ("busy", "idle"):
+			return bad_request()
+		sess = self.daemon.table.get(name)
+		if sess is None:
+			return err("no-session")
+		sess.state = state
+		return {"ok": True}
+
+	def stop(self, req):
+		name = req.get("name")
+		if not isinstance(name, str):
+			return bad_request()
+		sess = self.daemon.table.get(name)
+		if sess is not None:
+			t = threading.Thread(target=sess.terminate, daemon=True)
+			t.start()
+		# The session thread drops the entry once the reap lands.
+		return {"ok": True}
+
+	def handover(self, req):
+		file = req.get("file")
+		dir_ = req.get("dir")
+		after_pid = req.get("afterPid")
+		message = req.get("message")  # legacy; unused by the current client
+		if not (isinstance(file, str) and file and isinstance(dir_, str) and dir_):
+			return bad_request()
+		if after_pid is not None and not isinstance(after_pid, int):
+			return bad_request()
+		if message is not None and not (isinstance(message, str)
+									   and 0 < len(message) <= 8192):
+			return bad_request()
+		if not os.path.isdir(dir_):
+			return err("no-dir")
+		target = self.daemon.handover_target(dir_, file)
+		holder = self.daemon.table.get(target)
+		if holder is not None and not holder.holds_dir(dir_):
+			# Held by a session resuming this exact file already.
+			log("handover '%s' already hosted" % target)
+			return {"ok": True, "verdict": "hosted:%s" % target}
+		t = threading.Thread(
+			target=self.daemon.handover_thread,
+			args=(target, dir_, file, after_pid, message),
+			daemon=True)
+		t.start()
+		return {"ok": True, "verdict": "target:%s" % target}
+
+	def carry(self, req):
+		# /new without termination: spawn a fresh hosted session and move
+		# this session's bridge viewers onto it, leaving this pi running
+		# headless with its own conversation (the extension cancels pi's
+		# in-process switch, which would abort an in-flight turn). With
+		# "to", an existing session receives the viewers instead.
+		name = req.get("name")
+		if not isinstance(name, str) or not name:
+			return bad_request()
+		argv = req.get("argv")
+		if argv is not None and not (isinstance(argv, list) and argv
+									and all(isinstance(a, str) for a in argv)):
+			return bad_request()
+		to_name = req.get("to")
+		if to_name is not None and not isinstance(to_name, str):
+			return bad_request()
+		table = self.daemon.table
+		with table.lock:
+			sess = table.get(name)
+			if sess is None:
+				return err("no-session")
+			dir_ = sess.dir
+			rows, cols = sess.winsize()
+			target = None
+			new_name = None
+			if to_name is not None:
+				if to_name == name:
+					return err("no-session")
+				target = table.get(to_name)
+				if target is None:
+					return err("no-session")
+			else:
+				new_name = self.daemon.carry_target_name(_dir_base(dir_),
+														 name)
+				if new_name is None:
+					return err("no-free-name")
+		spawned = None
+		if target is None:
+			try:
+				spawned = self.daemon.spawn(new_name, dir_, argv or ["pi"],
+											cols, rows, verb="carry",
+											refuse_if_exists=True)
+			except OSError as exc:
+				log("carry '%s' failed: %s" % (name, exc))
+				return err("spawn-failed")
+			if spawned is None:
+				return err("name-taken")
+			target = spawned
+		if self.daemon.begin_carry(sess, target, "carry"):
+			return {"ok": True, "name": target.name}
+		# The source died between spawn and move: drop a freshly spawned
+		# session rather than leave an unviewed pi behind.
+		if spawned is not None:
+			threading.Thread(target=spawned.terminate, daemon=True).start()
+		return err("no-session")
+
+	def resume(self, req):
+		# /resume without termination: resolve the picked conversation to
+		# its live holder when one exists (a busy one first — never touch
+		# a working agent, just move this terminal's viewers there),
+		# otherwise spawn a fresh session resuming the file, then move the
+		# viewers. The source session keeps running headless with its own
+		# conversation; the extension cancels pi's in-process switch.
+		name = req.get("name")
+		file = req.get("file")
+		if not (isinstance(name, str) and name and isinstance(file, str)
+				and file and os.path.isabs(file)):
+			return bad_request()
+		if not os.path.isfile(file):
+			return err("no-file")
+		table = self.daemon.table
+		with table.lock:
+			sess = table.get(name)
+			if sess is None:
+				return err("no-session")
+			rows, cols = sess.winsize()
+			holders = [s for s in table.holders_of(file)
+					   if s is not sess
+					   and not self.daemon.ledger.pending(s.name)]
+			target = None
+			new_name = None
+			if holders:
+				holders.sort(key=lambda s: (s.state != "busy",
+											s.count_clients() == 0))
+				target = holders[0]
+			else:
+				base = _dir_base(sess.dir)
+				digest = hashlib.sha256(file.encode()).hexdigest()[:6]
+				new_name = self.daemon.carry_target_name(
+					"%s-%s" % (base, digest), name)
+				if new_name is None:
+					return err("no-free-name")
+		spawned = None
+		if target is None:
+			try:
+				spawned = self.daemon.spawn(new_name, sess.dir,
+											["pi", "--session", file],
+											cols, rows, verb="resume",
+											refuse_if_exists=True)
+			except OSError as exc:
+				log("resume '%s' failed: %s" % (name, exc))
+				return err("spawn-failed")
+			if spawned is None:
+				return err("name-taken")
+			target = spawned
+		if self.daemon.begin_carry(sess, target, "resume"):
+			return {"ok": True, "name": target.name}
+		# The source died between spawn and move: drop a freshly spawned
+		# session rather than leave an unviewed pi behind.
+		if spawned is not None:
+			threading.Thread(target=spawned.terminate, daemon=True).start()
+		return err("no-session")
+
+	def announce(self, req):
+		name = req.get("name")
+		file = req.get("file")
+		if not (isinstance(name, str) and name and isinstance(file, str)
+				and file and os.path.isabs(file)):
+			return bad_request()
+		table = self.daemon.table
+		with table.lock:
+			sess = table.get(name)
+			if sess is None:
+				return err("no-session")
+			sess.file = file
+			# Surface other live holders of the same conversation so the
+			# extension can warn about a picker-opened duplicate
+			# immediately.
+			others = [s for s in table.holders_of(file) if s is not sess]
+			also = [{"name": s.name, "state": s.state}
+					for s in others
+					if not (req.get("takeover")
+							and self.daemon.ledger.pending(s.name))]
+			handoff = None
+			took_over = []
+			if req.get("takeover") and others:
+				handoff, took_over = self.daemon.resolve_takeover(
+					sess, others)
+		self.daemon.registry.set_argv(name, ["pi", "--session", file])
+		log("announce '%s' -> %s" % (name, file))
+		return {"ok": True, "alsoLive": also, "handoff": handoff,
+				"tookOver": took_over}
+
+	def handoff_target(self, req):
+		name = req.get("name")
+		if not (isinstance(name, str) and name):
+			return bad_request()
+		with self.daemon.table.lock:
+			target = self.daemon.ledger.follow(name, self.daemon.table)
+		return {"ok": True, "target": target}
+
+	def shutdown(self, _req):
+		t = threading.Thread(target=self.daemon.shutdown, daemon=True)
+		t.start()
+		return {"ok": True}
+
+
+def _dir_base(dir_):
+	# Mirrors handover_target's name base handling.
+	base = os.path.basename(dir_).replace(":", "_")
+	if base.startswith("="):
+		base = base[1:]
+	return base
+
+
+# Sentinel returned by the attach dispatch: the connection is now a raw
+# bridge and the connection thread must not touch it again.
+_BRIDGE_HANDOFF = object()
+
+
+def main():
+	daemon = Daemon(Registry(REG_PATH))
+	return daemon.serve()
 
 
 if __name__ == "__main__":
