@@ -22,10 +22,15 @@ them, and can uninstall exactly what it installed.
   explicitly when an old conversation is wanted (they ride along into the
   hosted session). Backgrounding stays solely a `/bg` feature: before
   attaching, the wrapper resolves the target conversation file of a
-  `--resume` / `--continue` / `--session` call (without spawning pi) and
-  refuses with an attach hint when a live hosted session already backs
-  it; an unreachable daemon, unresolvable target, or no match degrades
-  open exactly as before, and plain `pi` starts are unaffected. One-shot invocations (`-p`/`--print`, `--no-session`),
+  `--resume` / `--continue` / `--session` call (without spawning pi) and,
+  when a live hosted session already backs it, ATTACHES to that session
+  instead of starting a second pi — entering an active session is not an
+  interruption, and only explicit user actions (the detach key, Ctrl-\)
+  ever touch the running model. If the attach itself fails (e.g. the
+  session died between check and attach), the wrapper degrades open with
+  the original args. An unreachable daemon, unresolvable target, or no
+  match degrades open exactly as before, and plain `pi` starts are
+  unaffected. One-shot invocations (`-p`/`--print`, `--no-session`),
   help/version, and non-tty stdin stay direct. The `PI_HOSTED` guard
   keeps hosted subagent/worker sessions and nested starts out of the way:
   anything already inside the daemon execs the real pi untouched. The
