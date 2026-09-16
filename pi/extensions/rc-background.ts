@@ -19,12 +19,14 @@
  * verdict ("target:<name>" = will host under that name; "hosted:<name>"
  * = already hosted, attach instead), then `pi-rc handover --after-exit`
  * makes the daemon background its own wait-for-exit-then-host thread and
- * reply immediately — no detached helper needed. If the agent is
- * mid-turn, the turn is aborted only after the handover is accepted, so
- * a failed request never interrupts the running turn; pi then shuts down
- * gracefully and the daemon hosts the session as `pi --session <file>`.
- * Reattach later with `pi-rc attach`. Ephemeral sessions (--no-session)
- * cannot be handed over.
+ * reply immediately — no detached helper needed. /bg NEVER aborts a
+ * running operation: if the agent is mid-turn, pi prints a notice, waits
+ * for the agent to fully settle (automatic retries, auto-compaction
+ * retries and queued follow-ups included) and only then shuts down
+ * gracefully, flushing the session; the daemon's wait thread has no
+ * timeout, so it hosts the session as `pi --session <file>` whenever the
+ * process goes away. Reattach later with `pi-rc attach`. Ephemeral
+ * sessions (--no-session) cannot be handed over.
  *
  * The extension also announces the session file to the daemon on every
  * session start (and again if it changes): the daemon stores it per
@@ -91,6 +93,36 @@ export default function (pi: ExtensionAPI) {
 		// The user reattaches with: pi-rc attach <name>.
 	}
 
+	// Take the running pi out of the foreground WITHOUT ever touching the
+	// model: /bg must never stop or abort an in-flight operation. If the
+	// agent is busy, ctx.waitForIdle() resolves only when the whole agent
+	// loop has settled (automatic retries, auto-compaction retries and
+	// queued follow-ups included — the settle signal pi's agent_settled
+	// event also reports); pi then exits cleanly through ctx.shutdown(),
+	// which flushes the session before the process goes away. The
+	// daemon's wait-for-exit thread (pi-ptyd handover_thread) polls the
+	// pid with no timeout, so a long settle simply delays the adoption.
+	// If the settle wait itself fails, pi stays up untouched: the daemon
+	// keeps waiting and adoption still happens whenever this pi later
+	// exits for any reason.
+	async function exitAfterSettle(ctx: any) {
+		if (!ctx?.isIdle?.()) {
+			ctx?.ui?.notify?.(
+				"bg: waiting for the current operation to settle before backgrounding...",
+				"info",
+			);
+			if (typeof ctx.waitForIdle === "function") {
+				await ctx.waitForIdle();
+			}
+			// Without waitForIdle (older pi), ctx.shutdown() below still
+			// defers until the agent is idle, so the wait degrades to the
+			// same graceful behavior rather than an interruption.
+		}
+		// Graceful: flushes the session before the process goes away; the
+		// daemon starts the hosted session only after this process is gone.
+		ctx.shutdown();
+	}
+
 	async function handover(ctx: any) {
 		const sessionFile: string | null | undefined =
 			ctx?.sessionManager?.getSessionFile?.();
@@ -149,25 +181,18 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Abort an in-flight turn only after the handover is accepted:
-		// ctx.shutdown() defers until the agent is idle, and without this
-		// a mid-turn /bg would wait for the whole turn to finish before
-		// pi ever exits. Aborting before a failed request would kill the
-		// turn with nothing handed over; the daemon resumes the session
-		// file, so the conversation continues there.
-		if (!ctx?.isIdle?.()) {
-			ctx.abort?.();
-		}
-
 		ctx?.ui?.notify?.(
 			`Handing this session to the background service as ${name}; pi will exit and the session lives on there. Reattach later with: pi-rc attach ${name.replace(/^pi-/, "")}`,
 			"info",
 		);
-		// Graceful: deferred until the agent is idle (immediately after
-		// the abort above settles) and flushes the session before the
-		// process goes away; the daemon starts the hosted session only
-		// after this process is gone.
-		ctx.shutdown();
+		// Fire-and-forget so the TUI stays responsive during the settle
+		// wait; the handler returns immediately either way.
+		void exitAfterSettle(ctx).catch((err: unknown) => {
+			ctx?.ui?.notify?.(
+				`bg: could not finish backgrounding (${err instanceof Error ? err.message : String(err)}); pi stays up and the daemon adopts the session whenever pi exits.`,
+				"warning",
+			);
+		});
 	}
 
 	pi.registerCommand("bg", {
