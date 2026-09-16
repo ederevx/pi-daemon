@@ -20,10 +20,139 @@
 # start always works (unhosted; /bg then offers a handover).
 #
 # REAL_PI is rewritten to the actual pi binary at install time.
+#
+# Resume guard: backgrounding is solely a /bg feature, so a `pi --resume`,
+# `--continue` (-c), or `--session` call must never interrupt a live hosted
+# session by opening the same conversation twice. Before attaching, the
+# wrapper resolves the target conversation file WITHOUT spawning pi (via
+# pi's own exported session helpers, or a direct path / partial-UUID match)
+# and asks the daemon (`pi-rc which <file>`) whether a live hosted session
+# backs it; if so, the wrapper ATTACHES to that session instead of starting
+# a second pi (entering an active session is not an interruption — only
+# explicit user actions, such as the detach key, ever touch the running
+# model). `--resume` is an interactive picker, so it is guarded only when
+# exactly ONE live hosted session exists in this directory — that is
+# treated as the target. An unreachable daemon, an unresolvable target, or
+# no match degrades open: the call proceeds exactly as before. If the
+# attach itself fails (e.g. the session died between check and attach),
+# the wrapper degrades open with the original args rather than leaving
+# the user stranded. Plain `pi` starts are unaffected.
 set -euo pipefail
 
 REAL_PI="@REAL_PI@"
 PI_RC="$HOME/.local/bin/pi-rc"
+
+# Attach to a live hosted session backing the requested resume target:
+# print a one-line notice, then hand the TUI to the attach bridge, whose
+# clean detach (Ctrl-\) ends the wrapper with exit 0. On failure (e.g.
+# the session died between check and attach) return nonzero so the caller
+# degrades open with the original args instead of stranding the user.
+guard_attach() {
+	printf 'attaching to active session %s...\n' "$1" >&2
+	if "$PI_RC" attach "$1"; then
+		exit 0
+	fi
+	return 1
+}
+
+# Resolve a conversation file without spawning pi. $1 = mode
+# (continue|session), $2 = the --session argument (unused for continue).
+# Prints the absolute session file, or nothing when the target cannot be
+# determined outside pi (findMostRecentSession comes from pi's own
+# session-manager.js, located by walking up from the real pi binary).
+guard_resolve_file() {
+	node --input-type=module -e '
+import { closeSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
+import { pathToFileURL } from "node:url";
+const [mode, arg, cwd] = process.argv.slice(2);
+let dir = dirname(realpathSync(process.argv[1])), sm = null;
+for (let i = 0; i < 8 && dir !== dirname(dir); i++) {
+	try { sm = join(dir, "dist", "core", "session-manager.js"); statSync(sm); break; }
+	catch { sm = null; dir = dirname(dir); }
+}
+if (!sm) process.exit(0);
+const { findMostRecentSession } = await import(pathToFileURL(sm).href);
+// Mirror pi getDefaultSessionDirPath (default agent dir, cwd-encoded name)
+// without its mkdir side effect: nothing to continue when the dir is absent.
+const agentDir = process.env.PI_CODING_AGENT_DIR
+	|| join(homedir(), ".pi", "agent");
+const safe = "--" + cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-") + "--";
+const sessionDir = join(agentDir, "sessions", safe);
+let file = null;
+if (mode === "continue") {
+	file = findMostRecentSession(sessionDir, cwd);
+} else if (arg.includes("/") || arg.includes("\\") || arg.endsWith(".jsonl")) {
+	file = resolve(cwd, arg);
+} else {
+	// Partial-UUID match, like pi resolveSessionPath: exact id first, then
+	// an id prefix, scanned from each file session header line.
+	const headerId = (path) => {
+		try {
+			const fd = openSync(path, "r");
+			const buf = Buffer.alloc(65536);
+			const n = readSync(fd, buf, 0, 65536, 0);
+			closeSync(fd);
+			const head = JSON.parse(buf.toString("utf8", 0, n).split("\n", 1)[0]);
+			return head && typeof head.id === "string" ? head.id : null;
+		} catch { return null; }
+	};
+	try {
+		for (const f of readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"))) {
+			const id = headerId(join(sessionDir, f));
+			if (id === arg) { file = join(sessionDir, f); break; }
+			if (!file && id !== null && id.startsWith(arg)) file = join(sessionDir, f);
+		}
+	} catch { file = null; }
+}
+process.stdout.write(file || "");
+' "$REAL_PI" "$1" "$2" "$(pwd -P)" 2>/dev/null || true
+}
+
+# Guard entry: attach when the requested resume flags target a live hosted
+# session (return nonzero if that attach fails); return (proceed as today)
+# in every other case.
+guard_check() {
+	local -a args=("$@")
+	local i arg mode="" value
+	for (( i = 0; i < ${#args[@]}; i++ )); do
+		arg=${args[i]}
+		case "$arg" in
+			--) return 0 ;;  # everything after -- is a message, not a flag
+			--resume|-r) mode=resume; break ;;
+			--continue|-c) mode=continue; break ;;
+			--session)
+				if (( i + 1 < ${#args[@]} )); then
+					mode=session; value=${args[i + 1]}; break
+				fi
+				return 0 ;;  # pi would error on the missing value anyway
+			esac
+	done
+	[[ -n $mode ]] || return 0
+	if [[ $mode == resume ]]; then
+		# An interactive picker cannot be resolved without spawning pi.
+		# Guard only the unambiguous case: exactly one live hosted session
+		# in this directory must be the conversation being resumed.
+		local -a same=()
+		while IFS=$'\t' read -r name dir _; do
+			[[ $dir == "$(pwd -P)" ]] && same+=("$name")
+		done < <("$PI_RC" ls 2>/dev/null)
+		if (( ${#same[@]} == 1 )); then
+			guard_attach "${same[0]}" || return 1
+		fi
+		return 0
+	fi
+	local target
+	target=$(guard_resolve_file "$mode" "${value:-}")
+	[[ -n $target ]] || return 0
+	local live
+	live=$("$PI_RC" which "$target" 2>/dev/null) || return 0
+	if [[ -n $live ]]; then
+		guard_attach "$live" || return 1
+	fi
+	return 0
+}
 
 if [[ -t 0 && -z "${PI_HOSTED:-}" && -x "$PI_RC" ]]; then
 	direct=0
@@ -33,6 +162,11 @@ if [[ -t 0 && -z "${PI_HOSTED:-}" && -x "$PI_RC" ]]; then
 		esac
 	done
 	if [[ $direct -eq 0 ]]; then
+		if ! guard_check "$@"; then
+			# Guard attach failed (session died between check and attach):
+			# degrade open with the original args so the call still works.
+			exec "$REAL_PI" "$@"
+		fi
 		"$PI_RC" attach --new -- "$@" && exit 0
 		# Attach failed (service down, or the bridge refused): degrade to
 		# the real pi so a start always works.

@@ -20,7 +20,17 @@ them, and can uninstall exactly what it installed.
   conversation under a unique session name, attached to the terminal.
   Nothing is resumed implicitly; pass `--resume` / `--continue` to pi
   explicitly when an old conversation is wanted (they ride along into the
-  hosted session). One-shot invocations (`-p`/`--print`, `--no-session`),
+  hosted session). Backgrounding stays solely a `/bg` feature: before
+  attaching, the wrapper resolves the target conversation file of a
+  `--resume` / `--continue` / `--session` call (without spawning pi) and,
+  when a live hosted session already backs it, ATTACHES to that session
+  instead of starting a second pi — entering an active session is not an
+  interruption, and only explicit user actions (the detach key, Ctrl-\)
+  ever touch the running model. If the attach itself fails (e.g. the
+  session died between check and attach), the wrapper degrades open with
+  the original args. An unreachable daemon, unresolvable target, or no
+  match degrades open exactly as before, and plain `pi` starts are
+  unaffected. One-shot invocations (`-p`/`--print`, `--no-session`),
   help/version, and non-tty stdin stay direct. The `PI_HOSTED` guard
   keeps hosted subagent/worker sessions and nested starts out of the way:
   anything already inside the daemon execs the real pi untouched. The
@@ -80,7 +90,7 @@ bash scripts/uninstall.sh
 ```
 pi/
   extensions/rc-background.ts       # /bg: instant detach when hosted, handover otherwise
-  bin/pi-rc                         # client: start/attach/detach/announce/ls/stop/handover
+  bin/pi-rc                         # client: start/attach/detach/announce/ls/which/stop/handover
   ptyd/pi-ptyd                      # stdlib Python PTY host daemon
   systemd/pi-background-service.service
   install-subagent.sh               # official subagent extension installer
