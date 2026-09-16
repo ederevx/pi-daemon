@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install the Pi background service from this repo into the Pi agent home.
 #
-# Copies the rc-background extension, the pi-rc client, the pi-ptyd PTY
+# Copies the rc-background extension, the pi-rc client, the pi-daemon PTY
 # host daemon, and the systemd user unit, recording every owned file in a
 # manifest so uninstall removes exactly what this repo installed.
 # Idempotent: re-running refreshes owned copies in place. Existing
@@ -12,14 +12,14 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pi_home="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
 local_bin="$HOME/.local/bin"
 systemd_dir="$HOME/.config/systemd/user"
-state_dir="$pi_home/.pi-background-service"
+state_dir="$pi_home/.pi-daemon"
 manifest="$state_dir/manifest.json"
 
 [[ -d "$pi_home" ]] || { echo "install: missing Pi agent home: $pi_home" >&2; exit 1; }
-# pi-ptyd is a stdlib-only Python 3 daemon; the same interpreter is used
+# pi-daemon is a stdlib-only Python 3 daemon; the same interpreter is used
 # by uninstall's manifest reading.
 command -v python3 >/dev/null 2>&1 || {
-  echo "install: python3 not found on PATH (required for pi-ptyd)" >&2
+  echo "install: python3 not found on PATH (required for pi-daemon)" >&2
   exit 1
 }
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,8) else 1)' || {
@@ -29,15 +29,15 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,8) else 1)' || {
 
 dest_extension="$pi_home/extensions/rc-background.ts"
 dest_helper="$local_bin/pi-rc"
-dest_daemon="$local_bin/pi-ptyd"
-dest_unit="$systemd_dir/pi-background-service.service"
+dest_daemon="$local_bin/pi-daemon"
+dest_unit="$systemd_dir/pi-daemon.service"
 dest_wrapper="$local_bin/pi"
 
 mkdir -p "$pi_home/extensions" "$local_bin" "$systemd_dir" "$state_dir"
 
 install -m 644 "$repo_root/pi/extensions/rc-background.ts" "$dest_extension"
 install -m 755 "$repo_root/pi/bin/pi-rc" "$dest_helper"
-install -m 755 "$repo_root/pi/ptyd/pi-ptyd" "$dest_daemon"
+install -m 755 "$repo_root/pi/daemon/pi-daemon" "$dest_daemon"
 
 # The real pi binary must be resolved by PATH while skipping the
 # wrapper's own directory, so an already-installed wrapper can never be
@@ -55,7 +55,7 @@ IFS="$old_ifs"
   exit 1
 }
 sed "s|@REAL_PI@|$real_pi|;s|@PI_BIN_DIR@|$(dirname "$real_pi")|" \
-  "$repo_root/pi/systemd/pi-background-service.service" > "$dest_unit"
+  "$repo_root/pi/systemd/pi-daemon.service" > "$dest_unit"
 sed "s|@REAL_PI@|$real_pi|" "$repo_root/pi/bin/pi-wrapper" > "$dest_wrapper"
 chmod 755 "$dest_wrapper"
 
@@ -83,7 +83,7 @@ systemctl --user daemon-reload
 # makes the user manager start at boot; already-enabled linger is a no-op.
 loginctl enable-linger "${USER:-$(id -un)}" 2>/dev/null || \
   echo "install: warning — could not enable linger; the service starts at login only"
-systemctl --user enable --now pi-background-service.service
+systemctl --user enable --now pi-daemon.service
 
 echo "install: ok"
 echo "  daemon:    $dest_daemon"

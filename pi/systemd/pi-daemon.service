@@ -10,7 +10,7 @@ Environment=HOME=%h
 # carries neither ~/.local/bin nor the node bin dir, so the real pi's
 # directory is substituted at install time (@PI_BIN_DIR@).
 Environment=PATH=@PI_BIN_DIR@:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=%h/.local/bin/pi-ptyd
+ExecStart=%h/.local/bin/pi-daemon
 ExecStop=%h/.local/bin/pi-rc daemon-stop
 Restart=on-failure
 RestartSec=2
