@@ -78,12 +78,16 @@ owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_extension" "$dest_un
 } > "$manifest.tmp"
 mv "$manifest.tmp" "$manifest"
 
-systemctl --user daemon-reload
-# Enabled by default, matching the codex-remote-control pattern. Linger
-# makes the user manager start at boot; already-enabled linger is a no-op.
-loginctl enable-linger "${USER:-$(id -un)}" 2>/dev/null || \
-  echo "install: warning — could not enable linger; the service starts at login only"
-systemctl --user enable --now pi-background-service.service
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user daemon-reload
+  # Enabled by default, matching the codex-remote-control pattern. Linger
+  # makes the user manager start at boot; already-enabled linger is a no-op.
+  loginctl enable-linger "${USER:-$(id -un)}" 2>/dev/null || \
+    echo "install: warning — could not enable linger; the service starts at login only"
+  systemctl --user enable --now pi-background-service.service
+else
+  echo "install: warning — systemctl not found; files installed but the service was not enabled (non-systemd system?)"
+fi
 
 echo "install: ok"
 echo "  daemon:    $dest_daemon"

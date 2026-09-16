@@ -12,17 +12,24 @@ if [[ ! -f "$manifest" ]]; then
   exit 1
 fi
 
-systemctl --user disable --now pi-background-service.service 2>/dev/null || true
-systemctl --user daemon-reload
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user disable --now pi-background-service.service 2>/dev/null || true
+  systemctl --user daemon-reload
+fi
 
 mapfile -t owned < <(python3 - "$manifest" <<'EOF'
 import json, sys
+# Windows Python writes stdout in text mode, turning "\n" into "\r\n";
+# force binary newlines so paths never carry a trailing "\r".
+sys.stdout.reconfigure(newline="\n")
 for path in json.load(open(sys.argv[1]))["owned"]:
     print(path)
 EOF
 )
 
 for path in "${owned[@]}"; do
+  # Belt-and-braces: also strip any stray CR (e.g. a CRLF-authored manifest).
+  path="${path%$'\r'}"
   if [[ -f "$path" || -L "$path" ]]; then
     rm -f "$path"
     echo "uninstall: removed $path"
