@@ -35,6 +35,12 @@
 #                                       duplicate of a live conversation
 #                                       hands its viewers to the live holder
 #                                       instead of diverging from it
+#   pi-rc carry <name>                  /new without termination: ask the
+#                                       daemon to spawn a fresh hosted
+#                                       session and move this session's
+#                                       viewers onto it; this session
+#                                       keeps running headless. Used by
+#                                       the rc-background extension.
 #   pi-rc detach <name>                 detach a client; the session lives on
 #                                       (Ctrl-\ inside an attached session
 #                                       detaches your terminal the same way
@@ -381,6 +387,18 @@ def cmd_stop(args):
 	print("pi-rc: stopped '%s'" % session)
 
 
+def cmd_carry(args):
+	# Extension-only helper for /new: the daemon spawns a fresh hosted
+	# session sized like the current view, moves this session's bridge
+	# viewers onto it, and leaves this session running headless.
+	if len(args) != 1:
+		usage_error("carry takes exactly one session name")
+	resp = control({"cmd": "carry", "name": session_name(args[0])})
+	if not resp.get("ok"):
+		die("carry failed: %s" % resp.get("error"))
+	print("carried %s" % short_name(resp.get("name", "")))
+
+
 def cmd_announce(args):
 	takeover = False
 	rest = []
@@ -408,6 +426,9 @@ def cmd_announce(args):
 		# tab separator: session names may contain spaces
 		print("handoff %s\t%s" % (short_name(handoff["name"]),
 								   handoff.get("state", "idle")))
+	for h in resp.get("tookOver") or []:
+		# tab after the keyword: session names may contain spaces
+		print("took-over\t%s" % short_name(h))
 	# Other live holders of the same conversation: the extension turns
 	# these into a duplicate-open warning when no handoff happened.
 	for h in resp.get("alsoLive") or []:
@@ -881,6 +902,8 @@ def main():
 		cmd_whichall(rest)
 	elif cmd == "state":
 		cmd_state(rest)
+	elif cmd == "carry":
+		cmd_carry(rest)
 	elif cmd == "start":
 		cmd_start(rest)
 	elif cmd == "attach":
