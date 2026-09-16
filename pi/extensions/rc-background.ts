@@ -184,10 +184,15 @@ export class RcBackground {
 
 	/** Publish whether the model is working so other terminals can see
 	 *  the state in `pi-rc ls` and attach notices without attaching.
-	 *  Fire-and-forget: cosmetic only when the daemon is unreachable. */
-	async setState(state: "busy" | "idle"): Promise<void> {
+	 *  Skipped without a session file: hosted `--no-session` children
+	 *  (subagents, one-shots) inherit this session's name in their env,
+	 *  and their start/end would otherwise overwrite the working
+	 *  session's daemon-side state. Fire-and-forget: cosmetic only when
+	 *  the daemon is unreachable. */
+	async setState(state: "busy" | "idle", ctx?: any): Promise<void> {
 		const session = this.hostedSession();
 		if (!session) return;
+		if (ctx && !ctx?.sessionManager?.getSessionFile?.()) return;
 		try {
 			await this.exec(this.piRc, ["state", session, state]);
 		} catch {
@@ -376,20 +381,20 @@ export default function (pi: ExtensionAPI) {
 	// free. The first prompt is also where a turn begins: report busy.
 	pi.on("session_start", async (_event, ctx) => {
 		await app.announce(ctx);
-		await app.setState("idle");
+		await app.setState("idle", ctx);
 	});
 	pi.on("before_agent_start", async (_event, ctx) => {
 		await app.announce(ctx);
-		await app.setState("busy");
+		await app.setState("busy", ctx);
 	});
 	// The loop ended; agent_settled additionally covers automatic retries,
 	// compaction retries and queued follow-ups. Both report the same idle
 	// state, so whichever lands last leaves the correct value behind.
-	pi.on("agent_end", async () => {
-		await app.setState("idle");
+	pi.on("agent_end", async (_event, ctx) => {
+		await app.setState("idle", ctx);
 	});
-	pi.on("agent_settled", async () => {
-		await app.setState("idle");
+	pi.on("agent_settled", async (_event, ctx) => {
+		await app.setState("idle", ctx);
 	});
 	pi.on("session_before_switch", async (event, ctx) => {
 		return app.beforeSwitch(event, ctx);
