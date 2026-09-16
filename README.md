@@ -26,7 +26,11 @@ them, and can uninstall exactly what it installed.
   when a live hosted session already backs it, ATTACHES to that session
   instead of starting a second pi — entering an active session is not an
   interruption, and only explicit user actions (the detach key, Ctrl-\)
-  ever touch the running model. If the attach itself fails (e.g. the
+  ever touch the running model. The interactive `--resume` picker cannot
+  be resolved before pi opens; when it still opens a conversation a live
+  session already backs, the duplicate hands its viewers to the live
+  holder (a busy one first) and shuts down, so the terminal lands on the
+  live view. If the attach itself fails (e.g. the
   session died between check and attach), the wrapper degrades open with
   the original args. An unreachable daemon, unresolvable target, or no
   match degrades open exactly as before, and plain `pi` starts are
