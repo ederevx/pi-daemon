@@ -1,7 +1,7 @@
 /**
  * Remote-control backgrounding for Pi.
  *
- * Inside a hosted session (the pi-ptyd daemon sets PI_HOSTED and
+ * Inside a hosted session (the pi-daemon sets PI_HOSTED and
  * PI_HOSTED_SESSION in every hosted child's env), /bg is an instantaneous
  * detach: it asks the daemon to drop the client bridge (pi-rc detach).
  * The pi process keeps running headless in the daemon until the user exits
@@ -225,7 +225,7 @@ export class RcBackground {
 	 *  queued follow-ups included — the settle signal pi's agent_settled
 	 *  event also reports); pi then exits cleanly through ctx.shutdown(),
 	 *  which flushes the session before the process goes away. The
-	 *  daemon's wait-for-exit thread (pi-ptyd handover_thread) polls the
+	 *  daemon's wait-for-exit thread (pi-daemon handover_thread) polls the
 	 *  pid with no timeout, so a long settle simply delays the adoption.
 	 *  If the settle wait itself fails, pi stays up untouched: the daemon
 	 *  keeps waiting and adoption still happens whenever this pi later
@@ -249,7 +249,7 @@ export class RcBackground {
 	}
 
 	/** Take the running pi out of the foreground WITHOUT ever touching
-	 *  the model, handing its saved session to the background service
+	 *  the model, handing its saved session to the pi-daemon
 	 *  when hosted subagent/worker sessions are not in play. */
 	async handover(ctx: any): Promise<void> {
 		const sessionFile: string | null | undefined =
@@ -310,7 +310,7 @@ export class RcBackground {
 		}
 
 		ctx?.ui?.notify?.(
-			`Handing this session to the background service as ${name}; pi will exit and the session lives on there. Reattach later with: pi-rc attach ${name.replace(/^pi-/, "")}`,
+			`Handing this session to the pi-daemon as ${name}; pi will exit and the session lives on there. Reattach later with: pi-rc attach ${name.replace(/^pi-/, "")}`,
 			"info",
 		);
 		// Fire-and-forget so the TUI stays responsive during the settle
@@ -323,7 +323,7 @@ export class RcBackground {
 		});
 	}
 
-	/** /bg: detach when hosted, hand over to the background service
+	/** /bg: detach when hosted, hand over to the pi-daemon
 	 *  otherwise. */
 	async background(ctx: any): Promise<void> {
 		if (process.env.PI_HOSTED) {
@@ -369,7 +369,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("bg", {
 		description:
-			"Background this session (detach when hosted, hand over to the background service otherwise)",
+			"Background this session (detach when hosted, hand over to the pi-daemon otherwise)",
 		handler: async (_args, ctx) => {
 			await app.background(ctx);
 		},
