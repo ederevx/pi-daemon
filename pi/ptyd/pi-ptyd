@@ -281,6 +281,22 @@ def discard_client(sess, c=None):
 		except OSError:
 			pass
 		try:
+			# Pin the fd number to devnull before closing it. The session
+			# loop and control threads run concurrently with the accept
+			# loop, so the moment this number is released a fresh
+			# connection can claim it; anything still holding the old
+			# socket must never let its close() land on that new socket.
+			# dup2 repoints the number at devnull (implicitly closing the
+			# dead socket), so the close below releases a number nobody
+			# else can own mid-flight.
+			null = os.open(os.devnull, os.O_RDONLY)
+			try:
+				os.dup2(null, c.fileno())
+			finally:
+				os.close(null)
+		except OSError:
+			pass
+		try:
 			c.close()
 		except OSError:
 			pass
