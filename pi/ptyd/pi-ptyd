@@ -51,7 +51,6 @@
 #
 # Env: XDG_RUNTIME_DIR (control socket), XDG_STATE_HOME (registry).
 
-import errno
 import fcntl
 import hashlib
 import json
@@ -199,9 +198,10 @@ def spawn_session(name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS,
 		"argv": list(argv),
 		"pid": pid,
 		"master_fd": master,
-		"client": None,
+		"clients": {},       # bridge sockets -> per-client output buffer
 		"lock": threading.Lock(),
 		"file": None,       # announced pi session file, for revival
+		"state": "idle",    # model run state, published by the extension
 		"stopping": False,  # set by an explicit stop: never revive
 		"spawned_at": time.time(),
 	}
@@ -232,72 +232,85 @@ def spawn_session(name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS,
 	return sess
 
 
-def get_client(sess):
+def get_clients(sess):
+	# Snapshot {socket: outbuf}; the session loop is the only writer of
+	# existing entries, control threads only add new ones.
 	with sess["lock"]:
-		return sess["client"]
+		return dict(sess["clients"])
 
 
-def set_client(sess, client):
+def client_count(sess):
 	with sess["lock"]:
-		old = sess["client"]
-		sess["client"] = client
-	return old
+		return len(sess["clients"])
 
 
-def close_client(sess):
-	# Detach the client and signal its socket, but do NOT close the fd
-	# here: control threads run concurrently with the session loop's
-	# select, and closing could let a freshly accepted connection recycle
-	# the fd number before the loop's next recv. The loop does the close
-	# once it observes the EOF/error. Returns the detached socket.
+def file_holders(file):
+	# All live sessions backing this conversation file: the announced
+	# file first (the extension recorded it), then a --session argv
+	# match, which covers handover/revive spawns and announce-less
+	# spawns that resume the same file. Caller holds SESS_LOCK.
+	hits = []
+	for sess in SESSIONS.values():
+		if sess.get("file") == file:
+			hits.append(sess)
+	for sess in SESSIONS.values():
+		if sess in hits:
+			continue
+		argv = sess.get("argv") or []
+		for i, arg in enumerate(argv[:-1]):
+			if arg == "--session" and argv[i + 1] == file:
+				hits.append(sess)
+				break
+	return hits
+
+
+def kill_client(client):
+	# Shut the socket down and pin its fd number to devnull before closing
+	# it: control threads and session loops run concurrently, so the moment
+	# the number is released a fresh connection could claim it and inherit
+	# a stray shutdown or close.
+	try:
+		client.shutdown(socket.SHUT_RDWR)
+	except OSError:
+		pass
+	try:
+		null = os.open(os.devnull, os.O_RDONLY)
+		try:
+			os.dup2(null, client.fileno())
+		finally:
+			os.close(null)
+	except OSError:
+		pass
+	try:
+		client.close()
+	except OSError:
+		pass
+
+
+def add_client(sess, client):
+	# Control-side: install a new bridge client. Returns the client count.
 	with sess["lock"]:
-		c = sess["client"]
-		sess["client"] = None
-	if c is not None:
+		sess["clients"][client] = bytearray()
+		return len(sess["clients"])
+
+
+def remove_client(sess, client):
+	# Session-loop side: drop a client after an EOF/error the loop itself
+	# observed; the pinned close happens here, never in the control thread.
+	with sess["lock"]:
+		sess["clients"].pop(client, None)
+	kill_client(client)
+
+
+def close_all_clients(sess):
+	# Control-side detach (cmd_detach, shutdown): signal every bridge
+	# socket without closing; the session loop observes the EOFs and does
+	# the pinned closes itself, so no recycled fd can be caught mid-flight.
+	with sess["lock"]:
+		clients = list(sess["clients"])
+	for c in clients:
 		try:
 			c.shutdown(socket.SHUT_RDWR)
-		except OSError:
-			pass
-	return c
-
-
-def discard_client(sess, c=None):
-	# Session-loop side: shut the socket down and actually close the fd.
-	# With an explicit socket (an EOF/error the loop observed itself), it
-	# is closed unconditionally but only clears the session slot when it
-	# is still that same client — a concurrent steal-attach may already
-	# have installed a newer one.
-	if c is None:
-		with sess["lock"]:
-			c = sess["client"]
-			sess["client"] = None
-	else:
-		with sess["lock"]:
-			if sess["client"] is c:
-				sess["client"] = None
-	if c is not None:
-		try:
-			c.shutdown(socket.SHUT_RDWR)
-		except OSError:
-			pass
-		try:
-			# Pin the fd number to devnull before closing it. The session
-			# loop and control threads run concurrently with the accept
-			# loop, so the moment this number is released a fresh
-			# connection can claim it; anything still holding the old
-			# socket must never let its close() land on that new socket.
-			# dup2 repoints the number at devnull (implicitly closing the
-			# dead socket), so the close below releases a number nobody
-			# else can own mid-flight.
-			null = os.open(os.devnull, os.O_RDONLY)
-			try:
-				os.dup2(null, c.fileno())
-			finally:
-				os.close(null)
-		except OSError:
-			pass
-		try:
-			c.close()
 		except OSError:
 			pass
 
@@ -306,12 +319,7 @@ def discard_client(sess, c=None):
 
 def drop_session(sess, code):
 	name = sess["name"]
-	c = close_client(sess)
-	if c is not None:
-		try:
-			c.close()
-		except OSError:
-			pass
+	close_all_clients(sess)
 	try:
 		os.close(sess["master_fd"])
 	except OSError:
@@ -364,26 +372,32 @@ def revive_session(sess, status):
 		log("revive '%s' skipped: name taken during revive" % sess["name"])
 
 
-def close_bridge(sess, to_client):
-	# Send whatever is still buffered, then drop and close the client.
-	c = get_client(sess)
-	if c is None:
-		return
-	try:
-		while to_client:
-			sent = c.send(bytes(to_client[:65536]))
-			del to_client[:sent]
-	except OSError:
-		pass
-	discard_client(sess)
+def close_bridge(sess):
+	# Child-side teardown: flush every client's remaining buffer, then
+	# drop and close all bridge sockets.
+	with sess["lock"]:
+		clients = list(sess["clients"].items())
+		sess["clients"] = {}
+	for c, buf in clients:
+		try:
+			while buf:
+				sent = c.send(bytes(buf[:65536]))
+				del buf[:sent]
+		except OSError:
+			pass
+		kill_client(c)
 
 
 def session_loop(sess):
-	# Owns the master fd: bridge relay plus child reaping.
+	# Owns the master fd: bridge relay to every attached client plus
+	# child reaping. Clients share one view: all of them receive the
+	# child's output, and any client's input is forwarded to the child
+	# (interleaved, like a shared tmux pane). Per-client output buffers
+	# keep one slow viewer from stalling the others or the child; a
+	# client that falls too far behind loses its bridge instead.
 	master = sess["master_fd"]
 	pid = sess["pid"]
 	name = sess["name"]
-	to_client = bytearray()
 	to_master = bytearray()
 	dead_input = False
 	while True:
@@ -393,80 +407,77 @@ def session_loop(sess):
 			reaped = (pid, 0)
 		if reaped[0] == pid:
 			break
-		client = get_client(sess)
+		clients = get_clients(sess)
 		rlist = []
 		wlist = []
-		if client is not None:
-			rlist.append(client)
-			if to_client:
-				wlist.append(client)
-			if not dead_input and len(to_client) < MAX_BUF:
-				rlist.append(master)
-			if to_master:
-				wlist.append(master)
-		else:
-			# Detached: keep draining the master so the headless child
-			# never blocks writing to a full tty buffer; output is
-			# discarded since the daemon holds no terminal history. Also
-			# flush any input buffered at detach time instead of letting
-			# it sit until a client reattaches.
+		if not dead_input:
 			rlist.append(master)
-			if to_master:
-				wlist.append(master)
+		if to_master:
+			wlist.append(master)
+		for c, buf in clients.items():
+			rlist.append(c)
+			if buf:
+				wlist.append(c)
+		if not rlist and not wlist:
+			# Detached after the master hit EOF: nothing left to poll, so
+			# just wait for the child like the reap check above.
+			time.sleep(REAP_TICK)
+			continue
 		try:
 			r, w, _ = select.select(rlist, wlist, [], REAP_TICK)
 		except OSError:
 			# A polled fd vanished; the next iteration re-evaluates.
 			continue
-		if client in r:
-			try:
-				data = client.recv(65536)
-			except OSError:
-				data = b""
-			if data:
-				to_master += data
-				if len(to_master) > MAX_BUF:
-					del to_master[: len(to_master) - MAX_BUF]
-			else:
-				log("detach '%s'" % name)
-				discard_client(sess, client)
-				client = None
+		for c, buf in clients.items():
+			if c in r:
+				try:
+					data = c.recv(65536)
+				except OSError:
+					data = b""
+				if data:
+					to_master += data
+					if len(to_master) > MAX_BUF:
+						del to_master[: len(to_master) - MAX_BUF]
+				else:
+					log("client-exit '%s'" % name)
+					remove_client(sess, c)
 		if master in r:
 			try:
 				data = os.read(master, 65536)
-			except OSError as exc:
+			except OSError:
 				# EIO is the normal PTY read failure after child exit.
-				if exc.errno == errno.EIO:
-					data = b""
-				else:
-					data = b""
+				data = b""
 			if data:
-				if get_client(sess) is not None:
-					to_client += data
-					if len(to_client) > MAX_BUF:
-						del to_client[: len(to_client) - MAX_BUF]
-				# detached: discard; the daemon holds no terminal history
+				stalled = []
+				with sess["lock"]:
+					for c, buf in sess["clients"].items():
+						buf.extend(data)
+						if len(buf) > MAX_BUF:
+							stalled.append(c)
+				for c in stalled:
+					remove_client(sess, c)
+					log("drop slow client '%s'" % name)
 			else:
 				dead_input = True
-				if get_client(sess) is not None and not to_client:
-					close_bridge(sess, to_client)
+				# The child closed its tty (or died without reaping yet);
+				# flush and drop the bridges like a single client did.
+				close_bridge(sess)
 		if master in w:
 			try:
 				sent = os.write(master, bytes(to_master[:65536]))
 				del to_master[:sent]
 			except OSError:
 				del to_master[:]
-				close_bridge(sess, to_client)
-		if client in w:
-			try:
-				sent = client.send(bytes(to_client[:65536]))
-				del to_client[:sent]
-			except OSError:
-				del to_client[:]
-				discard_client(sess, client)
-				client = None
-	if get_client(sess) is not None:
-		close_bridge(sess, to_client)
+		for c, buf in clients.items():
+			if c in w:
+				try:
+					sent = c.send(bytes(buf[:65536]))
+					del buf[:sent]
+				except OSError:
+					remove_client(sess, c)
+	# Child gone: flush whatever is still buffered per client, drop every
+	# bridge, then tear the session down and decide on revival.
+	close_bridge(sess)
 	drop_session(sess, reaped[1])
 	revive_session(sess, reaped[1])
 
@@ -526,30 +537,33 @@ def cmd_attach(req, conn):
 	if sess is None:
 		return err("no-session"), False
 	# The attach response must reach the client BEFORE the connection
-	# becomes the live bridge: set_client() starts relaying pi's output
+	# becomes a live bridge: add_client() starts relaying pi's output
 	# on this socket immediately, and response bytes interleaved with
 	# stream output made pi-rc read a non-JSON line ("attach failed:
 	# no response"). Send the response first; the client then enters
 	# bridge mode, and only after that do we install the client and
 	# force the repaint.
-	send_json(conn, {"ok": True, "name": name})
+	with sess["lock"]:
+		# The count after this client joins; the response must reach the
+		# socket before add_client() starts relaying onto it.
+		nclients = len(sess["clients"]) + 1
+	send_json(conn, {"ok": True, "name": name, "state": sess.get("state", "idle"),
+					 "clients": nclients})
 	conn.setblocking(False)
-	old = set_client(sess, conn)
-	if old is not None:
-		log("steal '%s'" % name)
-		# Signal only; the session loop observes the EOF and closes the fd
-		# (closing here could race a recycled fd number into its select).
-		try:
-			old.shutdown(socket.SHUT_RDWR)
-		except OSError:
-			pass
+	add_client(sess, conn)
+	if nclients > 1:
+		# Multiple terminals share this session: every viewer sees the
+		# same output and any of them can type into the child.
+		log("attach '%s' %dx%d (%d clients)" % (name, cols, rows, nclients))
+	else:
+		log("attach '%s' %dx%d" % (name, cols, rows))
 	try:
 		# pi's TUI only repaints when the winsize actually changes (Node
 		# fires the resize event on a change), so a reattach at the same
 		# size would stay silent until the user types or resizes. Nudge the
 		# size by one line first so the final size is always seen as a
 		# change and the child redraws its whole frame. This must happen
-		# only after set_client(): the full-frame repaint pi produces from
+		# only after add_client(): the full-frame repaint pi produces from
 		# the resize is forwarded exclusively to the installed client, so
 		# resizing before the bridge exists made the drain loop discard it,
 		# and the trailing SIGWINCH carried no size change, so Node never
@@ -566,7 +580,6 @@ def cmd_attach(req, conn):
 	except OSError:
 		pass
 	child_sigwinch(sess["pid"])
-	log("attach '%s' %dx%d" % (name, cols, rows))
 	# Response already sent above; tell conn_thread the connection is now
 	# the bridge and must not be read or written again.
 	return None, True
@@ -583,9 +596,9 @@ def cmd_detach(req):
 		# the response to decide whether the user's terminal was handed
 		# back, and a silent ok hid a name-mangling bug for a day.
 		return err("no-session")
-	if get_client(sess) is not None:
+	if client_count(sess) > 0:
 		log("detach '%s'" % name)
-		close_client(sess)
+		close_all_clients(sess)
 	return {"ok": True}
 
 
@@ -619,7 +632,10 @@ def cmd_list(_req):
 			"name": sess["name"],
 			"dir": sess["dir"],
 			"pid": sess["pid"],
-			"attached": get_client(sess) is not None,
+			"attached": client_count(sess) > 0,
+			"clients": client_count(sess),
+			"file": sess.get("file"),
+			"state": sess.get("state", "idle"),
 			"argv": sess["argv"],
 		})
 	return {"ok": True, "sessions": out}
@@ -630,20 +646,34 @@ def cmd_which(req):
 	if not (isinstance(file, str) and file):
 		return bad_request()
 	with SESS_LOCK:
-		sessions = list(SESSIONS.values())
-	# Exact announce match first: the extension recorded this conversation
-	# file as the one backing the session. Then a registry-style argv
-	# match, which covers handover/revive sessions before their extension
-	# announces (and announce-less spawns) that resume the same file.
-	for sess in sessions:
-		if sess.get("file") == file:
-			return {"ok": True, "name": sess["name"]}
-	for sess in sessions:
-		argv = sess.get("argv") or []
-		for i, arg in enumerate(argv[:-1]):
-			if arg == "--session" and argv[i + 1] == file:
-				return {"ok": True, "name": sess["name"]}
-	return {"ok": True, "name": None}
+		holders = file_holders(file)
+	# First match, preserving the historical exact-pass-wins-then-argv
+	# order; pi-rc whichall exposes every holder.
+	return {"ok": True, "name": holders[0]["name"] if holders else None}
+
+
+def cmd_whichall(req):
+	file = req.get("file")
+	if not (isinstance(file, str) and file):
+		return bad_request()
+	with SESS_LOCK:
+		holders = file_holders(file)
+	return {"ok": True,
+			"names": [{"name": s["name"], "state": s.get("state", "idle")}
+					  for s in holders]}
+
+
+def cmd_state(req):
+	name = req.get("name")
+	state = req.get("state")
+	if not (isinstance(name, str) and name) or state not in ("busy", "idle"):
+		return bad_request()
+	with SESS_LOCK:
+		sess = SESSIONS.get(name)
+	if sess is None:
+		return err("no-session")
+	sess["state"] = state
+	return {"ok": True}
 
 
 def kill_and_wait(pid, grace):
@@ -753,12 +783,17 @@ def cmd_announce(req):
 		return bad_request()
 	with SESS_LOCK:
 		sess = SESSIONS.get(name)
-	if sess is None:
-		return err("no-session")
-	sess["file"] = file
+		if sess is None:
+			return err("no-session")
+		sess["file"] = file
+		# Surface other live holders of the same conversation so the
+		# extension can warn about a picker-opened duplicate immediately.
+		others = [s for s in file_holders(file) if s is not sess]
+		also = [{"name": s["name"], "state": s.get("state", "idle")}
+				for s in others]
 	registry_set_argv(name, ["pi", "--session", file])
 	log("announce '%s' -> %s" % (name, file))
-	return {"ok": True}
+	return {"ok": True, "alsoLive": also}
 
 
 def cmd_handover(req):
@@ -825,7 +860,7 @@ def do_shutdown():
 		except OSError:
 			pass
 	for sess in sessions:
-		close_client(sess)
+		close_all_clients(sess)
 		try:
 			os.close(sess["master_fd"])
 		except OSError:
@@ -907,6 +942,10 @@ def conn_thread(conn):
 				send_json(conn, cmd_list(req))
 			elif cmd == "which":
 				send_json(conn, cmd_which(req))
+			elif cmd == "whichall":
+				send_json(conn, cmd_whichall(req))
+			elif cmd == "state":
+				send_json(conn, cmd_state(req))
 			elif cmd == "stop":
 				send_json(conn, cmd_stop(req))
 			elif cmd == "handover":
