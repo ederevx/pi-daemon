@@ -281,6 +281,22 @@ def discard_client(sess, c=None):
 		except OSError:
 			pass
 		try:
+			# Pin the fd number to devnull before closing it. The session
+			# loop and control threads run concurrently with the accept
+			# loop, so the moment this number is released a fresh
+			# connection can claim it; anything still holding the old
+			# socket must never let its close() land on that new socket.
+			# dup2 repoints the number at devnull (implicitly closing the
+			# dead socket), so the close below releases a number nobody
+			# else can own mid-flight.
+			null = os.open(os.devnull, os.O_RDONLY)
+			try:
+				os.dup2(null, c.fileno())
+			finally:
+				os.close(null)
+		except OSError:
+			pass
+		try:
 			c.close()
 		except OSError:
 			pass
@@ -509,12 +525,35 @@ def cmd_attach(req, conn):
 		sess = SESSIONS.get(name)
 	if sess is None:
 		return err("no-session"), False
+	# The attach response must reach the client BEFORE the connection
+	# becomes the live bridge: set_client() starts relaying pi's output
+	# on this socket immediately, and response bytes interleaved with
+	# stream output made pi-rc read a non-JSON line ("attach failed:
+	# no response"). Send the response first; the client then enters
+	# bridge mode, and only after that do we install the client and
+	# force the repaint.
+	send_json(conn, {"ok": True, "name": name})
+	conn.setblocking(False)
+	old = set_client(sess, conn)
+	if old is not None:
+		log("steal '%s'" % name)
+		# Signal only; the session loop observes the EOF and closes the fd
+		# (closing here could race a recycled fd number into its select).
+		try:
+			old.shutdown(socket.SHUT_RDWR)
+		except OSError:
+			pass
 	try:
 		# pi's TUI only repaints when the winsize actually changes (Node
 		# fires the resize event on a change), so a reattach at the same
 		# size would stay silent until the user types or resizes. Nudge the
 		# size by one line first so the final size is always seen as a
-		# change and the child redraws its whole frame.
+		# change and the child redraws its whole frame. This must happen
+		# only after set_client(): the full-frame repaint pi produces from
+		# the resize is forwarded exclusively to the installed client, so
+		# resizing before the bridge exists made the drain loop discard it,
+		# and the trailing SIGWINCH carried no size change, so Node never
+		# fired resize again — a reattached client showed a stale frame.
 		if rows > 1:
 			set_winsize(sess["master_fd"], cols, rows - 1)
 		else:
@@ -527,18 +566,10 @@ def cmd_attach(req, conn):
 	except OSError:
 		pass
 	child_sigwinch(sess["pid"])
-	conn.setblocking(False)
-	old = set_client(sess, conn)
-	if old is not None:
-		log("steal '%s'" % name)
-		# Signal only; the session loop observes the EOF and closes the fd
-		# (closing here could race a recycled fd number into its select).
-		try:
-			old.shutdown(socket.SHUT_RDWR)
-		except OSError:
-			pass
 	log("attach '%s' %dx%d" % (name, cols, rows))
-	return {"ok": True, "name": name}, True
+	# Response already sent above; tell conn_thread the connection is now
+	# the bridge and must not be read or written again.
+	return None, True
 
 
 def cmd_detach(req):
@@ -857,7 +888,10 @@ def conn_thread(conn):
 			cmd = req["cmd"]
 			if cmd == "attach":
 				resp, handoff = cmd_attach(req, conn)
-				send_json(conn, resp)
+				# cmd_attach may have already delivered the response itself
+				# before installing the client bridge (see cmd_attach).
+				if resp is not None:
+					send_json(conn, resp)
 				if handoff:
 					handed_off = True
 					return
