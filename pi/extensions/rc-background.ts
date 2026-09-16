@@ -35,12 +35,15 @@
  * reply also names any OTHER live hosted session backing the same
  * conversation — possible when pi's resume picker opens a live session
  * from a second terminal. With takeover (always requested) the daemon
- * hands this duplicate's bridge viewers to a live holder — a busy one
- * first — and this pi shuts down, so resuming a working conversation
- * lands on the live view instead of an idle duplicate that would
- * silently diverge from it; without a handoff (older daemon, vanished
- * holder) the extension falls back to a warning naming the holder and
- * its attach command, since pi has no cross-process session locking.
+ * resolves the duplicate: a BUSY holder wins — the daemon hands this
+ * duplicate's bridge viewers to it and this pi shuts down, so resuming
+ * a working conversation lands on the live view; holders that are
+ * merely idle at the prompt instead get absorbed — this pi keeps the
+ * conversation and stays open, so an in-TUI /resume never tears down
+ * the view the user is in. Without a handoff or absorption (older
+ * daemon, vanished holder) the extension falls back to a warning
+ * naming the holder and its attach command, since pi has no
+ * cross-process session locking.
  * The announced marker is only set after a successful announce, so a
  * transient daemon outage retries on the next prompt instead of being
  * skipped for the session's lifetime.
@@ -51,6 +54,13 @@
  * can show whether the model is working without attaching. Both are
  * fire-and-forget; a missing or unreachable daemon only costs the
  * crash-revive safety net and the state display.
+ *
+ * /new is carried, never terminated: pi's in-process switch aborts an
+ * in-flight turn, so in a hosted session the extension cancels the
+ * switch and asks the daemon to spawn a fresh hosted session and move
+ * this terminal's bridge onto it (pi-rc carry). This pi keeps running
+ * headless with its conversation — detach and attach to the new
+ * session, old session backgrounded, in-flight work untouched.
  *
  * Ctrl+D cannot be used for this: pi refuses extension shortcuts that
  * conflict with a built-in binding (app.exit is Ctrl+D) — registration is
@@ -103,6 +113,21 @@ export default function (pi: ExtensionAPI) {
 				.map((l) => /^handoff (.+)\t(\S+)$/.exec(l))
 				.filter(Boolean)
 				.map((m) => ({ name: m![1], state: m![2] }))[0];
+			const tookOver = lines
+				.filter((l) => l.startsWith("took-over\t"))
+				.map((l) => l.slice("took-over\t".length))
+				.filter(Boolean);
+			if (tookOver.length > 0) {
+				// Idle holders of the picked conversation were absorbed:
+				// this session keeps the conversation and stays open — no
+				// shutdown, the user never leaves their view.
+				ctx?.ui?.notify?.(
+					`Took this conversation over from idle session${tookOver.length > 1 ? "s" : ""} ` +
+						`${tookOver.join(", ")}; their views follow here.`,
+					"info",
+				);
+				return;
+			}
 			if (handoff) {
 				if (typeof ctx?.shutdown === "function") {
 					ctx?.ui?.notify?.(
@@ -293,6 +318,26 @@ export default function (pi: ExtensionAPI) {
 				await handover(ctx);
 			}
 		},
+	});
+
+	pi.on("session_before_switch", async (event, ctx) => {
+		// /new in a hosted session must never terminate or abort it: pi's
+		// in-process switch calls session.abort() on an in-flight turn.
+		// Cancel it and carry instead: the daemon spawns a fresh hosted
+		// session, moves this terminal's bridge onto it, and this pi keeps
+		// running headless with its conversation (return with
+		// `pi-rc attach <old-name>`). Outside hosting — or when the daemon
+		// is unreachable — pi's native /new applies untouched.
+		if (event?.reason !== "new") return;
+		const session = hostedShort();
+		if (!session) return;
+		try {
+			const result = await pi.exec(piRc, ["carry", session]);
+			if (result.code !== 0) return;
+		} catch {
+			return;
+		}
+		return { cancel: true };
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
