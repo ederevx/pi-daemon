@@ -41,6 +41,13 @@
 #                                       viewers onto it; this session
 #                                       keeps running headless. Used by
 #                                       the rc-background extension.
+#   pi-rc resume <name> <file>          /resume without termination: ask
+#                                       the daemon to move this session's
+#                                       viewers onto a live holder of
+#                                       the conversation (busy first) or
+#                                       a fresh session resuming the
+#                                       file; this session keeps running
+#                                       headless. Used by the extension.
 #   pi-rc detach <name>                 detach a client; the session lives on
 #                                       (Ctrl-\ inside an attached session
 #                                       detaches your terminal the same way
@@ -397,6 +404,23 @@ def cmd_carry(args):
 	if not resp.get("ok"):
 		die("carry failed: %s" % resp.get("error"))
 	print("carried %s" % short_name(resp.get("name", "")))
+
+
+def cmd_resume(args):
+	# Extension-only helper for /resume: the daemon resolves the picked
+	# conversation to its live holder (busy first) or a fresh session
+	# resuming the file, and moves this session's viewers there; this
+	# session keeps running headless instead of being switched or aborted.
+	if len(args) != 2:
+		usage_error("resume takes exactly a session name and a session file")
+	name, file = args
+	if not os.path.isabs(file):
+		die("resume expects an absolute session file path")
+	resp = control({"cmd": "resume", "name": session_name(name),
+					"file": file})
+	if not resp.get("ok"):
+		die("resume failed: %s" % resp.get("error"))
+	print("resumed %s" % short_name(resp.get("name", "")))
 
 
 def cmd_announce(args):
@@ -904,6 +928,8 @@ def main():
 		cmd_state(rest)
 	elif cmd == "carry":
 		cmd_carry(rest)
+	elif cmd == "resume":
+		cmd_resume(rest)
 	elif cmd == "start":
 		cmd_start(rest)
 	elif cmd == "attach":

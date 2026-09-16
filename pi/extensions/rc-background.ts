@@ -321,19 +321,30 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_before_switch", async (event, ctx) => {
-		// /new in a hosted session must never terminate or abort it: pi's
-		// in-process switch calls session.abort() on an in-flight turn.
-		// Cancel it and carry instead: the daemon spawns a fresh hosted
-		// session, moves this terminal's bridge onto it, and this pi keeps
-		// running headless with its conversation (return with
-		// `pi-rc attach <old-name>`). Outside hosting — or when the daemon
-		// is unreachable — pi's native /new applies untouched.
-		if (event?.reason !== "new") return;
+		// /new and /resume in a hosted session must never terminate or
+		// abort it: pi's in-process switch tears the current session down
+		// (session.abort() on an in-flight turn). Cancel it and carry
+		// instead: /new asks the daemon to spawn a fresh hosted session
+		// and move this terminal's bridge onto it; /resume moves it onto
+		// a live holder of the picked conversation or a fresh session
+		// resuming the file. Either way this pi keeps running headless
+		// with its conversation (return with `pi-rc attach <old-name>`).
+		// Outside hosting — or when the daemon is unreachable — pi's
+		// native behavior applies untouched.
+		if (event?.reason !== "new" && event?.reason !== "resume") return;
 		const session = hostedShort();
 		if (!session) return;
 		try {
-			const result = await pi.exec(piRc, ["carry", session]);
-			if (result.code !== 0) return;
+			if (event.reason === "resume") {
+				const target = event.targetSessionFile;
+				const current = ctx?.sessionManager?.getSessionFile?.();
+				if (!target || target === current) return { cancel: true };
+				const result = await pi.exec(piRc, ["resume", session, target]);
+				if (result.code !== 0) return;
+			} else {
+				const result = await pi.exec(piRc, ["carry", session]);
+				if (result.code !== 0) return;
+			}
 		} catch {
 			return;
 		}
