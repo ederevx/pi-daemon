@@ -22,21 +22,24 @@
 # REAL_PI is rewritten to the actual pi binary at install time.
 #
 # Resume guard: backgrounding is solely a /bg feature, so a `pi --resume`,
-# `--continue` (-c), or `--session` call must never interrupt a live hosted
-# session by opening the same conversation twice. Before attaching, the
-# wrapper resolves the target conversation file WITHOUT spawning pi (via
-# pi's own exported session helpers, or a direct path / partial-UUID match)
-# and asks the daemon (`pi-rc which <file>`) whether a live hosted session
-# backs it; if so, the wrapper ATTACHES to that session instead of starting
-# a second pi (entering an active session is not an interruption — only
-# explicit user actions, such as the detach key, ever touch the running
-# model). `--resume` is an interactive picker, so it is guarded only when
-# exactly ONE live hosted session exists in this directory — that is
-# treated as the target. An unreachable daemon, an unresolvable target, or
-# no match degrades open: the call proceeds exactly as before. If the
-# attach itself fails (e.g. the session died between check and attach),
-# the wrapper degrades open with the original args rather than leaving
-# the user stranded. Plain `pi` starts are unaffected.
+# `--continue` (-c), or `--session` call must never open a conversation a
+# live hosted session already has (pi has no cross-process session locking;
+# two processes on one session file silently diverge). For --continue and
+# --session the target file is resolved WITHOUT spawning pi and checked
+# against the daemon (`pi-rc which <file>`); a live holder means the
+# wrapper ATTACHES to it instead (entering an active session is not an
+# interruption — only explicit user actions, such as the detach key, ever
+# touch the running model). `--resume` is an interactive picker, so its
+# target is only known after pi opens: the wrapper attaches when every
+# live hosted session in this directory backs ONE distinct conversation
+# (several terminals may share it), and otherwise warns that the picker
+# may duplicate a live session and degrades open — rc-background's
+# post-resume notice then points at the live holder. An unreachable
+# daemon, an unresolvable target, or no match degrades open: the call
+# proceeds exactly as before. If the attach itself fails (e.g. the
+# session died between check and attach), the wrapper degrades open with
+# the original args rather than leaving the user stranded. Plain `pi`
+# starts are unaffected.
 set -euo pipefail
 
 REAL_PI="@REAL_PI@"
@@ -132,14 +135,40 @@ guard_check() {
 	[[ -n $mode ]] || return 0
 	if [[ $mode == resume ]]; then
 		# An interactive picker cannot be resolved without spawning pi.
-		# Guard only the unambiguous case: exactly one live hosted session
-		# in this directory must be the conversation being resumed.
-		local -a same=()
-		while IFS=$'\t' read -r name dir _; do
-			[[ $dir == "$(pwd -P)" ]] && same+=("$name")
+		# Attach when every live hosted session in this directory backs
+		# ONE distinct conversation (several terminals may share it);
+		# otherwise warn that the picker may duplicate a live session and
+		# degrade open — rc-background's post-resume notice catches that.
+		local -a names=() files=() states=()
+		local name dir _pid _marker state file
+		while IFS=$'\t' read -r name dir _pid _marker state file; do
+			[[ $dir == "$(pwd -P)" ]] || continue
+			if [[ -z $file || $file == "-" ]]; then
+				file="-"
+			fi
+			names+=("$name"); files+=("$file"); states+=("$state")
 		done < <("$PI_RC" ls 2>/dev/null)
-		if (( ${#same[@]} == 1 )); then
-			guard_attach "${same[0]}" || return 1
+		if (( ${#names[@]} == 1 )); then
+			guard_attach "${names[0]}" || return 1
+			return 0
+		fi
+		if (( ${#names[@]} > 1 )); then
+			local -a known=()
+			for file in "${files[@]}"; do
+				[[ $file != "-" ]] && known+=("$file")
+			done
+			if (( ${#known[@]} == ${#names[@]} )) \
+				&& (( $(printf '%s\n' "${known[@]}" | sort -u | wc -l) == 1 )); then
+				# Several views of one conversation: attach to the first.
+				guard_attach "${names[0]}" || return 1
+				return 0
+			fi
+			# Ambiguous picker target: warn (with state) and degrade open.
+			printf 'pi: %d live hosted sessions in this directory; the resume picker may open a conversation that is already live:\n' "${#names[@]}" >&2
+			local i
+			for i in "${!names[@]}"; do
+				printf '  %s\t%s\t%s\n' "${names[i]}" "${states[i]}" "${files[i]}" >&2
+			done
 		fi
 		return 0
 	fi
