@@ -33,6 +33,12 @@
 #   detach {name}                         close the bridge, session lives on
 #   resize {name,cols,rows}               winsize + SIGWINCH
 #   list                                  live sessions
+#   which {file}                          the live hosted session backing
+#                                         that pi session file (exact
+#                                         announce match first, then a
+#                                         session argv --session match);
+#                                         name is null when none — used by
+#                                         the wrapper's resume guard
 #   stop {name}                           TERM the process group, KILL
 #                                         after a 2s grace, drop entry
 #   handover {file,dir,afterPid}          host a pi session file once the
@@ -588,6 +594,27 @@ def cmd_list(_req):
 	return {"ok": True, "sessions": out}
 
 
+def cmd_which(req):
+	file = req.get("file")
+	if not (isinstance(file, str) and file):
+		return bad_request()
+	with SESS_LOCK:
+		sessions = list(SESSIONS.values())
+	# Exact announce match first: the extension recorded this conversation
+	# file as the one backing the session. Then a registry-style argv
+	# match, which covers handover/revive sessions before their extension
+	# announces (and announce-less spawns) that resume the same file.
+	for sess in sessions:
+		if sess.get("file") == file:
+			return {"ok": True, "name": sess["name"]}
+	for sess in sessions:
+		argv = sess.get("argv") or []
+		for i, arg in enumerate(argv[:-1]):
+			if arg == "--session" and argv[i + 1] == file:
+				return {"ok": True, "name": sess["name"]}
+	return {"ok": True, "name": None}
+
+
 def kill_and_wait(pid, grace):
 	try:
 		os.killpg(pid, signal.SIGTERM)
@@ -844,6 +871,8 @@ def conn_thread(conn):
 				send_json(conn, cmd_resize(req))
 			elif cmd == "list":
 				send_json(conn, cmd_list(req))
+			elif cmd == "which":
+				send_json(conn, cmd_which(req))
 			elif cmd == "stop":
 				send_json(conn, cmd_stop(req))
 			elif cmd == "handover":
