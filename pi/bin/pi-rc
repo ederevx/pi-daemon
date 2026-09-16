@@ -36,6 +36,12 @@
 #                                       detaches your terminal the same way
 #                                       without touching the hosted pi)
 #   pi-rc ls                            list hosted sessions
+#   pi-rc which <file>                  print the short name of the live
+#                                       hosted session backing that pi
+#                                       session file (empty output, exit 0
+#                                       when none; exit 4 when the daemon
+#                                       is unreachable); used by the pi
+#                                       wrapper's resume guard
 #   pi-rc stop <name>                   kill one session (ends that pi)
 #   pi-rc handover <file> [dir]         host a specific pi session file in a
 #                                       new detached session; used by /bg
@@ -313,6 +319,21 @@ def cmd_ls(_args):
 		print("%s\t%s\tpid %d\t%s"
 			  % (short_name(s.get("name", "")), s.get("dir", ""),
 				 s.get("pid", 0), marker))
+
+
+def cmd_which(args):
+	# Used by the pi wrapper's resume guard: does any live hosted session
+	# back this conversation file? Prints the short session name when one
+	# does, stays silent with exit 0 otherwise, and reuses the existing
+	# exit-code semantics (4 = daemon unreachable) on the way there.
+	if len(args) != 1:
+		usage_error("which takes exactly one session file")
+	resp = control({"cmd": "which", "file": args[0]})
+	if not resp.get("ok"):
+		die("which failed: %s" % resp.get("error"))
+	name = resp.get("name")
+	if name:
+		print(short_name(name))
 
 
 def cmd_stop(args):
@@ -721,6 +742,8 @@ def main():
 	rest = argv[1:]
 	if cmd in ("ls", "list"):
 		cmd_ls(rest)
+	elif cmd == "which":
+		cmd_which(rest)
 	elif cmd == "start":
 		cmd_start(rest)
 	elif cmd == "attach":
