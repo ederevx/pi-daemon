@@ -34,9 +34,13 @@
  * can be revived headless from the same conversation. The announce
  * reply also names any OTHER live hosted session backing the same
  * conversation — possible when pi's resume picker opens a live session
- * from a second terminal — and the extension turns that into a warning
- * naming the holder and its attach command, since pi has no
- * cross-process session locking and the copies would silently diverge.
+ * from a second terminal. With takeover (always requested) the daemon
+ * hands this duplicate's bridge viewers to a live holder — a busy one
+ * first — and this pi shuts down, so resuming a working conversation
+ * lands on the live view instead of an idle duplicate that would
+ * silently diverge from it; without a handoff (older daemon, vanished
+ * holder) the extension falls back to a warning naming the holder and
+ * its attach command, since pi has no cross-process session locking.
  * The announced marker is only set after a successful announce, so a
  * transient daemon outage retries on the next prompt instead of being
  * skipped for the session's lifetime.
@@ -83,16 +87,50 @@ export default function (pi: ExtensionAPI) {
 			ctx?.sessionManager?.getSessionFile?.();
 		if (!file || file === announced) return;
 		try {
-			const result = await pi.exec(piRc, ["announce", session, file]);
+			const result = await pi.exec(piRc, ["announce", session, file, "--takeover"]);
 			if (result.code !== 0) return;
 			announced = file;
-			// Multi-terminal sync: another live hosted session backing
-			// this conversation means pi's picker duplicated a live
+			const lines = (result.stdout || "")
+				.split("\n")
+				.map((l) => l.trim());
+			// Resume takeover: this pi is a duplicate holder of a live
+			// conversation (the picker opened one another session already
+			// backs). The daemon closed this session's bridges toward its
+			// holder and this pi must go away: the user's pi-rc attach
+			// follows the handoff and lands on the live view, busy state
+			// included, instead of an idle duplicate.
+			const handoff = lines
+				.map((l) => /^handoff (.+)\t(\S+)$/.exec(l))
+				.filter(Boolean)
+				.map((m) => ({ name: m![1], state: m![2] }))[0];
+			if (handoff) {
+				if (typeof ctx?.shutdown === "function") {
+					ctx?.ui?.notify?.(
+						`This conversation is already live in ${handoff.name} ` +
+							`(${handoff.state === "busy" ? "model working" : "idle"}); ` +
+							`handing this view over to it.`,
+						"info",
+					);
+					ctx.shutdown();
+				} else {
+					// Without a way to shut this duplicate down it would
+					// linger headless beside the holder; point the user at
+					// the live view instead.
+					ctx?.ui?.notify?.(
+						`This conversation is already live in ${handoff.name} ` +
+							`(${handoff.state === "busy" ? "model working" : "idle"}); ` +
+							`attach there: pi-rc attach ${handoff.name}`,
+						"warning",
+					);
+				}
+				return;
+			}
+			// Multi-terminal sync without a handoff (daemon too old to take
+			// over, or the holder vanished): another live hosted session
+			// backing this conversation means pi's picker duplicated a live
 			// session; the copies would diverge silently (pi has no
 			// cross-process session locking).
-			const others = (result.stdout || "")
-				.split("\n")
-				.map((l) => l.trim())
+			const others = lines
 				.filter((l) => l.startsWith("also-live "))
 				.map((l) => l.split(/\s+/)[1])
 				.filter(Boolean);

@@ -43,10 +43,16 @@
 #                                         after a 2s grace, drop entry
 #   handover {file,dir,afterPid}          host a pi session file once the
 #                                         owning process exits
-#   announce {name,file}                  record the pi session file that
+#   announce {name,file[,takeover]}       record the pi session file that
 #                                         backs a hosted session (drives
 #                                         crash revival and the registry
-#                                         resume argv)
+#                                         resume argv); with takeover, a
+#                                         duplicate holder of a live
+#                                         conversation hands its viewers
+#                                         to a live holder instead
+#   handoff-target {name}                 the live holder a resumed-away
+#                                         duplicate session's viewers
+#                                         should attach to, if any
 #   shutdown                              stop everything and exit
 #
 # Env: XDG_RUNTIME_DIR (control socket), XDG_STATE_HOME (registry).
@@ -84,6 +90,11 @@ REAP_TICK = 0.5
 MIN_REVIVE_LIFE = float(os.environ.get("PI_PTYD_MIN_REVIVE_LIFE", "30"))
 
 SESSIONS = {}  # name -> session dict
+# Resume takeover: a duplicate holder of a live conversation announces
+# with takeover, hands its bridge viewers to a live holder, and shuts
+# down; HANDOFFS remembers where its viewers went so pi-rc attach can
+# follow, surviving until the target itself dies.
+HANDOFFS = {}  # announced name -> target name
 SESS_LOCK = threading.Lock()
 REG_LOCK = threading.Lock()
 LOG_LOCK = threading.Lock()
@@ -327,6 +338,19 @@ def drop_session(sess, code):
 	with SESS_LOCK:
 		if SESSIONS.get(name) is sess:
 			del SESSIONS[name]
+			# Handoff bookkeeping for the dead session: its own entry (as a
+			# duplicate) survives — late viewers still follow it after the
+			# duplicate shut down, and it dies with its target instead. But
+			# as a TARGET it can no longer take viewers: re-point handoffs
+			# through its own handoff when it was itself a duplicate, else
+			# clear them.
+			next_hop = HANDOFFS.get(name)
+			for key, val in list(HANDOFFS.items()):
+				if val == name:
+					if next_hop and next_hop != key:
+						HANDOFFS[key] = next_hop
+					else:
+						HANDOFFS.pop(key, None)
 	registry_drop(name)
 	log("child-exit '%s' pid %d status %s" % (name, sess["pid"], code))
 
@@ -523,6 +547,26 @@ def cmd_start(req):
 	return {"ok": True, "name": name, "created": True}
 
 
+def attach_handoff(name):
+	# The live holder a handed-off duplicate's viewers should follow, or
+	# None. Caller holds SESS_LOCK. A dead intermediate target re-points
+	# at its own handoff so a chain of simultaneous duplicates resolves
+	# to a live holder instead of ending the follow.
+	seen = set()
+	while True:
+		entry = HANDOFFS.get(name)
+		if entry is None or entry in seen:
+			return None
+		seen.add(entry)
+		target = SESSIONS.get(entry)
+		if target is not None:
+			return {"name": target["name"], "state": target.get("state", "idle")}
+		# The holder died before the viewers followed; follow its own
+		# handoff when it was itself a duplicate, else give up.
+		HANDOFFS.pop(name, None)
+		name = entry
+
+
 def cmd_attach(req, conn):
 	name = req.get("name")
 	try:
@@ -534,8 +578,27 @@ def cmd_attach(req, conn):
 		return bad_request(), False
 	with SESS_LOCK:
 		sess = SESSIONS.get(name)
+		follow = attach_handoff(name)
 	if sess is None:
-		return err("no-session"), False
+		if follow is None:
+			return err("no-session"), False
+		# The duplicate already shut down, but its handoff survives: a
+		# late viewer follows it instead of recreating the duplicate.
+		send_json(conn, {"ok": True, "name": name, "state": follow["state"],
+						 "clients": 0, "handoff": follow})
+		log("attach '%s' -> handoff '%s' (session gone)"
+			% (name, follow["name"]))
+		return None, False
+	if follow is not None:
+		# This duplicate already handed its viewers to a live holder
+		# (resume takeover): reply with the handoff instead of installing
+		# a bridge that would die the moment the duplicate shuts down.
+		send_json(conn, {"ok": True, "name": name,
+						 "state": sess.get("state", "idle"),
+						 "clients": client_count(sess),
+						 "handoff": follow})
+		log("attach '%s' -> handoff '%s'" % (name, follow["name"]))
+		return None, False
 	# The attach response must reach the client BEFORE the connection
 	# becomes a live bridge: add_client() starts relaying pi's output
 	# on this socket immediately, and response bytes interleaved with
@@ -790,10 +853,40 @@ def cmd_announce(req):
 		# extension can warn about a picker-opened duplicate immediately.
 		others = [s for s in file_holders(file) if s is not sess]
 		also = [{"name": s["name"], "state": s.get("state", "idle")}
-				for s in others]
+				for s in others
+				if not (req.get("takeover") and s["name"] in HANDOFFS)]
+		handoff = None
+		if req.get("takeover") and others:
+			# A second live pi on one conversation can only diverge: with
+			# takeover (the rc-background extension always asks on announce)
+			# the duplicate hands its bridge viewers to a live holder — a
+			# busy one first, then an attached one, then the first holder;
+			# duplicates already handing off themselves are never targets.
+			# The extension shuts this duplicate down on the reply; closing
+			# the bridges here makes each viewer's pi-rc attach follow the
+			# handoff instead of reporting a detach.
+			candidates = [s for s in others if s["name"] not in HANDOFFS]
+			if candidates:
+				candidates.sort(key=lambda s: (s.get("state") != "busy",
+											   client_count(s) == 0))
+				target = candidates[0]
+				HANDOFFS[name] = target["name"]
+				close_all_clients(sess)
+				log("handoff '%s' -> '%s'" % (name, target["name"]))
+				handoff = {"name": target["name"],
+						   "state": target.get("state", "idle")}
 	registry_set_argv(name, ["pi", "--session", file])
 	log("announce '%s' -> %s" % (name, file))
-	return {"ok": True, "alsoLive": also}
+	return {"ok": True, "alsoLive": also, "handoff": handoff}
+
+
+def cmd_handoff_target(req):
+	name = req.get("name")
+	if not (isinstance(name, str) and name):
+		return bad_request()
+	with SESS_LOCK:
+		target = attach_handoff(name)
+	return {"ok": True, "target": target}
 
 
 def cmd_handover(req):
@@ -922,12 +1015,12 @@ def conn_thread(conn):
 				continue
 			cmd = req["cmd"]
 			if cmd == "attach":
-				resp, handoff = cmd_attach(req, conn)
+				resp, became_bridge = cmd_attach(req, conn)
 				# cmd_attach may have already delivered the response itself
 				# before installing the client bridge (see cmd_attach).
 				if resp is not None:
 					send_json(conn, resp)
-				if handoff:
+				if became_bridge:
 					handed_off = True
 					return
 			elif cmd == "ping":
@@ -952,6 +1045,8 @@ def conn_thread(conn):
 				send_json(conn, cmd_handover(req))
 			elif cmd == "announce":
 				send_json(conn, cmd_announce(req))
+			elif cmd == "handoff-target":
+				send_json(conn, cmd_handoff_target(req))
 			elif cmd == "shutdown":
 				send_json(conn, cmd_shutdown(req))
 			else:
