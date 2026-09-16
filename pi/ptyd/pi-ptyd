@@ -43,10 +43,18 @@
 #                                         after a 2s grace, drop entry
 #   handover {file,dir,afterPid}          host a pi session file once the
 #                                         owning process exits
-#   carry {name}                          /new without termination: spawn
-#                                         a fresh hosted session and move
+#   carry {name[,to,argv]}                /new without termination: move
 #                                         this session's bridge viewers
-#                                         onto it; this session keeps
+#                                         onto a fresh hosted session
+#                                         (or an existing "to" session);
+#                                         this session keeps running
+#                                         headless
+#   resume {name,file}                    /resume without termination:
+#                                         move this session's viewers
+#                                         onto a live holder of the
+#                                         conversation (busy first) or
+#                                         a fresh session resuming the
+#                                         file; this session keeps
 #                                         running headless
 #   announce {name,file[,takeover]}       record the pi session file that
 #                                         backs a hosted session (drives
@@ -168,6 +176,19 @@ def registry_set_argv(name, argv):
 
 def set_winsize(fd, cols, rows):
 	fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+def sess_winsize(sess):
+	# Current PTY size of a session, or the defaults when unknown.
+	try:
+		pack = fcntl.ioctl(sess["master_fd"], termios.TIOCGWINSZ,
+						   struct.pack("HHHH", 0, 0, 0, 0))
+		rows, cols = struct.unpack("HHHH", pack)[:2]
+	except OSError:
+		rows, cols = 0, 0
+	if not (rows > 0 and cols > 0):
+		rows, cols = DEFAULT_ROWS, DEFAULT_COLS
+	return rows, cols
 
 
 def child_sigwinch(pid):
@@ -451,7 +472,9 @@ def session_loop(sess):
 			with sess["lock"]:
 				moved = list(sess["clients"].items())
 				sess["clients"] = {}
-			for client in moved:
+			for client, _buf in moved:
+				# Stale old-TUI buffers are dropped; a clear first, so no
+				# stale frame survives the fresh TUI's first full repaint.
 				with carry_to["lock"]:
 					carry_to["clients"][client] = bytearray(
 						b"\x1b[H\x1b[2J\x1b[m")
@@ -920,80 +943,151 @@ def handover_thread(target, dir_, file, after_pid, message=None):
 		log("handover '%s' skipped: name taken during handover" % target)
 
 
+def _carry_target_name(base, exclude):
+	# Unique carry/relay target name: "<base>-<hash>", collision-checked
+	# against live sessions (a refuse_if_exists backstop covers races).
+	for attempt in range(8):
+		suffix = hashlib.sha256(
+			("%d-%d-%d" % (time.time_ns(), os.getpid(), attempt)).encode()
+		).hexdigest()[:4]
+		candidate = "pi-%s-%s" % (base, suffix)
+		if candidate != exclude and SESSIONS.get(candidate) is None:
+			return candidate
+	return None
+
+
+def _move_viewers(sess, target, verb):
+	# Hand the viewers over on the source session loop (it performs the
+	# move at its next iteration boundary): two loops recv()ing on one
+	# socket would split the viewer's input between the two TUIs. The
+	# loop prepends a clear and repaints the target; errors there are
+	# its own. Returns False when the source died before the handoff
+	# could be recorded.
+	with SESS_LOCK:
+		if SESSIONS.get(sess["name"]) is not sess:
+			return False
+		sess["carry_to"] = target
+	return True
+
+
 def cmd_carry(req):
-	# /new without termination: spawn a fresh hosted session and MOVE this
-	# session's bridge viewers onto it, leaving this pi running headless
-	# with its own conversation (the extension cancels pi's in-process
-	# switch, which would abort an in-flight turn).
+	# /new without termination: spawn a fresh hosted session and move
+	# this session's bridge viewers onto it, leaving this pi running
+	# headless with its own conversation (the extension cancels pi's
+	# in-process switch, which would abort an in-flight turn). With "to",
+	# an existing session receives the viewers instead.
 	name = req.get("name")
 	if not isinstance(name, str) or not name:
+		return bad_request()
+	argv = req.get("argv")
+	if argv is not None and not (isinstance(argv, list) and argv
+								and all(isinstance(a, str) for a in argv)):
+		return bad_request()
+	to_name = req.get("to")
+	if to_name is not None and not isinstance(to_name, str):
 		return bad_request()
 	with SESS_LOCK:
 		sess = SESSIONS.get(name)
 		if sess is None:
 			return err("no-session")
 		dir_ = sess["dir"]
-		# Size the fresh session like the viewer's current view: the moved
+		# Size a fresh session like the viewer's current view: the moved
 		# bridges keep their terminals, so inherit the source PTY size.
-		try:
-			pack = fcntl.ioctl(sess["master_fd"], termios.TIOCGWINSZ,
-								  struct.pack("HHHH", 0, 0, 0, 0))
-			rows, cols = struct.unpack("HHHH", pack)[:2]
-		except OSError:
-			rows, cols = 0, 0
-		if not (rows > 0 and cols > 0):
-			rows, cols = DEFAULT_ROWS, DEFAULT_COLS
-		# mirrors handover_target's name base (no pi-rc imports here)
-		base = os.path.basename(dir_).replace(":", "_")
-		if base.startswith("="):
-			base = base[1:]
-		new_name = None
-		for attempt in range(8):
-			suffix = hashlib.sha256(
-				("%d-%d-%d" % (time.time_ns(), os.getpid(), attempt)).encode()
-			).hexdigest()[:4]
-			candidate = "pi-%s-%s" % (base, suffix)
-			if candidate != name and SESSIONS.get(candidate) is None:
-				new_name = candidate
-				break
-		if new_name is None:
-			return err("no-free-name")
+		rows, cols = sess_winsize(sess)
+		if to_name is not None:
+			target = SESSIONS.get(to_name)
+			if to_name == name or target is None:
+				return err("no-session")
+		else:
+			base = os.path.basename(dir_).replace(":", "_")
+			if base.startswith("="):
+				base = base[1:]
+			new_name = _carry_target_name(base, name)
+			if new_name is None:
+				return err("no-free-name")
+			target = None
 	try:
-		spawned = spawn_session(new_name, dir_, ["pi"], cols, rows,
-								verb="carry", refuse_if_exists=True)
+		if to_name is None:
+			spawned = spawn_session(new_name, dir_, argv or ["pi"], cols,
+									rows, verb="carry", refuse_if_exists=True)
+			if spawned is None:
+				return err("name-taken")
+			target = spawned
+		if _move_viewers(sess, target, "carry"):
+			log("carry '%s' -> '%s'" % (name, target["name"]))
+			return {"ok": True, "name": target["name"]}
 	except OSError as exc:
 		log("carry '%s' failed: %s" % (name, exc))
+		if to_name is None and target is not None:
+			threading.Thread(target=stop_session, args=(target,),
+							 daemon=True).start()
 		return err("spawn-failed")
-	if spawned is None:
-		return err("name-taken")
+	# The source died between spawn and move: drop a freshly spawned
+	# session rather than leave an unviewed pi behind.
+	if to_name is None:
+		threading.Thread(target=stop_session, args=(target,),
+						 daemon=True).start()
+	return err("no-session")
+
+
+def cmd_resume(req):
+	# /resume without termination: resolve the picked conversation to its
+	# live holder when one exists (a busy one first — never touch a
+	# working agent, just move this terminal's viewers there), otherwise
+	# spawn a fresh session resuming the file, then move the viewers.
+	# The source session keeps running headless with its own
+	# conversation; the extension cancels pi's in-process switch.
+	name = req.get("name")
+	file = req.get("file")
+	if not (isinstance(name, str) and name and isinstance(file, str)
+			and file and os.path.isabs(file)):
+		return bad_request()
+	if not os.path.isfile(file):
+		return err("no-file")
 	with SESS_LOCK:
 		sess = SESSIONS.get(name)
 		if sess is None:
-			# The source died between spawn and move: drop the fresh
-			# session rather than leave an unviewed pi behind.
-			threading.Thread(target=stop_session, args=(spawned,),
-							 daemon=True).start()
 			return err("no-session")
-		with sess["lock"]:
-			moved = list(sess["clients"].items())
-			sess["clients"] = {}
-	for client, _buf in moved:
-		with spawned["lock"]:
-			# A clear first, so no stale frame of the old TUI survives
-			# until the fresh pi's first full repaint.
-			spawned["clients"][client] = bytearray(b"\x1b[H\x1b[2J\x1b[m")
-	try:
-		if rows > 1:
-			set_winsize(spawned["master_fd"], cols, rows - 1)
+		rows, cols = sess_winsize(sess)
+		holders = [s for s in file_holders(file)
+				   if s is not sess and s["name"] not in HANDOFFS]
+		target = None
+		new_name = None
+		if holders:
+			holders.sort(key=lambda s: (s.get("state") != "busy",
+										client_count(s) == 0))
+			target = holders[0]
+			to_name = target["name"]
 		else:
-			set_winsize(spawned["master_fd"], max(cols - 1, 1), rows)
-		time.sleep(0.05)
-		set_winsize(spawned["master_fd"], cols, rows)
-		child_sigwinch(spawned["pid"])
-	except OSError:
-		pass
-	log("carry '%s' -> '%s' (%d viewers)" % (name, new_name, len(moved)))
-	return {"ok": True, "name": new_name}
+			base = os.path.basename(sess["dir"]).replace(":", "_")
+			if base.startswith("="):
+				base = base[1:]
+			digest = hashlib.sha256(file.encode()).hexdigest()[:6]
+			new_name = _carry_target_name("%s-%s" % (base, digest), name)
+			if new_name is None:
+				return err("no-free-name")
+			to_name = None
+	try:
+		if target is None:
+			spawned = spawn_session(new_name, sess["dir"],
+									["pi", "--session", file], cols, rows,
+									verb="resume", refuse_if_exists=True)
+			if spawned is None:
+				return err("name-taken")
+			target = spawned
+		if _move_viewers(sess, target, "resume"):
+			log("resume '%s' -> '%s'" % (name, target["name"]))
+			return {"ok": True, "name": target["name"]}
+	except OSError as exc:
+		log("resume '%s' failed: %s" % (name, exc))
+		if target is not None and to_name is None:
+			threading.Thread(target=stop_session, args=(target,),
+							 daemon=True).start()
+		return err("spawn-failed")
+	if target is not None and to_name is None:
+		threading.Thread(target=stop_session, args=(target,),
+						 daemon=True).start()
+	return err("no-session")
 
 
 def cmd_announce(req):
@@ -1226,6 +1320,8 @@ def conn_thread(conn):
 				send_json(conn, cmd_handover(req))
 			elif cmd == "carry":
 				send_json(conn, cmd_carry(req))
+			elif cmd == "resume":
+				send_json(conn, cmd_resume(req))
 			elif cmd == "announce":
 				send_json(conn, cmd_announce(req))
 			elif cmd == "handoff-target":
