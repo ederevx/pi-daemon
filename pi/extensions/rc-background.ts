@@ -44,9 +44,16 @@
  * daemon, vanished holder) the extension falls back to a warning
  * naming the holder and its attach command, since pi has no
  * cross-process session locking.
- * The announced marker is only set after a successful announce, so a
- * transient daemon outage retries on the next prompt instead of being
- * skipped for the session's lifetime.
+ *
+ * /new and /resume are carried, never terminated: pi's in-process
+ * switch tears the current session down (session.abort() on an
+ * in-flight turn). In a hosted session the extension cancels the
+ * switch via session_before_switch and asks the daemon to carry
+ * instead: /new moves this terminal's bridge onto a fresh hosted
+ * session; /resume moves it onto a live holder of the picked
+ * conversation or a fresh session resuming the file. Either way this
+ * pi keeps running headless with its conversation — detach and attach
+ * to the new view, old session backgrounded, in-flight work untouched.
  *
  * Run-state publishing keeps other terminals in sync: before each agent
  * turn the extension reports "busy" to the daemon and when the agent
@@ -54,13 +61,6 @@
  * can show whether the model is working without attaching. Both are
  * fire-and-forget; a missing or unreachable daemon only costs the
  * crash-revive safety net and the state display.
- *
- * /new is carried, never terminated: pi's in-process switch aborts an
- * in-flight turn, so in a hosted session the extension cancels the
- * switch and asks the daemon to spawn a fresh hosted session and move
- * this terminal's bridge onto it (pi-rc carry). This pi keeps running
- * headless with its conversation — detach and attach to the new
- * session, old session backgrounded, in-flight work untouched.
  *
  * Ctrl+D cannot be used for this: pi refuses extension shortcuts that
  * conflict with a built-in binding (app.exit is Ctrl+D) — registration is
@@ -70,50 +70,61 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-export default function (pi: ExtensionAPI) {
-	// Session file already reported to the daemon for this extension
-	// instance; skipped announces keep the per-prompt hook free of execs.
-	let announced: string | null = null;
+/** One line of the daemon's announce reply, parsed. */
+interface Handoff {
+	name: string;
+	state: string;
+}
 
-	const piRc = `${process.env.HOME || "."}/.local/bin/pi-rc`;
+export class RcBackground {
+	/** Session file already reported to the daemon; skipped announces
+	 *  keep the per-prompt hook free of execs. */
+	private announced: string | null = null;
 
-	// PI_HOSTED_SESSION is the full daemon name ("pi-<base>"); pi-rc's
-	// session_name() prepends another "pi-", so commands taking a name
-	// get the short form exactly like detach does.
-	const hostedShort = () =>
-		(process.env.PI_HOSTED_SESSION || "").replace(/^pi-/, "");
+	private readonly piRc: string;
 
-	// Tell the daemon which session file backs this hosted pi so an
-	// abnormal death can be revived as `pi --session <file>`. The daemon
-	// also rewrites its registry argv with it, so a daemon restart
-	// respawns the same conversation instead of a blank one, and replies
-	// with any other live holder of the same conversation. No-op outside
-	// hosting and for ephemeral sessions; failures are retried on the
-	// next prompt (the announced marker is only set on success).
-	async function announce(ctx: any) {
-		const session = hostedShort();
+	/** The only mutable dependency, injected: how to run pi-rc. */
+	private readonly exec: (file: string, args: string[]) => Promise<any>;
+
+	constructor(exec: (file: string, args: string[]) => Promise<any>) {
+		this.exec = exec;
+		this.piRc = `${process.env.HOME || "."}/.local/bin/pi-rc`;
+	}
+
+	/** PI_HOSTED_SESSION is the full daemon name ("pi-<base>"); pi-rc's
+	 *  session_name() prepends another "pi-", so commands taking a name
+	 *  get the short form exactly like detach does. */
+	private hostedSession(): string {
+		return (process.env.PI_HOSTED_SESSION || "").replace(/^pi-/, "");
+	}
+
+	/** Tell the daemon which session file backs this hosted pi so an
+	 *  abnormal death can be revived as `pi --session <file>`. The daemon
+	 *  also rewrites its registry argv with it, so a daemon restart
+	 *  respawns the same conversation instead of a blank one, and replies
+	 *  with any other live holder of the same conversation plus, with
+	 *  takeover, its resolution of the duplicate. No-op outside hosting
+	 *  and for ephemeral sessions; failures are retried on the next
+	 *  prompt (the announced marker is only set on success). */
+	async announce(ctx: any): Promise<void> {
+		const session = this.hostedSession();
 		if (!session) return;
 		const file: string | null | undefined =
 			ctx?.sessionManager?.getSessionFile?.();
-		if (!file || file === announced) return;
+		if (!file || file === this.announced) return;
 		try {
-			const result = await pi.exec(piRc, ["announce", session, file, "--takeover"]);
+			const result = await this.exec(this.piRc,
+				["announce", session, file, "--takeover"]);
 			if (result.code !== 0) return;
-			announced = file;
-			const lines = (result.stdout || "")
+			this.announced = file;
+			const lines: string[] = (result.stdout || "")
 				.split("\n")
-				.map((l) => l.trim());
-			// Resume takeover: this pi is a duplicate holder of a live
-			// conversation (the picker opened one another session already
-			// backs). The daemon closed this session's bridges toward its
-			// holder and this pi must go away: the user's pi-rc attach
-			// follows the handoff and lands on the live view, busy state
-			// included, instead of an idle duplicate.
-			const handoff = lines
+				.map((l: string) => l.trim());
+			const handoff: Handoff | undefined = lines
 				.map((l) => /^handoff (.+)\t(\S+)$/.exec(l))
 				.filter(Boolean)
 				.map((m) => ({ name: m![1], state: m![2] }))[0];
-			const tookOver = lines
+			const tookOver: string[] = lines
 				.filter((l) => l.startsWith("took-over\t"))
 				.map((l) => l.slice("took-over\t".length))
 				.filter(Boolean);
@@ -155,7 +166,7 @@ export default function (pi: ExtensionAPI) {
 			// backing this conversation means pi's picker duplicated a live
 			// session; the copies would diverge silently (pi has no
 			// cross-process session locking).
-			const others = lines
+			const others: string[] = lines
 				.filter((l) => l.startsWith("also-live "))
 				.map((l) => l.split(/\s+/)[1])
 				.filter(Boolean);
@@ -171,32 +182,28 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	// Publish whether the model is working so other terminals can see
-	// the state in `pi-rc ls` and attach notices without attaching.
-	// Fire-and-forget: cosmetic only when the daemon is unreachable.
-	async function setState(state: "busy" | "idle") {
-		const session = hostedShort();
+	/** Publish whether the model is working so other terminals can see
+	 *  the state in `pi-rc ls` and attach notices without attaching.
+	 *  Fire-and-forget: cosmetic only when the daemon is unreachable. */
+	async setState(state: "busy" | "idle"): Promise<void> {
+		const session = this.hostedSession();
 		if (!session) return;
 		try {
-			await pi.exec(piRc, ["state", session, state]);
+			await this.exec(this.piRc, ["state", session, state]);
 		} catch {
 			// State display is best-effort.
 		}
 	}
 
-	async function detach(ctx: any) {
-		// PI_HOSTED_SESSION is the full daemon name ("pi-<base>") but pi-rc's
-		// detach expects the short name and prepends "pi-" itself — passing
-		// the full name detached "pi-pi-<base>" (a session that does not
-		// exist), the daemon replied ok, and the user's terminal never left
-		// the TUI. Strip exactly one prefix so session_name() rebuilds the
-		// same name (correct even for "pi-pi-*" sessions from "pi-*" dirs).
-		const session = (process.env.PI_HOSTED_SESSION || "").replace(/^pi-/, "");
-		// The daemon closes every attached client bridge for this session;
-		// the session and its pi process stay alive hosted (milliseconds
-		// round-trip). With several terminals sharing the view, /bg drops
-		// all of them — the daemon cannot tell which one asked.
-		const result = await pi.exec(piRc, ["detach", session]);
+	/** The daemon closes every attached client bridge for this session;
+	 *  the session and its pi process stay alive hosted (milliseconds
+	 *  round-trip). With several terminals sharing the view, /bg drops
+	 *  all of them — the daemon cannot tell which one asked. The user
+	 *  reattaches with: pi-rc attach <name>. */
+	async detach(ctx: any): Promise<void> {
+		const session = this.hostedSession();
+		if (!session) return;
+		const result = await this.exec(this.piRc, ["detach", session]);
 		if (result.code !== 0 && !result.killed) {
 			ctx?.ui?.notify?.(
 				`Detach failed: ${(result.stderr || result.stdout || "").trim() || `exit ${result.code}`}`,
@@ -204,22 +211,21 @@ export default function (pi: ExtensionAPI) {
 			);
 			return;
 		}
-		// The user reattaches with: pi-rc attach <name>.
 	}
 
-	// Take the running pi out of the foreground WITHOUT ever touching the
-	// model: /bg must never stop or abort an in-flight operation. If the
-	// agent is busy, ctx.waitForIdle() resolves only when the whole agent
-	// loop has settled (automatic retries, auto-compaction retries and
-	// queued follow-ups included — the settle signal pi's agent_settled
-	// event also reports); pi then exits cleanly through ctx.shutdown(),
-	// which flushes the session before the process goes away. The
-	// daemon's wait-for-exit thread (pi-ptyd handover_thread) polls the
-	// pid with no timeout, so a long settle simply delays the adoption.
-	// If the settle wait itself fails, pi stays up untouched: the daemon
-	// keeps waiting and adoption still happens whenever this pi later
-	// exits for any reason.
-	async function exitAfterSettle(ctx: any) {
+	/** Take the running pi out of the foreground WITHOUT ever touching the
+	 *  model: /bg must never stop or abort an in-flight operation. If the
+	 *  agent is busy, ctx.waitForIdle() resolves only when the whole agent
+	 *  loop has settled (automatic retries, auto-compaction retries and
+	 *  queued follow-ups included — the settle signal pi's agent_settled
+	 *  event also reports); pi then exits cleanly through ctx.shutdown(),
+	 *  which flushes the session before the process goes away. The
+	 *  daemon's wait-for-exit thread (pi-ptyd handover_thread) polls the
+	 *  pid with no timeout, so a long settle simply delays the adoption.
+	 *  If the settle wait itself fails, pi stays up untouched: the daemon
+	 *  keeps waiting and adoption still happens whenever this pi later
+	 *  exits for any reason. */
+	async exitAfterSettle(ctx: any): Promise<void> {
 		if (!ctx?.isIdle?.()) {
 			ctx?.ui?.notify?.(
 				"bg: waiting for the current operation to settle before backgrounding...",
@@ -237,7 +243,10 @@ export default function (pi: ExtensionAPI) {
 		ctx.shutdown();
 	}
 
-	async function handover(ctx: any) {
+	/** Take the running pi out of the foreground WITHOUT ever touching
+	 *  the model, handing its saved session to the background service
+	 *  when hosted subagent/worker sessions are not in play. */
+	async handover(ctx: any): Promise<void> {
 		const sessionFile: string | null | undefined =
 			ctx?.sessionManager?.getSessionFile?.();
 		if (!sessionFile) {
@@ -256,7 +265,8 @@ export default function (pi: ExtensionAPI) {
 		// is taken by another conversation); "hosted:<name>" (with exit 3)
 		// means this session is already hosted — attach instead of
 		// duplicating it. Exit 4 means the daemon is unreachable.
-		const check = await pi.exec(piRc, ["handover", sessionFile, dir, "--check"]);
+		const check = await this.exec(this.piRc,
+			["handover", sessionFile, dir, "--check"]);
 		const verdict = (check.stdout || "").trim();
 		const match = /^(target|hosted):(.+)$/.exec(verdict);
 		if (match && match[1] === "hosted") {
@@ -279,7 +289,7 @@ export default function (pi: ExtensionAPI) {
 		// its own wait-for-exit-then-host thread: once this pi exits, it
 		// hosts the exact session file as `pi --session <file>`, resuming
 		// the conversation idle at the prompt. No setsid helper is needed.
-		const spawn = await pi.exec(piRc, [
+		const spawn = await this.exec(this.piRc, [
 			"handover",
 			sessionFile,
 			dir,
@@ -300,7 +310,7 @@ export default function (pi: ExtensionAPI) {
 		);
 		// Fire-and-forget so the TUI stays responsive during the settle
 		// wait; the handler returns immediately either way.
-		void exitAfterSettle(ctx).catch((err: unknown) => {
+		void this.exitAfterSettle(ctx).catch((err: unknown) => {
 			ctx?.ui?.notify?.(
 				`bg: could not finish backgrounding (${err instanceof Error ? err.message : String(err)}); pi stays up and the daemon adopts the session whenever pi exits.`,
 				"warning",
@@ -308,70 +318,80 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	pi.registerCommand("bg", {
-		description:
-			"Background this session (detach when hosted, hand over to the background service otherwise)",
-		handler: async (_args, ctx) => {
-			if (process.env.PI_HOSTED) {
-				await detach(ctx);
-			} else {
-				await handover(ctx);
-			}
-		},
-	});
+	/** /bg: detach when hosted, hand over to the background service
+	 *  otherwise. */
+	async background(ctx: any): Promise<void> {
+		if (process.env.PI_HOSTED) {
+			await this.detach(ctx);
+		} else {
+			await this.handover(ctx);
+		}
+	}
 
-	pi.on("session_before_switch", async (event, ctx) => {
-		// /new and /resume in a hosted session must never terminate or
-		// abort it: pi's in-process switch tears the current session down
-		// (session.abort() on an in-flight turn). Cancel it and carry
-		// instead: /new asks the daemon to spawn a fresh hosted session
-		// and move this terminal's bridge onto it; /resume moves it onto
-		// a live holder of the picked conversation or a fresh session
-		// resuming the file. Either way this pi keeps running headless
-		// with its conversation (return with `pi-rc attach <old-name>`).
-		// Outside hosting — or when the daemon is unreachable — pi's
-		// native behavior applies untouched.
-		if (event?.reason !== "new" && event?.reason !== "resume") return;
-		const session = hostedShort();
+	/** /new and /resume must never terminate or abort the session: pi's
+	 *  in-process switch tears the current session down
+	 *  (session.abort()). In a hosted session, cancel the switch and
+	 *  carry instead — /new onto a fresh hosted session, /resume onto a
+	 *  live holder of the picked conversation or a fresh session
+	 *  resuming the file. Outside hosting — or when the daemon is
+	 *  unreachable — pi's native behavior applies untouched. */
+	async beforeSwitch(event: any, ctx: any): Promise<{ cancel: boolean } | void> {
+		const reason = event?.reason;
+		if (reason !== "new" && reason !== "resume") return;
+		const session = this.hostedSession();
 		if (!session) return;
 		try {
-			if (event.reason === "resume") {
+			if (reason === "resume") {
 				const target = event.targetSessionFile;
 				const current = ctx?.sessionManager?.getSessionFile?.();
 				if (!target || target === current) return { cancel: true };
-				const result = await pi.exec(piRc, ["resume", session, target]);
+				const result = await this.exec(this.piRc,
+					["resume", session, target]);
 				if (result.code !== 0) return;
 			} else {
-				const result = await pi.exec(piRc, ["carry", session]);
+				const result = await this.exec(this.piRc, ["carry", session]);
 				if (result.code !== 0) return;
 			}
 		} catch {
 			return;
 		}
 		return { cancel: true };
-	});
+	}
+}
 
-	pi.on("session_start", async (_event, ctx) => {
-		await announce(ctx);
-		await setState("idle");
+export default function (pi: ExtensionAPI) {
+	const app = new RcBackground((file, args) => pi.exec(file, args));
+
+	pi.registerCommand("bg", {
+		description:
+			"Background this session (detach when hosted, hand over to the background service otherwise)",
+		handler: async (_args, ctx) => {
+			await app.background(ctx);
+		},
 	});
 
 	// A brand-new session may not have written its file when session_start
 	// fires; re-check on the first prompt (and after /fork etc., which fire
 	// their own session_start). The announced-file guard keeps repeats
 	// free. The first prompt is also where a turn begins: report busy.
-	pi.on("before_agent_start", async (_event, ctx) => {
-		await announce(ctx);
-		await setState("busy");
+	pi.on("session_start", async (_event, ctx) => {
+		await app.announce(ctx);
+		await app.setState("idle");
 	});
-
+	pi.on("before_agent_start", async (_event, ctx) => {
+		await app.announce(ctx);
+		await app.setState("busy");
+	});
 	// The loop ended; agent_settled additionally covers automatic retries,
 	// compaction retries and queued follow-ups. Both report the same idle
 	// state, so whichever lands last leaves the correct value behind.
 	pi.on("agent_end", async () => {
-		await setState("idle");
+		await app.setState("idle");
 	});
 	pi.on("agent_settled", async () => {
-		await setState("idle");
+		await app.setState("idle");
+	});
+	pi.on("session_before_switch", async (event, ctx) => {
+		return app.beforeSwitch(event, ctx);
 	});
 }
