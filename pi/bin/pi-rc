@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# pi-rc — client for the pi-background-service PTY host daemon.
+# pi-rc — client for the pi-daemon PTY host daemon.
 #
 # The systemd user service runs pi-ptyd, a persistent host for live pi TUI
 # sessions, each on its own PTY. This client talks JSON lines over the
@@ -219,7 +219,7 @@ class DaemonClient:
 		except OSError:
 			sock.close()
 			die("background service is not running "
-				"(systemctl --user start pi-background-service)",
+				"(systemctl --user start pi-daemon)",
 				EXIT_NO_DAEMON)
 		return sock
 

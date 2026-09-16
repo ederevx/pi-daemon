@@ -1,4 +1,4 @@
-# pi-background-service
+# pi-daemon
 
 Persistent backgrounding for the Pi coding agent, maintained like
 `agent-delegation-protocol` and `agent-mem-struct`: a private repo whose
@@ -7,7 +7,7 @@ them, and can uninstall exactly what it installed.
 
 ## What it provides
 
-- **PTY host daemon** (`pi-ptyd`): a stdlib-only Python daemon, run by the
+- **PTY host daemon** (`pi-daemon`): a stdlib-only Python daemon, run by the
   systemd user service, that owns one PTY per hosted pi TUI session.
   Sessions survive client disconnect and a daemon restart (respawned from
   a state registry); every hosted child gets `PI_HOSTED` and
@@ -82,7 +82,7 @@ bash scripts/install.sh
 ```
 
 Re-run to refresh owned copies in place. Requires `pi` on PATH and
-`python3` (>= 3.8, stdlib-only) for the pi-ptyd daemon and uninstall's
+`python3` (>= 3.8, stdlib-only) for the pi-daemon daemon and uninstall's
 manifest reading.
 
 ## Uninstall
@@ -97,8 +97,8 @@ bash scripts/uninstall.sh
 pi/
   extensions/rc-background.ts       # /bg: instant detach when hosted, handover otherwise
   bin/pi-rc                         # client: start/attach/detach/announce/ls/which/stop/handover
-  ptyd/pi-ptyd                      # stdlib Python PTY host daemon
-  systemd/pi-background-service.service
+  daemon/pi-daemon                      # stdlib Python PTY host daemon
+  systemd/pi-daemon.service
 scripts/
   install.sh                        # manifest-owned install into the agent home
   uninstall.sh
