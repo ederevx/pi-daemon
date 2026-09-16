@@ -5,16 +5,16 @@
 # sessions, each on its own PTY. This client talks JSON lines over the
 # daemon's unix control socket: start/stop sessions, list them, detach and
 # resize them, and attach, which switches the connection into a raw byte
-# bridge with the session's PTY (one client per session; a new attach
-# steals it). Inside a hosted pi, /bg (the rc-background extension)
-# detaches the client: pi keeps running headless until the user quits it
-# (Ctrl+D) or deletes the session through pi's own session manager. An
-# abnormally dying hosted pi (crash, SIGKILL, OOM) is revived headless
-# from its announced session file; clean exits and deleted files are
-# final. If the hosted pi is ever gone (reboot, daemon restart), the next
-# attach recreates it and resumes the latest pi session from disk. A pi
-# started outside the daemon (non-wrapped) hands its saved session over
-# through "handover" instead of being left behind.
+# bridge with the session's PTY (several viewers may share one session).
+# Inside a hosted pi, /bg (the rc-background extension) detaches the
+# client: pi keeps running headless until the user quits it (Ctrl+D) or
+# deletes the session through pi's own session manager. An abnormally
+# dying hosted pi (crash, SIGKILL, OOM) is revived headless from its
+# announced session file; clean exits and deleted files are final. If the
+# hosted pi is ever gone (reboot, daemon restart), the next attach
+# recreates it and resumes the latest pi session from disk. A pi started
+# outside the daemon (non-wrapped) hands its saved session over through
+# "handover" instead of being left behind.
 #
 # Usage:
 #   pi-rc start [name] [dir] [--fresh]  create a detached pi session
@@ -103,6 +103,13 @@ EXIT_NO_DAEMON = 4       # control socket unreachable
 
 USAGE_LINE = "usage: pi-rc <command> [args]; run 'pi-rc help' for details"
 
+DETACH_KEY = b"\x1c"  # Ctrl-\: pop out of an attached session without exiting pi
+
+# Commands served by main(); ls has a list alias.
+_COMMANDS = ("which", "whichall", "state", "carry", "resume", "start",
+			 "attach", "announce", "detach", "stop", "handover",
+			 "daemon-start", "daemon-stop")
+
 
 def die(msg, code=EXIT_USAGE):
 	sys.stderr.write("pi-rc: %s\n" % msg)
@@ -162,7 +169,18 @@ def same_dir(a, b):
 		return a == b
 
 
-# ---------------------------------------------------------------- protocol
+def unique_session_name(base, pid, taken):
+	# "<base>-<hash>" names for --new starts; collision-checked against a
+	# live-set callable, with a bounded attempt budget.
+	for attempt in range(8):
+		suffix = hashlib.sha256(
+			("%d-%d-%d" % (time.time_ns(), pid, attempt)).encode()
+		).hexdigest()[:4]
+		candidate = "pi-%s-%s" % (base, suffix)
+		if not taken(candidate):
+			return candidate
+	return None
+
 
 def send_json(sock, obj):
 	sock.sendall(json.dumps(obj).encode() + b"\n")
@@ -187,37 +205,48 @@ def read_json_line(sock):
 	return obj, rest
 
 
-def connect_daemon(timeout=CONTROL_TIMEOUT):
-	sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-	sock.settimeout(timeout)
-	try:
-		sock.connect(SOCK_PATH)
-	except OSError:
-		sock.close()
-		die("background service is not running "
-			"(systemctl --user start pi-background-service)", EXIT_NO_DAEMON)
-	return sock
+class DaemonClient:
+	"""Short-lived control connections to the pi-ptyd socket."""
 
+	def __init__(self, sock_path=SOCK_PATH):
+		self.sock_path = sock_path
 
-def control(req):
-	# one JSON-line round-trip on a short-lived control connection
-	sock = connect_daemon()
-	try:
-		send_json(sock, req)
-		resp, _ = read_json_line(sock)
-	except OSError as exc:
-		die("control connection failed: %s" % exc)
-	finally:
-		sock.close()
-	if resp is None:
-		die("daemon closed the connection without a response")
-	return resp
+	def connect(self, timeout=CONTROL_TIMEOUT):
+		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		sock.settimeout(timeout)
+		try:
+			sock.connect(self.sock_path)
+		except OSError:
+			sock.close()
+			die("background service is not running "
+				"(systemctl --user start pi-background-service)",
+				EXIT_NO_DAEMON)
+		return sock
 
+	def control(self, req):
+		# one JSON-line round-trip on a short-lived control connection
+		sock = self.connect()
+		try:
+			send_json(sock, req)
+			resp, _ = read_json_line(sock)
+		except OSError as exc:
+			die("control connection failed: %s" % exc)
+		finally:
+			sock.close()
+		if resp is None:
+			die("daemon closed the connection without a response")
+		return resp
 
-DETACH_KEY = b"\x1c"  # Ctrl-\: pop out of an attached session without exiting pi
+	def alive(self):
+		probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		try:
+			probe.connect(self.sock_path)
+			return True
+		except OSError:
+			return False
+		finally:
+			probe.close()
 
-
-# ----------------------------------------------------------------- daemon
 
 def find_daemon():
 	here = os.path.dirname(os.path.realpath(__file__))
@@ -231,20 +260,394 @@ def find_daemon():
 	return None
 
 
-def daemon_alive():
-	probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+def restore_tty(saved):
 	try:
-		probe.connect(SOCK_PATH)
+		termios.tcsetattr(0, termios.TCSADRAIN, saved)
+	except termios.error:
+		pass
+
+
+class Bridge:
+	"""Raw byte relay between our tty and the daemon bridge; the only
+	unbounded phase, and the tty is restored on every exit path. run()
+	returns a short status word for the caller to report after the tty is
+	restored (the user must be able to tell they left the TUI)."""
+
+	def __init__(self, client, sock, session, initial=b""):
+		self.client = client
+		self.sock = sock
+		self.session = session
+		self.initial = initial
+		self.status = "lost"
+
+	def run(self):
+		saved = termios.tcgetattr(0)
+		atexit.register(restore_tty, saved)
+		wake_r, wake_w = os.pipe()
+		winch = [False]
+		prev_winch = signal.getsignal(signal.SIGWINCH)
+		self._install_signal_handlers(wake_w, winch)
+		os.set_blocking(0, False)
+		os.set_blocking(1, False)
+		self.sock.setblocking(False)
+		try:
+			self._raw_mode()
+			self._relay(wake_r, winch)
+		finally:
+			restore_tty(saved)
+			signal.signal(signal.SIGWINCH, prev_winch)
+			os.close(wake_r)
+			os.close(wake_w)
+			self.sock.close()
+		return self.status
+
+	def _install_signal_handlers(self, wake_w, winch):
+		def on_winch(_signum, _frame):
+			# only flag it here; all daemon work happens in the main loop
+			winch[0] = True
+			try:
+				os.write(wake_w, b"x")
+			except OSError:
+				pass
+
+		def on_term(_signum, _frame):
+			# turn lethal signals into a normal unwind so the tty is
+			# restored
+			raise SystemExit(0)
+
+		signal.signal(signal.SIGWINCH, on_winch)
+		signal.signal(signal.SIGTERM, on_term)
+		signal.signal(signal.SIGHUP, on_term)
+
+	def _raw_mode(self):
+		attrs = termios.tcgetattr(0)
+		attrs[0] &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK
+					  | termios.ISTRIP | termios.IXON)
+		attrs[1] &= ~termios.OPOST
+		attrs[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG
+					  | termios.IEXTEN)
+		attrs[6][termios.VMIN] = 1
+		attrs[6][termios.VTIME] = 0
+		termios.tcsetattr(0, termios.TCSANOW, attrs)
+
+	def _resize(self):
+		# the bridge connection is raw bytes; resize rides a second
+		# short-lived control connection
+		try:
+			cols, rows = tty_size(0)
+			self.client.control({"cmd": "resize", "name": self.session,
+								 "cols": cols, "rows": rows})
+		except (OSError, SystemExit):
+			pass
+
+	def _relay(self, wake_r, winch):
+		to_sock = bytearray()
+		to_tty = bytearray(self.initial)
+		while True:
+			if winch[0]:
+				winch[0] = False
+				self._resize()
+			rlist = [wake_r]
+			if len(to_sock) < MAX_BUF:
+				rlist.append(0)
+			if len(to_tty) < MAX_BUF:
+				rlist.append(self.sock)
+			wlist = []
+			if to_sock:
+				wlist.append(self.sock)
+			if to_tty:
+				wlist.append(1)
+			try:
+				rl, wl, _ = select.select(rlist, wlist, [])
+			except OSError:
+				# a polled fd vanished; nothing left to relay
+				break
+			if wake_r in rl:
+				try:
+					os.read(wake_r, 4096)
+				except OSError:
+					pass
+			if not self._pump_stdin(rl, to_sock):
+				break
+			if not self._pump_socket(rl, to_tty):
+				break
+			if not self._drain_to_socket(wl, to_sock):
+				break
+			if not self._drain_to_tty(wl, to_tty):
+				break
+		if to_tty:
+			self._final_flush(to_tty)
+
+	def _pump_stdin(self, ready, to_sock):
+		if 0 not in ready:
+			return True
+		try:
+			data = os.read(0, 65536)
+		except (BlockingIOError, InterruptedError):
+			return True
+		except OSError:
+			self.status = "detached"
+			return False
+		if data == b"":
+			# EOF on stdin: detach; the session keeps running
+			self.status = "detached"
+			return False
+		if data:
+			# Ctrl-\ pops out: keep the hosted pi running, hand the
+			# terminal back, and never forward the key to the TUI
+			if DETACH_KEY in data:
+				to_sock += data[:data.index(DETACH_KEY)]
+				self.status = "detached"
+				return False
+			to_sock += data
 		return True
-	except OSError:
-		return False
-	finally:
-		probe.close()
+
+	def _pump_socket(self, ready, to_tty):
+		if self.sock not in ready:
+			return True
+		try:
+			data = self.sock.recv(65536)
+		except (BlockingIOError, InterruptedError):
+			return True
+		except OSError:
+			self.status = "lost"
+			return False
+		if data == b"":
+			# bridge closed: detached, child exited, or stolen
+			self.status = "closed"
+			return False
+		if data:
+			to_tty += data
+			if len(to_tty) > MAX_BUF:
+				del to_tty[:len(to_tty) - MAX_BUF]
+		return True
+
+	def _drain_to_socket(self, ready, to_sock):
+		if self.sock not in ready or not to_sock:
+			return True
+		try:
+			sent = self.sock.send(to_sock[:65536])
+			del to_sock[:sent]
+		except (BlockingIOError, InterruptedError):
+			pass
+		except OSError:
+			self.status = "lost"
+			return False
+		return True
+
+	def _drain_to_tty(self, ready, to_tty):
+		if 1 not in ready or not to_tty:
+			return True
+		try:
+			sent = os.write(1, to_tty[:65536])
+			del to_tty[:sent]
+		except (BlockingIOError, InterruptedError):
+			pass
+		except OSError:
+			self.status = "lost"
+			return False
+		return True
+
+	def _final_flush(self, to_tty):
+		# flush whatever the child produced before the bridge ended so the
+		# final frame is not dropped
+		try:
+			self.sock.setblocking(True)
+		except OSError:
+			pass
+		deadline = time.monotonic() + 2.0
+		while to_tty and time.monotonic() < deadline:
+			try:
+				sent = os.write(1, to_tty[:65536])
+				del to_tty[:sent]
+			except (BlockingIOError, InterruptedError):
+				time.sleep(0.05)
+			except OSError:
+				break
 
 
-def cmd_daemon_start(_args):
+class AttachFlow:
+	"""The attach lifecycle: start a fresh session when asked, handshake
+	(with recreate-on-gone), follow daemon handoffs (both via the attach
+	response and after a bridge closes), and report the outcome."""
+
+	def __init__(self, client, session, cols, rows, fresh_new=False, dir_=None):
+		self.client = client
+		self.session = session
+		self.cols = cols
+		self.rows = rows
+		self.fresh_new = fresh_new
+		self.dir_ = dir_
+
+	def start_new(self, pi_args):
+		# Every call gets its own hosted session: a unique name per
+		# invocation and always a fresh conversation unless the caller
+		# passed pi's own resume flags through pi_args.
+		base = session_base(os.path.basename(self.dir_))
+		argv = ["pi"] + pi_args
+		sock = self.client.connect()
+		for _ in range(8):
+			self.session = unique_session_name(base, os.getpid(),
+											   lambda n: False)
+			send_json(sock, {"cmd": "start", "name": self.session,
+							 "dir": self.dir_, "argv": argv,
+							 "cols": self.cols, "rows": self.rows})
+			resp, _ = read_json_line(sock)
+			if resp is None or not resp.get("ok"):
+				die("start failed: %s"
+					% (resp or {}).get("error", "no response"))
+			if resp.get("created", True):
+				break
+		else:
+			die("could not find a free session name")
+		print("pi-rc: started '%s' in %s (background: /bg)"
+			  % (self.session, self.dir_))
+		return sock
+
+	def handshake(self, sock):
+		# Attach the current connection to self.session; recreates the
+		# session (resuming the latest conversation) when it is gone.
+		send_json(sock, {"cmd": "attach", "name": self.session,
+						 "cols": self.cols, "rows": self.rows})
+		resp, rest = read_json_line(sock)
+		if resp is None or not resp.get("ok"):
+			error = (resp or {}).get("error") if resp else "no response"
+			if error == "no-session" and not self.fresh_new:
+				return self._recreate(sock)
+			die("attach failed: %s" % error)
+		return resp, rest
+
+	def _recreate(self, sock):
+		argv = ["sh", "-c", "pi -c || exec pi"]
+		send_json(sock, {"cmd": "start", "name": self.session,
+						 "dir": self.dir_, "argv": argv,
+						 "cols": self.cols, "rows": self.rows})
+		start_resp, _ = read_json_line(sock)
+		if start_resp is None or not start_resp.get("ok"):
+			die("attach failed: start failed: %s"
+				% (start_resp or {}).get("error", "no response"))
+		print("pi-rc: recreated '%s' in %s (resuming latest session)"
+			  % (self.session, self.dir_))
+		send_json(sock, {"cmd": "attach", "name": self.session,
+						 "cols": self.cols, "rows": self.rows})
+		resp, rest = read_json_line(sock)
+		if resp is None or not resp.get("ok"):
+			error = (resp or {}).get("error") if resp else "no response"
+			die("attach failed: %s" % error)
+		return resp, rest
+
+	@staticmethod
+	def notice(session, resp):
+		# The daemon only replies ok to an attach when the hosted session
+		# is alive, so this line is the user's signal that streaming
+		# continues behind the TUI — the cue a stale reattached frame used
+		# to hide. The daemon's idea of the model run state and the
+		# viewer count comes with the response.
+		state = resp.get("state") or "idle"
+		nclients = resp.get("clients") or 1
+		note = "model working" if state == "busy" else "idle at prompt"
+		shared = "" if nclients <= 1 else \
+			" (%d terminals share this view)" % nclients
+		print("pi-rc: attached to '%s' — session is active (%s)%s"
+			  % (session, note, shared))
+
+	def follow_response_handoffs(self, sock, resp, rest):
+		# A duplicate that already handed its viewers to a live holder
+		# (resume takeover) must not gain a new viewer: follow the
+		# recorded handoff to the live holder of the conversation this
+		# attach tried to open.
+		while resp.get("ok") and resp.get("handoff"):
+			follow = resp["handoff"]
+			print("pi-rc: '%s' opened a conversation already live in '%s' "
+				  "(%s); attaching there"
+				  % (self.session, short_name(follow["name"]),
+					 follow.get("state") or "idle"))
+			self.session = follow["name"]
+			rest = b""
+			try:
+				sock.close()
+			except OSError:
+				pass
+			sock = self.client.connect()
+			send_json(sock, {"cmd": "attach", "name": self.session,
+							 "cols": self.cols, "rows": self.rows})
+			resp, rest = read_json_line(sock)
+			if resp is None or not resp.get("ok"):
+				error = (resp or {}).get("error") if resp else "no response"
+				die("attach failed: %s" % error)
+		return sock, resp, rest
+
+	def bridge_loop(self, sock, resp, rest):
+		# The bridge ends when the child exits, the daemon closes it (a
+		# /bg detach, a steal, or a resume handoff), or the connection
+		# drops. A handoff points this viewer at the live holder of the
+		# conversation it tried to open, so follow it with a fresh bridge
+		# instead of reporting a detach from a session that must not keep
+		# running.
+		attempts = 0
+		while True:
+			status = Bridge(self.client, sock, self.session, rest).run()
+			# Make the drop unmistakable: wipe the frozen TUI frame and
+			# state where the session went — this is the exact gap that
+			# made a detached session look like a stuck TUI.
+			print("\x1b[H\x1b[2J\x1b[m", end="")
+			attempts += 1
+			handoff = (self._query_handoff()
+					   if status == "closed" and attempts < 4 else None)
+			if handoff is None:
+				return status
+			print("pi-rc: '%s' opened a conversation already live in '%s' "
+				  "(%s); attaching there"
+				  % (self.session, short_name(handoff["name"]),
+					 handoff.get("state") or "idle"))
+			self.session = handoff["name"]
+			rest = b""
+			sock = self.client.connect()
+			send_json(sock, {"cmd": "attach", "name": self.session,
+							 "cols": self.cols, "rows": self.rows})
+			resp, rest = read_json_line(sock)
+			if resp is None or not resp.get("ok"):
+				# The holder died before we followed; report the closed
+				# bridge for this session through the normal path below.
+				return status
+			AttachFlow.notice(self.session, resp)
+
+	def _query_handoff(self):
+		# A session the daemon handed off (resume takeover) names the live
+		# holder its viewers should follow instead of staying detached.
+		try:
+			resp = self.client.control({"cmd": "handoff-target",
+										"name": self.session})
+		except SystemExit:
+			return None
+		if resp.get("ok") and resp.get("target"):
+			return resp["target"]
+		return None
+
+	def report_exit(self, status):
+		if status in ("detached", "closed"):
+			note = "session keeps running in the background"
+			if status == "closed":
+				# daemon closed our bridge: a /bg detach, a steal, or the
+				# child exiting — ask the daemon which one it was
+				try:
+					live = {s.get("name") for s in
+							self.client.control({"cmd": "list"}).get("sessions") or []}
+					note = (note if self.session in live
+							else "session ended")
+				except SystemExit:
+					note = "session state unknown (daemon unreachable)"
+			print("pi-rc: detached '%s' (%s; return with: pi-rc attach %s)"
+				  % (self.session, note, short_name(self.session)))
+		elif status == "lost":
+			print("pi-rc: connection to '%s' lost" % self.session)
+
+
+# ------------------------------------------------------------------ daemon
+
+def cmd_daemon_start(_args, client):
 	# already up: done silently
-	if daemon_alive():
+	if client.alive():
 		return
 	daemon = find_daemon()
 	if daemon is None:
@@ -262,29 +665,27 @@ def cmd_daemon_start(_args):
 		logf.close()
 	deadline = time.time() + DAEMON_START_WAIT
 	while time.time() < deadline:
-		if daemon_alive():
+		if client.alive():
 			return
 		time.sleep(0.05)
 	die("background daemon did not come up (see %s)" % LOG_PATH,
 		EXIT_NO_DAEMON)
 
 
-def cmd_daemon_stop(_args):
+def cmd_daemon_stop(_args, client):
 	# best-effort: a missing daemon is already the desired state
 	try:
-		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-		sock.settimeout(CONTROL_TIMEOUT)
-		sock.connect(SOCK_PATH)
+		sock = client.connect()
 		send_json(sock, {"cmd": "shutdown"})
 		read_json_line(sock)
 		sock.close()
-	except OSError:
+	except (OSError, SystemExit):
 		pass
 
 
-# -------------------------------------------------------------- commands
+# ---------------------------------------------------------------- commands
 
-def cmd_start(args):
+def cmd_start(args, client):
 	name = None
 	dir_arg = None
 	fresh = False
@@ -303,8 +704,8 @@ def cmd_start(args):
 	# conversations survive the hosted process dying; --fresh starts empty
 	argv = ["pi"] if fresh else ["sh", "-c", "pi -c || exec pi"]
 	cols, rows = tty_size(0)
-	resp = control({"cmd": "start", "name": session, "dir": dir_,
-					"argv": argv, "cols": cols, "rows": rows})
+	resp = client.control({"cmd": "start", "name": session, "dir": dir_,
+						   "argv": argv, "cols": cols, "rows": rows})
 	if not resp.get("ok"):
 		die("start failed: %s" % resp.get("error"))
 	if not resp.get("created", True):
@@ -315,18 +716,18 @@ def cmd_start(args):
 		  % (session, dir_, short_name(session)))
 
 
-def cmd_detach(args):
+def cmd_detach(args, client):
 	if len(args) != 1:
 		usage_error("detach takes exactly one session name")
 	session = session_name(args[0])
-	resp = control({"cmd": "detach", "name": session})
+	resp = client.control({"cmd": "detach", "name": session})
 	if not resp.get("ok"):
 		die("detach failed: %s" % resp.get("error"))
 	print("pi-rc: detached '%s'" % session)
 
 
-def cmd_ls(_args):
-	resp = control({"cmd": "list"})
+def cmd_ls(_args, client):
+	resp = client.control({"cmd": "list"})
 	sessions = resp.get("sessions") or []
 	if not sessions:
 		print("pi-rc: no hosted sessions")
@@ -343,14 +744,14 @@ def cmd_ls(_args):
 				 s.get("pid", 0), marker, state, file))
 
 
-def cmd_which(args):
+def cmd_which(args, client):
 	# Used by the pi wrapper's resume guard: does any live hosted session
 	# back this conversation file? Prints the short session name when one
 	# does, stays silent with exit 0 otherwise, and reuses the existing
 	# exit-code semantics (4 = daemon unreachable) on the way there.
 	if len(args) != 1:
 		usage_error("which takes exactly one session file")
-	resp = control({"cmd": "which", "file": args[0]})
+	resp = client.control({"cmd": "which", "file": args[0]})
 	if not resp.get("ok"):
 		die("which failed: %s" % resp.get("error"))
 	name = resp.get("name")
@@ -358,12 +759,12 @@ def cmd_which(args):
 		print(short_name(name))
 
 
-def cmd_whichall(args):
+def cmd_whichall(args, client):
 	# Every live hosted session backing a conversation file, one
 	# "<short-name>\t<state>" line each; silent with exit 0 when none.
 	if len(args) != 1:
 		usage_error("whichall takes exactly one session file")
-	resp = control({"cmd": "whichall", "file": args[0]})
+	resp = client.control({"cmd": "whichall", "file": args[0]})
 	if not resp.get("ok"):
 		die("whichall failed: %s" % resp.get("error"))
 	for h in resp.get("names") or []:
@@ -371,7 +772,7 @@ def cmd_whichall(args):
 						  h.get("state", "idle")))
 
 
-def cmd_state(args):
+def cmd_state(args, client):
 	# Published by the rc-background extension: whether the model is
 	# working or idle in this hosted session; surfaced by ls and attach.
 	if len(args) != 2:
@@ -379,34 +780,34 @@ def cmd_state(args):
 	if args[1] not in ("busy", "idle"):
 		usage_error("state must be busy or idle")
 	session = session_name(args[0])
-	resp = control({"cmd": "state", "name": session, "state": args[1]})
+	resp = client.control({"cmd": "state", "name": session, "state": args[1]})
 	if not resp.get("ok"):
 		die("state failed: %s" % resp.get("error"))
 
 
-def cmd_stop(args):
+def cmd_stop(args, client):
 	if len(args) != 1:
 		usage_error("stop takes exactly one session name")
 	session = session_name(args[0])
-	resp = control({"cmd": "stop", "name": session})
+	resp = client.control({"cmd": "stop", "name": session})
 	if not resp.get("ok"):
 		die("stop failed: %s" % resp.get("error"))
 	print("pi-rc: stopped '%s'" % session)
 
 
-def cmd_carry(args):
+def cmd_carry(args, client):
 	# Extension-only helper for /new: the daemon spawns a fresh hosted
 	# session sized like the current view, moves this session's bridge
 	# viewers onto it, and leaves this session running headless.
 	if len(args) != 1:
 		usage_error("carry takes exactly one session name")
-	resp = control({"cmd": "carry", "name": session_name(args[0])})
+	resp = client.control({"cmd": "carry", "name": session_name(args[0])})
 	if not resp.get("ok"):
 		die("carry failed: %s" % resp.get("error"))
 	print("carried %s" % short_name(resp.get("name", "")))
 
 
-def cmd_resume(args):
+def cmd_resume(args, client):
 	# Extension-only helper for /resume: the daemon resolves the picked
 	# conversation to its live holder (busy first) or a fresh session
 	# resuming the file, and moves this session's viewers there; this
@@ -416,14 +817,14 @@ def cmd_resume(args):
 	name, file = args
 	if not os.path.isabs(file):
 		die("resume expects an absolute session file path")
-	resp = control({"cmd": "resume", "name": session_name(name),
-					"file": file})
+	resp = client.control({"cmd": "resume", "name": session_name(name),
+						   "file": file})
 	if not resp.get("ok"):
 		die("resume failed: %s" % resp.get("error"))
 	print("resumed %s" % short_name(resp.get("name", "")))
 
 
-def cmd_announce(args):
+def cmd_announce(args, client):
 	takeover = False
 	rest = []
 	for arg in args:
@@ -439,7 +840,7 @@ def cmd_announce(args):
 	req = {"cmd": "announce", "name": session_name(name), "file": file}
 	if takeover:
 		req["takeover"] = True
-	resp = control(req)
+	resp = client.control(req)
 	if not resp.get("ok"):
 		die("announce failed: %s" % resp.get("error"))
 	# With takeover the daemon may have decided this duplicate must not
@@ -460,11 +861,11 @@ def cmd_announce(args):
 								   h.get("state", "idle")))
 
 
-def handover_check(dir_, file):
+def handover_check(client, dir_, file):
 	# client-side preflight mirroring the daemon's target logic: the
 	# directory's primary name when free or held from the same directory,
 	# otherwise a hash-suffixed name derived from the session file
-	resp = control({"cmd": "list"})
+	resp = client.control({"cmd": "list"})
 	live = {s.get("name"): s for s in (resp.get("sessions") or [])}
 	base = session_base(os.path.basename(dir_))
 	primary = "pi-" + base
@@ -478,7 +879,7 @@ def handover_check(dir_, file):
 	return "target:%s" % hashed
 
 
-def cmd_handover(args):
+def cmd_handover(args, client):
 	check = False
 	file = None
 	dir_arg = None
@@ -518,7 +919,7 @@ def cmd_handover(args):
 	dir_ = resolve_dir(dir_arg)
 	if check:
 		# read-only preflight used by the rc-background extension
-		print(handover_check(dir_, file))
+		print(handover_check(client, dir_, file))
 		return
 	if not os.path.isfile(file):
 		die("session file not found: %s" % file)
@@ -527,7 +928,7 @@ def cmd_handover(args):
 		req["afterPid"] = after_pid
 	if message:
 		req["message"] = message
-	resp = control(req)
+	resp = client.control(req)
 	if not resp.get("ok"):
 		die("handover failed: %s" % resp.get("error"))
 	verdict = resp.get("verdict") or ""
@@ -544,203 +945,7 @@ def cmd_handover(args):
 		  % (session, os.path.basename(file), short_name(session)))
 
 
-# ---------------------------------------------------------------- attach
-
-def send_resize(session):
-	# the bridge connection is raw bytes; resize rides a second
-	# short-lived control connection
-	try:
-		cols, rows = tty_size(0)
-		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-		sock.settimeout(CONTROL_TIMEOUT)
-		sock.connect(SOCK_PATH)
-		send_json(sock, {"cmd": "resize", "name": session,
-						 "cols": cols, "rows": rows})
-		read_json_line(sock)
-		sock.close()
-	except OSError:
-		pass
-
-
-def restore_tty(saved):
-	try:
-		termios.tcsetattr(0, termios.TCSADRAIN, saved)
-	except termios.error:
-		pass
-
-
-def bridge(sock, session, initial=b""):
-	# raw byte relay between our tty and the daemon bridge; this is the
-	# only unbounded phase, and the tty is restored on every exit path.
-	# Returns a short status word for cmd_attach to report after the tty
-	# is restored (the user must be able to tell they left the TUI).
-	saved = termios.tcgetattr(0)
-	atexit.register(restore_tty, saved)
-	status = "lost"
-	wake_r, wake_w = os.pipe()
-	winch = [False]
-	prev_winch = signal.getsignal(signal.SIGWINCH)
-
-	def on_winch(_signum, _frame):
-		# only flag it here; all daemon work happens in the main loop
-		winch[0] = True
-		try:
-			os.write(wake_w, b"x")
-		except OSError:
-			pass
-
-	def on_term(_signum, _frame):
-		# turn lethal signals into a normal unwind so the tty is restored
-		raise SystemExit(0)
-
-	signal.signal(signal.SIGWINCH, on_winch)
-	signal.signal(signal.SIGTERM, on_term)
-	signal.signal(signal.SIGHUP, on_term)
-	os.set_blocking(0, False)
-	os.set_blocking(1, False)
-	sock.setblocking(False)
-	try:
-		attrs = termios.tcgetattr(0)
-		attrs[0] &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK
-					  | termios.ISTRIP | termios.IXON)
-		attrs[1] &= ~termios.OPOST
-		attrs[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG
-					  | termios.IEXTEN)
-		attrs[6][termios.VMIN] = 1
-		attrs[6][termios.VTIME] = 0
-		termios.tcsetattr(0, termios.TCSANOW, attrs)
-		to_sock = bytearray()
-		to_tty = bytearray(initial)
-		while True:
-			if winch[0]:
-				winch[0] = False
-				send_resize(session)
-			rlist = [wake_r]
-			if len(to_sock) < MAX_BUF:
-				rlist.append(0)
-			if len(to_tty) < MAX_BUF:
-				rlist.append(sock)
-			wlist = []
-			if to_sock:
-				wlist.append(sock)
-			if to_tty:
-				wlist.append(1)
-			try:
-				rl, wl, _ = select.select(rlist, wlist, [])
-			except OSError:
-				# a polled fd vanished; nothing left to relay
-				break
-			if wake_r in rl:
-				try:
-					os.read(wake_r, 4096)
-				except OSError:
-					pass
-			if 0 in rl:
-				try:
-					data = os.read(0, 65536)
-				except (BlockingIOError, InterruptedError):
-					data = None
-				except OSError:
-					status = "detached"
-					break
-				if data == b"":
-					# EOF on stdin: detach; the session keeps running
-					status = "detached"
-					break
-				if data:
-					# Ctrl-\ pops out: keep the hosted pi running, hand the
-					# terminal back, and never forward the key to the TUI
-					if DETACH_KEY in data:
-						to_sock += data[:data.index(DETACH_KEY)]
-						status = "detached"
-						break
-					to_sock += data
-			if sock in rl:
-				try:
-					data = sock.recv(65536)
-				except (BlockingIOError, InterruptedError):
-					data = None
-				except OSError:
-					status = "lost"
-					break
-				if data == b"":
-					# bridge closed: detached, child exited, or stolen
-					status = "closed"
-					break
-				if data:
-					to_tty += data
-					if len(to_tty) > MAX_BUF:
-						del to_tty[:len(to_tty) - MAX_BUF]
-			if sock in wl:
-				try:
-					sent = sock.send(to_sock[:65536])
-					del to_sock[:sent]
-				except (BlockingIOError, InterruptedError):
-					pass
-				except OSError:
-					status = "lost"
-					break
-			if 1 in wl:
-				try:
-					sent = os.write(1, to_tty[:65536])
-					del to_tty[:sent]
-				except (BlockingIOError, InterruptedError):
-					pass
-				except OSError:
-					status = "lost"
-					break
-		if to_tty:
-			# flush whatever the child produced before the bridge ended so
-			# the final frame is not dropped
-			try:
-				sock.setblocking(True)
-			except OSError:
-				pass
-			deadline = time.monotonic() + 2.0
-			while to_tty and time.monotonic() < deadline:
-				try:
-					sent = os.write(1, to_tty[:65536])
-					del to_tty[:sent]
-				except (BlockingIOError, InterruptedError):
-					time.sleep(0.05)
-				except OSError:
-					break
-	finally:
-		restore_tty(saved)
-		signal.signal(signal.SIGWINCH, prev_winch)
-		os.close(wake_r)
-		os.close(wake_w)
-		sock.close()
-	return status
-
-
-def query_handoff(session):
-	# A session the daemon handed off (resume takeover) names the live
-	# holder its viewers should follow instead of staying detached.
-	try:
-		resp = control({"cmd": "handoff-target", "name": session})
-	except SystemExit:
-		return None
-	if resp.get("ok") and resp.get("target"):
-		return resp["target"]
-	return None
-
-
-def active_notice(session, resp):
-	# The daemon only replies ok to an attach when the hosted session is
-	# alive, so this line is the user's signal that streaming continues
-	# behind the TUI — the cue a stale reattached frame used to hide. The
-	# daemon's idea of the model run state and the viewer count comes
-	# with the response.
-	state = resp.get("state") or "idle"
-	nclients = resp.get("clients") or 1
-	note = "model working" if state == "busy" else "idle at prompt"
-	shared = "" if nclients <= 1 else " (%d terminals share this view)" % nclients
-	print("pi-rc: attached to '%s' — session is active (%s)%s"
-		  % (session, note, shared))
-
-
-def cmd_attach(args):
+def cmd_attach(args, client):
 	fresh_new = False
 	pi_args = []
 	name = None
@@ -767,132 +972,19 @@ def cmd_attach(args):
 	if not os.isatty(0):
 		die("attach requires a terminal on stdin; run 'pi-rc attach' "
 			"inside a tty (see pi-rc help)")
-	dir_ = resolve_dir(dir_arg)
-	session = session_for(name, dir_)
-	cols, rows = tty_size(0)
-	sock = connect_daemon()
-	try:
-		if fresh_new:
-			# Every call gets its own hosted session: a unique name per
-			# invocation and always a fresh conversation unless the caller
-			# passed pi's own resume flags through pi_args.
-			base = session_base(os.path.basename(dir_))
-			argv = ["pi"] + pi_args
-			for attempt in range(8):
-				suffix = hashlib.sha256(
-					("%d-%d-%d" % (time.time_ns(), os.getpid(), attempt)).encode()
-				).hexdigest()[:4]
-				session = "pi-%s-%s" % (base, suffix)
-				send_json(sock, {"cmd": "start", "name": session,
-									 "dir": dir_, "argv": argv,
-									 "cols": cols, "rows": rows})
-				resp, _ = read_json_line(sock)
-				if resp is None or not resp.get("ok"):
-					die("start failed: %s"
-						% (resp or {}).get("error", "no response"))
-				if resp.get("created", True):
-					break
-			else:
-				die("could not find a free session name")
-			print("pi-rc: started '%s' in %s (background: /bg)"
-				  % (session, dir_))
-		send_json(sock, {"cmd": "attach", "name": session,
-						 "cols": cols, "rows": rows})
-		resp, rest = read_json_line(sock)
-		if resp is None or not resp.get("ok"):
-			error = (resp or {}).get("error") if resp else "no response"
-			if error == "no-session" and not fresh_new:
-				# recreate + resume, then attach the same connection
-				argv = ["sh", "-c", "pi -c || exec pi"]
-				send_json(sock, {"cmd": "start", "name": session,
-								 "dir": dir_, "argv": argv,
-								 "cols": cols, "rows": rows})
-				start_resp, _ = read_json_line(sock)
-				if start_resp is None or not start_resp.get("ok"):
-					die("attach failed: start failed: %s"
-						% (start_resp or {}).get("error", "no response"))
-				print("pi-rc: recreated '%s' in %s (resuming latest session)"
-					  % (session, dir_))
-				send_json(sock, {"cmd": "attach", "name": session,
-								 "cols": cols, "rows": rows})
-				resp, rest = read_json_line(sock)
-				if resp is None or not resp.get("ok"):
-					error = (resp or {}).get("error") if resp else "no response"
-					die("attach failed: %s" % error)
-			else:
-				die("attach failed: %s" % error)
-	except OSError as exc:
-		die("control connection failed: %s" % exc)
-	# A duplicate that already handed its viewers to a live holder (resume
-	# takeover) must not gain a new viewer: follow the recorded handoff to
-	# the live holder of the conversation this attach tried to open.
-	while resp.get("ok") and resp.get("handoff"):
-		follow = resp["handoff"]
-		print("pi-rc: '%s' opened a conversation already live in '%s' (%s); "
-			  "attaching there"
-			  % (session, short_name(follow["name"]),
-				 follow.get("state") or "idle"))
-		session = follow["name"]
-		rest = b""
-		try:
-			sock.close()
-		except OSError:
-			pass
-		sock = connect_daemon()
-		send_json(sock, {"cmd": "attach", "name": session,
-						 "cols": cols, "rows": rows})
-		resp, rest = read_json_line(sock)
-		if resp is None or not resp.get("ok"):
-			error = (resp or {}).get("error") if resp else "no response"
-			die("attach failed: %s" % error)
-	active_notice(session, resp)
-	# The bridge ends when the child exits, the daemon closes it (a /bg
-	# detach, a steal, or a resume handoff), or the connection drops. A
-	# handoff points this viewer at the live holder of the conversation it
-	# tried to open, so follow it with a fresh bridge instead of reporting
-	# a detach from a session that must not keep running.
-	attempts = 0
-	while True:
-		status = bridge(sock, session, rest)
-		# Make the drop unmistakable: wipe the frozen TUI frame and state
-		# where the session went — this is the exact gap that made a
-		# detached session look like a stuck TUI.
-		print("\x1b[H\x1b[2J\x1b[m", end="")
-		attempts += 1
-		handoff = (query_handoff(session)
-				   if status == "closed" and attempts < 4 else None)
-		if handoff is None:
-			break
-		print("pi-rc: '%s' opened a conversation already live in '%s' (%s); "
-			  "attaching there"
-			  % (session, short_name(handoff["name"]),
-				 handoff.get("state") or "idle"))
-		session = handoff["name"]
-		rest = b""
-		sock = connect_daemon()
-		send_json(sock, {"cmd": "attach", "name": session,
-						 "cols": cols, "rows": rows})
-		resp, rest = read_json_line(sock)
-		if resp is None or not resp.get("ok"):
-			# The holder died before we followed; report the closed bridge
-			# for this session through the normal path below.
-			break
-		active_notice(session, resp)
-	if status in ("detached", "closed"):
-		note = "session keeps running in the background"
-		if status == "closed":
-			# daemon closed our bridge: a /bg detach, a steal, or the child
-			# exiting — ask the daemon which one it was
-			try:
-				live = {s.get("name")
-						for s in control({"cmd": "list"}).get("sessions") or []}
-				note = (note if session in live else "session ended")
-			except SystemExit:
-				note = "session state unknown (daemon unreachable)"
-		print("pi-rc: detached '%s' (%s; return with: pi-rc attach %s)"
-			  % (session, note, short_name(session)))
-	elif status == "lost":
-		print("pi-rc: connection to '%s' lost" % session)
+	flow = AttachFlow(client, session_for(name, resolve_dir(dir_arg)),
+					  tty_size(0)[0], tty_size(0)[1],
+					  fresh_new=fresh_new, dir_=resolve_dir(dir_arg))
+	flow.cols, flow.rows = tty_size(0)
+	if fresh_new:
+		sock = flow.start_new(pi_args)
+	else:
+		sock = client.connect()
+	resp, rest = flow.handshake(sock)
+	sock, resp, rest = flow.follow_response_handoffs(sock, resp, rest)
+	AttachFlow.notice(flow.session, resp)
+	status = flow.bridge_loop(sock, resp, rest)
+	flow.report_exit(status)
 
 
 # ------------------------------------------------------------------ help
@@ -915,37 +1007,19 @@ def print_help():
 # ------------------------------------------------------------------ main
 
 def main():
+	client = DaemonClient()
 	argv = sys.argv[1:]
 	cmd = argv[0] if argv else "help"
 	rest = argv[1:]
 	if cmd in ("ls", "list"):
-		cmd_ls(rest)
-	elif cmd == "which":
-		cmd_which(rest)
-	elif cmd == "whichall":
-		cmd_whichall(rest)
-	elif cmd == "state":
-		cmd_state(rest)
-	elif cmd == "carry":
-		cmd_carry(rest)
-	elif cmd == "resume":
-		cmd_resume(rest)
-	elif cmd == "start":
-		cmd_start(rest)
-	elif cmd == "attach":
-		cmd_attach(rest)
-	elif cmd == "announce":
-		cmd_announce(rest)
-	elif cmd == "detach":
-		cmd_detach(rest)
-	elif cmd == "stop":
-		cmd_stop(rest)
-	elif cmd == "handover":
-		cmd_handover(rest)
-	elif cmd == "daemon-start":
-		cmd_daemon_start(rest)
-	elif cmd == "daemon-stop":
-		cmd_daemon_stop(rest)
+		cmd_ls(rest, client)
+	elif cmd in _COMMANDS:
+		{"which": cmd_which, "whichall": cmd_whichall, "state": cmd_state,
+		 "carry": cmd_carry, "resume": cmd_resume, "start": cmd_start,
+		 "attach": cmd_attach, "announce": cmd_announce,
+		 "detach": cmd_detach, "stop": cmd_stop, "handover": cmd_handover,
+		 "daemon-start": cmd_daemon_start,
+		 "daemon-stop": cmd_daemon_stop}[cmd](rest, client)
 	elif cmd == "help":
 		print_help()
 	else:
