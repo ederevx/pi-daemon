@@ -695,6 +695,10 @@ def cmd_attach(args):
 				die("attach failed: %s" % error)
 	except OSError as exc:
 		die("control connection failed: %s" % exc)
+	# The daemon only replies ok to an attach when the hosted session is
+	# alive, so this line is the user's signal that streaming continues
+	# behind the TUI — the cue a stale reattached frame used to hide.
+	print("pi-rc: attached to '%s' — session is active" % session)
 	status = bridge(sock, session, rest)
 	# Make the drop unmistakable: wipe the frozen TUI frame and state
 	# where the session went — this is the exact gap that made a detached
