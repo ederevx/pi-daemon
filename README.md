@@ -44,11 +44,12 @@ them, and can uninstall exactly what it installed.
   zero process churn — and the pi keeps running headless until
   reattached; no continuation prompt is sent, so a backgrounded session
   idles once its in-flight work settles. Outside hosting, `/bg` hands
-  the session over to the service (`pi-rc handover`): an in-flight turn
-  is aborted so the handover is not deferred behind it, the daemon waits
-  for the current pi to exit and hosts it as `pi --session <file>`,
-  while pi shuts down gracefully. Ephemeral (`--no-session`) sessions
-  are refused. (Ctrl+D cannot be rebound: pi refuses extension shortcuts
+  the session over to the service (`pi-rc handover`): the daemon waits
+  for the current pi to exit and hosts it as `pi --session <file>`.
+  `/bg` never aborts a running operation: if the agent is mid-turn, pi
+  prints a notice, waits for the work to settle (retries and queued
+  follow-ups included), then shuts down gracefully. Ephemeral
+  (`--no-session`) sessions are refused. (Ctrl+D cannot be rebound: pi refuses extension shortcuts
   that conflict with its built-in `app.exit` Ctrl+D binding.) The
   extension also announces each session's file to the daemon so abnormal
   deaths can be revived from the same conversation.
