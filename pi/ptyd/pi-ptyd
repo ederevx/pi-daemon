@@ -43,13 +43,19 @@
 #                                         after a 2s grace, drop entry
 #   handover {file,dir,afterPid}          host a pi session file once the
 #                                         owning process exits
+#   carry {name}                          /new without termination: spawn
+#                                         a fresh hosted session and move
+#                                         this session's bridge viewers
+#                                         onto it; this session keeps
+#                                         running headless
 #   announce {name,file[,takeover]}       record the pi session file that
 #                                         backs a hosted session (drives
 #                                         crash revival and the registry
 #                                         resume argv); with takeover, a
 #                                         duplicate holder of a live
-#                                         conversation hands its viewers
-#                                         to a live holder instead
+#                                         conversation yields to a busy
+#                                         holder or absorbs idle holders
+#                                         instead of diverging from them
 #   handoff-target {name}                 the live holder a resumed-away
 #                                         duplicate session's viewers
 #                                         should attach to, if any
@@ -69,7 +75,6 @@ import struct
 import sys
 import threading
 import time
-import time
 import termios
 
 UID = os.getuid()
@@ -88,6 +93,11 @@ REAP_TICK = 0.5
 # treated as a crash-loop symptom rather than a lost background session.
 # Overridable for isolated tests (PI_PTYD_MIN_REVIVE_LIFE=0).
 MIN_REVIVE_LIFE = float(os.environ.get("PI_PTYD_MIN_REVIVE_LIFE", "30"))
+# How long an in-flight absorption makes its announcer look authoritative
+# to concurrent announces, and how long the settle recheck waits before
+# SIGTERMing an absorbed holder.
+ABSORB_GUARD = 10.0
+ABSORB_SETTLE = 0.5
 
 SESSIONS = {}  # name -> session dict
 # Resume takeover: a duplicate holder of a live conversation announces
@@ -308,8 +318,12 @@ def add_client(sess, client):
 def remove_client(sess, client):
 	# Session-loop side: drop a client after an EOF/error the loop itself
 	# observed; the pinned close happens here, never in the control thread.
+	# A carry may have moved this socket to another session: skip when the
+	# entry is already gone, so a stale loop snapshot never closes a live
+	# bridge owned elsewhere.
 	with sess["lock"]:
-		sess["clients"].pop(client, None)
+		if sess["clients"].pop(client, None) is None:
+			return
 	kill_client(client)
 
 
@@ -330,6 +344,7 @@ def close_all_clients(sess):
 
 def drop_session(sess, code):
 	name = sess["name"]
+	sess["carry_to"] = None
 	close_all_clients(sess)
 	try:
 		os.close(sess["master_fd"])
@@ -425,6 +440,37 @@ def session_loop(sess):
 	to_master = bytearray()
 	dead_input = False
 	while True:
+		carry_to = sess.get("carry_to")
+		if carry_to is not None:
+			# /new carry: move every bridge viewer to the fresh session
+			# here, between iterations, so exactly one loop ever recvs on
+			# a moved socket. Stale old-TUI buffers are dropped; each
+			# viewer gets a clear followed by the fresh TUI's full
+			# repaint (nudged below).
+			sess["carry_to"] = None
+			with sess["lock"]:
+				moved = list(sess["clients"].items())
+				sess["clients"] = {}
+			for client in moved:
+				with carry_to["lock"]:
+					carry_to["clients"][client] = bytearray(
+						b"\x1b[H\x1b[2J\x1b[m")
+			try:
+				size = fcntl.ioctl(master, termios.TIOCGWINSZ,
+								   struct.pack("HHHH", 0, 0, 0, 0))
+				trows, tcols = struct.unpack("HHHH", size)[:2]
+				if trows > 1:
+					set_winsize(carry_to["master_fd"], tcols, trows - 1)
+				else:
+					set_winsize(carry_to["master_fd"], max(tcols - 1, 1),
+								trows)
+				time.sleep(0.05)
+				set_winsize(carry_to["master_fd"], tcols, trows)
+				child_sigwinch(carry_to["pid"])
+			except OSError:
+				pass
+			log("carried '%s' -> '%s' (%d viewers)"
+				% (name, carry_to["name"], len(moved)))
 		try:
 			reaped = os.waitpid(pid, os.WNOHANG)
 		except ChildProcessError:
@@ -765,6 +811,42 @@ def stop_session(sess):
 	kill_and_wait(sess["pid"], KILL_GRACE)
 
 
+def absorb_session(holder, announcer):
+	# Kill an absorbed idle holder — but only after a short settle that
+	# rechecks the best-effort run state: a holder whose turn just started
+	# (state publish still in flight) must not be killed mid-turn.
+	time.sleep(ABSORB_SETTLE)
+	with SESS_LOCK:
+		if holder.get("state") != "busy":
+			stop_session(holder)
+			return
+		# The holder started working during the settle: it wins instead.
+		# Never kill a working agent — and never kill the announcer while
+		# it is working either; if both sides started within the window,
+		# sparing both leaves a divergence, but aborting a working agent
+		# is worse. One yield wins; later busy holders are only spared.
+		holder["stopping"] = False
+		HANDOFFS.pop(holder["name"], None)
+		sess = SESSIONS.get(announcer)
+		if sess is None:
+			return
+		sess["absorbing_until"] = 0
+		if sess.get("yielded_to") is not None:
+			log("absorb spare '%s': announcer '%s' already yielded"
+				% (holder["name"], announcer))
+			return
+		if sess.get("state") == "busy":
+			log("absorb aborted '%s' vs busy '%s': both working, left alone"
+				% (announcer, holder["name"]))
+			return
+		sess["yielded_to"] = holder["name"]
+		HANDOFFS[announcer] = holder["name"]
+		close_all_clients(sess)
+		log("absorb yield '%s' -> busy '%s'" % (announcer, holder["name"]))
+		threading.Thread(target=stop_session, args=(sess,),
+						 daemon=True).start()
+
+
 def cmd_stop(req):
 	name = req.get("name")
 	if not isinstance(name, str):
@@ -838,6 +920,82 @@ def handover_thread(target, dir_, file, after_pid, message=None):
 		log("handover '%s' skipped: name taken during handover" % target)
 
 
+def cmd_carry(req):
+	# /new without termination: spawn a fresh hosted session and MOVE this
+	# session's bridge viewers onto it, leaving this pi running headless
+	# with its own conversation (the extension cancels pi's in-process
+	# switch, which would abort an in-flight turn).
+	name = req.get("name")
+	if not isinstance(name, str) or not name:
+		return bad_request()
+	with SESS_LOCK:
+		sess = SESSIONS.get(name)
+		if sess is None:
+			return err("no-session")
+		dir_ = sess["dir"]
+		# Size the fresh session like the viewer's current view: the moved
+		# bridges keep their terminals, so inherit the source PTY size.
+		try:
+			pack = fcntl.ioctl(sess["master_fd"], termios.TIOCGWINSZ,
+								  struct.pack("HHHH", 0, 0, 0, 0))
+			rows, cols = struct.unpack("HHHH", pack)[:2]
+		except OSError:
+			rows, cols = 0, 0
+		if not (rows > 0 and cols > 0):
+			rows, cols = DEFAULT_ROWS, DEFAULT_COLS
+		# mirrors handover_target's name base (no pi-rc imports here)
+		base = os.path.basename(dir_).replace(":", "_")
+		if base.startswith("="):
+			base = base[1:]
+		new_name = None
+		for attempt in range(8):
+			suffix = hashlib.sha256(
+				("%d-%d-%d" % (time.time_ns(), os.getpid(), attempt)).encode()
+			).hexdigest()[:4]
+			candidate = "pi-%s-%s" % (base, suffix)
+			if candidate != name and SESSIONS.get(candidate) is None:
+				new_name = candidate
+				break
+		if new_name is None:
+			return err("no-free-name")
+	try:
+		spawned = spawn_session(new_name, dir_, ["pi"], cols, rows,
+								verb="carry", refuse_if_exists=True)
+	except OSError as exc:
+		log("carry '%s' failed: %s" % (name, exc))
+		return err("spawn-failed")
+	if spawned is None:
+		return err("name-taken")
+	with SESS_LOCK:
+		sess = SESSIONS.get(name)
+		if sess is None:
+			# The source died between spawn and move: drop the fresh
+			# session rather than leave an unviewed pi behind.
+			threading.Thread(target=stop_session, args=(spawned,),
+							 daemon=True).start()
+			return err("no-session")
+		with sess["lock"]:
+			moved = list(sess["clients"].items())
+			sess["clients"] = {}
+	for client, _buf in moved:
+		with spawned["lock"]:
+			# A clear first, so no stale frame of the old TUI survives
+			# until the fresh pi's first full repaint.
+			spawned["clients"][client] = bytearray(b"\x1b[H\x1b[2J\x1b[m")
+	try:
+		if rows > 1:
+			set_winsize(spawned["master_fd"], cols, rows - 1)
+		else:
+			set_winsize(spawned["master_fd"], max(cols - 1, 1), rows)
+		time.sleep(0.05)
+		set_winsize(spawned["master_fd"], cols, rows)
+		child_sigwinch(spawned["pid"])
+	except OSError:
+		pass
+	log("carry '%s' -> '%s' (%d viewers)" % (name, new_name, len(moved)))
+	return {"ok": True, "name": new_name}
+
+
 def cmd_announce(req):
 	name = req.get("name")
 	file = req.get("file")
@@ -856,28 +1014,51 @@ def cmd_announce(req):
 				for s in others
 				if not (req.get("takeover") and s["name"] in HANDOFFS)]
 		handoff = None
+		took_over = []
 		if req.get("takeover") and others:
-			# A second live pi on one conversation can only diverge: with
-			# takeover (the rc-background extension always asks on announce)
-			# the duplicate hands its bridge viewers to a live holder — a
-			# busy one first, then an attached one, then the first holder;
-			# duplicates already handing off themselves are never targets.
-			# The extension shuts this duplicate down on the reply; closing
-			# the bridges here makes each viewer's pi-rc attach follow the
-			# handoff instead of reporting a detach.
-			candidates = [s for s in others if s["name"] not in HANDOFFS]
-			if candidates:
-				candidates.sort(key=lambda s: (s.get("state") != "busy",
-											   client_count(s) == 0))
-				target = candidates[0]
+			# A second live pi on one conversation can only diverge. The
+			# announcing session is the one the user is actively looking
+			# at, so it never shuts down while every holder is merely
+			# idle at the prompt: it absorbs them instead, and each of
+			# their viewers follows here. Only a busy holder wins —
+			# never touch a working agent; the announcer yields to it
+			# and shuts down. Holders already handing off are neither
+			# followed nor absorbed.
+			busy = [s for s in others
+					if (s.get("state") == "busy"
+						or s.get("absorbing_until", 0) > time.time())
+					and s["name"] not in HANDOFFS]
+			if busy:
+				busy.sort(key=lambda s: client_count(s) == 0)
+				target = busy[0]
 				HANDOFFS[name] = target["name"]
 				close_all_clients(sess)
 				log("handoff '%s' -> '%s'" % (name, target["name"]))
 				handoff = {"name": target["name"],
 						   "state": target.get("state", "idle")}
+			else:
+				# A concurrent announce must yield to an in-flight
+				# absorption instead of absorbing the absorber.
+				sess["absorbing_until"] = time.time() + ABSORB_GUARD
+				for holder in others:
+					if holder["name"] in HANDOFFS:
+						continue
+					# Record before the first signal so the holder's
+					# viewers follow here, a concurrent announce sees it
+					# as already absorbed, and an abnormal death in the
+					# settle window never revives it.
+					HANDOFFS[holder["name"]] = name
+					holder["stopping"] = True
+					took_over.append(holder["name"])
+					threading.Thread(target=absorb_session,
+									 args=(holder, name),
+									 daemon=True).start()
+					log("took-over '%s' <- '%s'"
+						% (holder["name"], name))
 	registry_set_argv(name, ["pi", "--session", file])
 	log("announce '%s' -> %s" % (name, file))
-	return {"ok": True, "alsoLive": also, "handoff": handoff}
+	return {"ok": True, "alsoLive": also, "handoff": handoff,
+			"tookOver": took_over}
 
 
 def cmd_handoff_target(req):
@@ -1043,6 +1224,8 @@ def conn_thread(conn):
 				send_json(conn, cmd_stop(req))
 			elif cmd == "handover":
 				send_json(conn, cmd_handover(req))
+			elif cmd == "carry":
+				send_json(conn, cmd_carry(req))
 			elif cmd == "announce":
 				send_json(conn, cmd_announce(req))
 			elif cmd == "handoff-target":
