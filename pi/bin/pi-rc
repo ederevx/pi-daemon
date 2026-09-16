@@ -316,9 +316,14 @@ def cmd_ls(_args):
 		return
 	for s in sessions:
 		marker = "attached" if s.get("attached") else "detached"
-		print("%s\t%s\tpid %d\t%s"
+		nclients = s.get("clients") or 0
+		if nclients > 1:
+			marker += " x%d" % nclients
+		state = s.get("state") or "idle"
+		file = s.get("file") or "-"
+		print("%s\t%s\tpid %d\t%s\t%s\t%s"
 			  % (short_name(s.get("name", "")), s.get("dir", ""),
-				 s.get("pid", 0), marker))
+				 s.get("pid", 0), marker, state, file))
 
 
 def cmd_which(args):
@@ -334,6 +339,32 @@ def cmd_which(args):
 	name = resp.get("name")
 	if name:
 		print(short_name(name))
+
+
+def cmd_whichall(args):
+	# Every live hosted session backing a conversation file, one
+	# "<short-name>\t<state>" line each; silent with exit 0 when none.
+	if len(args) != 1:
+		usage_error("whichall takes exactly one session file")
+	resp = control({"cmd": "whichall", "file": args[0]})
+	if not resp.get("ok"):
+		die("whichall failed: %s" % resp.get("error"))
+	for h in resp.get("names") or []:
+		print("%s\t%s" % (short_name(h.get("name", "")),
+						  h.get("state", "idle")))
+
+
+def cmd_state(args):
+	# Published by the rc-background extension: whether the model is
+	# working or idle in this hosted session; surfaced by ls and attach.
+	if len(args) != 2:
+		usage_error("state takes exactly a session name and busy|idle")
+	if args[1] not in ("busy", "idle"):
+		usage_error("state must be busy or idle")
+	session = session_name(args[0])
+	resp = control({"cmd": "state", "name": session, "state": args[1]})
+	if not resp.get("ok"):
+		die("state failed: %s" % resp.get("error"))
 
 
 def cmd_stop(args):
@@ -356,6 +387,11 @@ def cmd_announce(args):
 					"file": file})
 	if not resp.get("ok"):
 		die("announce failed: %s" % resp.get("error"))
+	# Other live holders of the same conversation: the extension turns
+	# these into a duplicate-open warning.
+	for h in resp.get("alsoLive") or []:
+		print("also-live %s %s" % (short_name(h.get("name", "")),
+								   h.get("state", "idle")))
 
 
 def handover_check(dir_, file):
@@ -697,8 +733,15 @@ def cmd_attach(args):
 		die("control connection failed: %s" % exc)
 	# The daemon only replies ok to an attach when the hosted session is
 	# alive, so this line is the user's signal that streaming continues
-	# behind the TUI — the cue a stale reattached frame used to hide.
-	print("pi-rc: attached to '%s' — session is active" % session)
+	# behind the TUI — the cue a stale reattached frame used to hide. The
+	# daemon's idea of the model run state and the viewer count comes
+	# with the response.
+	state = resp.get("state") or "idle"
+	nclients = resp.get("clients") or 1
+	note = "model working" if state == "busy" else "idle at prompt"
+	shared = "" if nclients <= 1 else " (%d terminals share this view)" % nclients
+	print("pi-rc: attached to '%s' — session is active (%s)%s"
+		  % (session, note, shared))
 	status = bridge(sock, session, rest)
 	# Make the drop unmistakable: wipe the frozen TUI frame and state
 	# where the session went — this is the exact gap that made a detached
@@ -748,6 +791,10 @@ def main():
 		cmd_ls(rest)
 	elif cmd == "which":
 		cmd_which(rest)
+	elif cmd == "whichall":
+		cmd_whichall(rest)
+	elif cmd == "state":
+		cmd_state(rest)
 	elif cmd == "start":
 		cmd_start(rest)
 	elif cmd == "attach":
