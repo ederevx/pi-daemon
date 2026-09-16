@@ -30,7 +30,11 @@
 #   pi-rc announce <name> <file>        record the pi session file backing a
 #                                       hosted session (drives crash revival
 #                                       and daemon-restart respawning); used
-#                                       by the rc-background extension
+#                                       by the rc-background extension, which
+#                                       always asks for takeover: a resumed
+#                                       duplicate of a live conversation
+#                                       hands its viewers to the live holder
+#                                       instead of diverging from it
 #   pi-rc detach <name>                 detach a client; the session lives on
 #                                       (Ctrl-\ inside an attached session
 #                                       detaches your terminal the same way
@@ -378,17 +382,34 @@ def cmd_stop(args):
 
 
 def cmd_announce(args):
-	if len(args) != 2:
+	takeover = False
+	rest = []
+	for arg in args:
+		if arg == "--takeover":
+			takeover = True
+		else:
+			rest.append(arg)
+	if len(rest) != 2:
 		usage_error("announce takes exactly a session name and a session file")
-	name, file = args
+	name, file = rest
 	if not os.path.isabs(file):
 		die("announce expects an absolute session file path")
-	resp = control({"cmd": "announce", "name": session_name(name),
-					"file": file})
+	req = {"cmd": "announce", "name": session_name(name), "file": file}
+	if takeover:
+		req["takeover"] = True
+	resp = control(req)
 	if not resp.get("ok"):
 		die("announce failed: %s" % resp.get("error"))
+	# With takeover the daemon may have decided this duplicate must not
+	# keep running: it closed our session's bridges and recorded where its
+	# viewers should follow; the extension shuts the duplicate down.
+	handoff = resp.get("handoff") or None
+	if handoff and handoff.get("name"):
+		# tab separator: session names may contain spaces
+		print("handoff %s\t%s" % (short_name(handoff["name"]),
+								   handoff.get("state", "idle")))
 	# Other live holders of the same conversation: the extension turns
-	# these into a duplicate-open warning.
+	# these into a duplicate-open warning when no handoff happened.
 	for h in resp.get("alsoLive") or []:
 		print("also-live %s %s" % (short_name(h.get("name", "")),
 								   h.get("state", "idle")))
@@ -648,6 +669,32 @@ def bridge(sock, session, initial=b""):
 	return status
 
 
+def query_handoff(session):
+	# A session the daemon handed off (resume takeover) names the live
+	# holder its viewers should follow instead of staying detached.
+	try:
+		resp = control({"cmd": "handoff-target", "name": session})
+	except SystemExit:
+		return None
+	if resp.get("ok") and resp.get("target"):
+		return resp["target"]
+	return None
+
+
+def active_notice(session, resp):
+	# The daemon only replies ok to an attach when the hosted session is
+	# alive, so this line is the user's signal that streaming continues
+	# behind the TUI — the cue a stale reattached frame used to hide. The
+	# daemon's idea of the model run state and the viewer count comes
+	# with the response.
+	state = resp.get("state") or "idle"
+	nclients = resp.get("clients") or 1
+	note = "model working" if state == "busy" else "idle at prompt"
+	shared = "" if nclients <= 1 else " (%d terminals share this view)" % nclients
+	print("pi-rc: attached to '%s' — session is active (%s)%s"
+		  % (session, note, shared))
+
+
 def cmd_attach(args):
 	fresh_new = False
 	pi_args = []
@@ -731,22 +778,61 @@ def cmd_attach(args):
 				die("attach failed: %s" % error)
 	except OSError as exc:
 		die("control connection failed: %s" % exc)
-	# The daemon only replies ok to an attach when the hosted session is
-	# alive, so this line is the user's signal that streaming continues
-	# behind the TUI — the cue a stale reattached frame used to hide. The
-	# daemon's idea of the model run state and the viewer count comes
-	# with the response.
-	state = resp.get("state") or "idle"
-	nclients = resp.get("clients") or 1
-	note = "model working" if state == "busy" else "idle at prompt"
-	shared = "" if nclients <= 1 else " (%d terminals share this view)" % nclients
-	print("pi-rc: attached to '%s' — session is active (%s)%s"
-		  % (session, note, shared))
-	status = bridge(sock, session, rest)
-	# Make the drop unmistakable: wipe the frozen TUI frame and state
-	# where the session went — this is the exact gap that made a detached
-	# session look like a stuck TUI.
-	print("\x1b[H\x1b[2J\x1b[m", end="")
+	# A duplicate that already handed its viewers to a live holder (resume
+	# takeover) must not gain a new viewer: follow the recorded handoff to
+	# the live holder of the conversation this attach tried to open.
+	while resp.get("ok") and resp.get("handoff"):
+		follow = resp["handoff"]
+		print("pi-rc: '%s' opened a conversation already live in '%s' (%s); "
+			  "attaching there"
+			  % (session, short_name(follow["name"]),
+				 follow.get("state") or "idle"))
+		session = follow["name"]
+		rest = b""
+		try:
+			sock.close()
+		except OSError:
+			pass
+		sock = connect_daemon()
+		send_json(sock, {"cmd": "attach", "name": session,
+						 "cols": cols, "rows": rows})
+		resp, rest = read_json_line(sock)
+		if resp is None or not resp.get("ok"):
+			error = (resp or {}).get("error") if resp else "no response"
+			die("attach failed: %s" % error)
+	active_notice(session, resp)
+	# The bridge ends when the child exits, the daemon closes it (a /bg
+	# detach, a steal, or a resume handoff), or the connection drops. A
+	# handoff points this viewer at the live holder of the conversation it
+	# tried to open, so follow it with a fresh bridge instead of reporting
+	# a detach from a session that must not keep running.
+	attempts = 0
+	while True:
+		status = bridge(sock, session, rest)
+		# Make the drop unmistakable: wipe the frozen TUI frame and state
+		# where the session went — this is the exact gap that made a
+		# detached session look like a stuck TUI.
+		print("\x1b[H\x1b[2J\x1b[m", end="")
+		attempts += 1
+		handoff = (query_handoff(session)
+				   if status == "closed" and attempts < 4 else None)
+		if handoff is None:
+			break
+		print("pi-rc: '%s' opened a conversation already live in '%s' (%s); "
+			  "attaching there"
+			  % (session, short_name(handoff["name"]),
+				 handoff.get("state") or "idle"))
+		session = handoff["name"]
+		rest = b""
+		sock = connect_daemon()
+		send_json(sock, {"cmd": "attach", "name": session,
+						 "cols": cols, "rows": rows})
+		resp, rest = read_json_line(sock)
+		if resp is None or not resp.get("ok"):
+			# The holder died before we followed; report the closed bridge
+			# for this session through the normal path below.
+			break
+		active_notice(session, resp)
 	if status in ("detached", "closed"):
 		note = "session keeps running in the background"
 		if status == "closed":
