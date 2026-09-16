@@ -64,10 +64,6 @@ them, and can uninstall exactly what it installed.
   daemon respawns it from its registry, and `pi-rc attach` or
   `pi-rc start` resumes the latest session for that directory (`pi -c`),
   falling back to a fresh pi; pass `--fresh` to force an empty session.
-- **Official subagent extension** (`pi/install-subagent.sh`): installs the
-  subagent extension shipped with pi itself using pi's documented symlink
-  method, with sample agents converted to local copies that inherit the
-  session model.
 
 ## Install
 
@@ -93,7 +89,6 @@ pi/
   bin/pi-rc                         # client: start/attach/detach/announce/ls/which/stop/handover
   ptyd/pi-ptyd                      # stdlib Python PTY host daemon
   systemd/pi-background-service.service
-  install-subagent.sh               # official subagent extension installer
 scripts/
   install.sh                        # manifest-owned install into the agent home
   uninstall.sh
