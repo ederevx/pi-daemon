@@ -57,8 +57,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** pi-rc exit code when the control socket is unreachable. */
+/** pi-rc exit codes: 4 = unreachable before any request landed (safe to
+ *  run the task locally); 7 = the request was sent but the outcome is
+ *  unknown — the daemon may have acted on it, so callers must adopt any
+ *  matching ticket instead of re-running. */
 const EXIT_NO_DAEMON = 4;
+const EXIT_AMBIGUOUS = 7;
 
 /** Default hand-off bound for bash offloading, in seconds. */
 const DEFAULT_WAIT_SECONDS = 120;
@@ -73,6 +77,7 @@ interface Ticket {
 	cwd: string;
 	command: string;
 	status: "running" | "done" | "failed" | "cancelled" | "lost";
+	kind?: "shell" | "agent";
 	created: number;
 	started: number;
 	finished: number | null;
@@ -82,8 +87,16 @@ interface Ticket {
 	error: string | null;
 }
 
-/** Error thrown when the daemon cannot be reached or misbehaves. */
-class DaemonUnavailable extends Error {}
+/** Error thrown when the daemon cannot be reached or misbehaves.
+ *  ambiguous=true means the request may have been acted on already. */
+class DaemonUnavailable extends Error {
+	constructor(
+		message: string,
+		public readonly ambiguous = false,
+	) {
+		super(message);
+	}
+}
 
 /** Formats one completed ticket + its output as agent-facing text. */
 function formatResult(ticket: Ticket, output: string): string {
@@ -153,6 +166,9 @@ class TicketClient {
 		}
 		if (result.code === EXIT_NO_DAEMON) {
 			throw new DaemonUnavailable("background service is not running");
+		}
+		if (result.code === EXIT_AMBIGUOUS) {
+			throw new DaemonUnavailable("submit outcome unknown (connection lost mid-request)", true);
 		}
 		if (result.code !== 0) {
 			const detail = (result.stderr || result.stdout || "").trim();
@@ -393,6 +409,27 @@ class DaemonTasks {
 	}
 }
 
+/** Ambiguous submit recovery: find a shell ticket created recently for
+ *  this session with the exact same command, so the caller adopts the
+ *  daemon's copy instead of re-running the command locally. */
+async function adoptRecentShellTicket(
+	tasks: DaemonTasks,
+	sessionFile: string | null,
+	command: string,
+): Promise<string | null> {
+	try {
+		const tickets = await tasks.list(sessionFile);
+		const cutoff = Date.now() / 1000 - 60;
+		const matches = tickets
+			.filter((t) => t.kind === "shell" && t.command === command
+				&& (t.created ?? 0) >= cutoff)
+			.sort((a, b) => b.created - a.created);
+		return matches[0]?.id ?? null;
+	} catch {
+		return null;
+	}
+}
+
 /** The session env vars the offloaded command should inherit beyond the
  *  pi process environment pi-rc already forwards. */
 function sessionEnvExtra(env?: NodeJS.ProcessEnv): Record<string, string> {
@@ -610,10 +647,25 @@ export default function (pi: ExtensionAPI) {
 			try {
 				id = await tasks.submit(
 					sessionFile, cwd, command, sessionEnvExtra(env));
-			} catch {
-				// Daemon unreachable: the command never started anywhere,
-				// so clean fallback to local execution is safe.
-				return localBash.exec(command, cwd, { onData, signal, timeout, env });
+			} catch (exc) {
+				if (!(exc instanceof DaemonUnavailable) || !exc.ambiguous) {
+					// Daemon unreachable (contact never established) or a
+					// deterministic refusal: the command never started in
+					// the daemon, so local fallback is safe and exclusive.
+					return localBash.exec(command, cwd, { onData, signal, timeout, env });
+				}
+				// Ambiguous: the ticket may already be running. Adopt a
+				// matching recent ticket instead of re-running locally.
+				const adopted = await adoptRecentShellTicket(
+					tasks, sessionFile, command);
+				if (adopted === null) {
+					onData(Buffer.from(
+						`[pi-daemon submit outcome unknown; NOT re-running ` +
+						`locally to avoid duplication - check daemon_tasks ` +
+						`list to locate the ticket]\n`));
+					return { exitCode: null };
+				}
+				id = adopted;
 			}
 			const deadline = Date.now() + (timeout ?? waitBoundSeconds()) * 1000;
 			// One abort listener for the whole call: when the user aborts,
