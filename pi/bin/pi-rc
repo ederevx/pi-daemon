@@ -60,6 +60,24 @@
 #                                       is unreachable); used by the pi
 #                                       wrapper's resume guard
 #   pi-rc stop <name>                   kill one session (ends that pi)
+#   pi-rc ticket-submit [--session <n>] [--cwd <dir>] [--env KEY=VALUE]
+#                       -- <command>... run a shell command as a
+#                                       daemon-owned ticket: it outlives
+#                                       the submitting agent, output is
+#                                       captured server-side, and the
+#                                       ticket is tracked in tickets.json
+#                                       (prints "ticket <id>"); env is
+#                                       this process's environment plus
+#                                       --env overrides
+#   pi-rc ticket-wait <id> [timeout]    block until the ticket finishes or
+#                                       timeout (default 0) seconds pass;
+#                                       prints the ticket record as one
+#                                       JSON line
+#   pi-rc ticket-output <id> [offset]   print the ticket's output from
+#                                       byte offset (default 0) to stdout
+#   pi-rc ticket-list [session]         print one ticket record JSON line
+#                                       per ticket, oldest first
+#   pi-rc ticket-cancel <id>            TERM then KILL a running ticket
 #   pi-rc handover <file> [dir]         host a specific pi session file in a
 #                                       new detached session; used by /bg
 #                                       outside the host to hand a live
@@ -73,6 +91,7 @@
 #                                       session
 
 import atexit
+import base64
 import hashlib
 import json
 import os
@@ -108,7 +127,9 @@ DETACH_KEY = b"\x1c"  # Ctrl-\: pop out of an attached session without exiting p
 # Commands served by main(); ls has a list alias.
 _COMMANDS = ("which", "whichall", "state", "carry", "resume", "start",
 			 "attach", "announce", "detach", "stop", "handover",
-			 "daemon-start", "daemon-stop")
+			 "daemon-start", "daemon-stop",
+			 "ticket-submit", "ticket-wait", "ticket-output",
+			 "ticket-list", "ticket-cancel")
 
 
 def die(msg, code=EXIT_USAGE):
@@ -223,9 +244,10 @@ class DaemonClient:
 				EXIT_NO_DAEMON)
 		return sock
 
-	def control(self, req):
-		# one JSON-line round-trip on a short-lived control connection
-		sock = self.connect()
+	def control(self, req, timeout=None):
+		# one JSON-line round-trip on a short-lived control connection;
+		# wait-shaped requests pass their own (longer) timeout
+		sock = self.connect(timeout if timeout is not None else CONTROL_TIMEOUT)
 		try:
 			send_json(sock, req)
 			resp, _ = read_json_line(sock)
@@ -987,6 +1009,104 @@ def cmd_attach(args, client):
 	flow.report_exit(status)
 
 
+# ------------------------------------------------------------- tickets
+
+def cmd_ticket_submit(args, client):
+	# Offload a shell command to the daemon as a ticket: it outlives the
+	# submitting agent, output is captured daemon-side, and completion is
+	# tracked in the persisted ticket store. Prints "ticket <id>".
+	session_arg = None
+	dir_arg = None
+	env_overrides = []
+	while args:
+		arg = args.pop(0)
+		if arg == "--":
+			break
+		if arg == "--session" and args:
+			session_arg = args.pop(0)
+		elif arg == "--cwd" and args:
+			dir_arg = args.pop(0)
+		elif arg == "--env" and args:
+			env_overrides.append(args.pop(0))
+		else:
+			usage_error("bad argument %r for 'ticket-submit'" % arg)
+	if not args:
+		usage_error("ticket-submit needs a command after --")
+	command = " ".join(args)
+	session = short_name(session_arg or os.environ.get("PI_HOSTED_SESSION")
+						 or "standalone")
+	dir_ = resolve_dir(dir_arg)
+	env = dict(os.environ)
+	for pair in env_overrides:
+		key, _, value = pair.partition("=")
+		if not key:
+			usage_error("--env needs KEY=VALUE")
+		env[key] = value
+	resp = client.control({"cmd": "ticket-submit", "session": session,
+						   "cwd": dir_, "command": command, "env": env})
+	if not resp.get("ok"):
+		die("ticket-submit failed: %s" % resp.get("error"))
+	print("ticket %s" % resp["id"])
+
+
+def cmd_ticket_wait(args, client):
+	# Block until the ticket finishes or the timeout passes; timeout 0
+	# (default) just polls the record. Prints one JSON line.
+	if len(args) not in (1, 2):
+		usage_error("ticket-wait takes an id and an optional timeout")
+	try:
+		timeout = float(args[1]) if len(args) > 1 else 0.0
+	except ValueError:
+		usage_error("ticket-wait timeout must be a number")
+	resp = client.control({"cmd": "ticket-wait", "id": args[0],
+						   "timeout": timeout},
+						  timeout=CONTROL_TIMEOUT + max(0.0, timeout) + 5.0)
+	if not resp.get("ok"):
+		die("ticket-wait failed: %s" % resp.get("error"))
+	print(json.dumps(resp["ticket"]))
+
+
+def cmd_ticket_output(args, client):
+	# Raw incremental output from byte offset (default 0) to stdout.
+	if len(args) not in (1, 2):
+		usage_error("ticket-output takes an id and an optional offset")
+	try:
+		offset = int(args[1]) if len(args) > 1 else 0
+	except ValueError:
+		usage_error("ticket-output offset must be an integer")
+	resp = client.control({"cmd": "ticket-output", "id": args[0],
+						   "offset": offset})
+	if not resp.get("ok"):
+		die("ticket-output failed: %s" % resp.get("error"))
+	sys.stdout.buffer.write(base64.b64decode(resp["data"]))
+	sys.stdout.buffer.flush()
+
+
+def cmd_ticket_list(args, client):
+	# One ticket record JSON line per ticket, oldest first; a session
+	# argument filters to that owning session.
+	if len(args) > 1:
+		usage_error("ticket-list takes an optional session name")
+	req = {"cmd": "ticket-list"}
+	if args:
+		req["session"] = args[0]
+	resp = client.control(req)
+	if not resp.get("ok"):
+		die("ticket-list failed: %s" % resp.get("error"))
+	for ticket in resp.get("tickets") or []:
+		print(json.dumps(ticket))
+
+
+def cmd_ticket_cancel(args, client):
+	if len(args) != 1:
+		usage_error("ticket-cancel takes exactly one ticket id")
+	resp = client.control({"cmd": "ticket-cancel", "id": args[0]})
+	if not resp.get("ok"):
+		die("ticket-cancel failed: %s" % resp.get("error"))
+	print("pi-rc: ticket '%s' status %s"
+		  % (args[0], resp["ticket"].get("status", "?")))
+
+
 # ------------------------------------------------------------------ help
 
 def print_help():
@@ -1018,8 +1138,10 @@ def main():
 		 "carry": cmd_carry, "resume": cmd_resume, "start": cmd_start,
 		 "attach": cmd_attach, "announce": cmd_announce,
 		 "detach": cmd_detach, "stop": cmd_stop, "handover": cmd_handover,
-		 "daemon-start": cmd_daemon_start,
-		 "daemon-stop": cmd_daemon_stop}[cmd](rest, client)
+		 "daemon-start": cmd_daemon_start, "daemon-stop": cmd_daemon_stop,
+		 "ticket-submit": cmd_ticket_submit, "ticket-wait": cmd_ticket_wait,
+		 "ticket-output": cmd_ticket_output, "ticket-list": cmd_ticket_list,
+		 "ticket-cancel": cmd_ticket_cancel}[cmd](rest, client)
 	elif cmd == "help":
 		print_help()
 	else:
