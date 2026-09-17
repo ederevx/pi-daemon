@@ -180,7 +180,7 @@ _WIRE_COMMANDS = ("ping", "start", "detach", "resize", "list", "which",
 				  "ticket-list", "ticket-cancel", "ticket-remove",
 				  "tickets-reset",
 				  "agent-submit", "agent-wait", "agent-output",
-				  "agent-cancel")
+				  "agent-cancel", "agent-detach")
 
 
 def log(msg):
@@ -1033,6 +1033,16 @@ class AgentTicketRunner:
 				stream.close()
 			except OSError:
 				pass
+
+	def mark_detached(self, tid):
+		# The owner's bridge handed this ticket off to the daemon: the
+		# owner's session extension watches terminal transitions of
+		# detached tickets to deliver the completion notification.
+		rec = self.store.get(tid)
+		if rec is None or rec.get("detached"):
+			return rec
+		self.store.update(tid, detached=True)
+		return self.store.get(tid)
 
 	def _finish(self, tid, code, truncated):
 		with self._lock:
@@ -2528,6 +2538,15 @@ class Control:
 		if not (isinstance(tid, str) and tid) or timeout < 0:
 			return bad_request()
 		rec = self.daemon.agents.wait(tid, timeout)
+		if rec is None:
+			return err("no-ticket")
+		return {"ok": True, "ticket": rec}
+
+	def agent_detach(self, req):
+		tid = req.get("id")
+		if not (isinstance(tid, str) and tid):
+			return bad_request()
+		rec = self.daemon.agents.mark_detached(tid)
 		if rec is None:
 			return err("no-ticket")
 		return {"ok": True, "ticket": rec}
