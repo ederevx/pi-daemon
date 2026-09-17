@@ -68,6 +68,30 @@ them, and can uninstall exactly what it installed.
   that conflict with its built-in `app.exit` Ctrl+D binding.) The
   extension also announces each session's file to the daemon so abnormal
   deaths can be revived from the same conversation.
+- **Command offloading** (`offload` pi extension): every `bash` call is
+  rerouted to the daemon as a **ticket** — a daemon-owned shell command
+  that outlives the submitting agent. Results are delivered in one go
+  when the command finishes (nothing streams into the tool result), so
+  an agent reads a complete result exactly once. A command outliving
+  the wait bound (the tool's timeout, or `PI_OFFLOAD_WAIT` seconds,
+  default 120) is handed off instead of killed: the tool result frees
+  the agent immediately, the ticket keeps running daemon-side, and the
+  full output is delivered as a follow-up message on completion. Every
+  ticket is recorded in the daemon's persisted `tickets.json` and
+  assigned to the owning session (hosted session name, else the
+  conversation file stem), so `daemon_tasks list` shows them and a
+  crashed or restarted session re-arms its pending results on
+  `session_start`. The `daemon_tasks` tool exposes the machinery
+  explicitly: `submit` (fire-and-forget background command), `result`
+  (one-go fetch), `watch` (live output via partial updates), plus
+  `status`, `list` and `cancel`. When the daemon is unreachable the
+  bash tool falls back to pi's local execution transparently, and
+  `PI_OFFLOAD=off` disables offloading entirely. Tickets are garbage
+  collected by the daemon: finished tickets expire after
+  `PI_PTYD_TICKET_TTL` seconds (default 24h) with the finished set
+  capped at 200 (oldest evicted), and each sweep unlinks the expired
+  output logs; a daemon restart or shutdown marks running tickets
+  `lost` instead of ever claiming a live process.
 - **Always backgrounded**: a hosted session never dies silently. When
   its pi process dies abnormally (crash, SIGKILL, OOM), the daemon
   revives it headless as `pi --session <file>` under the same name. Only
@@ -102,7 +126,8 @@ bash scripts/uninstall.sh
 ```
 pi/
   extensions/daemon.ts       # /bg: instant detach when hosted, handover otherwise
-  bin/pi-rc                         # client: start/attach/detach/announce/ls/which/stop/handover
+  extensions/offload.ts      # ticket-based command offloading + daemon_tasks tool
+  bin/pi-rc                         # client: start/attach/detach/announce/ls/which/stop/handover/tickets
   daemon/pi-daemon                      # stdlib Python PTY host daemon
   systemd/pi-daemon.service
 scripts/

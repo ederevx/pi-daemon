@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Install the Pi background service from this repo into the Pi agent home.
 #
-# Copies the daemon extension, the pi-rc client, the pi-daemon PTY
-# host daemon, and the systemd user unit, recording every owned file in a
-# manifest so uninstall removes exactly what this repo installed.
+# Copies the daemon and offload extensions, the pi-rc client, the
+# pi-daemon PTY host daemon, and the systemd user unit, recording every
+# owned file in a manifest so uninstall removes exactly what this repo
+# installed.
 # Idempotent: re-running refreshes owned copies in place. Existing
 # unrelated files are never touched.
 set -euo pipefail
@@ -28,6 +29,7 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,8) else 1)' || {
 }
 
 dest_extension="$pi_home/extensions/daemon.ts"
+dest_offload="$pi_home/extensions/offload.ts"
 dest_helper="$local_bin/pi-rc"
 dest_daemon="$local_bin/pi-daemon"
 dest_unit="$systemd_dir/pi-daemon.service"
@@ -36,6 +38,7 @@ dest_wrapper="$local_bin/pi"
 mkdir -p "$pi_home/extensions" "$local_bin" "$systemd_dir" "$state_dir"
 
 install -m 644 "$repo_root/pi/extensions/daemon.ts" "$dest_extension"
+install -m 644 "$repo_root/pi/extensions/offload.ts" "$dest_offload"
 install -m 755 "$repo_root/pi/bin/pi-rc" "$dest_helper"
 install -m 755 "$repo_root/pi/daemon/pi-daemon" "$dest_daemon"
 
@@ -59,7 +62,7 @@ sed "s|@REAL_PI@|$real_pi|;s|@PI_BIN_DIR@|$(dirname "$real_pi")|" \
 sed "s|@REAL_PI@|$real_pi|" "$repo_root/pi/bin/pi-wrapper" > "$dest_wrapper"
 chmod 755 "$dest_wrapper"
 
-owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_extension" "$dest_unit")
+owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_extension" "$dest_offload" "$dest_unit")
 {
   printf '{\n'
   printf '  "version": 1,\n'
@@ -90,6 +93,7 @@ echo "  daemon:    $dest_daemon"
 echo "  launcher:  $dest_helper"
 echo "  pi wrap:   $dest_wrapper"
 echo "  extension: $dest_extension"
+echo "  offload:   $dest_offload"
 echo "  unit:      $dest_unit"
 echo "  manifest:  $manifest"
 echo
