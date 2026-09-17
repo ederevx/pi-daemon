@@ -251,7 +251,7 @@ class DaemonTasks {
 	readonly client: TicketClient;
 	private readonly send: (
 		message: { customType: string; content: string; display: boolean; details?: unknown },
-		options: { triggerTurn: boolean; deliverAs: "followUp" },
+		options: { triggerTurn: boolean; deliverAs: "steer" | "followUp" },
 	) => void;
 
 	/** ticket id -> live watcher; owning object mutates this only. */
@@ -345,6 +345,11 @@ class DaemonTasks {
 				if (watcher.stopped || this.fetched.has(id)) return;
 				const output = await this.client.outputAll(id);
 				if (this.fetched.has(id)) return;
+				// Steer, not followUp: the notification must reach the
+				// agent after its current tool calls finish but BEFORE
+				// its next model call, so it learns the task completed
+				// instead of re-running it. followUp waits for full idle,
+				// which let agents duplicate work.
 				this.send(
 					{
 						customType: "daemon-task",
@@ -352,7 +357,7 @@ class DaemonTasks {
 						display: true,
 						details: { ticket },
 					},
-					{ triggerTurn: true, deliverAs: "followUp" },
+					{ triggerTurn: true, deliverAs: "steer" },
 				);
 			} catch {
 				// Daemon went away mid-watch: nothing to deliver. The
