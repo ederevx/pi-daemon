@@ -701,8 +701,11 @@ export default function (pi: ExtensionAPI) {
 		const head = `${t.id} ${t.status} - ${when}` +
 			(t.exit !== null ? ` - exit ${t.exit}` : "");
 		if (!expanded) {
-			return new Text(theme.bg("customMessageBg",
-				theme.bold(`[daemon-task] ${head}`)));
+			// Box pads the line to full width, so the bg spans the card.
+			const box = new Box(0, 0, (text) =>
+				theme.bg("customMessageBg", text));
+			box.addChild(new Text(theme.bold(`[daemon-task] ${head}`)));
+			return box;
 		}
 		const box = new Box(1, 0, (text) => theme.bg("customMessageBg", text));
 		box.addChild(new Text(theme.bold(`[daemon-task] ${head}`)));
