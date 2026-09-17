@@ -196,6 +196,21 @@ class TicketClient {
 		return Buffer.concat(parts).toString("utf8");
 	}
 
+	/** Drops a finished ticket (and its artifacts) from the store. */
+	async remove(id: string): Promise<string> {
+		await this.run(["ticket-remove", id]);
+		return id;
+	}
+
+	/** Resets the whole ticketing state: cancels every running ticket,
+	 *  wipes the store and artifacts. */
+	async resetAll(): Promise<{ cancelled: number; removed: number }> {
+		const out = await this.run(["tickets-reset"]);
+		const c = /cancelled (\d+)/.exec(out);
+		const r = /removed (\d+)/.exec(out);
+		return { cancelled: Number(c?.[1] ?? 0), removed: Number(r?.[1] ?? 0) };
+	}
+
 	async list(session?: string): Promise<Ticket[]> {
 		const args = ["ticket-list"];
 		if (session) args.push(session);
@@ -208,7 +223,7 @@ class TicketClient {
 	}
 
 	async cancel(id: string): Promise<Ticket> {
-		await this.run(["ticket-cancel", id]);
+		const out = await this.run(["ticket-cancel", id]);
 		return this.wait(id, 0);
 	}
 }
@@ -503,7 +518,7 @@ export default function (pi: ExtensionAPI) {
 				"Use result to fetch a ticket's output, watch to follow it live.",
 		],
 		parameters: Type.Object({
-			action: StringEnum(["submit", "status", "result", "watch", "cancel", "list"] as const),
+			action: StringEnum(["submit", "status", "result", "watch", "cancel", "remove", "reset", "list"] as const),
 			command: Type.Optional(Type.String({ description: "Shell command (submit)" })),
 			cwd: Type.Optional(Type.String({ description: "Working directory (submit; default session cwd)" })),
 			id: Type.Optional(Type.String({ description: "Ticket id (status/result/watch/cancel)" })),
@@ -590,6 +605,25 @@ export default function (pi: ExtensionAPI) {
 								(ticket.error ? ` (${ticket.error})` : ""),
 						}],
 						details: { ticket },
+					};
+				}
+			case "remove": {
+					if (!params.id) throw new Error("remove needs a ticket id");
+					await tasks.client.remove(params.id);
+					return {
+						content: [{ type: "text", text: `ticket ${params.id} removed` }],
+						details: undefined,
+					};
+				}
+				case "reset": {
+					const { cancelled, removed } = await tasks.client.resetAll();
+					return {
+						content: [{
+							type: "text",
+							text: `ticketing reset: ${cancelled} running ticket(s) cancelled, ` +
+								`${removed} record(s) wiped; the id counter restarted at t-1`,
+						}],
+						details: undefined,
 					};
 				}
 				case "list": {

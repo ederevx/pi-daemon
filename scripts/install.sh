@@ -30,6 +30,7 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,8) else 1)' || {
 
 dest_extension="$pi_home/extensions/daemon.ts"
 dest_offload="$pi_home/extensions/offload.ts"
+dest_front="$local_bin/pi-agent-entry.mjs"
 dest_helper="$local_bin/pi-rc"
 dest_daemon="$local_bin/pi-daemon"
 dest_unit="$systemd_dir/pi-daemon.service"
@@ -62,7 +63,13 @@ sed "s|@REAL_PI@|$real_pi|;s|@PI_BIN_DIR@|$(dirname "$real_pi")|" \
 sed "s|@REAL_PI@|$real_pi|" "$repo_root/pi/bin/pi-wrapper" > "$dest_wrapper"
 chmod 755 "$dest_wrapper"
 
-owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_extension" "$dest_offload" "$dest_unit")
+# The pi-compatible front entry loads the real pi entry in-process, so
+# it needs the resolved (symlink-free) entry path baked in.
+real_entry="$(realpath "$real_pi")"
+sed "s|@REAL_ENTRY@|$real_entry|" "$repo_root/pi/daemon/pi-agent-entry.mjs" > "$dest_front"
+chmod 755 "$dest_front"
+
+owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_extension" "$dest_offload" "$dest_front" "$dest_unit")
 {
   printf '{\n'
   printf '  "version": 1,\n'
@@ -94,6 +101,7 @@ echo "  launcher:  $dest_helper"
 echo "  pi wrap:   $dest_wrapper"
 echo "  extension: $dest_extension"
 echo "  offload:   $dest_offload"
+echo "  pi front:  $dest_front"
 echo "  unit:      $dest_unit"
 echo "  manifest:  $manifest"
 echo
