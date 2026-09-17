@@ -700,9 +700,12 @@ export default function (pi: ExtensionAPI) {
 			.toLocaleTimeString("en-GB");
 		const head = `${t.id} ${t.status} - ${when}` +
 			(t.exit !== null ? ` - exit ${t.exit}` : "");
-		if (!expanded) return new Text(theme.bold(head));
+		if (!expanded) {
+			return new Text(theme.bg("customMessageBg",
+				theme.bold(`[daemon-task] ${head}`)));
+		}
 		const box = new Box(1, 0, (text) => theme.bg("customMessageBg", text));
-		box.addChild(new Text(theme.bold(head)));
+		box.addChild(new Text(theme.bold(`[daemon-task] ${head}`)));
 		box.addChild(new Text(theme.fg("dim", data.command ?? t.command)));
 		const trunc = truncateTail(data.output ?? "", {
 			maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES,
