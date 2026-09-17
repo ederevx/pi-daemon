@@ -15,13 +15,19 @@ them, and can uninstall exactly what it installed.
   drains the PTY and discards output, so a headless agent can keep
   working without ever blocking on a full tty buffer. This replaces tmux
   hosting entirely — there is no tmux anywhere.
-- **Auto-hosting wrapper** (`pi`): every interactive `pi` call creates its
-  OWN new hosted session through `pi-rc attach --new` — a fresh
-  conversation under a unique session name, attached to the terminal.
-  Nothing is resumed implicitly; pass `--resume` / `--continue` to pi
-  explicitly when an old conversation is wanted (they ride along into the
-  hosted session). Backgrounding stays solely a `/bg` feature: before
-  attaching, the wrapper resolves the target conversation file of a
+- **Auto-hosting wrapper** (`pi`): a plain interactive `pi` call attaches
+  to the directory's daemon-owned session — the live hosted session
+  backing this directory's latest conversation — so terminals become
+  interchangeable viewports of one daemon-owned session instead of
+  spawning duplicates; the daemon owns the sessions, the terminal just
+  views. `pi --new` (a wrapper flag, consumed before pi sees it) keeps
+  the old behavior: a fresh conversation in its own new hosted session
+  through `pi-rc attach --new`. The owned-session scan only considers
+  sessions with a real conversation file on record, so `--no-session`
+  children (subagent workers share the directory in the listing) are
+  never attached. Resume flags (--resume / --continue) ride along into
+  the hosted session as pi args. Before attaching, the wrapper resolves
+  the target conversation file of a
   `--resume` / `--continue` / `--session` call (without spawning pi) and,
   when a live hosted session already backs it, ATTACHES to that session
   instead of starting a second pi — entering an active session is not an
