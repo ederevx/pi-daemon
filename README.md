@@ -92,6 +92,22 @@ them, and can uninstall exactly what it installed.
   capped at 200 (oldest evicted), and each sweep unlinks the expired
   output logs; a daemon restart or shutdown marks running tickets
   `lost` instead of ever claiming a live process.
+- **Subagent interception** (pi-compatible front): hosted sessions and
+  offloaded delegation children run through `pi-agent-entry.mjs`, a
+  daemon-owned front that loads pi's real entry in-process — to any
+  caller (the delegation protocol included) it is pi, and nothing needs
+  to know the daemon exists. Delegation-shaped headless calls
+  (`--mode json -p --no-session`) are handed to the daemon as agent
+  tickets: the daemon spawns and owns the real pi child, captures its
+  stdout NDJSON and stderr separately, enforces the turn budget by
+  counting assistant turns, and the front relays everything back
+  byte-for-byte with the child's exit code — synchronous callers block
+  exactly as before, while the child now survives the parent. Tickets
+  can be cancelled, removed once finished, or wiped entirely with
+  `pi-rc tickets-reset` (cancel all running, wipe the store, restart
+  the id counter; hosted sessions untouched — `pi-rc daemon-stop`
+  remains the full stop). Service down or capacity exhausted → the
+  front runs pi directly, so unoffloaded behavior is byte-identical.
 - **Always backgrounded**: a hosted session never dies silently. When
   its pi process dies abnormally (crash, SIGKILL, OOM), the daemon
   revives it headless as `pi --session <file>` under the same name. Only
@@ -127,8 +143,9 @@ bash scripts/uninstall.sh
 pi/
   extensions/daemon.ts       # /bg: instant detach when hosted, handover otherwise
   extensions/offload.ts      # ticket-based command offloading + daemon_tasks tool
-  bin/pi-rc                         # client: start/attach/detach/announce/ls/which/stop/handover/tickets
-  daemon/pi-daemon                      # stdlib Python PTY host daemon
+  bin/pi-rc                         # client: tickets, agents, bridge, start/attach/detach/announce/ls/which/stop
+  daemon/pi-daemon                      # stdlib Python PTY host daemon + ticket/agent runners
+  daemon/pi-agent-entry.mjs             # pi-compatible front: delegation interception
   systemd/pi-daemon.service
 scripts/
   install.sh                        # manifest-owned install into the agent home
