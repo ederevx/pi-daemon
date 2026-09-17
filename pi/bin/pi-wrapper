@@ -183,24 +183,72 @@ guard_check() {
 	return 0
 }
 
+# Resolve the daemon-owned session for a plain start: the daemon owns
+# one live session per directory's latest conversation, and terminals
+# are interchangeable viewports of it, so plain `pi` attaches to that
+# session (busy first — watching a working session never disturbs it)
+# instead of spawning a duplicate. `pi --new` keeps the old behavior:
+# a fresh conversation in its own new session. Candidates must back a
+# real conversation (a session file on record) so --no-session children
+# — subagent workers share the directory in the listing — are never
+# attached. Prints the chosen name, or nothing when a fresh start is
+# wanted (no candidates, or candidates whose files all vanished).
+owned_session() {
+	local name dir _pid _marker state file newest="" newest_file="" f
+	while IFS=$'\t' read -r name dir _pid _marker state file; do
+		[[ $dir == "$(pwd -P)" && -n $file && $file != "-" ]] || continue
+		[[ -f $file ]] || continue
+		f=$(stat -c %Y -- "$file" 2>/dev/null) || continue
+		if [[ -z $newest_file || $f -gt $newest_file \
+			|| ( $f -eq $newest_file && $state == busy ) ]]; then
+			newest=$name; newest_file=$f
+		fi
+	done < <("$PI_RC" ls 2>/dev/null)
+	printf '%s' "$newest"
+}
+
+# A wrapper-level flag, not a pi flag: force a fresh conversation in a
+# new hosted session. Anything before -- that is exactly --new is
+# consumed here; everything else rides through to pi untouched.
+force_new=0
+args=()
+for arg in "$@"; do
+	if [[ $force_new -eq 0 && $arg == --new ]]; then
+		force_new=1
+	else
+		args+=("$arg")
+	fi
+done
+
 if [[ -t 0 && -z "${PI_HOSTED:-}" && -x "$PI_RC" ]]; then
 	direct=0
-	for arg in "$@"; do
+	for arg in "${args[@]}"; do
 		case "$arg" in
 			-p|--print|--no-session|-h|--help|-v|--version) direct=1; break ;;
 		esac
 	done
 	if [[ $direct -eq 0 ]]; then
-		if ! guard_check "$@"; then
+		if ! guard_check "${args[@]}"; then
 			# Guard attach failed (session died between check and attach):
 			# degrade open with the original args so the call still works.
-			exec "$REAL_PI" "$@"
+			exec "$REAL_PI" "${args[@]}"
 		fi
-		"$PI_RC" attach --new -- "$@" && exit 0
+		if [[ $force_new -eq 0 ]]; then
+			owned=$(owned_session)
+			if [[ -n $owned ]]; then
+				printf 'pi: attaching to the daemon-owned session %s (pi --new starts a fresh conversation)\n' "$owned" >&2
+				if "$PI_RC" attach "$owned"; then
+					exit 0
+				fi
+				# The session died between check and attach: fall through to
+				# a fresh start instead of stranding the user.
+			fi
+		fi
+		"$PI_RC" attach --new -- "${args[@]}" && exit 0
 		# Attach failed (service down, or the bridge refused): degrade to
 		# the real pi so a start always works.
-		exec "$REAL_PI" "$@"
+		exec "$REAL_PI" "${args[@]}"
 	fi
 fi
 
-exec "$REAL_PI" "$@"
+exec "$REAL_PI" "${args[@]}"
