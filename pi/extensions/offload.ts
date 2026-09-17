@@ -480,6 +480,12 @@ class DaemonTasksDock {
 	private tui: TUI | null = null;
 	private theme: { fg: (role: string, text: string) => string } | null = null;
 	private done: ((result: null) => void) | null = null;
+	// ui.custom re-invokes the mount factory per render; without these
+	// guards every mount started another 1s poll chain, multiplying into
+	// a spawn storm of pi-rc children (with unreaped zombies).
+	private mounted = false;
+	private stopped = false;
+	private pollInFlight = false;
 
 	constructor(client: TicketClient) {
 		this.client = client;
@@ -494,7 +500,10 @@ class DaemonTasksDock {
 				this.tui = tui;
 				this.theme = theme;
 				this.done = done;
-				void this.poll();
+				if (!this.mounted) {
+					this.mounted = true;
+					void this.poll();
+				}
 				return this as unknown as Component;
 			});
 		} catch {
@@ -505,11 +514,15 @@ class DaemonTasksDock {
 	}
 
 	stop(): void {
+		this.stopped = true;
 		if (this.pollTimer) clearTimeout(this.pollTimer);
 		this.pollTimer = undefined;
 	}
 
 	private async poll(): Promise<void> {
+		// Exactly one chain, one in-flight request, ever.
+		if (this.stopped || this.pollInFlight) return;
+		this.pollInFlight = true;
 		try {
 			const tickets = await this.client.list();
 			// Latest first, top to bottom.
@@ -521,12 +534,16 @@ class DaemonTasksDock {
 		} catch (err) {
 			this.rows = [];
 			this.lastError = err instanceof Error ? err.message : String(err);
+		} finally {
+			this.pollInFlight = false;
 		}
 		if (this.selected >= this.rows.length) {
 			this.selected = Math.max(0, this.rows.length - 1);
 		}
 		this.tui?.requestRender();
-		this.pollTimer = setTimeout(() => void this.poll(), 1000);
+		if (!this.stopped) {
+			this.pollTimer = setTimeout(() => void this.poll(), 1000);
+		}
 	}
 
 	render(width: number): string[] {
