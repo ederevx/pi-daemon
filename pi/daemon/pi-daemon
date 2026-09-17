@@ -1487,20 +1487,34 @@ class SessionSpawner:
 		return sess
 
 	@staticmethod
-	def _write_pi_shim(shim_dir, node_path, front_path):
+	def _write_pi_shim(shim_dir, node_path, front_path, real_pi):
 		# A `pi` that launches the front, placed first on hosted children's
 		# PATH: every pi resolution inside a hosted session — the session
 		# start command, revive/handover spawns, agent delegations, plain
 		# `pi` shell calls — lands on the daemon's front, whose argv[1]
-		# brings delegation spawns back to the daemon. Unhosted contexts
-		# never see this PATH and keep resolving the installed wrapper.
+		# brings delegation spawns back to the daemon. The shim execs the
+		# real pi when node or the front is unusable, so the daemon can
+		# never block access to pi. Unhosted contexts never see this PATH
+		# and keep resolving the installed wrapper.
 		try:
 			os.makedirs(shim_dir, exist_ok=True)
 			shim = os.path.join(shim_dir, "pi")
 			with open(shim, "w") as f:
-				f.write("#!/usr/bin/env bash\n"
-						"exec %s %s \"$@\"\n"
-						% (json.dumps(node_path), json.dumps(front_path)))
+				f.write(
+					"#!/usr/bin/env bash\n"
+					"# pi-daemon's hosted-session pi shim: prefer the\n"
+					"# daemon's pi front; if the front or node is unusable,\n"
+					"# exec the real pi so the daemon can never block\n"
+					"# access to pi.\n"
+					"front=%s\n"
+					"node_bin=%s\n"
+					"real_pi=%s\n"
+					"if [[ -x \"$node_bin\" && -r \"$front\" ]]; then\n"
+					"\texec \"$node_bin\" \"$front\" \"$@\"\n"
+					"fi\n"
+					"exec \"$real_pi\" \"$@\"\n"
+					% (json.dumps(front_path), json.dumps(node_path),
+					   json.dumps(real_pi)))
 			os.chmod(shim, 0o755)
 			return shim_dir
 		except OSError as exc:
@@ -1553,15 +1567,30 @@ class Daemon:
 		self.shutdown_event = threading.Event()
 		# The pi-compatible front: hosted children get a PATH-shimmed `pi`
 		# and offloaded delegation children get the front directly, both
-		# only when node and the front entry are actually present.
+		# only when node, the front entry, and a real-pi fallback are all
+		# actually resolvable — the shim and the front must never become a
+		# single point of failure for reaching pi.
 		self.node_path = shutil.which("node")
 		front = AGENT_ENTRY
 		self.front_path = front if (self.node_path and front
 									and os.path.isfile(front)) else None
-		shim_dir = None
+		self.real_pi_path = None
 		if self.front_path:
+			skip = {AGENT_SHIM_DIR,
+					os.path.join(os.path.expanduser("~"), ".local", "bin")}
+			skip = {os.path.realpath(x) for x in skip}
+			for dir_ in os.environ.get("PATH", "").split(os.pathsep):
+				if not dir_ or os.path.realpath(dir_) in skip:
+					continue
+				cand = os.path.join(dir_, "pi")
+				if os.path.isfile(cand) and os.access(cand, os.X_OK):
+					self.real_pi_path = cand
+					break
+		shim_dir = None
+		if self.front_path and self.real_pi_path:
 			shim_dir = SessionSpawner._write_pi_shim(
-				AGENT_SHIM_DIR, self.node_path, self.front_path)
+				AGENT_SHIM_DIR, self.node_path, self.front_path,
+				self.real_pi_path)
 		self.spawner = SessionSpawner(self.table, registry, owner=self,
 									  shim_dir=shim_dir)
 		self.tickets = TicketRunner(

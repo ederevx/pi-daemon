@@ -38,20 +38,35 @@ dest_wrapper="$local_bin/pi"
 
 mkdir -p "$pi_home/extensions" "$local_bin" "$systemd_dir" "$state_dir"
 
-install -m 644 "$repo_root/pi/extensions/daemon.ts" "$dest_extension"
-install -m 644 "$repo_root/pi/extensions/offload.ts" "$dest_offload"
-install -m 755 "$repo_root/pi/bin/pi-rc" "$dest_helper"
-install -m 755 "$repo_root/pi/daemon/pi-daemon" "$dest_daemon"
+install_to() {
+	# Atomic replacement, per shared convention: never truncate a file
+	# that running software may read or execute — land the complete new
+	# content via a same-directory temp file and rename it over.
+	local mode="$1" src="$2" dest="$3" tmp="$3.tmp.$$"
+	install -m "$mode" "$src" "$tmp"
+	mv -f "$tmp" "$dest"
+}
+
+install_to 644 "$repo_root/pi/extensions/daemon.ts" "$dest_extension"
+install_to 644 "$repo_root/pi/extensions/offload.ts" "$dest_offload"
+install_to 755 "$repo_root/pi/bin/pi-rc" "$dest_helper"
+install_to 755 "$repo_root/pi/daemon/pi-daemon" "$dest_daemon"
 
 # The real pi binary must be resolved by PATH while skipping the
-# wrapper's own directory, so an already-installed wrapper can never be
-# mistaken for the real binary. Its bin dir is substituted into both the
-# wrapper (REAL_PI) and the unit (hosted children's PATH).
+# wrapper's own directory and the daemon's hosted-session shim. An install
+# launched from a hosted Pi inherits the shim first on PATH; treating that
+# Bash shim as Pi's Node entry bakes it into the front and makes Node try to
+# import a shell script. Its bin dir is substituted into both the wrapper
+# (REAL_PI) and the unit (hosted children's PATH).
 real_pi=""
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+shim_pi="$state_home/pi-pty-host/pi-shim/pi"
 old_ifs="$IFS"; IFS=:
 for dir in $PATH; do
   [[ "$dir" == "$local_bin" ]] && continue
-  if [[ -x "$dir/pi" ]]; then real_pi="$dir/pi"; break; fi
+  candidate="$dir/pi"
+  [[ -e "$shim_pi" && "$candidate" -ef "$shim_pi" ]] && continue
+  if [[ -x "$candidate" ]]; then real_pi="$candidate"; break; fi
 done
 IFS="$old_ifs"
 [[ -n "$real_pi" ]] || {
@@ -59,14 +74,18 @@ IFS="$old_ifs"
   exit 1
 }
 sed "s|@REAL_PI@|$real_pi|;s|@PI_BIN_DIR@|$(dirname "$real_pi")|" \
-  "$repo_root/pi/systemd/pi-daemon.service" > "$dest_unit"
-sed "s|@REAL_PI@|$real_pi|" "$repo_root/pi/bin/pi-wrapper" > "$dest_wrapper"
+  "$repo_root/pi/systemd/pi-daemon.service" > "$dest_unit.tmp.$$"
+mv -f "$dest_unit.tmp.$$" "$dest_unit"
+sed "s|@REAL_PI@|$real_pi|" "$repo_root/pi/bin/pi-wrapper" > "$dest_wrapper.tmp.$$"
+mv -f "$dest_wrapper.tmp.$$" "$dest_wrapper"
 chmod 755 "$dest_wrapper"
 
 # The pi-compatible front entry loads the real pi entry in-process, so
 # it needs the resolved (symlink-free) entry path baked in.
 real_entry="$(realpath "$real_pi")"
-sed "s|@REAL_ENTRY@|$real_entry|" "$repo_root/pi/daemon/pi-agent-entry.mjs" > "$dest_front"
+sed "s|@REAL_ENTRY@|$real_entry|" "$repo_root/pi/daemon/pi-agent-entry.mjs" \
+  > "$dest_front.tmp.$$"
+mv -f "$dest_front.tmp.$$" "$dest_front"
 chmod 755 "$dest_front"
 
 owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_extension" "$dest_offload" "$dest_front" "$dest_unit")
