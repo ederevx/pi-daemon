@@ -68,10 +68,36 @@
 #   handoff-target {name}                 the live holder a resumed-away
 #                                         duplicate session's viewers
 #                                         should attach to, if any
-#   shutdown                              stop everything and exit
+#   ticket-submit {session,cwd,command
+#                  [,env]}                run a command as a daemon-owned
+#                                         ticket: the command outlives
+#                                         the submitting session, its
+#                                         output is captured to a log
+#                                         file, and the ticket record
+#                                         (id, status, exit, timing) is
+#                                         persisted in tickets.json; env
+#                                         is the caller's environment,
+#                                         forwarded so commands run with
+#                                         the submitting agent's PATH and
+#                                         PI_* context
+#   ticket-wait {id[,timeout]}            block until the ticket finishes
+#                                         or the timeout (capped) passes;
+#                                         timeout 0 polls the record
+#   ticket-output {id[,offset]}           incremental output since byte
+#                                         offset, base64 in the reply
+#   ticket-list [{session}]               ticket records, oldest first
+#   ticket-cancel {id}                    TERM/KILL a running ticket
 #
-# Env: XDG_RUNTIME_DIR (control socket), XDG_STATE_HOME (registry).
+# Tickets are garbage collected: finished tickets expire after
+# PI_PTYD_TICKET_TTL seconds (default 24h) and the finished set is
+# capped, oldest evicted first; each sweep also unlinks the expired
+# output logs. A daemon restart or shutdown interrupts running tickets
+# (status "lost"); their logs survive until GC.
+#
+# Env: XDG_RUNTIME_DIR (control socket), XDG_STATE_HOME (registry and
+# ticket state).
 
+import base64
 import fcntl
 import hashlib
 import json
@@ -81,6 +107,7 @@ import select
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -92,6 +119,18 @@ STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/st
 SOCK_PATH = os.path.join(RUNTIME_DIR, "pi-pty-host.sock")
 REG_DIR = os.path.join(STATE_HOME, "pi-pty-host")
 REG_PATH = os.path.join(REG_DIR, "sessions.json")
+TICKETS_PATH = os.path.join(REG_DIR, "tickets.json")
+TICKET_LOG_DIR = os.path.join(REG_DIR, "tickets")
+# Finished tickets expire after TICKET_TTL seconds and the finished set
+# is capped at TICKET_MAX_FINISHED (oldest evicted). Both TTL and the
+# sweep interval are overridable for isolated tests.
+TICKET_TTL = float(os.environ.get("PI_PTYD_TICKET_TTL", 24 * 3600.0))
+TICKET_GC_TICK = float(os.environ.get("PI_PTYD_TICKET_GC", 60.0))
+TICKET_MAX_FINISHED = 200
+TICKET_OUTPUT_MAX = 4 << 20  # per-ticket captured output bound
+TICKET_CHUNK = 256 << 10     # max output bytes per ticket-output reply
+TICKET_MAX_RUNNING = 32      # soft cap; further submits get too-busy
+TICKET_MAX_WAIT = 600.0      # cap on a single ticket-wait round trip
 
 DEFAULT_COLS = 120
 DEFAULT_ROWS = 40
@@ -116,7 +155,9 @@ CLEAR_SEQ = b"\x1b[H\x1b[2J\x1b[m"
 # the connection loop).
 _WIRE_COMMANDS = ("ping", "start", "detach", "resize", "list", "which",
 				  "whichall", "state", "stop", "handover", "carry", "resume",
-				  "announce", "handoff-target")
+				  "announce", "handoff-target",
+				  "ticket-submit", "ticket-wait", "ticket-output",
+				  "ticket-list", "ticket-cancel")
 
 
 def log(msg):
@@ -253,6 +294,357 @@ class Registry:
 		if name in data:
 			data[name]["argv"] = list(argv)
 			self.write(data)
+
+
+class TicketStore:
+	"""Durable offloaded-command ticket state: one tickets.json plus one
+	output log per ticket. The in-memory dict is authoritative; every
+	mutation is written through atomically like Registry. The store's
+	lock doubles as the wait condition so ticket completion signals
+	blocked ticket-wait callers."""
+
+	def __init__(self, path, log_dir):
+		self.path = path
+		self.log_dir = log_dir
+		self.lock = threading.Lock()
+		self.cond = threading.Condition(self.lock)
+		self._tickets = {}
+		self._next = 1
+
+	def load(self):
+		try:
+			with open(self.path) as f:
+				data = json.load(f)
+		except (OSError, ValueError):
+			data = {}
+		if not isinstance(data, dict):
+			data = {}
+		tickets = data.get("tickets")
+		self._tickets = tickets if isinstance(tickets, dict) else {}
+		try:
+			self._next = int(data.get("next", 1))
+		except (TypeError, ValueError):
+			self._next = 1
+		if self._next < 1:
+			self._next = 1
+
+	def _write_locked(self):
+		os.makedirs(os.path.dirname(self.path), exist_ok=True)
+		tmp = self.path + ".tmp"
+		with open(tmp, "w") as f:
+			json.dump({"next": self._next, "tickets": self._tickets}, f)
+			f.write("\n")
+			f.flush()
+			os.fsync(f.fileno())
+		os.replace(tmp, self.path)
+
+	def alloc_id_locked(self):
+		# Caller holds the lock: ids must strictly increase across the
+		# whole persisted history, so the counter rides the same file.
+		tid = "t-%d" % self._next
+		self._next += 1
+		return tid
+
+	def add(self, rec):
+		with self.lock:
+			self._tickets[rec["id"]] = rec
+			self._write_locked()
+			return dict(rec)
+
+	def get(self, tid):
+		with self.lock:
+			rec = self._tickets.get(tid)
+			return dict(rec) if rec is not None else None
+
+	def get_locked(self, tid):
+		# Caller already holds the lock (directly or via cond.wait).
+		return self._tickets.get(tid)
+
+	def snapshot(self, session=None):
+		with self.lock:
+			recs = [dict(r) for r in self._tickets.values()
+					if session is None or r.get("session") == session]
+		return sorted(recs, key=lambda r: r["id"])
+
+	def update(self, tid, **fields):
+		# Mutate, persist, and broadcast under one lock; the broadcast
+		# wakes every blocked ticket-wait caller.
+		with self.cond:
+			rec = self._tickets.get(tid)
+			if rec is None:
+				return None
+			rec.update(fields)
+			self._write_locked()
+			self.cond.notify_all()
+			return dict(rec)
+
+	def mark_interrupted(self):
+		# Daemon restart: subprocesses died with the old process, so a
+		# ticket can never finish. Logs survive for inspection until GC.
+		with self.lock:
+			changed = False
+			for rec in self._tickets.values():
+				if rec.get("status") == "running":
+					rec["status"] = "lost"
+					rec["finished"] = time.time()
+					rec["error"] = "interrupted by daemon restart"
+					changed = True
+			if changed:
+				self._write_locked()
+
+	def log_path(self, tid):
+		return os.path.join(self.log_dir, "%s.log" % tid)
+
+	def gc(self, now, ttl, max_finished):
+		# Running tickets never expire; finished tickets drop after ttl
+		# seconds, plus the oldest ones beyond the finished cap. Expired
+		# output logs are unlinked by the caller.
+		with self.lock:
+			finished = sorted(
+				(tid for tid, r in self._tickets.items()
+				 if r.get("status") != "running"),
+				key=lambda tid: self._tickets[tid].get("finished") or 0.0)
+			removed = [tid for tid in finished
+					   if now - (self._tickets[tid].get("finished") or 0.0) > ttl]
+			for tid in finished:
+				if len(finished) - len(removed) <= max_finished:
+					break
+				if tid not in removed:
+					removed.append(tid)
+			for tid in removed:
+				del self._tickets[tid]
+			if removed:
+				self._write_locked()
+		return removed
+
+
+class TicketRunner:
+	"""Runs offloaded commands as daemon-owned subprocesses: one output
+	log per ticket, condition-signalled completion, a periodic GC sweep,
+	and a stop() that reaps children before daemon shutdown persists."""
+
+	def __init__(self, store, shutdown_event):
+		self.store = store
+		self.shutdown_event = shutdown_event
+		self._lock = threading.Lock()
+		self._procs = {}    # tid -> Popen, under _lock
+		self._stops = {}    # tid -> cancellation reason, under _lock
+
+	def start(self):
+		self.store.load()
+		self.store.mark_interrupted()
+		t = threading.Thread(target=self._gc_loop, daemon=True)
+		t.start()
+
+	def running_count(self):
+		with self._lock:
+			return len(self._procs)
+
+	def submit(self, session, cwd, command, env=None):
+		with self._lock:
+			if len(self._procs) >= TICKET_MAX_RUNNING:
+				return None
+		with self.store.lock:
+			tid = self.store.alloc_id_locked()
+		rec = {"id": tid, "session": session, "cwd": cwd, "command": command,
+			   "status": "running", "created": time.time(),
+			   "started": time.time(), "finished": None, "exit": None,
+			   "term": None, "truncated": False, "error": None}
+		os.makedirs(self.store.log_dir, exist_ok=True)
+		proc = subprocess.Popen(
+			["bash", "-c", command], cwd=cwd,
+			env=env if env else os.environ.copy(),
+			stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+			stderr=subprocess.STDOUT, start_new_session=True, bufsize=0)
+		rec = self.store.add(rec)
+		with self._lock:
+			self._procs[tid] = proc
+		t = threading.Thread(target=self._run, args=(tid, proc), daemon=True)
+		t.start()
+		log("ticket-submit '%s' session '%s' in %s"
+			% (tid, session, cwd))
+		return rec
+
+	def wait(self, tid, timeout):
+		deadline = time.time() + max(0.0, min(float(timeout or 0), TICKET_MAX_WAIT))
+		with self.store.cond:
+			rec = self.store.get_locked(tid)
+			if rec is None:
+				return None
+			while rec["status"] == "running" and time.time() < deadline:
+				self.store.cond.wait(deadline - time.time())
+				rec = self.store.get_locked(tid)
+				if rec is None:
+					return None
+			return dict(rec)
+
+	def output(self, tid, offset):
+		rec = self.store.get(tid)
+		if rec is None:
+			return None
+		path = self.store.log_path(tid)
+		try:
+			size = os.path.getsize(path)
+		except OSError:
+			size = 0
+		if offset >= size:
+			return {"offset": offset, "next": offset, "size": size,
+					"data": b""}
+		length = min(TICKET_CHUNK, size - offset)
+		try:
+			with open(path, "rb") as f:
+				f.seek(offset)
+				data = f.read(length)
+		except OSError:
+			data = b""
+		return {"offset": offset, "next": offset + len(data), "size": size,
+				"data": data}
+
+	def cancel(self, tid):
+		rec = self.store.get(tid)
+		if rec is None:
+			return None
+		if rec["status"] != "running":
+			return rec
+		with self._lock:
+			proc = self._procs.get(tid)
+			if proc is not None and proc.poll() is None:
+				self._stops[tid] = "cancelled"
+				target = proc
+			else:
+				target = None
+		if target is None:
+			# Reaped between the record read and here: the runner thread's
+			# final update lands within a moment; wait for it.
+			self.wait(tid, 5.0)
+			return self.store.get(tid)
+		try:
+			os.killpg(target.pid, signal.SIGTERM)
+		except OSError:
+			pass
+		deadline = time.time() + KILL_GRACE
+		while time.time() < deadline and target.poll() is None:
+			time.sleep(0.05)
+		if target.poll() is None:
+			try:
+				os.killpg(target.pid, signal.SIGKILL)
+			except OSError:
+				pass
+		try:
+			target.wait(timeout=KILL_GRACE)
+		except Exception:
+			pass
+		return self.store.get(tid)
+
+	def _run(self, tid, proc):
+		# Reader thread: append the child's merged stdout/stderr to the
+		# ticket log until the output cap, then record the exit.
+		captured = 0
+		truncated = False
+		logf = None
+		try:
+			logf = open(self.store.log_path(tid), "wb")
+		except OSError as exc:
+			log("ticket '%s' log open failed: %s" % (tid, exc))
+		try:
+			while True:
+				try:
+					# bufsize=0: os.read returns whatever is available, so
+					# incremental output lands in the log as it is produced.
+					chunk = os.read(proc.stdout.fileno(), 65536)
+				except OSError:
+					chunk = b""
+				if not chunk:
+					break
+				if logf is None:
+					truncated = True
+				elif captured < TICKET_OUTPUT_MAX:
+					room = TICKET_OUTPUT_MAX - captured
+					logf.write(chunk[:room])
+					logf.flush()
+					captured += min(len(chunk), room)
+					if len(chunk) > room:
+						truncated = True
+						logf.close()
+						logf = None
+				else:
+					truncated = True
+		finally:
+			if logf is not None:
+				logf.close()
+			try:
+				proc.stdout.close()
+			except OSError:
+				pass
+			code = proc.wait()
+		self._finish(tid, code, truncated)
+
+	def _finish(self, tid, code, truncated):
+		with self._lock:
+			self._procs.pop(tid, None)
+			reason = self._stops.pop(tid, None)
+		fields = {"status": "done" if code == 0 else "failed",
+				  "exit": code if code >= 0 else None,
+				  "term": -code if code < 0 else None,
+				  "finished": time.time(), "truncated": truncated}
+		if reason is not None:
+			fields["status"] = "cancelled"
+			fields["error"] = reason
+		self.store.update(tid, **fields)
+		log("ticket-done '%s' status %s" % (tid, fields["status"]))
+
+	def _gc_loop(self):
+		while not self.shutdown_event.wait(TICKET_GC_TICK):
+			try:
+				removed = self.store.gc(time.time(), TICKET_TTL,
+										TICKET_MAX_FINISHED)
+				for tid in removed:
+					try:
+						os.unlink(self.store.log_path(tid))
+					except OSError:
+						pass
+				if removed:
+					log("ticket-gc removed %d" % len(removed))
+			except Exception as exc:
+				log("ticket-gc error: %r" % (exc,))
+
+	def stop(self):
+		# Daemon shutdown: TERM every running child, bounded grace, KILL,
+		# then force any record the reader threads lost the race on to
+		# "lost" so the persisted state never claims a live process.
+		with self._lock:
+			procs = list(self._procs.values())
+			tids = list(self._procs.keys())
+			for tid in tids:
+				self._stops.setdefault(tid, "interrupted by daemon shutdown")
+		for proc in procs:
+			try:
+				os.killpg(proc.pid, signal.SIGTERM)
+			except OSError:
+				pass
+		deadline = time.time() + KILL_GRACE
+		while time.time() < deadline:
+			with self._lock:
+				if not self._procs:
+					break
+			time.sleep(0.05)
+		with self._lock:
+			alive = list(self._procs.values())
+		for proc in alive:
+			try:
+				os.killpg(proc.pid, signal.SIGKILL)
+			except OSError:
+				pass
+		for proc in alive:
+			try:
+				proc.wait(timeout=KILL_GRACE)
+			except Exception:
+				pass
+		for tid in tids:
+			rec = self.store.get(tid)
+			if rec is not None and rec["status"] == "running":
+				self.store.update(tid, status="lost", finished=time.time(),
+							  error="interrupted by daemon shutdown")
 
 
 class SessionTable:
@@ -745,8 +1137,10 @@ class Daemon:
 		self.table = SessionTable()
 		self.ledger = HandoffLedger()
 		self.spawner = SessionSpawner(self.table, registry, owner=self)
-		self.control = Control(self)
 		self.shutdown_event = threading.Event()
+		self.tickets = TicketRunner(
+			TicketStore(TICKETS_PATH, TICKET_LOG_DIR), self.shutdown_event)
+		self.control = Control(self)
 
 	# -- control socket ------------------------------------------------------
 
@@ -774,6 +1168,7 @@ class Daemon:
 		log("listening on %s (registry %s)" % (self.sock_path,
 											   self.registry.path))
 		self.respawn_from_registry()
+		self.tickets.start()
 		try:
 			self._accept_loop(srv)
 		except SystemExit:
@@ -863,6 +1258,7 @@ class Daemon:
 			return
 		self.shutdown_event.set()
 		log("shutdown")
+		self.tickets.stop()
 		sessions = self.table.snapshot()
 		for sess in sessions:
 			try:
@@ -1462,6 +1858,77 @@ class Control:
 		with self.daemon.table.lock:
 			target = self.daemon.ledger.follow(name, self.daemon.table)
 		return {"ok": True, "target": target}
+
+	# -- command offloading (tickets) -------------------------------------
+
+	def ticket_submit(self, req):
+		session = req.get("session")
+		dir_ = req.get("cwd")
+		command = req.get("command")
+		env = req.get("env")
+		if not (isinstance(session, str) and session
+				and isinstance(dir_, str) and os.path.isabs(dir_)
+				and os.path.isdir(dir_)
+				and isinstance(command, str) and command):
+			return bad_request()
+		if env is not None and not (isinstance(env, dict)
+									and all(isinstance(k, str) and isinstance(v, str)
+										for k, v in env.items())):
+			return bad_request()
+		if self.daemon.tickets.running_count() >= TICKET_MAX_RUNNING:
+			return err("too-busy")
+		try:
+			rec = self.daemon.tickets.submit(session, dir_, command, env)
+		except OSError as exc:
+			log("ticket-submit failed: %s" % exc)
+			return err("spawn-failed")
+		if rec is None:
+			return err("too-busy")
+		return {"ok": True, "id": rec["id"], "ticket": rec}
+
+	def ticket_wait(self, req):
+		tid = req.get("id")
+		try:
+			timeout = float(req.get("timeout", 0))
+		except (TypeError, ValueError):
+			return bad_request()
+		if not (isinstance(tid, str) and tid) or timeout < 0:
+			return bad_request()
+		rec = self.daemon.tickets.wait(tid, timeout)
+		if rec is None:
+			return err("no-ticket")
+		return {"ok": True, "ticket": rec}
+
+	def ticket_output(self, req):
+		tid = req.get("id")
+		try:
+			offset = int(req.get("offset", 0))
+		except (TypeError, ValueError):
+			return bad_request()
+		if not (isinstance(tid, str) and tid) or offset < 0:
+			return bad_request()
+		out = self.daemon.tickets.output(tid, offset)
+		if out is None:
+			return err("no-ticket")
+		return {"ok": True, "offset": out["offset"], "next": out["next"],
+				"size": out["size"],
+				"data": base64.b64encode(out["data"]).decode()}
+
+	def ticket_list(self, req):
+		session = req.get("session")
+		if session is not None and not isinstance(session, str):
+			return bad_request()
+		return {"ok": True,
+				"tickets": self.daemon.tickets.store.snapshot(session)}
+
+	def ticket_cancel(self, req):
+		tid = req.get("id")
+		if not (isinstance(tid, str) and tid):
+			return bad_request()
+		rec = self.daemon.tickets.cancel(tid)
+		if rec is None:
+			return err("no-ticket")
+		return {"ok": True, "ticket": rec}
 
 	def shutdown(self, _req):
 		t = threading.Thread(target=self.daemon.shutdown, daemon=True)
