@@ -67,6 +67,14 @@ async function runPi() {
 	}
 }
 
+/** How many ms the bridge keeps the spawner waiting on a ticket before
+ *  handing it off to the daemon. 0 disables the hand-off (always bridge).
+ *  The env name mirrors PI_OFFLOAD_WAIT used for shell offloading. */
+const AGENT_BRIDGE_WAIT_MS = (() => {
+	const raw = Number(process.env.PI_AGENT_OFFLOAD_WAIT || 20000);
+	return Number.isFinite(raw) && raw >= 0 ? raw : 20000;
+})();
+
 /** Bridges a ticket: relays its stdout/stderr to ours and exits with the
  *  child's exit code. Caller-visible behavior is byte-identical to a
  *  direct `pi --mode json -p` child. */
@@ -83,10 +91,40 @@ function bridgeTicket(ticket) {
 		process.exit(143);
 	}
 	const bridge = spawn(PI_RC, ["agent-bridge", ticket], { stdio: "inherit" });
+	let handedOff = false;
+	let bridgeExited = false;
 	bridge.on("error", () => process.exit(1));
 	bridge.on("exit", (code, signal) => {
+		bridgeExited = true;
+		if (handedOff) return;
 		process.exit(signal ? 143 : (code ?? 1));
 	});
+	if (AGENT_BRIDGE_WAIT_MS > 0) {
+		// Delegate completion to the ticket side of the hand-off: wait up
+		// to the bound for the run to finish inline; if it is still going,
+		// hand it off to the daemon and return now. The spawner (ADP) only
+		// ever observes a child that completed, so it stays agnostic.
+		const detachAt = setTimeout(() => {
+			if (bridgeExited) return;
+			handedOff = true;
+			try {
+				spawnSync(PI_RC, ["agent-detach", ticket], { stdio: "ignore" });
+			} catch {
+				// daemon unreachable: nothing left to mark
+			}
+			process.stdout.write(
+				`{"type":"agent_handoff","ticket":"${ticket}"}\n`);
+			try {
+				bridge.kill("SIGTERM");
+			} catch {
+				// already gone
+			}
+			process.exit(0);
+		}, AGENT_BRIDGE_WAIT_MS);
+		// The happy path must clear the timer so a run that finishes right
+		// at the bound does not double-exit.
+		bridge.on("exit", () => clearTimeout(detachAt));
+	}
 	return undefined; // exiting happens via the bridge handlers
 }
 
@@ -117,9 +155,17 @@ function adoptRecentAgent() {
 function offload() {
 	let submitted;
 	try {
+		// The ticket's owning session for completion routing: the hosted
+		// session key survives ADP's PI_HOSTED_* stripping because the
+		// session holds it under PI_PTYD_SESSKEY, then PI_HOSTED_SESSION,
+		// then the session-file stem for plain runs.
+		const sessKey = process.env.PI_PTYD_SESSKEY
+			|| process.env.PI_HOSTED_SESSION
+			|| (process.env.PI_SESSION_FILE || "").split("/").pop()
+				?.replace(/\.jsonl$/, "") || "";
 		submitted = spawnSync(
 			PI_RC,
-			["agent-submit", "--session", process.env.PI_HOSTED_SESSION || "",
+			["agent-submit", "--session", sessKey,
 				"--cwd", process.cwd(), "--pi", SELF, "--", ...args],
 			{ encoding: "utf8" },
 		);

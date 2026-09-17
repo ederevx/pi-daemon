@@ -79,6 +79,7 @@ interface Ticket {
 	command: string;
 	status: "running" | "done" | "failed" | "cancelled" | "lost";
 	kind?: "shell" | "agent";
+	detached?: boolean;
 	created: number;
 	started: number;
 	finished: number | null;
@@ -254,6 +255,31 @@ class TicketClient {
 		const out = await this.run(["ticket-cancel", id]);
 		return this.wait(id, 0);
 	}
+
+	/** Reads a whole agent ticket's stdout log (same bounded loop). */
+	async agentOutput(id: string): Promise<string> {
+		const parts: Buffer[] = [];
+		let offset = 0;
+		for (let i = 0; i < 256; i++) {
+			const out = await this.run(["agent-output", id, String(offset)]);
+			const chunk = Buffer.from(out, "binary");
+			if (chunk.length === 0) break;
+			parts.push(chunk);
+			offset += chunk.length;
+		}
+		return Buffer.concat(parts).toString("utf8");
+	}
+
+	async agentList(session?: string): Promise<Ticket[]> {
+		const args = ["agent-list"];
+		if (session) args.push(session);
+		const out = await this.run(args);
+		return out
+			.trim()
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line) as Ticket);
+	}
 }
 
 /**
@@ -277,6 +303,12 @@ class DaemonTasks {
 
 	/** Tickets whose result was already fetched by an explicit call. */
 	private fetched = new Set<string>();
+
+	/** Detached-agent delivery state: latest snapshot per detached agent
+	 *  ticket plus the single poller timer (see startAgentWatch). */
+	private agentSeen = new Map<string, Ticket>();
+	private agentWatchTimer: ReturnType<typeof setTimeout> | undefined;
+	private agentWatchInFlight = false;
 
 	constructor(
 		exec: TicketClient["exec"],
@@ -305,6 +337,70 @@ class DaemonTasks {
 			this.sessionKey(sessionFile), cwd, command, extraEnv);
 		this.armDelivery(id, command);
 		return id;
+	}
+
+	/** Starts the detached-agent watcher: a single serialized poller that
+	 *  watches this session's agent tickets flagged `detached` (the front
+	 *  marked them "handed off to the daemon") for running -> terminal
+	 *  transitions, then delivers the same one-line card + display:false
+	 *  steer a shell ticket would have produced inline. */
+	startAgentWatch(): void {
+		if (this.agentWatchTimer !== undefined) return;
+		this.agentWatchTimer = setTimeout(
+			() => void this.agentWatchTick(), AGENT_WATCH_TICK_MS);
+	}
+
+	private async agentWatchTick(): Promise<void> {
+		if (this.agentWatchInFlight) return;
+		this.agentWatchInFlight = true;
+		try {
+			let tickets: Ticket[] = [];
+			try {
+				tickets = await this.client.agentList(this.sessionKey());
+			} catch {
+				// daemon unreachable or reset: retry next tick
+			}
+			const current = new Set<string>();
+			for (const t of tickets) {
+				if (t.kind !== "agent" || !t.detached) continue;
+				current.add(t.id);
+				const prev = this.agentSeen.get(t.id);
+				this.agentSeen.set(t.id, t);
+				if (prev !== undefined && prev.status === "running"
+					&& t.status !== "running") {
+					void this.deliverAgentDone(t);
+				}
+			}
+			for (const [id, t] of this.agentSeen) {
+				if (t.status !== "running" && !current.has(id)) {
+					this.agentSeen.delete(id);
+				}
+			}
+		} finally {
+			this.agentWatchInFlight = false;
+			this.agentWatchTimer = setTimeout(
+				() => void this.agentWatchTick(), AGENT_WATCH_TICK_MS);
+		}
+	}
+
+	private async deliverAgentDone(ticket: Ticket): Promise<void> {
+		let output = "";
+		try {
+			output = await this.client.agentOutput(ticket.id);
+		} catch {
+			// keep the card even when the output fetch failed
+		}
+		this.append("daemon-task", { ticket });
+		this.send(
+			{
+				customType: "daemon-task",
+				content: `Background task finished (detached): `
+					+ `${ticket.command}\n${formatResult(ticket, output)}`,
+				display: false,
+				details: { ticket },
+			},
+			{ triggerTurn: true, deliverAs: "steer" },
+		);
 	}
 
 	status(id: string): Promise<Ticket> {
@@ -437,6 +533,9 @@ async function adoptRecentShellTicket(
 		return null;
 	}
 }
+
+/** Detached-agent watcher poll cadence. */
+const AGENT_WATCH_TICK_MS = 5000;
 
 /** Character-wrap text to width (0/negative width returns it as-is). */
 function wrapLine(text: string, width: number): string[] {
@@ -683,12 +782,19 @@ class DaemonTasksDock {
 }
 
 export default function (pi: ExtensionAPI) {
+	// Detach routing: hand the hosted session key to spawned children
+	// under a name ADP does not strip, so the front can record the
+	// owning session on the agent tickets it creates.
+	if (process.env.PI_HOSTED_SESSION && !process.env.PI_PTYD_SESSKEY) {
+		process.env.PI_PTYD_SESSKEY = process.env.PI_HOSTED_SESSION;
+	}
 	const exec = (file: string, args: string[]) => pi.exec(file, args);
 	const tasks = new DaemonTasks(exec, (message, options) => {
 		void pi.sendMessage(message, options);
 	}, (customType, data) => {
 		void pi.appendEntry(customType, data);
 	});
+	tasks.startAgentWatch();
 
 	// Static one-line card; full detail lives in /daemon-tasks.
 	pi.registerEntryRenderer("daemon-task", (entry, _opts, theme) => {

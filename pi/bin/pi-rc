@@ -101,6 +101,9 @@
 #                                      stderr chunk since erhoff to stderr
 #   pi-rc agent-cancel <id>             TERM then KILL a running agent
 #   pi-rc agent-list [session]          agent-kind tickets, JSON lines
+#   pi-rc agent-detach <id>             mark an agent ticket handed off to
+#                                      the daemon so its owner's session
+#                                      notifies on completion
 #   pi-rc agent-bridge <id>             relay an agent ticket's stdout and
 #                                      stderr to this process's streams
 #                                      until it finishes, then exit with
@@ -163,7 +166,8 @@ _COMMANDS = ("which", "whichall", "state", "carry", "resume", "start",
 			 "ticket-submit", "ticket-wait", "ticket-output",
 			 "ticket-list", "ticket-cancel", "ticket-remove", "tickets-reset",
 			 "agent-submit", "agent-wait", "agent-output",
-			 "agent-cancel", "agent-list", "agent-bridge")
+			 "agent-cancel", "agent-list", "agent-detach",
+			 "agent-bridge")
 
 
 def die(msg, code=EXIT_USAGE):
@@ -1263,6 +1267,14 @@ def cmd_agent_cancel(args, client):
 		  % (args[0], resp["ticket"].get("status", "?")))
 
 
+def cmd_agent_detach(args, client):
+	if len(args) != 1:
+		usage_error("agent-detach takes exactly one ticket id")
+	resp = client.control({"cmd": "agent-detach", "id": args[0]})
+	if not resp.get("ok"):
+		die("agent-detach failed: %s" % resp.get("error"))
+
+
 def cmd_agent_list(args, client):
 	if len(args) > 1:
 		usage_error("agent-list takes an optional session name")
@@ -1364,7 +1376,7 @@ def main():
 		 "ticket-cancel": cmd_ticket_cancel, "ticket-remove": cmd_ticket_remove,
 		 "tickets-reset": cmd_tickets_reset,
 		 "agent-submit": cmd_agent_submit, "agent-wait": cmd_agent_wait,
-		 "agent-output": cmd_agent_output, "agent-cancel": cmd_agent_cancel,
+		 "agent-output": cmd_agent_output, "agent-cancel": cmd_agent_cancel, "agent-detach": cmd_agent_detach,
 		 "agent-list": cmd_agent_list, "agent-bridge": cmd_agent_bridge,
 		 }[cmd](rest, client)
 	elif cmd == "help":
