@@ -45,6 +45,7 @@ import {
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import {
+	Box,
 	matchesKey,
 	Text,
 	truncateToWidth,
@@ -269,6 +270,7 @@ class DaemonTasks {
 		message: { customType: string; content: string; display: boolean; details?: unknown },
 		options: { triggerTurn: boolean; deliverAs: "steer" | "followUp" },
 	) => void;
+	private readonly append: (customType: string, data: unknown) => void;
 
 	/** ticket id -> live watcher; owning object mutates this only. */
 	private watchers = new Map<string, { stopped: boolean }>();
@@ -279,9 +281,11 @@ class DaemonTasks {
 	constructor(
 		exec: TicketClient["exec"],
 		send: DaemonTasks["send"],
+		append: DaemonTasks["append"],
 	) {
 		this.client = new TicketClient(exec);
 		this.send = send;
+		this.append = append;
 	}
 
 	/** The owning session's stable key: the hosted session's short name
@@ -366,11 +370,14 @@ class DaemonTasks {
 				// its next model call, so it learns the task completed
 				// instead of re-running it. followUp waits for full idle,
 				// which let agents duplicate work.
+				// The user sees a one-line card (expandable via ctrl+o or
+				// click); the agent gets the full result invisibly.
+				this.append("daemon-task", { ticket, output, command });
 				this.send(
 					{
 						customType: "daemon-task",
 						content: `Background task finished: ${command}\n${formatResult(ticket, output)}`,
-						display: true,
+						display: false,
 						details: { ticket },
 					},
 					{ triggerTurn: true, deliverAs: "steer" },
@@ -452,7 +459,6 @@ function sessionEnvExtra(env?: NodeJS.ProcessEnv): Record<string, string> {
 
 interface TaskRow {
 	ticket: Ticket;
-	group: string;
 }
 
 /** Settings-styled dock listing every daemon ticket across sessions:
@@ -466,6 +472,8 @@ class DaemonTasksDock {
 	private readonly client: TicketClient;
 	private rows: TaskRow[] = [];
 	private selected = 0;
+	private expandedId: string | null = null;
+	private readonly outputs = new Map<string, string>();
 	private pollTimer: ReturnType<typeof setTimeout> | undefined;
 	private lastError: string | null = null;
 	private rowMap: { y: number; index: number }[] = [];
@@ -504,12 +512,11 @@ class DaemonTasksDock {
 	private async poll(): Promise<void> {
 		try {
 			const tickets = await this.client.list();
-			const running = tickets.filter((t) => t.status === "running");
-			const finished = tickets.filter((t) => t.status !== "running");
-			this.rows = [
-				...running.map((ticket) => ({ ticket, group: "Running" })),
-				...finished.map((ticket) => ({ ticket, group: "Finished" })),
-			];
+			// Latest first, top to bottom.
+			this.rows = tickets
+				.sort((a, b) =>
+					(b.started ?? b.created) - (a.started ?? a.created))
+				.map((ticket) => ({ ticket }));
 			this.lastError = null;
 		} catch (err) {
 			this.rows = [];
@@ -533,7 +540,7 @@ class DaemonTasksDock {
 			lines.push(...this.renderBody(width));
 		}
 		lines.push(this.st.hint(truncateToWidth(
-			"  up/down navigate - enter cancel/remove - esc close (live)", width)));
+			"  up/down navigate - enter expand - c cancel/remove - esc close (live)", width)));
 		lines.push(...this.border.render(width));
 		return lines;
 	}
@@ -553,13 +560,26 @@ class DaemonTasksDock {
 			this.selected = (this.selected + 1) % this.rows.length;
 		} else if (matchesKey(data, "enter") || data === " ") {
 			const row = this.rows[this.selected];
-			if (row.ticket.status === "running") {
-				void this.client.cancel(row.ticket.id)
-					.catch(() => undefined).then(() => this.poll());
+			const id = row.ticket.id;
+			if (this.expandedId === id) {
+				this.expandedId = null;
 			} else {
-				void this.client.remove(row.ticket.id)
-					.catch(() => undefined).then(() => this.poll());
+				this.expandedId = id;
+				if (!this.outputs.has(id)) {
+					// Cache the full output once; the expanded view reads
+					// it from the cache on every render.
+					void this.client.outputAll(id).then((output) => {
+						this.outputs.set(id, output);
+						this.tui?.requestRender();
+					}).catch(() => this.poll());
+				}
 			}
+		} else if (data === "c") {
+			const row = this.rows[this.selected];
+			const action = row.ticket.status === "running"
+				? this.client.cancel(row.ticket.id)
+				: this.client.remove(row.ticket.id);
+			void action.catch(() => undefined).then(() => this.poll());
 			return;
 		} else return;
 		this.tui?.requestRender();
@@ -589,29 +609,41 @@ class DaemonTasksDock {
 		const endIndex = Math.min(startIndex + maxVisible, this.rows.length);
 		const lines: string[] = [];
 		this.rowMap = [];
-		let prevGroup = "";
 		const now = Date.now() / 1000;
 		for (let i = startIndex; i < endIndex; i++) {
 			const row = this.rows[i];
-			if (row.group !== prevGroup) {
-				if (prevGroup !== "") lines.push("");
-				const count = this.rows.filter((r) => r.group === row.group).length;
-				lines.push(truncateToWidth(`\x1b[1m${row.group} (${count})\x1b[22m`, width));
-				prevGroup = row.group;
-			}
 			const isSelected = i === this.selected;
 			const prefix = isSelected ? this.st.cursor : "  ";
 			const t = row.ticket;
-			const age = Math.max(0, Math.round((t.finished ?? now) - (t.started ?? t.created)));
-			const label = `${t.id}  ${t.session}`;
-			const value = `${t.status}${t.exit !== null ? ` exit ${t.exit}` : ""} - ${age}s - ${
-				t.command.length > 44 ? t.command.slice(0, 41) + "..." : t.command}`;
+			const when = new Date((t.started ?? t.created) * 1000)
+				.toLocaleTimeString("en-GB");
+			const label = `${t.id}  ${when}`;
+			const value = `${t.status}${t.exit !== null ? ` exit ${t.exit}` : ""} - ${
+				t.command.length > 40 ? t.command.slice(0, 37) + "..." : t.command}`;
 			lines.push(truncateToWidth(
 				prefix
-					+ this.st.label(truncateToWidth(label, 22) + "  ", isSelected)
+					+ this.st.label(truncateToWidth(label, 16) + "  ", isSelected)
 					+ this.st.value(value, isSelected),
 				width));
 			this.rowMap.push({ y: lines.length, index: i });
+			if (this.expandedId === t.id) {
+				// Expanded detail: full command, timestamp, output tail.
+				lines.push(this.st.hint(truncateToWidth(
+					`    ${t.command}`, width)));
+				const output = this.outputs.get(t.id);
+				if (output !== undefined) {
+					const trunc = truncateTail(output, {
+						maxLines: 14, maxBytes: 8 << 10,
+					});
+					for (const line of trunc.content.split("\n")) {
+						lines.push(this.st.hint(truncateToWidth(
+							`    ${line}`, width)));
+					}
+				} else {
+					lines.push(this.st.hint(truncateToWidth(
+						"    loading output...", width)));
+				}
+			}
 		}
 		if (startIndex > 0 || endIndex < this.rows.length) {
 			lines.push(this.st.hint(truncateToWidth(
@@ -625,6 +657,35 @@ export default function (pi: ExtensionAPI) {
 	const exec = (file: string, args: string[]) => pi.exec(file, args);
 	const tasks = new DaemonTasks(exec, (message, options) => {
 		void pi.sendMessage(message, options);
+	}, (customType, data) => {
+		void pi.appendEntry(customType, data);
+	});
+
+	// One-line collapsed card; full output on expand (ctrl+o / click).
+	pi.registerEntryRenderer("daemon-task", (entry, { expanded }, theme) => {
+		const data = (entry.data ?? {}) as {
+			ticket?: Ticket; output?: string; command?: string;
+		};
+		const t = data.ticket;
+		if (!t) return new Text("daemon task", 0, 0);
+		const when = new Date((t.finished ?? t.created) * 1000)
+			.toLocaleTimeString("en-GB");
+		const head = `${t.id} ${t.status} - ${when}` +
+			(t.exit !== null ? ` - exit ${t.exit}` : "");
+		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+		box.addChild(new Text(theme.bold(head)));
+		if (!expanded) {
+			box.addChild(new Text(theme.fg("dim", "  ctrl+o to expand")));
+			return box;
+		}
+		box.addChild(new Text(theme.fg("dim", `  ${data.command ?? t.command}`)));
+		const trunc = truncateTail(data.output ?? "", {
+			maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES,
+		});
+		for (const line of trunc.content.split("\n")) {
+			box.addChild(new Text(theme.fg("dim", `  ${line}`)));
+		}
+		return box;
 	});
 	const localBash: BashOperations = createLocalBashOperations();
 
