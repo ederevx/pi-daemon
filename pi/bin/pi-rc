@@ -146,7 +146,11 @@ MAX_BUF = 1 << 20        # per-direction bridge buffer bound (backpressure)
 EXIT_OK = 0
 EXIT_USAGE = 1
 EXIT_HOSTED = 3          # handover: the session is already hosted
-EXIT_NO_DAEMON = 4       # control socket unreachable
+EXIT_NO_DAEMON = 4       # control socket unreachable (before any request
+                         # landed: safe to run the task locally instead)
+EXIT_AMBIGUOUS = 7       # the request was sent but the outcome is unknown:
+                         # the daemon may have acted on it, so callers must
+                         # NOT blindly re-run the task locally
 
 USAGE_LINE = "usage: pi-rc <command> [args]; run 'pi-rc help' for details"
 
@@ -282,11 +286,13 @@ class DaemonClient:
 			send_json(sock, req)
 			resp, _ = read_json_line(sock)
 		except OSError as exc:
-			die("control connection failed: %s" % exc)
+			# The request may already have been acted on: ambiguous.
+			die("control connection failed: %s" % exc, EXIT_AMBIGUOUS)
 		finally:
 			sock.close()
 		if resp is None:
-			die("daemon closed the connection without a response")
+			die("daemon closed the connection without a response",
+				EXIT_AMBIGUOUS)
 		return resp
 
 	def alive(self):
