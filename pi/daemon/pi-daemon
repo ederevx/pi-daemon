@@ -790,6 +790,11 @@ class AgentTicketRunner:
 			argv = [self.node_path, self.front_path] + run_args
 			env_run = dict(env_run)
 			env_run["PI_DAEMON_AGENT_CHILD"] = "1"
+		# A delegation child is a plain worker, not a hosted session: strip
+		# the hosting identity so the child's own daemon extension cannot
+		# announce or publish state against the parent's live session.
+		env_run.pop("PI_HOSTED", None)
+		env_run.pop("PI_HOSTED_SESSION", None)
 		rec = {"id": tid, "kind": "agent", "session": session, "cwd": cwd,
 			   "command": " ".join(argv), "status": "running",
 			   "created": time.time(), "started": time.time(),
