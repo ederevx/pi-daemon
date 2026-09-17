@@ -38,10 +38,21 @@ import {
 	truncateTail,
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
+	DynamicBorder,
+	getSettingsListTheme,
 	type BashOperations,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import {
+	matchesKey,
+	Text,
+	truncateToWidth,
+	visibleWidth,
+	type Component,
+	type TUI,
+	type TuiMouseEvent,
+} from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -395,6 +406,179 @@ function sessionEnvExtra(env?: NodeJS.ProcessEnv): Record<string, string> {
 	return extra;
 }
 
+// -- /daemon-tasks dock (derived from the subagents dock interface) ----
+
+interface TaskRow {
+	ticket: Ticket;
+	group: string;
+}
+
+/** Settings-styled dock listing every daemon ticket across sessions:
+ *  Running first, then Finished. Enter cancels a running ticket or
+ *  removes a finished one; the owning session's own watcher delivers
+ *  the cancellation notice when it is still alive. The list live-polls
+ *  the daemon once a second while mounted. */
+class DaemonTasksDock {
+	private readonly st = getSettingsListTheme();
+	private readonly border = new DynamicBorder((s: string) => this.theme?.fg("border", s) ?? s);
+	private readonly client: TicketClient;
+	private rows: TaskRow[] = [];
+	private selected = 0;
+	private pollTimer: ReturnType<typeof setTimeout> | undefined;
+	private lastError: string | null = null;
+	private rowMap: { y: number; index: number }[] = [];
+	private tui: TUI | null = null;
+	private theme: { fg: (role: string, text: string) => string } | null = null;
+	private done: ((result: null) => void) | null = null;
+
+	constructor(client: TicketClient) {
+		this.client = client;
+	}
+
+	/** Mounts the dock like /settings (non-overlay ui.custom) and blocks
+	 *  until Esc; cancel/remove actions happen in-view and refresh. */
+	async run(ui: any): Promise<void> {
+		try {
+			await ui.custom((tui: TUI, theme: any, _kb: any, done: (r: null) => void) => {
+				void _kb;
+				this.tui = tui;
+				this.theme = theme;
+				this.done = done;
+				void this.poll();
+				return this as unknown as Component;
+			});
+		} catch {
+			/* dock unavailable or canceled */
+		} finally {
+			this.stop();
+		}
+	}
+
+	stop(): void {
+		if (this.pollTimer) clearTimeout(this.pollTimer);
+		this.pollTimer = undefined;
+	}
+
+	private async poll(): Promise<void> {
+		try {
+			const tickets = await this.client.list();
+			const running = tickets.filter((t) => t.status === "running");
+			const finished = tickets.filter((t) => t.status !== "running");
+			this.rows = [
+				...running.map((ticket) => ({ ticket, group: "Running" })),
+				...finished.map((ticket) => ({ ticket, group: "Finished" })),
+			];
+			this.lastError = null;
+		} catch (err) {
+			this.rows = [];
+			this.lastError = err instanceof Error ? err.message : String(err);
+		}
+		if (this.selected >= this.rows.length) {
+			this.selected = Math.max(0, this.rows.length - 1);
+		}
+		this.tui?.requestRender();
+		this.pollTimer = setTimeout(() => void this.poll(), 1000);
+	}
+
+	render(width: number): string[] {
+		const lines = [...this.border.render(width)];
+		if (this.rows.length === 0) {
+			const msg = this.lastError
+				? `  Daemon unreachable: ${this.lastError}`
+				: "  No daemon tickets.";
+			lines.push(this.st.hint(truncateToWidth(msg, width)));
+		} else {
+			lines.push(...this.renderBody(width));
+		}
+		lines.push(this.st.hint(truncateToWidth(
+			"  up/down navigate - enter cancel/remove - esc close (live)", width)));
+		lines.push(...this.border.render(width));
+		return lines;
+	}
+
+	invalidate(): void {}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+			this.stop();
+			this.done?.(null);
+			return;
+		}
+		if (this.rows.length === 0) return;
+		if (matchesKey(data, "up")) {
+			this.selected = (this.selected - 1 + this.rows.length) % this.rows.length;
+		} else if (matchesKey(data, "down")) {
+			this.selected = (this.selected + 1) % this.rows.length;
+		} else if (matchesKey(data, "enter") || data === " ") {
+			const row = this.rows[this.selected];
+			if (row.ticket.status === "running") {
+				void this.client.cancel(row.ticket.id)
+					.catch(() => undefined).then(() => this.poll());
+			} else {
+				void this.client.remove(row.ticket.id)
+					.catch(() => undefined).then(() => this.poll());
+			}
+			return;
+		} else return;
+		this.tui?.requestRender();
+	}
+
+	handleMouse(event: TuiMouseEvent): { handled: boolean } {
+		if (this.rows.length === 0) return { handled: false };
+		if (event.type === "wheel") {
+			this.selected =
+				(this.selected + (event.wheelDelta && event.wheelDelta < 0 ? -1 : 1)
+					+ this.rows.length) % this.rows.length;
+		} else if (event.type === "press" || event.type === "click") {
+			const row = this.rowMap.find((r) => r.y === event.y);
+			if (!row) return { handled: false };
+			this.selected = row.index;
+		} else return { handled: false };
+		this.tui?.requestRender();
+		return { handled: true };
+	}
+
+	private renderBody(width: number): string[] {
+		const maxVisible = Math.min(this.rows.length, 12);
+		const startIndex = Math.max(
+			0,
+			Math.min(this.selected - Math.floor(maxVisible / 2), this.rows.length - maxVisible),
+		);
+		const endIndex = Math.min(startIndex + maxVisible, this.rows.length);
+		const lines: string[] = [];
+		this.rowMap = [];
+		let prevGroup = "";
+		const now = Date.now() / 1000;
+		for (let i = startIndex; i < endIndex; i++) {
+			const row = this.rows[i];
+			if (row.group !== prevGroup) {
+				if (prevGroup !== "") lines.push("");
+				const count = this.rows.filter((r) => r.group === row.group).length;
+				lines.push(truncateToWidth(`\x1b[1m${row.group} (${count})\x1b[22m`, width));
+				prevGroup = row.group;
+			}
+			const isSelected = i === this.selected;
+			const prefix = isSelected ? this.st.cursor : "  ";
+			const t = row.ticket;
+			const age = Math.max(0, Math.round((t.finished ?? now) - (t.started ?? t.created)));
+			const label = `${t.id}  ${t.session}`;
+			const value = `${t.status}${t.exit !== null ? ` exit ${t.exit}` : ""} - ${age}s - ${
+				t.command.length > 44 ? t.command.slice(0, 41) + "..." : t.command}`;
+			lines.push(truncateToWidth(
+				prefix
+					+ this.st.label(truncateToWidth(label, 22) + "  ", isSelected)
+					+ this.st.value(value, isSelected),
+				width));
+			this.rowMap.push({ y: lines.length, index: i });
+		}
+		if (startIndex > 0 || endIndex < this.rows.length) {
+			lines.push(this.st.hint(truncateToWidth(
+				`  (${this.selected + 1}/${this.rows.length})`, width)));
+		}
+		return lines;
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	const exec = (file: string, args: string[]) => pi.exec(file, args);
 	const tasks = new DaemonTasks(exec, (message, options) => {
@@ -651,5 +835,20 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", async () => {
 		tasks.stopWatching();
+	});
+
+	// User-facing dock: see every daemon ticket, cancel running ones,
+	// remove finished ones. Cancelling notifies the owning session's own
+	// watcher (a follow-up message) whenever that session still exists.
+	pi.registerCommand("daemon-tasks", {
+		description:
+			"Browse daemon tickets (all sessions); cancel running, remove finished",
+		handler: async (_args, cmdCtx) => {
+			if (cmdCtx.mode !== "tui") {
+				cmdCtx.ui?.notify?.("daemon-tasks requires the interactive TUI", "warning");
+				return;
+			}
+			await new DaemonTasksDock(tasks.client).run(cmdCtx.ui);
+		},
 	});
 }

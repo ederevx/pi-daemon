@@ -2387,7 +2387,12 @@ class Control:
 		tid = req.get("id")
 		if not (isinstance(tid, str) and tid):
 			return bad_request()
-		rec = self.daemon.tickets.cancel(tid)
+		rec = self.daemon.tickets.store.get(tid)
+		if rec is None:
+			return err("no-ticket")
+		runner = (self.daemon.agents if rec.get("kind") == "agent"
+				  else self.daemon.tickets)
+		rec = runner.cancel(tid)
 		if rec is None:
 			return err("no-ticket")
 		return {"ok": True, "ticket": rec}
