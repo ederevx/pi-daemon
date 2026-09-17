@@ -67,8 +67,53 @@ async function runPi() {
 	}
 }
 
+/** Bridges a ticket: relays its stdout/stderr to ours and exits with the
+ *  child's exit code. Caller-visible behavior is byte-identical to a
+ *  direct `pi --mode json -p` child. */
+function bridgeTicket(ticket) {
+	process.on("SIGTERM", onSignal);
+	process.on("SIGINT", onSignal);
+	process.on("SIGHUP", onSignal);
+	function onSignal() {
+		try {
+			spawnSync(PI_RC, ["agent-cancel", ticket], { stdio: "ignore" });
+		} catch {
+			// daemon unreachable: the ticket is orphaned by design
+		}
+		process.exit(143);
+	}
+	const bridge = spawn(PI_RC, ["agent-bridge", ticket], { stdio: "inherit" });
+	bridge.on("error", () => process.exit(1));
+	bridge.on("exit", (code, signal) => {
+		process.exit(signal ? 143 : (code ?? 1));
+	});
+	return undefined; // exiting happens via the bridge handlers
+}
+
+/** Ambiguous agent-submit recovery: find an agent ticket created recently
+ *  whose command ends with our exact pi args, so a lost submit reply
+ *  never leads to re-running the delegation. */
+function adoptRecentAgent() {
+	try {
+		const listed = spawnSync(PI_RC, ["agent-list"], { encoding: "utf8" });
+		if (listed.status !== 0) return null;
+		const cutoff = Date.now() / 1000 - 60;
+		const suffix = " " + args.join(" ");
+		const matches = (listed.stdout || "").trim().split("\n").filter(Boolean)
+			.map((line) => JSON.parse(line))
+			.filter((t) => typeof t.command === "string"
+				&& t.command.endsWith(suffix) && (t.created ?? 0) >= cutoff);
+		return matches.length ? matches[matches.length - 1].id : null;
+	} catch {
+		return null;
+	}
+}
+
 /** Hands a delegation to the daemon and bridges it. Returns null to fall
- *  back to running pi directly when the daemon is unavailable. */
+ *  back to running pi directly when the daemon is unavailable or the
+ *  submit was deterministically refused. Exit 7 (ambiguous - the request
+ *  was sent but the outcome is unknown) adopts a matching recent ticket
+ *  instead of ever re-running the delegation. */
 function offload() {
 	let submitted;
 	try {
@@ -82,28 +127,12 @@ function offload() {
 		return null; // pi-rc vanished
 	}
 	const id = /^ticket (\S+)$/m.exec((submitted.stdout || "").trim());
-	if (submitted.status !== 0 || !id) return null;
-	const ticket = id[1];
-	process.on("SIGTERM", onSignal);
-	process.on("SIGINT", onSignal);
-	process.on("SIGHUP", onSignal);
-	function onSignal() {
-		try {
-			spawnSync(PI_RC, ["agent-cancel", ticket], { stdio: "ignore" });
-		} catch {
-			// daemon unreachable: the ticket is orphaned by design
-		}
-		process.exit(143);
+	if (submitted.status === 0 && id) return bridgeTicket(id[1]);
+	if (submitted.status === 7) {
+		const adopted = adoptRecentAgent();
+		return adopted ? bridgeTicket(adopted) : null;
 	}
-	// The bridge relays the ticket's stdout/stderr to ours and exits with
-	// the child's exit code; caller-visible behavior is byte-identical to
-	// a direct `pi --mode json -p` child.
-	const bridge = spawn(PI_RC, ["agent-bridge", ticket], { stdio: "inherit" });
-	bridge.on("error", () => process.exit(1));
-	bridge.on("exit", (code, signal) => {
-		process.exit(signal ? 143 : (code ?? 1));
-	});
-	return undefined; // exiting happens via the bridge handlers
+	return null; // unreachable or deterministically refused: safe to run pi
 }
 
 (async () => {
