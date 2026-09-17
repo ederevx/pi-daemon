@@ -138,6 +138,10 @@ TICKET_MAX_WAIT = 600.0      # cap on a single ticket-wait round trip
 # stream would corrupt the result.
 AGENT_MAX_RUNNING = 16
 AGENT_OUTPUT_MAX = 64 << 20
+# Headless pi keeps the process alive after a run settles (background
+# listeners), so the daemon stops the child itself shortly after the
+# agent_settled marker instead of waiting forever for an exit.
+AGENT_SETTLE_GRACE = float(os.environ.get("PI_PTYD_AGENT_GRACE", 3.0))
 AGENT_CHUNK = 256 << 10      # max bytes per stream per agent-output reply
 # The pi-compatible front entry: hosted sessions and offloaded
 # delegation children run through it so argv[1] resolves delegation
@@ -753,6 +757,7 @@ class AgentTicketRunner:
 		self._lock = threading.Lock()
 		self._procs = {}    # tid -> Popen, under _lock
 		self._stops = {}    # tid -> cancellation reason, under _lock
+		self._settled = {}  # tid -> settle time, under _lock
 
 	def running_count(self):
 		with self._lock:
@@ -945,6 +950,7 @@ class AgentTicketRunner:
 				while b"\n" in line_buf:
 					line, line_buf = line_buf.split(b"\n", 1)
 					self._count_event(tid, line, max_turns)
+					self._note_settled(tid, line)
 		finally:
 			if logf is not None:
 				logf.close()
@@ -954,6 +960,48 @@ class AgentTicketRunner:
 				pass
 			code = proc.wait()
 		self._finish(tid, code, truncated)
+
+	def _note_settled(self, tid, line):
+		# The stream ends with {"type":"agent_settled"} once the run is
+		# complete. pi does not exit on its own after that marker (it
+		# keeps background listeners alive), so arm the settle-kill once:
+		# after a short grace the child is stopped and the ticket is
+		# finished as a normal completion instead of hanging "running".
+		try:
+			obj = json.loads(line.decode("utf-8", "replace"))
+		except (ValueError, UnicodeDecodeError):
+			return
+		if not isinstance(obj, dict) or obj.get("type") != "agent_settled":
+			return
+		with self._lock:
+			if self._settled.get(tid):
+				return
+			self._settled[tid] = time.time()
+			proc = self._procs.get(tid)
+		if proc is None or proc.poll() is not None:
+			return
+
+		def killer():
+			time.sleep(AGENT_SETTLE_GRACE)
+			with self._lock:
+				settled = tid in self._settled
+				target = self._procs.get(tid) if settled else None
+			if target is None or target.poll() is not None:
+				return
+			try:
+				os.killpg(target.pid, signal.SIGTERM)
+			except OSError:
+				pass
+			deadline = time.time() + KILL_GRACE
+			while time.time() < deadline and target.poll() is None:
+				time.sleep(0.05)
+			if target.poll() is None:
+				try:
+					os.killpg(target.pid, signal.SIGKILL)
+				except OSError:
+					pass
+
+		threading.Thread(target=killer, daemon=True).start()
 
 	def _pump(self, tid, stream):
 		# Stderr drain: separate log, never merged with the NDJSON stream.
@@ -990,6 +1038,7 @@ class AgentTicketRunner:
 		with self._lock:
 			self._procs.pop(tid, None)
 			reason = self._stops.pop(tid, None)
+			settled = self._settled.pop(tid, None) is not None
 		fields = {"status": "done" if code == 0 else "failed",
 				  "exit": code if code >= 0 else None,
 				  "term": -code if code < 0 else None,
@@ -997,6 +1046,12 @@ class AgentTicketRunner:
 		if reason is not None:
 			fields["status"] = "cancelled"
 			fields["error"] = reason
+		elif settled:
+			# The run completed; we stopped the lingering process. A
+			# termination after settle is a normal completion, not a
+			# failure: report exit 0 with the signal noted.
+			fields["status"] = "done"
+			fields["exit"] = 0
 		self.store.update(tid, **fields)
 		log("agent-done '%s' status %s" % (tid, fields["status"]))
 
