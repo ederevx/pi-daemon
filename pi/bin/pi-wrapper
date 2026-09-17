@@ -33,7 +33,7 @@
 # target is only known after pi opens: the wrapper attaches when every
 # live hosted session in this directory backs ONE distinct conversation
 # (several terminals may share it), and otherwise warns that the picker
-# may duplicate a live session and degrades open — rc-background's
+# may duplicate a live session and degrades open — daemon's
 # post-resume notice then points at the live holder. An unreachable
 # daemon, an unresolvable target, or no match degrades open: the call
 # proceeds exactly as before. If the attach itself fails (e.g. the
@@ -138,7 +138,7 @@ guard_check() {
 		# Attach when every live hosted session in this directory backs
 		# ONE distinct conversation (several terminals may share it);
 		# otherwise warn that the picker may duplicate a live session and
-		# degrade open — rc-background's post-resume notice catches that.
+		# degrade open — daemon's post-resume notice catches that.
 		local -a names=() files=() states=()
 		local name dir _pid _marker state file
 		while IFS=$'\t' read -r name dir _pid _marker state file; do

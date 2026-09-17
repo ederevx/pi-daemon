@@ -52,7 +52,7 @@ them, and can uninstall exactly what it installed.
   wrapper resolves the real binary at install time and is manifest-owned.
   If `pi-rc` is missing or the service is down, the wrapper degrades to
   the real pi so a start always works.
-- **`rc-background` pi extension**: `/bg` runs the moment it is entered,
+- **`daemon` pi extension**: `/bg` runs the moment it is entered,
   even while the agent is mid-turn (pi executes extension commands
   immediately). Inside a hosted session it is an instantaneous detach
   (`pi-rc detach`): the daemon drops the client bridge in milliseconds —
@@ -101,7 +101,7 @@ bash scripts/uninstall.sh
 
 ```
 pi/
-  extensions/rc-background.ts       # /bg: instant detach when hosted, handover otherwise
+  extensions/daemon.ts       # /bg: instant detach when hosted, handover otherwise
   bin/pi-rc                         # client: start/attach/detach/announce/ls/which/stop/handover
   daemon/pi-daemon                      # stdlib Python PTY host daemon
   systemd/pi-daemon.service
