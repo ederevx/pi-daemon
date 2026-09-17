@@ -437,6 +437,16 @@ async function adoptRecentShellTicket(
 	}
 }
 
+/** Character-wrap text to width (0/negative width returns it as-is). */
+function wrapLine(text: string, width: number): string[] {
+	if (width <= 0 || text.length <= width) return [text];
+	const out: string[] = [];
+	for (let i = 0; i < text.length; i += width) {
+		out.push(text.slice(i, i + width));
+	}
+	return out;
+}
+
 /** The session env vars the offloaded command should inherit beyond the
  *  pi process environment pi-rc already forwards. */
 function sessionEnvExtra(env?: NodeJS.ProcessEnv): Record<string, string> {
@@ -644,21 +654,22 @@ class DaemonTasksDock {
 				width));
 			this.rowMap.push({ y: lines.length, index: i });
 			if (this.expandedId === t.id) {
-				// Expanded detail: full command, timestamp, output tail.
-				lines.push(this.st.hint(truncateToWidth(
-					`    ${t.command}`, width)));
+				// Expanded detail: full command and output tail, wrapped.
+				for (const part of wrapLine(t.command, width - 4)) {
+					lines.push(this.st.hint(`    ${part}`));
+				}
 				const output = this.outputs.get(t.id);
 				if (output !== undefined) {
 					const trunc = truncateTail(output, {
 						maxLines: 14, maxBytes: 8 << 10,
 					});
 					for (const line of trunc.content.split("\n")) {
-						lines.push(this.st.hint(truncateToWidth(
-							`    ${line}`, width)));
+						for (const part of wrapLine(line, width - 4)) {
+							lines.push(this.st.hint(`    ${part}`));
+						}
 					}
 				} else {
-					lines.push(this.st.hint(truncateToWidth(
-						"    loading output...", width)));
+					lines.push(this.st.hint("    loading output..."));
 				}
 			}
 		}
@@ -678,7 +689,7 @@ export default function (pi: ExtensionAPI) {
 		void pi.appendEntry(customType, data);
 	});
 
-	// One-line collapsed card; full output on expand (ctrl+o / click).
+	// One line collapsed; command + output tail on expand (ctrl+o/click).
 	pi.registerEntryRenderer("daemon-task", (entry, { expanded }, theme) => {
 		const data = (entry.data ?? {}) as {
 			ticket?: Ticket; output?: string; command?: string;
@@ -689,18 +700,15 @@ export default function (pi: ExtensionAPI) {
 			.toLocaleTimeString("en-GB");
 		const head = `${t.id} ${t.status} - ${when}` +
 			(t.exit !== null ? ` - exit ${t.exit}` : "");
-		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+		if (!expanded) return new Text(theme.bold(head));
+		const box = new Box(1, 0, (text) => theme.bg("customMessageBg", text));
 		box.addChild(new Text(theme.bold(head)));
-		if (!expanded) {
-			box.addChild(new Text(theme.fg("dim", "  ctrl+o to expand")));
-			return box;
-		}
-		box.addChild(new Text(theme.fg("dim", `  ${data.command ?? t.command}`)));
+		box.addChild(new Text(theme.fg("dim", data.command ?? t.command)));
 		const trunc = truncateTail(data.output ?? "", {
 			maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES,
 		});
 		for (const line of trunc.content.split("\n")) {
-			box.addChild(new Text(theme.fg("dim", `  ${line}`)));
+			box.addChild(new Text(theme.fg("dim", line)));
 		}
 		return box;
 	});
