@@ -6,7 +6,7 @@
 # daemon's unix control socket: start/stop sessions, list them, detach and
 # resize them, and attach, which switches the connection into a raw byte
 # bridge with the session's PTY (several viewers may share one session).
-# Inside a hosted pi, /bg (the rc-background extension) detaches the
+# Inside a hosted pi, /bg (the daemon extension) detaches the
 # client: pi keeps running headless until the user quits it (Ctrl+D) or
 # deletes the session through pi's own session manager. An abnormally
 # dying hosted pi (crash, SIGKILL, OOM) is revived headless from its
@@ -30,7 +30,7 @@
 #   pi-rc announce <name> <file>        record the pi session file backing a
 #                                       hosted session (drives crash revival
 #                                       and daemon-restart respawning); used
-#                                       by the rc-background extension, which
+#                                       by the daemon extension, which
 #                                       always asks for takeover: a resumed
 #                                       duplicate of a live conversation
 #                                       hands its viewers to the live holder
@@ -40,7 +40,7 @@
 #                                       session and move this session's
 #                                       viewers onto it; this session
 #                                       keeps running headless. Used by
-#                                       the rc-background extension.
+#                                       the daemon extension.
 #   pi-rc resume <name> <file>          /resume without termination: ask
 #                                       the daemon to move this session's
 #                                       viewers onto a live holder of
@@ -773,7 +773,7 @@ def cmd_whichall(args, client):
 
 
 def cmd_state(args, client):
-	# Published by the rc-background extension: whether the model is
+	# Published by the daemon extension: whether the model is
 	# working or idle in this hosted session; surfaced by ls and attach.
 	if len(args) != 2:
 		usage_error("state takes exactly a session name and busy|idle")
@@ -918,7 +918,7 @@ def cmd_handover(args, client):
 		usage_error("--message expects non-empty text")
 	dir_ = resolve_dir(dir_arg)
 	if check:
-		# read-only preflight used by the rc-background extension
+		# read-only preflight used by the daemon extension
 		print(handover_check(client, dir_, file))
 		return
 	if not os.path.isfile(file):

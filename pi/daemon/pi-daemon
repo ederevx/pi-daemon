@@ -12,7 +12,7 @@
 #
 # A hosted session must always end up backgrounded rather than lost: when
 # its pi child dies abnormally (crash, SIGKILL, OOM) and the session file
-# announced by the rc-background extension still exists, the daemon
+# announced by the daemon extension still exists, the daemon
 # revives the conversation headless as `pi --session <file>`. A clean
 # exit (a deliberate quit such as Ctrl+D), an explicit pi-rc stop, a
 # daemon shutdown, or a deleted session file are all final. A revived
@@ -1026,7 +1026,7 @@ class Daemon:
 		registry_argv = list(argv)
 		if message:
 			# Legacy hook kept for protocol compatibility; the
-			# rc-background extension no longer sends a continuation
+			# daemon extension no longer sends a continuation
 			# prompt, so hosted handovers start idle at the prompt.
 			argv.append(message)
 		try:

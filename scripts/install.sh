@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install the Pi background service from this repo into the Pi agent home.
 #
-# Copies the rc-background extension, the pi-rc client, the pi-daemon PTY
+# Copies the daemon extension, the pi-rc client, the pi-daemon PTY
 # host daemon, and the systemd user unit, recording every owned file in a
 # manifest so uninstall removes exactly what this repo installed.
 # Idempotent: re-running refreshes owned copies in place. Existing
@@ -27,7 +27,7 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,8) else 1)' || {
   exit 1
 }
 
-dest_extension="$pi_home/extensions/rc-background.ts"
+dest_extension="$pi_home/extensions/daemon.ts"
 dest_helper="$local_bin/pi-rc"
 dest_daemon="$local_bin/pi-daemon"
 dest_unit="$systemd_dir/pi-daemon.service"
@@ -35,7 +35,7 @@ dest_wrapper="$local_bin/pi"
 
 mkdir -p "$pi_home/extensions" "$local_bin" "$systemd_dir" "$state_dir"
 
-install -m 644 "$repo_root/pi/extensions/rc-background.ts" "$dest_extension"
+install -m 644 "$repo_root/pi/extensions/daemon.ts" "$dest_extension"
 install -m 755 "$repo_root/pi/bin/pi-rc" "$dest_helper"
 install -m 755 "$repo_root/pi/daemon/pi-daemon" "$dest_daemon"
 
