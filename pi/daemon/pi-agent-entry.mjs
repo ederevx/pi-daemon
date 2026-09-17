@@ -43,7 +43,28 @@ function isDelegation(a) {
 /** Runs the real pi entry in-process: this process IS pi from here on. */
 async function runPi() {
 	delete process.env.PI_DAEMON_AGENT_CHILD;
-	await import(REAL_ENTRY);
+	try {
+		await import(REAL_ENTRY);
+		return;
+	} catch (err) {
+		// The in-process load failed (bad entry bake, broken upgrade):
+		// fall back to spawning the real entry as a child so pi stays
+		// reachable. A load failure happens before pi runs anything, so
+		// no double execution is possible.
+		console.error("pi-agent-entry: front load failed, falling back to the real pi:",
+			err?.message || err);
+		if (!REAL_ENTRY || REAL_ENTRY.startsWith("@") || !existsSync(REAL_ENTRY)) {
+			throw err;
+		}
+		const child = spawn(process.execPath, [REAL_ENTRY, ...args],
+			{ stdio: "inherit" });
+		for (const sig of ["SIGTERM", "SIGHUP"]) {
+			process.on(sig, () => child.kill(sig));
+		}
+		child.on("exit", (code, signal) =>
+			process.exit(signal ? 143 : (code ?? 1)));
+		child.on("error", () => process.exit(1));
+	}
 }
 
 /** Hands a delegation to the daemon and bridges it. Returns null to fall
