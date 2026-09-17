@@ -370,9 +370,10 @@ class DaemonTasks {
 				// its next model call, so it learns the task completed
 				// instead of re-running it. followUp waits for full idle,
 				// which let agents duplicate work.
-				// The user sees a one-line card (expandable via ctrl+o or
-				// click); the agent gets the full result invisibly.
-				this.append("daemon-task", { ticket, output, command });
+				// The user sees a one-line card (full detail lives in
+				// /daemon-tasks); the agent gets the full result
+				// invisibly.
+				this.append("daemon-task", { ticket });
 				this.send(
 					{
 						customType: "daemon-task",
@@ -689,33 +690,18 @@ export default function (pi: ExtensionAPI) {
 		void pi.appendEntry(customType, data);
 	});
 
-	// One line collapsed; command + output tail on expand (ctrl+o/click).
-	pi.registerEntryRenderer("daemon-task", (entry, { expanded }, theme) => {
-		const data = (entry.data ?? {}) as {
-			ticket?: Ticket; output?: string; command?: string;
-		};
-		const t = data.ticket;
+	// Static one-line card; full detail lives in /daemon-tasks.
+	pi.registerEntryRenderer("daemon-task", (entry, _opts, theme) => {
+		const t = (entry.data as { ticket?: Ticket } | undefined)?.ticket;
 		if (!t) return new Text("daemon task", 0, 0);
 		const when = new Date((t.finished ?? t.created) * 1000)
 			.toLocaleTimeString("en-GB");
 		const head = `${t.id} ${t.status} - ${when}` +
 			(t.exit !== null ? ` - exit ${t.exit}` : "");
-		if (!expanded) {
-			// Box pads the line to full width, so the bg spans the card.
-			const box = new Box(0, 0, (text) =>
-				theme.bg("customMessageBg", text));
-			box.addChild(new Text(theme.bold(`[daemon-task] ${head}`)));
-			return box;
-		}
-		const box = new Box(1, 0, (text) => theme.bg("customMessageBg", text));
+		// Box pads the line to full width, so the bg spans the card.
+		const box = new Box(0, 0, (text) =>
+			theme.bg("customMessageBg", text));
 		box.addChild(new Text(theme.bold(`[daemon-task] ${head}`)));
-		box.addChild(new Text(theme.fg("dim", data.command ?? t.command)));
-		const trunc = truncateTail(data.output ?? "", {
-			maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES,
-		});
-		for (const line of trunc.content.split("\n")) {
-			box.addChild(new Text(theme.fg("dim", line)));
-		}
 		return box;
 	});
 	const localBash: BashOperations = createLocalBashOperations();
