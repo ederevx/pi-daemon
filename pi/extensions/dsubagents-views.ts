@@ -32,6 +32,13 @@
  */
 
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	agentRowMeta,
+	sessionKeyOf,
+	TicketClient,
+	type Ticket,
+} from "./offload.ts";
 import {
 	AssistantMessageComponent,
 	getMarkdownTheme,
@@ -58,8 +65,10 @@ import {
 } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
-// Data adapter (supplied by offload.ts over the daemon client)
+// Data adapter
 // ---------------------------------------------------------------------------
+
+/** The daemon-side view of one adopted subagent ticket. */
 
 /** The daemon-side view of one adopted subagent ticket. */
 export interface AdoptedSubagent {
@@ -85,6 +94,50 @@ export interface DaemonSubagentsData {
 	transcript(id: string): Promise<string>;
 	/** Current snapshot of one ticket (immediate; never blocks). */
 	refresh(id: string): Promise<AdoptedSubagent | null>;
+}
+
+/** Single owner of the daemon -> /daemon-subagents view translation:
+ *  maps tickets to view entries and serves the list, transcript, and
+ *  per-ticket snapshot the views poll. Owns the session scope and the
+ *  mapping; no mutation (the views are readers). The daemon wire layer
+ *  (TicketClient + session key) comes from the offload extension. */
+class AdoptedSubagentsSource implements DaemonSubagentsData {
+	constructor(
+		private readonly client: TicketClient,
+		private readonly session: string,
+	) {}
+
+	list(): Promise<AdoptedSubagent[]> {
+		return this.client.agentList(this.session).then((tickets) => tickets.map((t) => this.map(t)));
+	}
+
+	transcript(id: string): Promise<string> {
+		return this.client.agentOutput(id);
+	}
+
+	async refresh(id: string): Promise<AdoptedSubagent | null> {
+		try {
+			return this.map(await this.client.wait(id, 0));
+		} catch {
+			return null;
+		}
+	}
+
+	private map(ticket: Ticket): AdoptedSubagent {
+		const meta = agentRowMeta(ticket);
+		return {
+			id: ticket.id,
+			agent: meta.name || "subagent",
+			task: meta.task,
+			status: ticket.status,
+			started: ticket.started ?? ticket.created,
+			finished: ticket.finished ?? undefined,
+			exit: ticket.exit,
+			turns: ticket.turns,
+			max_turns: ticket.max_turns,
+			cwd: ticket.cwd,
+		};
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,4 +1072,26 @@ export class DaemonSubagentsBrowser {
 				new DaemonSubagentsDock(this.data, tui, theme, done),
 		) as Promise<AdoptedSubagent | null>;
 	}
+}
+// ---------------------------------------------------------------------------
+// Extension entry: /daemon-subagents owns its view layer (browser, dock,
+// detail view, source adapter). The daemon wire layer comes from the
+// offload extension; this extension is independently loadable and
+// registers nothing else.
+// ---------------------------------------------------------------------------
+export default function (pi: ExtensionAPI) {
+	pi.registerCommand("daemon-subagents", {
+		description:
+			"Browse daemon-adopted subagents of this session; open one to watch its activity",
+		handler: async (_args, cmdCtx) => {
+			if (cmdCtx.mode !== "tui") {
+				cmdCtx.ui?.notify?.("daemon-subagents requires the interactive TUI", "warning");
+				return;
+			}
+			const client = new TicketClient((file, args) => pi.exec(file, args));
+			await new DaemonSubagentsBrowser(
+				new AdoptedSubagentsSource(client, sessionKeyOf(null)),
+			).run(cmdCtx.ui);
+		},
+	});
 }
