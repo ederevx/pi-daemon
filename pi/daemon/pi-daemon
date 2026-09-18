@@ -682,6 +682,19 @@ class TicketRunner:
 				rec = self.store.get_locked(tid)
 				if rec is None:
 					return None
+			rec = self.store.get_locked(tid)
+			if rec is None:
+				return None
+			if rec["status"] == "running":
+				with self._lock:
+					proc = self._procs.get(tid)
+				if proc is not None and proc.poll() is not None:
+					settle_deadline = time.time() + 0.5
+					while rec["status"] == "running" and time.time() < settle_deadline:
+						self.store.cond.wait(0.05)
+						rec = self.store.get_locked(tid)
+						if rec is None:
+							return None
 			return dict(rec)
 
 	def output(self, tid, offset):
@@ -850,6 +863,71 @@ class TicketRunner:
 							  error="interrupted by daemon shutdown")
 
 
+def extract_agent_log(log_path):
+	"""Extract the last complete assistant message text and cumulative usage
+	from an NDJSON agent transcript log. Tolerates missing files or
+	malformed lines."""
+	last_text = None
+	usage_accum = {
+		"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+		"cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}
+	}
+	has_usage = False
+	if not (log_path and os.path.isfile(log_path)):
+		return None, None
+	try:
+		with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+			for line in f:
+				line = line.strip()
+				if not line:
+					continue
+				try:
+					obj = json.loads(line)
+				except (ValueError, UnicodeDecodeError):
+					continue
+				if not isinstance(obj, dict) or obj.get("type") != "message_end":
+					continue
+				event = obj.get("event") if isinstance(obj.get("event"), dict) else {}
+				msg = event.get("message") if isinstance(event.get("message"), dict) else obj.get("message")
+				if not isinstance(msg, dict):
+					continue
+				if msg.get("role") == "assistant":
+					content = msg.get("content")
+					text = ""
+					if isinstance(content, str):
+						text = content
+					elif isinstance(content, list):
+						texts = [b.get("text") for b in content
+								 if isinstance(b, dict) and b.get("type") == "text"
+								 and isinstance(b.get("text"), str)]
+						text = "".join(texts)
+					if text.strip():
+						last_text = text
+				u = msg.get("usage") if isinstance(msg.get("usage"), dict) \
+					else (obj.get("usage") if isinstance(obj.get("usage"), dict) else None)
+				if isinstance(u, dict):
+					has_usage = True
+					inp = int(u.get("input") or 0)
+					out = int(u.get("output") or 0)
+					cr = int(u.get("cacheRead") or 0)
+					cw = int(u.get("cacheWrite") or 0)
+					tot = int(u.get("totalTokens") or (inp + out + cr + cw))
+					usage_accum["input"] += inp
+					usage_accum["output"] += out
+					usage_accum["cacheRead"] += cr
+					usage_accum["cacheWrite"] += cw
+					usage_accum["totalTokens"] += tot
+					c = u.get("cost") if isinstance(u.get("cost"), dict) else {}
+					usage_accum["cost"]["input"] = round(usage_accum["cost"]["input"] + float(c.get("input") or 0.0), 8)
+					usage_accum["cost"]["output"] = round(usage_accum["cost"]["output"] + float(c.get("output") or 0.0), 8)
+					usage_accum["cost"]["cacheRead"] = round(usage_accum["cost"]["cacheRead"] + float(c.get("cacheRead") or 0.0), 8)
+					usage_accum["cost"]["cacheWrite"] = round(usage_accum["cost"]["cacheWrite"] + float(c.get("cacheWrite") or 0.0), 8)
+					usage_accum["cost"]["total"] = round(usage_accum["cost"]["total"] + float(c.get("total") or 0.0), 8)
+	except OSError:
+		pass
+	return last_text, (usage_accum if has_usage else None)
+
+
 class AgentTicketRunner:
 	"""Runs headless subagent delegations (`pi --mode json -p`) as
 	daemon-owned tickets, sharing the shell TicketStore: the stdout NDJSON
@@ -872,6 +950,7 @@ class AgentTicketRunner:
 		self._procs = {}    # tid -> Popen, under _lock
 		self._stops = {}    # tid -> cancellation reason, under _lock
 		self._settled = {}  # tid -> settle time, under _lock
+		self._last_output = {}  # tid -> last assistant text, under _lock
 
 	def running_count(self):
 		with self._lock:
@@ -920,7 +999,17 @@ class AgentTicketRunner:
 			   "created": time.time(), "started": time.time(),
 			   "finished": None, "exit": None, "term": None,
 			   "truncated": False, "error": None,
-			   "max_turns": max_turns, "turns": 0, "fp": fp}
+			   "max_turns": max_turns, "turns": 0, "fp": fp,
+			   "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+			   "totalTokens": 0,
+			   "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0,
+						"cacheWrite": 0.0, "total": 0.0},
+			   "usage": {"input": 0, "output": 0, "cacheRead": 0,
+						 "cacheWrite": 0, "totalTokens": 0,
+						 "cost": {"input": 0.0, "output": 0.0,
+								  "cacheRead": 0.0, "cacheWrite": 0.0,
+								  "total": 0.0}},
+			   "final_message": None}
 		proc = subprocess.Popen(
 			argv, cwd=cwd, env=env_run,
 			stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -1062,6 +1151,71 @@ class AgentTicketRunner:
 			return
 		turns = int(rec.get("turns") or 0) + 1
 		fields = {"turns": turns}
+
+		# Capture assistant text content
+		content = message.get("content")
+		if isinstance(content, str) and content.strip():
+			with self._lock:
+				self._last_output[tid] = content
+			fields["final_message"] = content
+			fields["output"] = content
+		elif isinstance(content, list):
+			texts = [b.get("text") for b in content
+					 if isinstance(b, dict) and b.get("type") == "text"
+					 and isinstance(b.get("text"), str)]
+			merged = "".join(texts)
+			if merged.strip():
+				with self._lock:
+					self._last_output[tid] = merged
+				fields["final_message"] = merged
+				fields["output"] = merged
+
+		# Aggregate streamed usage
+		u = message.get("usage") if isinstance(message.get("usage"), dict) \
+			else (obj.get("usage") if isinstance(obj.get("usage"), dict) else None)
+		if isinstance(u, dict):
+			inp_delta = int(u.get("input") or 0)
+			out_delta = int(u.get("output") or 0)
+			cr_delta = int(u.get("cacheRead") or 0)
+			cw_delta = int(u.get("cacheWrite") or 0)
+			tot_delta = int(u.get("totalTokens") or (inp_delta + out_delta + cr_delta + cw_delta))
+
+			c = u.get("cost") if isinstance(u.get("cost"), dict) else {}
+			cost_inp_delta = float(c.get("input") or 0.0)
+			cost_out_delta = float(c.get("output") or 0.0)
+			cost_cr_delta = float(c.get("cacheRead") or 0.0)
+			cost_cw_delta = float(c.get("cacheWrite") or 0.0)
+			cost_tot_delta = float(c.get("total") or (cost_inp_delta + cost_out_delta + cost_cr_delta + cost_cw_delta))
+
+			tot_inp = int(rec.get("input") or 0) + inp_delta
+			prev_usage = rec.get("usage") if isinstance(rec.get("usage"), dict) else {}
+			tot_out = int(prev_usage.get("output") or 0) + out_delta
+			tot_cr = int(rec.get("cacheRead") or 0) + cr_delta
+			tot_cw = int(rec.get("cacheWrite") or 0) + cw_delta
+			tot_tokens = int(rec.get("totalTokens") or 0) + tot_delta
+
+			prev_cost = rec.get("cost") if isinstance(rec.get("cost"), dict) else {}
+			cost_accum = {
+				"input": round(float(prev_cost.get("input") or 0.0) + cost_inp_delta, 8),
+				"output": round(float(prev_cost.get("output") or 0.0) + cost_out_delta, 8),
+				"cacheRead": round(float(prev_cost.get("cacheRead") or 0.0) + cost_cr_delta, 8),
+				"cacheWrite": round(float(prev_cost.get("cacheWrite") or 0.0) + cost_cw_delta, 8),
+				"total": round(float(prev_cost.get("total") or 0.0) + cost_tot_delta, 8),
+			}
+			fields["input"] = tot_inp
+			fields["cacheRead"] = tot_cr
+			fields["cacheWrite"] = tot_cw
+			fields["totalTokens"] = tot_tokens
+			fields["cost"] = cost_accum
+			fields["usage"] = {
+				"input": tot_inp,
+				"output": tot_out,
+				"cacheRead": tot_cr,
+				"cacheWrite": tot_cw,
+				"totalTokens": tot_tokens,
+				"cost": cost_accum,
+			}
+
 		if max_turns and turns >= max_turns \
 				and rec.get("status") == "running" \
 				and not rec.get("turn_budget_exhausted"):
@@ -1215,6 +1369,7 @@ class AgentTicketRunner:
 			self._procs.pop(tid, None)
 			reason = self._stops.pop(tid, None)
 			settled = self._settled.pop(tid, None) is not None
+			last_text = self._last_output.pop(tid, None)
 		fields = {"status": "done" if code == 0 else "failed",
 				  "exit": code if code >= 0 else None,
 				  "term": -code if code < 0 else None,
@@ -1228,6 +1383,23 @@ class AgentTicketRunner:
 			# failure: report exit 0 with the signal noted.
 			fields["status"] = "done"
 			fields["exit"] = 0
+		rec = self.store.get(tid)
+		final_text = last_text or (rec.get("final_message") if rec else None)
+		log_path = self.store.artifact_path(tid, "log")
+		if not final_text or (rec and not rec.get("usage")):
+			extracted_text, extracted_usage = extract_agent_log(log_path)
+			if not final_text and extracted_text:
+				final_text = extracted_text
+			if extracted_usage and rec and not rec.get("usage"):
+				fields["usage"] = extracted_usage
+				fields["cost"] = extracted_usage.get("cost")
+				fields["input"] = extracted_usage.get("input")
+				fields["cacheRead"] = extracted_usage.get("cacheRead")
+				fields["cacheWrite"] = extracted_usage.get("cacheWrite")
+				fields["totalTokens"] = extracted_usage.get("totalTokens")
+		if final_text:
+			fields["final_message"] = final_text
+			fields["output"] = final_text
 		self.store.update(tid, **fields)
 		log("agent-done '%s' status %s" % (tid, fields["status"]))
 
@@ -2591,25 +2763,59 @@ class Control:
 			return bad_request()
 		if not (isinstance(tid, str) and tid) or timeout < 0:
 			return bad_request()
-		rec = self.daemon.tickets.wait(tid, timeout)
+		rec = self.daemon.tickets.store.get(tid)
 		if rec is None:
 			return err("no-ticket")
-		return {"ok": True, "ticket": rec}
+		runner = (self.daemon.agents if rec.get("kind") == "agent"
+				  else self.daemon.tickets)
+		res = runner.wait(tid, timeout)
+		if res is None:
+			return err("no-ticket")
+		return {"ok": True, "ticket": res}
 
 	def ticket_output(self, req):
 		tid = req.get("id")
-		try:
-			offset = int(req.get("offset", 0))
-		except (TypeError, ValueError):
+		if not (isinstance(tid, str) and tid):
 			return bad_request()
-		if not (isinstance(tid, str) and tid) or offset < 0:
-			return bad_request()
-		out = self.daemon.tickets.output(tid, offset)
-		if out is None:
+		offset = req.get("offset")
+		if offset is not None:
+			try:
+				offset = int(offset)
+			except (TypeError, ValueError):
+				return bad_request()
+			if offset < 0:
+				return bad_request()
+			out = self.daemon.tickets.output(tid, offset)
+			if out is None:
+				return err("no-ticket")
+			return {"ok": True, "offset": out["offset"], "next": out["next"],
+					"size": out["size"],
+					"data": base64.b64encode(out["data"]).decode()}
+
+		rec = self.daemon.tickets.store.get(tid)
+		if rec is None:
 			return err("no-ticket")
-		return {"ok": True, "offset": out["offset"], "next": out["next"],
-				"size": out["size"],
-				"data": base64.b64encode(out["data"]).decode()}
+		output_text = rec.get("final_message") or rec.get("output")
+		usage = rec.get("usage")
+		kind = rec.get("kind", "shell")
+		log_path = self.daemon.tickets.store.artifact_path(tid, "log")
+		if kind == "agent":
+			if not output_text or not usage:
+				extracted_text, extracted_usage = extract_agent_log(log_path)
+				if not output_text and extracted_text:
+					output_text = extracted_text
+				if not usage and extracted_usage:
+					usage = extracted_usage
+		else:
+			if not output_text and os.path.isfile(log_path):
+				try:
+					with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+						output_text = f.read()
+				except OSError:
+					output_text = ""
+		return {"ok": True, "id": tid, "status": rec.get("status"),
+				"exit": rec.get("exit"), "output": output_text or "",
+				"usage": usage}
 
 	def ticket_list(self, req):
 		session = req.get("session")
@@ -2712,17 +2918,7 @@ class Control:
 		return {"ok": True, "id": rec["id"], "ticket": rec}
 
 	def agent_wait(self, req):
-		tid = req.get("id")
-		try:
-			timeout = float(req.get("timeout", 0))
-		except (TypeError, ValueError):
-			return bad_request()
-		if not (isinstance(tid, str) and tid) or timeout < 0:
-			return bad_request()
-		rec = self.daemon.agents.wait(tid, timeout)
-		if rec is None:
-			return err("no-ticket")
-		return {"ok": True, "ticket": rec}
+		return self.ticket_wait(req)
 
 	def agent_detach(self, req):
 		tid = req.get("id")
@@ -2735,21 +2931,27 @@ class Control:
 
 	def agent_output(self, req):
 		tid = req.get("id")
-		try:
-			out_offset = int(req.get("offset", 0))
-			err_offset = int(req.get("err_offset", 0))
-		except (TypeError, ValueError):
+		if not (isinstance(tid, str) and tid):
 			return bad_request()
-		if not (isinstance(tid, str) and tid) or out_offset < 0 or err_offset < 0:
-			return bad_request()
-		out = self.daemon.agents.output(tid, out_offset, err_offset)
-		if out is None:
-			return err("no-ticket")
-		return {"ok": True, "ticket": self.daemon.agents.store.get(tid),
-				"out_next": out["out"][1], "out_size": out["out"][2],
-				"out": base64.b64encode(out["out"][3]).decode(),
-				"err_next": out["err"][1], "err_size": out["err"][2],
-				"err": base64.b64encode(out["err"][3]).decode()}
+		offset = req.get("offset")
+		err_offset = req.get("err_offset")
+		if offset is not None or err_offset is not None:
+			try:
+				out_offset = int(offset or 0)
+				e_offset = int(err_offset or 0)
+			except (TypeError, ValueError):
+				return bad_request()
+			if out_offset < 0 or e_offset < 0:
+				return bad_request()
+			out = self.daemon.agents.output(tid, out_offset, e_offset)
+			if out is None:
+				return err("no-ticket")
+			return {"ok": True, "ticket": self.daemon.agents.store.get(tid),
+					"out_next": out["out"][1], "out_size": out["out"][2],
+					"out": base64.b64encode(out["out"][3]).decode(),
+					"err_next": out["err"][1], "err_size": out["err"][2],
+					"err": base64.b64encode(out["err"][3]).decode()}
+		return self.ticket_output(req)
 
 	def agent_cancel(self, req):
 		tid = req.get("id")

@@ -73,8 +73,10 @@
 #                                       timeout (default 0) seconds pass;
 #                                       prints the ticket record as one
 #                                       JSON line
-#   pi-rc ticket-output <id> [offset]   print the ticket's output from
-#                                       byte offset (default 0) to stdout
+#   pi-rc ticket-output <id> [--json] [offset]
+#                                       print the ticket's final output text
+#                                       (or JSON record with --json; raw bytes
+#                                       from offset when offset is given)
 #   pi-rc ticket-list [session]         print one ticket record JSON line
 #                                       per ticket, oldest first
 #   pi-rc ticket-cancel <id>            TERM then KILL a running ticket
@@ -106,9 +108,10 @@
 #                                      stderr separately, and enforces the
 #                                      turn budget (prints "ticket <id>")
 #   pi-rc agent-wait <id> [timeout]     like ticket-wait for agent tickets
-#   pi-rc agent-output <id> [off [erhoff]]
-#                                      stdout chunk since off to stdout,
-#                                      stderr chunk since erhoff to stderr
+#   pi-rc agent-output <id> [--json] [off [erhoff]]
+#                                      print the agent's final output text
+#                                      (or JSON record with --json; chunked
+#                                      stdout/stderr when offsets are given)
 #   pi-rc agent-cancel <id>             TERM then KILL a running agent
 #   pi-rc agent-list [session]          agent-kind tickets, JSON lines
 #   pi-rc agent-detach <id>             mark an agent ticket handed off to
@@ -955,9 +958,19 @@ def cmd_extensions_reload(args, client):
 		print("pi-rc: extension roots unchanged; nothing to reload")
 		return
 	diff = resp.get("diff") or {}
-	print("pi-rc: reloaded %s" % (resp.get("reloaded") or "no sessions"))
+	reloaded = resp.get("reloaded") or []
+	if reloaded:
+		print("pi-rc: reloaded %s" % ", ".join(reloaded))
+	else:
+		print("pi-rc: reloaded no sessions")
 	if resp.get("skipped"):
-		print("pi-rc: skipped %s" % ", ".join(resp["skipped"]))
+		kids = []
+		for entry in resp["skipped"]:
+			if isinstance(entry, dict):
+				kids.append("%s (%s)" % (entry.get("id", "?"), entry.get("reason", "?")))
+			else:
+				kids.append(str(entry))
+		print("pi-rc: skipped %s" % ", ".join(kids))
 	for p in diff.get("added") or []:
 		print("pi-rc: + %s" % p)
 	for p in diff.get("changed") or []:
@@ -1150,19 +1163,36 @@ def cmd_ticket_wait(args, client):
 
 
 def cmd_ticket_output(args, client):
-	# Raw incremental output from byte offset (default 0) to stdout.
-	if len(args) not in (1, 2):
-		usage_error("ticket-output takes an id and an optional offset")
-	try:
-		offset = int(args[1]) if len(args) > 1 else 0
-	except ValueError:
-		usage_error("ticket-output offset must be an integer")
-	resp = client.control({"cmd": "ticket-output", "id": args[0],
-						   "offset": offset})
-	if not resp.get("ok"):
-		die("ticket-output failed: %s" % resp.get("error"))
-	sys.stdout.buffer.write(base64.b64decode(resp["data"]))
-	sys.stdout.buffer.flush()
+	# Without offset: fetches the ticket's final output text from daemon
+	# control (or full JSON record with --json).
+	# With offset: raw incremental output from byte offset to stdout.
+	if len(args) < 1 or len(args) > 3:
+		usage_error("ticket-output takes an id and an optional offset (or --json)")
+	tid = args[0]
+	json_mode = "--json" in args
+	non_flag = [a for a in args[1:] if a != "--json"]
+	if not non_flag:
+		resp = client.control({"cmd": "ticket-output", "id": tid})
+		if not resp.get("ok"):
+			die("ticket-output failed: %s" % resp.get("error"))
+		if json_mode:
+			print(json.dumps(resp))
+		else:
+			out = resp.get("output", "")
+			if out:
+				sys.stdout.write(out if out.endswith("\n") else out + "\n")
+				sys.stdout.flush()
+	else:
+		try:
+			offset = int(non_flag[0])
+		except ValueError:
+			usage_error("ticket-output offset must be an integer")
+		resp = client.control({"cmd": "ticket-output", "id": tid,
+							   "offset": offset})
+		if not resp.get("ok"):
+			die("ticket-output failed: %s" % resp.get("error"))
+		sys.stdout.buffer.write(base64.b64decode(resp["data"]))
+		sys.stdout.buffer.flush()
 
 
 def cmd_ticket_list(args, client):
@@ -1278,26 +1308,43 @@ def cmd_agent_wait(args, client):
 
 
 def cmd_agent_output(args, client):
-	# stdout chunk to stdout, stderr chunk to stderr: lets a relay keep
-	# the two streams apart without parsing JSON itself.
-	if len(args) not in (1, 2, 3):
-		usage_error("agent-output takes an id and optional offsets")
-	offsets = []
-	for raw in args[1:]:
-		try:
-			offsets.append(int(raw))
-		except ValueError:
-			usage_error("agent-output offsets must be integers")
-	req = {"cmd": "agent-output", "id": args[0],
-		   "offset": offsets[0] if offsets else 0,
-		   "err_offset": offsets[1] if len(offsets) > 1 else 0}
-	resp = client.control(req)
-	if not resp.get("ok"):
-		die("agent-output failed: %s" % resp.get("error"))
-	sys.stdout.buffer.write(base64.b64decode(resp["out"]))
-	sys.stdout.buffer.flush()
-	sys.stderr.buffer.write(base64.b64decode(resp["err"]))
-	sys.stderr.buffer.flush()
+	# Without offsets: fetches the ticket's final output text from daemon
+	# control (or full JSON record with --json).
+	# With offsets: stdout chunk since off to stdout, stderr chunk since
+	# erhoff to stderr.
+	if len(args) < 1 or len(args) > 4:
+		usage_error("agent-output takes an id and optional offsets (or --json)")
+	tid = args[0]
+	json_mode = "--json" in args
+	non_flag = [a for a in args[1:] if a != "--json"]
+	if not non_flag:
+		resp = client.control({"cmd": "agent-output", "id": tid})
+		if not resp.get("ok"):
+			die("agent-output failed: %s" % resp.get("error"))
+		if json_mode:
+			print(json.dumps(resp))
+		else:
+			out = resp.get("output", "")
+			if out:
+				sys.stdout.write(out if out.endswith("\n") else out + "\n")
+				sys.stdout.flush()
+	else:
+		offsets = []
+		for raw in non_flag:
+			try:
+				offsets.append(int(raw))
+			except ValueError:
+				usage_error("agent-output offsets must be integers")
+		req = {"cmd": "agent-output", "id": tid,
+			   "offset": offsets[0] if offsets else 0,
+			   "err_offset": offsets[1] if len(offsets) > 1 else 0}
+		resp = client.control(req)
+		if not resp.get("ok"):
+			die("agent-output failed: %s" % resp.get("error"))
+		sys.stdout.buffer.write(base64.b64decode(resp["out"]))
+		sys.stdout.buffer.flush()
+		sys.stderr.buffer.write(base64.b64decode(resp["err"]))
+		sys.stderr.buffer.flush()
 
 
 def cmd_agent_cancel(args, client):
