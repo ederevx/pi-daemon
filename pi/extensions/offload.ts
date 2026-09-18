@@ -220,6 +220,16 @@ export class TicketClient {
 		return match[1];
 	}
 
+	/** Publishes a run-state for a session daemon-side (pi-rc state),
+	 *  best-effort: never throws, cosmetic when the daemon is down. */
+	async setState(session: string, state: string): Promise<void> {
+		try {
+			await this.exec(this.piRc, ["state", session, state]);
+		} catch {
+			// State display is best-effort.
+		}
+	}
+
 	/** Blocks at most timeoutSeconds; timeout 0 is a status probe. */
 	async wait(id: string, timeoutSeconds: number): Promise<Ticket> {
 		const args = ["ticket-wait", id];
@@ -359,6 +369,12 @@ class DaemonTasks {
 		return sessionKeyOf(sessionFile);
 	}
 
+	/** Publishes a run-state for this session (pi-rc state <key> <state>),
+	 *  fire-and-forget: one cheap pi-rc exec, all errors swallowed. */
+	setSessionState(state: string): void {
+		void this.client.setState(this.sessionKey(), state).catch(() => {});
+	}
+
 	async submit(sessionFile: string | null, cwd: string, command: string,
 		extraEnv: Record<string, string> = {},
 	): Promise<string> {
@@ -426,12 +442,16 @@ class DaemonTasks {
 		} catch {
 			// keep the card even when the output fetch failed
 		}
+		const meta = agentRowMeta(ticket);
+		const label = meta.name || meta.task
+			? `subagent ${meta.name}${meta.task ? ` - ${meta.task}` : ""}`
+			: ticket.id;
 		this.append("daemon-task", { ticket });
 		this.send(
 			{
 				customType: "daemon-task",
-				content: `Background task finished (detached): `
-					+ `${ticket.command}\n${formatResult(ticket, output)}`,
+				content: `Background task finished (detached): ${label}\n`
+					+ `${formatResult(ticket, output)}`,
 				display: false,
 				details: { ticket },
 			},
@@ -617,6 +637,14 @@ class DaemonTasksDock {
 	private readonly border = new DynamicBorder((s: string) => this.theme?.fg("border", s) ?? s);
 	private readonly client: TicketClient;
 	private rows: TaskRow[] = [];
+	/** This session's tickets (always visible, newest first). */
+	private sessionRows: TaskRow[] = [];
+	/** Every other session's tickets (collapsed by default). */
+	private globalRows: TaskRow[] = [];
+	/** Whether the global (other-sessions) section is expanded. */
+	private globalExpanded = false;
+	/** Selectable header rows, for click-to-toggle on the global one. */
+	private headerMap: { y: number; section: "session" | "global" }[] = [];
 	private selected = 0;
 	private expandedId: string | null = null;
 	private readonly outputs = new Map<string, string>();
@@ -633,8 +661,18 @@ class DaemonTasksDock {
 	private stopped = false;
 	private pollInFlight = false;
 
-	constructor(client: TicketClient) {
+	constructor(client: TicketClient, private readonly sessionKey: string) {
 		this.client = client;
+	}
+
+	/** Rebuilds the flat visible row list from the two sections and
+	 *  keeps the selection inside it. */
+	private rebuildRows(): void {
+		this.rows = [
+			...this.sessionRows,
+			...(this.globalExpanded ? this.globalRows : []),
+		];
+		this.selected = Math.min(this.selected, Math.max(0, this.rows.length - 1));
 	}
 
 	/** Mounts the dock like /settings (non-overlay ui.custom) and blocks
@@ -672,14 +710,25 @@ class DaemonTasksDock {
 		try {
 			const tickets = (await this.client.list())
 				.filter((ticket) => ticket.kind !== "agent");
-			// Latest first, top to bottom.
-			this.rows = tickets
-				.sort((a, b) =>
-					(b.started ?? b.created) - (a.started ?? a.created))
+			// Session tickets first (always visible), then everything
+			// else behind the collapsible global section; each section
+			// newest first, top to bottom.
+			const byNewest = (a: Ticket, b: Ticket) =>
+				(b.started ?? b.created) - (a.started ?? a.created);
+			this.sessionRows = tickets
+				.filter((t) => t.session === this.sessionKey)
+				.sort(byNewest)
 				.map((ticket) => ({ ticket }));
+			this.globalRows = tickets
+				.filter((t) => t.session !== this.sessionKey)
+				.sort(byNewest)
+				.map((ticket) => ({ ticket }));
+			this.rebuildRows();
 			this.lastError = null;
 		} catch (err) {
 			this.rows = [];
+			this.sessionRows = [];
+			this.globalRows = [];
 			this.lastError = err instanceof Error ? err.message : String(err);
 		} finally {
 			this.pollInFlight = false;
@@ -695,7 +744,7 @@ class DaemonTasksDock {
 
 	render(width: number): string[] {
 		const lines = [...this.border.render(width)];
-		if (this.rows.length === 0) {
+		if (this.rows.length === 0 && this.globalRows.length === 0) {
 			const msg = this.lastError
 				? `  Daemon unreachable: ${this.lastError}`
 				: "  No daemon tickets.";
@@ -704,7 +753,7 @@ class DaemonTasksDock {
 			lines.push(...this.renderBody(width));
 		}
 		lines.push(this.st.hint(truncateToWidth(
-			"  up/down navigate - enter expand - c cancel/remove - esc close (live)", width)));
+			"  up/down navigate - enter expand - tab sections - c cancel/remove - esc close (live)", width)));
 		lines.push(...this.border.render(width));
 		return lines;
 	}
@@ -715,6 +764,13 @@ class DaemonTasksDock {
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
 			this.stop();
 			this.done?.(null);
+			return;
+		}
+		if (matchesKey(data, "tab")) {
+			// Fold/unfold the global (other-sessions) section.
+			this.globalExpanded = !this.globalExpanded;
+			this.rebuildRows();
+			this.tui?.requestRender();
 			return;
 		}
 		if (this.rows.length === 0) return;
@@ -756,6 +812,13 @@ class DaemonTasksDock {
 				(this.selected + (event.wheelDelta && event.wheelDelta < 0 ? -1 : 1)
 					+ this.rows.length) % this.rows.length;
 		} else if (event.type === "press" || event.type === "click") {
+			const hit = this.headerMap.find((h) => h.y === event.y);
+			if (hit && hit.section === "global") {
+				this.globalExpanded = !this.globalExpanded;
+				this.rebuildRows();
+				this.tui?.requestRender();
+				return { handled: true };
+			}
 			const row = this.rowMap.find((r) => r.y === event.y);
 			if (!row) return { handled: false };
 			this.selected = row.index;
@@ -773,8 +836,33 @@ class DaemonTasksDock {
 		const endIndex = Math.min(startIndex + maxVisible, this.rows.length);
 		const lines: string[] = [];
 		this.rowMap = [];
+		this.headerMap = [];
 		const now = Date.now() / 1000;
+		// Section headers: this session's tickets always on top; the
+		// global list starts collapsed (tab or clicking the header
+		// toggles it).
+		const header = (title: string, count: number, section: "session" | "global") => {
+			const caret = section === "global" ? (this.globalExpanded ? "\u25bc" : "\u25b6") : "\u25cf";
+			const suffix = section === "global"
+				? (this.globalExpanded ? "  (tab folds)" : "  (tab expands)")
+				: "";
+			lines.push(truncateToWidth(
+				"  " + this.st.label(`${caret} ${title} (${count})${suffix}`, false), width));
+			this.headerMap.push({ y: lines.length, section });
+		};
+		let globalHeaderDone = this.sessionRows.length === 0;
+		if (this.sessionRows.length > 0) {
+			header("Session", this.sessionRows.length, "session");
+		}
+		if (globalHeaderDone && this.globalRows.length > 0) {
+			header("Other sessions", this.globalRows.length, "global");
+		}
 		for (let i = startIndex; i < endIndex; i++) {
+			if (!globalHeaderDone && i >= this.sessionRows.length
+				&& this.globalRows.length > 0) {
+				header("Other sessions", this.globalRows.length, "global");
+				globalHeaderDone = true;
+			}
 			const row = this.rows[i];
 			const isSelected = i === this.selected;
 			const prefix = isSelected ? this.st.cursor : "  ";
@@ -1106,8 +1194,11 @@ export default function (pi: ExtensionAPI) {
 				}
 				case "result": {
 					if (!params.id) throw new Error("result needs a ticket id");
+					const blocking = (params.wait ?? 0) > 0;
+					if (blocking) tasks.setSessionState("waiting");
 					const { ticket, output } = await tasks.result(
 						params.id, params.wait ?? 0);
+					if (blocking) tasks.setSessionState("busy");
 					if (ticket.status === "running") {
 						return {
 							content: [{
@@ -1127,16 +1218,23 @@ export default function (pi: ExtensionAPI) {
 				case "watch": {
 					if (!params.id) throw new Error("watch needs a ticket id");
 					let lastText = "";
-					const { ticket, output } = await tasks.watch(params.id, (tail) => {
-						const text = formatResult({ ...ticket, status: "running" }, tail);
-						if (text !== lastText) {
-							lastText = text;
-							onUpdate?.({
-								content: [{ type: "text", text }],
-								details: { ticketId: params.id, running: true },
-							});
-						}
-					});
+					tasks.setSessionState("waiting");
+					let watched: { ticket: Ticket; output: string };
+					try {
+						watched = await tasks.watch(params.id, (tail) => {
+							const text = formatResult({ ...ticket, status: "running" }, tail);
+							if (text !== lastText) {
+								lastText = text;
+								onUpdate?.({
+									content: [{ type: "text", text }],
+									details: { ticketId: params.id, running: true },
+								});
+							}
+						});
+					} finally {
+						tasks.setSessionState("busy");
+					}
+					const { ticket, output } = watched;
 					return {
 						content: [{ type: "text", text: formatResult(ticket, output) }],
 						details: { ticket },
@@ -1211,7 +1309,7 @@ export default function (pi: ExtensionAPI) {
 				cmdCtx.ui?.notify?.("daemon-tasks requires the interactive TUI", "warning");
 				return;
 			}
-			await new DaemonTasksDock(tasks.client).run(cmdCtx.ui);
+			await new DaemonTasksDock(tasks.client, sessionKeyOf(null)).run(cmdCtx.ui);
 		},
 	});
 
@@ -1275,15 +1373,23 @@ export default function (pi: ExtensionAPI) {
 			// The wait consumes the result: stop the detached-completion
 			// watcher from also steering it in.
 			tasks.markAgentFetched(params.ticket);
-			let ticket = await tasks.status(params.ticket);
-			if (ticket.status === "running") {
-				ticket = await tasks.client.wait(params.ticket, bound);
+			tasks.setSessionState("waiting");
+			let ticket: Ticket;
+			try {
+				ticket = await tasks.status(params.ticket);
+				if (ticket.status === "running") {
+					ticket = await tasks.client.wait(params.ticket, bound);
+				}
+			} finally {
+				tasks.setSessionState("busy");
 			}
 			if (ticket.status === "running") {
+				const meta = agentRowMeta(ticket);
 				return {
 					content: [{
 						type: "text",
-						text: `ticket ${ticket.id} still running after ${bound}s: ${ticket.command}\n` +
+						text: `ticket ${ticket.id} still running after ${bound}s: `
+							+ `subagent ${meta.name} - ${meta.task}\n` +
 							`Call daemon_subagent_wait again to keep blocking, or continue ` +
 							`and the result will be delivered when it finishes.`,
 					}],

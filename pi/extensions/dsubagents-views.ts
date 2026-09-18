@@ -505,7 +505,8 @@ const DETAIL_POLL_MS = 2000;
  * over the NDJSON message stream, lazy bottom-anchored span, sticky
  * followTail, wheel bridge, fullscreen layout-root swap). The live stream is
  * a bounded 2s poll of the ticket's transcript artifact + snapshot while the
- * view owns the screen; the poll stops in close().
+ * view owns the screen; the poll stops in close() and once the ticket
+ * settles (one post-settle fold, then the view is static).
  */
 export class DaemonSubagentsDetailView {
 	private readonly entry: AdoptedSubagent;
@@ -543,6 +544,9 @@ export class DaemonSubagentsDetailView {
 	private pollInFlight = false;
 	private closedFlag = false;
 	private parsedLines = 0;
+	/** Set once the ticket settled and the final transcript fold ticked;
+	 *  the output stops refreshing after it (the log is final then). */
+	private settledTail = false;
 
 	private readonly viewportTui: ViewportTUI | undefined;
 	private readonly widthSafe = new ConservativeWidth();
@@ -613,10 +617,15 @@ export class DaemonSubagentsDetailView {
 		this.pollInFlight = true;
 		try {
 			const [transcript, ticket] = await Promise.all([
-				this.data.transcript(this.entry.id),
+				// A settled ticket's log is final: after the post-settle
+				// fold the transcript is no longer re-fetched, while the
+				// ticket snapshot keeps refreshing until the poll stops.
+				this.settledTail
+					? Promise.resolve(null)
+					: this.data.transcript(this.entry.id),
 				this.data.refresh(this.entry.id).catch(() => null),
 			]);
-			this.appendTranscript(transcript);
+			if (transcript !== null) this.appendTranscript(transcript);
 			if (ticket) {
 				if (ticket.started > 0) this.entry.started = ticket.started;
 				if (ticket.finished) this.entry.finished = ticket.finished;
@@ -628,8 +637,19 @@ export class DaemonSubagentsDetailView {
 			/* daemon hiccup: keep the last transcript state */
 		}
 		this.pollInFlight = false;
-		if (!this.closedFlag) {
+		let reschedule = !this.closedFlag;
+		if (reschedule && this.entry.status !== "running") {
+			// Terminal: one more tick folds the tail written while the
+			// status flipped, then the poll stops — turns, elapsed and the
+			// transcript are final.
+			if (this.settledTail) reschedule = false;
+			else this.settledTail = true;
+		}
+		if (reschedule) {
 			this.pollTimer = setTimeout(() => void this.poll(), DETAIL_POLL_MS);
+		} else if (this.pollTimer) {
+			clearTimeout(this.pollTimer);
+			this.pollTimer = undefined;
 		}
 		this.tui.requestRender();
 	}
@@ -1020,6 +1040,81 @@ export class DaemonDetailViewWheelBridge {
 }
 
 // ---------------------------------------------------------------------------
+// Adoption notices (session-lifetime watcher)
+// ---------------------------------------------------------------------------
+
+const ADOPTION_TICK_MS = 2000;
+/** First-sight recency window: the front hands a delegation off at the
+ *  PI_AGENT_OFFLOAD_WAIT bound (default 20s), so a detached ticket older
+ *  than this predates the watcher (session restart) — skip it. */
+const ADOPTION_RECENT_SECS = 120;
+
+/** Informs the parent conversation the moment the daemon adopts one of
+ *  this session's subagent spawns. The front (pi-agent-entry.mjs) marks
+ *  the child 'detached' as an agent ticket when it hands it off; there
+ *  is no push channel back into the session, so — like every other
+ *  daemon→session signal — a poller notices the flag and steers one
+ *  daemon-task notice in (the offload watcher only announces the later
+ *  completion). Storm-guarded like the docks: one in-flight fetch, one
+ *  timer. */
+class AdoptionNotifier {
+	private readonly seen = new Set<string>();
+	private timer: ReturnType<typeof setTimeout> | undefined;
+	private inFlight = false;
+
+	constructor(
+		private readonly client: TicketClient,
+		private readonly session: string,
+		private readonly append: (customType: string, data: unknown) => void,
+		private readonly send: (
+			message: { customType: string; content: string; display: boolean; details?: unknown },
+			options: { triggerTurn: boolean; deliverAs: "steer" | "followUp" },
+		) => void,
+	) {}
+
+	start(): void {
+		if (this.timer !== undefined) return;
+		void this.tick();
+	}
+
+	private async tick(): Promise<void> {
+		if (this.inFlight) return;
+		this.inFlight = true;
+		try {
+			for (const t of await this.client.agentList(this.session)) {
+				if (t.kind !== "agent" || !t.detached || this.seen.has(t.id)) continue;
+				this.seen.add(t.id);
+				// Only fresh adoptions: a ticket that settled before
+				// first sight gets the completion notice only.
+				if (t.status !== "running") continue;
+				if ((t.created ?? 0) < Date.now() / 1000 - ADOPTION_RECENT_SECS) continue;
+				const name = agentRowMeta(t).name || "subagent";
+				this.append("daemon-task", { ticket: t });
+				this.send(
+					{
+						customType: "daemon-task",
+						content: `[daemon] subagent '${name}' adopted and moved to the daemon as ticket ${t.id}; `
+							+ `its result will be delivered when it finishes `
+							+ `(daemon_subagent_wait ${t.id} fetches it sooner)`,
+						display: false,
+						details: { ticket: t },
+					},
+					// Steer, matching the offload watcher: the notice must
+					// reach the agent before its next model call so it does
+					// not read the child's early exit as a failure.
+					{ triggerTurn: true, deliverAs: "steer" },
+				);
+			}
+		} catch {
+			// daemon unreachable or reset: retry next tick
+		} finally {
+			this.inFlight = false;
+			this.timer = setTimeout(() => void this.tick(), ADOPTION_TICK_MS);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Browser loop (port of the /subagents navigation: selector → detail → back)
 // ---------------------------------------------------------------------------
 
@@ -1077,9 +1172,21 @@ export class DaemonSubagentsBrowser {
 // Extension entry: /daemon-subagents owns its view layer (browser, dock,
 // detail view, source adapter). The daemon wire layer comes from the
 // offload extension; this extension is independently loadable and
-// registers nothing else.
+// registers nothing else besides the session-lifetime adoption watcher.
 // ---------------------------------------------------------------------------
 export default function (pi: ExtensionAPI) {
+	// Adoption notice: the front hands a long-running delegation to the
+	// daemon by marking its agent ticket `detached`; no push channel
+	// exists, so a session-lifetime poller notices the flag and steers
+	// one daemon-task card into the conversation immediately, before the
+	// completion notice the offload watcher delivers later.
+	const notifier = new AdoptionNotifier(
+		new TicketClient((file, args) => pi.exec(file, args)),
+		sessionKeyOf(null),
+		(customType, data) => void pi.appendEntry(customType, data),
+		(message, options) => void pi.sendMessage(message, options),
+	);
+	notifier.start();
 	pi.registerCommand("daemon-subagents", {
 		description:
 			"Browse daemon-adopted subagents of this session; open one to watch its activity",
