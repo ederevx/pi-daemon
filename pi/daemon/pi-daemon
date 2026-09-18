@@ -143,7 +143,6 @@ EXT_WATCH_INTERVAL = float(os.environ.get("PI_PTYD_EXT_WATCH_INTERVAL",
 										  "3.0"))
 EXT_WATCH_DEBOUNCE = float(os.environ.get("PI_PTYD_EXT_WATCH_DEBOUNCE",
 										   "4.0"))
-EXT_WATCH_BUSY_RETRIES = 20  # consecutive all-busy polls before giving up
 _default_watch_roots = [
 	os.path.join(os.path.expanduser("~/.pi/agent"), "extensions"),
 	os.path.join(os.path.expanduser("~/.pi/agent"), "npm"),
@@ -3092,20 +3091,31 @@ def ext_watch_loop(daemon, stop_event):
 			prev_fp = fp
 			busy_rounds = 0
 		else:
-			# Nothing was typed this round: every reloadable session was
-			# busy (or none existed). Retry the same diff on subsequent
-			# polls until a session is reloadable-idle; give up after
-			# EXT_WATCH_BUSY_RETRIES consecutive all-busy rounds.
-			busy_rounds += 1
-			if busy_rounds >= EXT_WATCH_BUSY_RETRIES:
-				log("extension reload deferred %d polls with all "
-					"sessions busy; giving up" % busy_rounds)
+			# Defer while at least one reloadable live session is mid-turn
+			# or waiting on a daemon wait (skipped "not-idle"): keep the OLD
+			# fingerprint and retry the pending diff every poll until the
+			# session goes idle. Never give up: absorbing the fingerprint
+			# without typing /reload would silently lose the change.
+			if any(s.get("reason") == "not-idle"
+					for s in (res.get("skipped") or [])):
+				busy_rounds += 1
+				if busy_rounds == 1 or busy_rounds % 5 == 0:
+					log("extension reload deferred: hosted session(s) "
+						"busy (round %d)" % busy_rounds)
+			else:
+				# No reloadable session exists (none hosted, headless
+				# workers only, or the write failed): nothing can take an
+				# in-place reload, and sessions started from here load the
+				# new code directly. Absorb and persist so the stored
+				# snapshot matches what is live.
 				prev_fp = fp
 				busy_rounds = 0
 				last_reload = now
-			else:
-				log("extension reload deferred: all hosted sessions busy "
-					"(round %d/%d)" % (busy_rounds, EXT_WATCH_BUSY_RETRIES))
+				diff = res.get("diff") or {}
+				_write_ext_snapshot(fp, diff)
+				if any(diff.values()):
+					_write_ext_diff(diff)
+				log("extension change absorbed: no hosted session to reload")
 
 
 def main():
