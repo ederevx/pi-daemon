@@ -793,6 +793,7 @@ class AgentTicketRunner:
 		with self._lock:
 			if len(self._procs) >= AGENT_MAX_RUNNING:
 				return None
+		fp = self._delegation_fp(args, max_turns)
 		with self.store.lock:
 			tid = self.store.alloc_id_locked()
 		# Copy the system prompt daemon-side before acking and repoint the
@@ -831,7 +832,7 @@ class AgentTicketRunner:
 			   "created": time.time(), "started": time.time(),
 			   "finished": None, "exit": None, "term": None,
 			   "truncated": False, "error": None,
-			   "max_turns": max_turns, "turns": 0}
+			   "max_turns": max_turns, "turns": 0, "fp": fp}
 		proc = subprocess.Popen(
 			argv, cwd=cwd, env=env_run,
 			stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -844,6 +845,56 @@ class AgentTicketRunner:
 		t.start()
 		log("agent-submit '%s' session '%s' in %s" % (tid, session, cwd))
 		return rec
+
+	def _delegation_fp(self, argv, max_turns):
+		"""Stable fingerprint of a delegation request. The only volatile
+		argv element across an identical re-emission is the
+		--append-system-prompt temp path; its payload (the content) is the
+		actual task, so the path is replaced by a hash of that content."""
+		canon = []
+		i = 0
+		n = len(argv)
+		while i < n:
+			a = argv[i]
+			if a == "--append-system-prompt" and i + 1 < n:
+				payload = argv[i + 1]
+				try:
+					with open(payload, "rb") as f:
+						canon.append("prompt:"
+									+ hashlib.sha256(f.read()).hexdigest())
+				except OSError:
+					# Payload missing: hash empty bytes so the fingerprint stays
+					# stable across re-emissions instead of leaking the volatile
+					# path into the digest (and drifting replay matches).
+					canon.append("prompt:" + hashlib.sha256(b"").hexdigest())
+				canon.append(a)
+				i += 2
+				continue
+			canon.append(a)
+			i += 1
+		h = hashlib.sha256()
+		h.update(str(max_turns or 0).encode())
+		for part in canon:
+			h.update(b"\x1f")
+			h.update(part.encode("utf-8", "surrogateescape"))
+		return h.hexdigest()
+
+	def find_running(self, session, cwd, argv, max_turns):
+		"""Replay suppression for delegations: an identical (session, cwd,
+		fingerprint) agent ticket still running is the same delegation
+		re-emitted after a resume or soft-compaction continuation - reuse
+		it instead of executing the delegation twice. Byte-identical
+		requests (same argv, same prompt payload) are deliberately
+		coalesced into one shared run; anything actually distinct (task
+		text, prompt content, agent/model/tools, cwd) has a different
+		fingerprint and still runs independently."""
+		fp = self._delegation_fp(argv, max_turns)
+		for rec in self.store.snapshot(session, "agent"):
+			if (rec.get("status") == "running"
+					and rec.get("cwd") == cwd
+					and rec.get("fp") == fp):
+				return rec
+		return None
 
 	def wait(self, tid, timeout):
 		# Same contract as TicketRunner.wait; the store condition is shared.
@@ -2551,6 +2602,15 @@ class Control:
 		if max_turns is not None \
 				and not (isinstance(max_turns, int) and max_turns > 0):
 			return bad_request()
+		# Replay suppression: an identical delegation already running in
+		# this session is the same request re-emitted after a resume or
+		# compaction continuation; hand the existing ticket back instead
+		# of executing the delegation twice (the front bridges it).
+		existing = self.daemon.agents.find_running(
+			session, dir_, args, max_turns)
+		if existing is not None:
+			return {"ok": True, "id": existing["id"],
+					"ticket": existing, "deduped": True}
 		if self.daemon.agents.running_count() >= AGENT_MAX_RUNNING:
 			return err("too-busy")
 		try:
