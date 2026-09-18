@@ -308,8 +308,8 @@ export class TicketClient {
  * Session-side task tracking: the watcher registry. Watchers poll a
  * ticket to completion and deliver its full output as one follow-up
  * message; a session restart re-arms watchers for its still-running
- * tickets; a result fetched through the tool suppresses the duplicate
- * notification.
+ * tickets; a result fetched through the tool, or consumed by an inline
+ * bash wait, suppresses the duplicate notification.
  */
 class DaemonTasks {
 	/** The pi-rc surface; exposed for the bash backend's wait/output. */
@@ -325,6 +325,13 @@ class DaemonTasks {
 
 	/** Tickets whose result was already fetched by an explicit call. */
 	private fetched = new Set<string>();
+
+	/** Records that the caller consumed a ticket's result itself (an
+	 *  inline bash wait or an explicit fetch); the armed delivery
+	 *  watcher then stays silent so one ticket notifies exactly once. */
+	markFetched(id: string): void {
+		this.fetched.add(id);
+	}
 
 	/** Detached-agent delivery state: latest snapshot per detached agent
 	 *  ticket plus the single poller timer (see startAgentWatch). */
@@ -965,6 +972,11 @@ class OffloadedBash implements BashOperations {
 				return { exitCode: null };
 			}
 		}
+		// The inline wait consumed the result: bash itself delivers the
+		// output as the tool result, so the delivery watcher armed by
+		// submit() must not also steer it in — one command, one delivery,
+		// by the parent that waited for it.
+		this.tasks.markFetched(id);
 		let output = "";
 		try {
 			output = await this.tasks.client.outputAll(id);
