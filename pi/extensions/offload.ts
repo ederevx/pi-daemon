@@ -43,11 +43,6 @@ import {
 	type BashOperations,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
-import {
-	DaemonSubagentsBrowser,
-	type AdoptedSubagent,
-	type DaemonSubagentsData,
-} from "./dsubagents-views.ts";
 import { Type } from "typebox";
 import {
 	Box,
@@ -77,7 +72,7 @@ const DEFAULT_WAIT_SECONDS = 120;
 const WAIT_CHUNK_SECONDS = 300;
 
 /** One ticket record as the daemon stores and returns it. */
-interface Ticket {
+export interface Ticket {
 	id: string;
 	session: string;
 	cwd: string;
@@ -148,8 +143,19 @@ function resolvePiRc(): string {
 	return candidates[candidates.length - 1];
 }
 
+/** The owning session's stable key, shared by the task machinery and the
+ *  /daemon-subagents views: the hosted session's short name when hosted,
+ *  else the conversation file's stem, else "standalone". */
+export function sessionKeyOf(sessionFile?: string | null): string {
+	const hosted = process.env.PI_HOSTED_SESSION;
+	if (hosted) return hosted.replace(/^pi-/, "");
+	const file = sessionFile || process.env.PI_SESSION_FILE;
+	if (file) return file.replace(/\.jsonl$/, "").split("/").pop() || "standalone";
+	return "standalone";
+}
+
 /** The pi-rc subprocess surface: one method per client command. */
-class TicketClient {
+export class TicketClient {
 	private readonly exec: (
 		file: string,
 		args: string[],
@@ -334,11 +340,7 @@ class DaemonTasks {
 	/** The owning session's stable key: the hosted session's short name
 	 *  when hosted, else the conversation file's stem, else standalone. */
 	sessionKey(sessionFile?: string | null): string {
-		const hosted = process.env.PI_HOSTED_SESSION;
-		if (hosted) return hosted.replace(/^pi-/, "");
-		const file = sessionFile || process.env.PI_SESSION_FILE;
-		if (file) return file.replace(/\.jsonl$/, "").split("/").pop() || "standalone";
-		return "standalone";
+		return sessionKeyOf(sessionFile);
 	}
 
 	async submit(sessionFile: string | null, cwd: string, command: string,
@@ -800,13 +802,14 @@ class DaemonTasksDock {
 	}
 }
 
-// -- /daemon-subagents dock: the daemon-adopted subagent selector ------
+// -- adopted-subagent metadata (names/status), shared with the
+// -- /daemon-subagents views extension and the daemon_subagent_list tool --
 
 /** One-shot label/task derivation for an adopted agent ticket: the tier
  *  worker's profile heading in its prompt copy, else the model name; the
  *  task is the last "Task:" line of the prompt, else the tail of the
  *  recorded command. */
-function agentRowMeta(ticket: Ticket): { name: string; task: string } {
+export function agentRowMeta(ticket: Ticket): { name: string; task: string } {
 	let name = "";
 	let task = "";
 	const promptMatch = /--append-system-prompt\s+(\S+)/.exec(ticket.command);
@@ -856,54 +859,6 @@ function agentStatusLine(ticket: Ticket, now: number): string {
 	}
 	if (ticket.detached) parts.push("adopted");
 	return parts.join(" \u00b7 ");
-}
-
-/** Settings-styled selector of the daemon-adopted subagents: this
- *  session's agent tickets, latest first, in the same row shape as the
- *  /subagents selector (#<id> <name> label + live status value), plus an
- *  expandable task/output tail. Enter expands, c cancels/removes, Esc
- *  closes. Live-polls once a second while mounted. */
-/** Single owner of the daemon -> /daemon-subagents view translation:
- *  maps tickets to view entries and serves the list, transcript, and
- *  per-ticket snapshot the daemon views poll. Owns the session scope and
- *  the mapping; no mutation (the views are readers). */
-class AdoptedSubagentsSource implements DaemonSubagentsData {
-	constructor(
-		private readonly client: TicketClient,
-		private readonly session: string,
-	) {}
-
-	list(): Promise<AdoptedSubagent[]> {
-		return this.client.agentList(this.session).then((tickets) => tickets.map((t) => this.map(t)));
-	}
-
-	transcript(id: string): Promise<string> {
-		return this.client.agentOutput(id);
-	}
-
-	async refresh(id: string): Promise<AdoptedSubagent | null> {
-		try {
-			return this.map(await this.client.wait(id, 0));
-		} catch {
-			return null;
-		}
-	}
-
-	private map(ticket: Ticket): AdoptedSubagent {
-		const meta = agentRowMeta(ticket);
-		return {
-			id: ticket.id,
-			agent: meta.name || "subagent",
-			task: meta.task,
-			status: ticket.status,
-			started: ticket.started ?? ticket.created,
-			finished: ticket.finished ?? undefined,
-			exit: ticket.exit,
-			turns: ticket.turns,
-			max_turns: ticket.max_turns,
-			cwd: ticket.cwd,
-		};
-	}
 }
 
 /** The offloading bash backend: submits a command to the daemon, waits for
@@ -1236,22 +1191,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			await new DaemonTasksDock(tasks.client).run(cmdCtx.ui);
-		},
-	});
-
-	// Daemon-adopted subagent selector: this session's agent tickets, in
-	// the /subagents row shape. Adopted workers are NOT in /subagents
-	// (their ADP child closed at hand-off) nor in /daemon-tasks.
-	pi.registerCommand("daemon-subagents", {
-		description: "Browse daemon-adopted subagents of this session; open one to watch its activity",
-		handler: async (_args, cmdCtx) => {
-			if (cmdCtx.mode !== "tui") {
-				cmdCtx.ui?.notify?.("daemon-subagents requires the interactive TUI", "warning");
-				return;
-			}
-			await new DaemonSubagentsBrowser(
-				new AdoptedSubagentsSource(tasks.client, tasks.sessionKey()),
-			).run(cmdCtx.ui);
 		},
 	});
 
