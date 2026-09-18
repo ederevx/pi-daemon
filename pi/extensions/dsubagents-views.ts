@@ -262,9 +262,7 @@ const LIST_POLL_MS = 1000;
 export class DaemonSubagentsDock {
 	private readonly st = getSettingsListTheme();
 	private readonly widthSafe = new ConservativeWidth();
-	private readonly rows: SelectorRow[];
-	private readonly maxLabelWidth: number;
-	private readonly maxVisible: number;
+	private readonly rows: SelectorRow[] = [];
 	private readonly border: DynamicBorder;
 	private readonly empty: Container;
 	private selected = 0;
@@ -284,14 +282,6 @@ export class DaemonSubagentsDock {
 		private readonly theme: Theme,
 		private readonly done: (entry: AdoptedSubagent | null) => void,
 	) {
-		const groups = [
-			{ title: "Active", entries: [] as AdoptedSubagent[] },
-			{ title: "Inactive", entries: [] as AdoptedSubagent[] },
-		];
-		this.rows = [];
-		this.maxLabelWidth = 0;
-		this.maxVisible = 0;
-		for (const g of groups) void g;
 		this.border = new DynamicBorder((s: string) => theme.fg("border", s));
 		this.empty = new Container();
 		this.empty.addChild(new DynamicBorder((s: string) => theme.fg("border", s)));
@@ -299,9 +289,6 @@ export class DaemonSubagentsDock {
 		this.empty.addChild(new Text(this.st.hint("  Workers adopted by the daemon appear here."), 0, 0));
 		this.empty.addChild(new Text(this.st.hint("  ↑↓/mouse select · Enter/Space open · Esc closes"), 0, 0));
 		this.empty.addChild(new DynamicBorder((s: string) => theme.fg("border", s)));
-		this.rows = this.groupRows([]);
-		this.maxLabelWidth = 0;
-		this.maxVisible = 0;
 		void this.poll();
 	}
 
@@ -491,7 +478,6 @@ export class DaemonSubagentsDetailView {
 	private cachedWidth: number | null = null;
 	private builtMessages = 0;
 	private dirtyItem: number | null = null;
-	private appendedBudget = false;
 	private readonly pendingTools = new Map<string, ToolExecutionComponent>();
 
 	private scrollOffset = 0;
@@ -639,7 +625,7 @@ export class DaemonSubagentsDetailView {
 		const rows = this.tui.terminal.rows;
 		const windowHeight = this.windowHeight();
 		const widthChanged = this.cachedWidth !== width;
-		this.ensureItems(width);
+		this.ensureItems();
 		if (widthChanged) this.resetLines(width, windowHeight);
 		this.syncLines();
 		this.growToWindow(windowHeight);
@@ -790,7 +776,7 @@ export class DaemonSubagentsDetailView {
 	// ------------------------------------------------------------------
 
 	/** Fold every message that arrived since the last build into items. */
-	private ensureItems(width: number): void {
+	private ensureItems(): void {
 		for (; this.builtMessages < this.msgs.length; this.builtMessages++) {
 			const msg = this.msgs[this.builtMessages];
 			if (msg.role === "assistant") {
@@ -823,8 +809,6 @@ export class DaemonSubagentsDetailView {
 				}
 			}
 		}
-		// Reserved for parity with the reference's tail decorations.
-		if (this.appendedBudget) void width;
 	}
 
 	// ------------------------------------------------------------------
