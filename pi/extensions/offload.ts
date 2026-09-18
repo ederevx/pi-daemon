@@ -312,6 +312,10 @@ class DaemonTasks {
 	private agentWatchTimer: ReturnType<typeof setTimeout> | undefined;
 	private agentWatchInFlight = false;
 
+	/** Agent tickets whose result an explicit wait already consumed; the
+	 *  watcher must not double-deliver their completion steer. */
+	private agentFetched = new Set<string>();
+
 	constructor(
 		exec: TicketClient["exec"],
 		send: DaemonTasks["send"],
@@ -385,7 +389,14 @@ class DaemonTasks {
 		}
 	}
 
+	/** Marks an agent ticket as already consumed by an explicit wait, so
+	 *  the detached-completion watcher skips its steer. */
+	markAgentFetched(id: string): void {
+		this.agentFetched.add(id);
+	}
+
 	private async deliverAgentDone(ticket: Ticket): Promise<void> {
+		if (this.agentFetched.has(ticket.id)) return;
 		let output = "";
 		try {
 			output = await this.client.agentOutput(ticket.id);
@@ -1380,6 +1391,89 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			await new DaemonSubagentsDock(tasks.client, tasks.sessionKey()).run(cmdCtx.ui);
+		},
+	});
+
+	pi.registerTool({
+		name: "daemon_subagent_list",
+		label: "list adopted subagents",
+		description:
+			"List this session's daemon-adopted subagents (agent tickets): " +
+			"id, worker name, status, turns and elapsed. Companion to " +
+			"daemon_subagent_wait. Requires the pi-daemon service.",
+		promptSnippet: "List daemon-adopted subagents",
+		parameters: Type.Object({}),
+		async execute(_t, _p, _s, _o, _c) {
+			if (disabled()) {
+				throw new Error("Command offloading is disabled (PI_OFFLOAD=off)");
+			}
+			const tickets = await tasks.client.agentList(tasks.sessionKey());
+			if (!tickets.length) {
+				return { content: [{ type: "text", text: "No adopted subagents in this session." }], details: {} };
+			}
+			const now = Date.now() / 1000;
+			const lines = tickets
+				.sort((a, b) => (b.started ?? b.created) - (a.started ?? a.created))
+				.map((t) => {
+					const m = agentRowMeta(t);
+					return `${t.id} ${m.name} - ${agentStatusLine(t, now)} - ${m.task}`;
+				});
+			return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
+		},
+	});
+	pi.registerTool({
+		name: "daemon_subagent_wait",
+		label: "wait on adopted subagent",
+		description:
+			"Wait (block) until a daemon-adopted subagent (an agent ticket of " +
+			"this session) finishes and return its full output. Use this when " +
+			"you spawned a subagent that was adopted by the daemon and need its " +
+			"result before continuing to make decisions: it blocks event-driven " +
+			"on the daemon (no sleep/poll loops, no wasted turns). The helper " +
+			"daemon_subagent_list lists this session's adopted subagents. " +
+			"Requires the pi-daemon service.",
+		promptSnippet: "Wait for a daemon-adopted subagent to finish",
+		promptGuidelines: [
+			"When you wait on an adopted subagent, do NOT invent sleep/poll " +
+				"loops to check on it - this tool blocks until it is done and " +
+				"returns the full result in one call. Re-call it to keep " +
+				"waiting; if you do NOT want to wait, just continue and the " +
+				"result is delivered when it finishes.",
+		],
+		parameters: Type.Object({
+			ticket: Type.String({ description: "Adopted subagent ticket id (e.g. \"t-268\")" }),
+			wait: Type.Optional(Type.Number({ description: "Max seconds to block (default 120, cap 600)" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (disabled()) {
+				throw new Error("Command offloading is disabled (PI_OFFLOAD=off)");
+			}
+			void ctx;
+			if (!params.ticket) throw new Error("wait needs a ticket id");
+			const bound = Math.min(Math.max(0, Math.floor(params.wait ?? 120)), 600);
+			// The wait consumes the result: stop the detached-completion
+			// watcher from also steering it in.
+			tasks.markAgentFetched(params.ticket);
+			let ticket = await tasks.status(params.ticket);
+			if (ticket.status === "running") {
+				ticket = await tasks.client.wait(params.ticket, bound);
+			}
+			if (ticket.status === "running") {
+				return {
+					content: [{
+						type: "text",
+						text: `ticket ${ticket.id} still running after ${bound}s: ${ticket.command}\n` +
+							`Call daemon_subagent_wait again to keep blocking, or continue ` +
+							`and the result will be delivered when it finishes.`,
+					}],
+					details: { ticket },
+				};
+			}
+			const output = await tasks.client.agentOutput(params.ticket);
+			return {
+				content: [{ type: "text", text: formatResult(ticket, output) }],
+				details: { ticket },
+			};
 		},
 	});
 }
