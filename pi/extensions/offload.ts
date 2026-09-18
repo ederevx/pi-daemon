@@ -863,36 +863,156 @@ function agentStatusLine(ticket: Ticket, now: number): string {
  *  /subagents selector (#<id> <name> label + live status value), plus an
  *  expandable task/output tail. Enter expands, c cancels/removes, Esc
  *  closes. Live-polls once a second while mounted. */
-/** Adopted-subagent view of a ticket (the /daemon-subagents data
- *  source: mapper + adapter over the daemon client). */
-function toAdoptedSubagent(ticket: Ticket): AdoptedSubagent {
-	const meta = agentRowMeta(ticket);
-	return {
-		id: ticket.id,
-		agent: meta.name || "subagent",
-		task: meta.task,
-		status: ticket.status,
-		started: ticket.started ?? ticket.created,
-		finished: ticket.finished ?? undefined,
-		exit: ticket.exit,
-		turns: ticket.turns,
-		max_turns: ticket.max_turns,
-		cwd: ticket.cwd,
-	};
+/** Single owner of the daemon -> /daemon-subagents view translation:
+ *  maps tickets to view entries and serves the list, transcript, and
+ *  per-ticket snapshot the daemon views poll. Owns the session scope and
+ *  the mapping; no mutation (the views are readers). */
+class AdoptedSubagentsSource implements DaemonSubagentsData {
+	constructor(
+		private readonly client: TicketClient,
+		private readonly session: string,
+	) {}
+
+	list(): Promise<AdoptedSubagent[]> {
+		return this.client.agentList(this.session).then((tickets) => tickets.map((t) => this.map(t)));
+	}
+
+	transcript(id: string): Promise<string> {
+		return this.client.agentOutput(id);
+	}
+
+	async refresh(id: string): Promise<AdoptedSubagent | null> {
+		try {
+			return this.map(await this.client.wait(id, 0));
+		} catch {
+			return null;
+		}
+	}
+
+	private map(ticket: Ticket): AdoptedSubagent {
+		const meta = agentRowMeta(ticket);
+		return {
+			id: ticket.id,
+			agent: meta.name || "subagent",
+			task: meta.task,
+			status: ticket.status,
+			started: ticket.started ?? ticket.created,
+			finished: ticket.finished ?? undefined,
+			exit: ticket.exit,
+			turns: ticket.turns,
+			max_turns: ticket.max_turns,
+			cwd: ticket.cwd,
+		};
+	}
 }
 
-function makeSubagentsData(tasks: DaemonTasks): DaemonSubagentsData {
-	const session = tasks.sessionKey();
-	return {
-		list: async () => (await tasks.client.agentList(session)).map(toAdoptedSubagent),
-		transcript: (id) => tasks.client.agentOutput(id),
-		refresh: async (id) => {
-			try {
-				return toAdoptedSubagent(await tasks.client.wait(id, 0));
-			} catch {
-				return null;
+/** The offloading bash backend: submits a command to the daemon, waits for
+ *  it within the call bound, hands off past the bound (ticket keeps running
+ *  daemon-side, delivery armed, agent freed), and always falls back to the
+ *  local shell when the daemon was never in play. Owns its fallback backend
+ *  and the wait-bound policy; state is per-call and never shared. */
+class OffloadedBash implements BashOperations {
+	constructor(
+		private readonly localBash: BashOperations,
+		private readonly tasks: DaemonTasks,
+	) {}
+
+	private offloadDisabled(): boolean {
+		return process.env.PI_OFFLOAD === "off";
+	}
+
+	private waitBoundSeconds(): number {
+		const raw = Number(process.env.PI_OFFLOAD_WAIT);
+		return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_WAIT_SECONDS;
+	}
+
+	exec: BashOperations["exec"] = async (command, cwd, { onData, signal, timeout, env }) => {
+		if (this.offloadDisabled()) {
+			return this.localBash.exec(command, cwd, { onData, signal, timeout, env });
+		}
+		const sessionFile =
+			typeof env?.PI_SESSION_FILE === "string" ? env.PI_SESSION_FILE : null;
+		let id: string;
+		try {
+			id = await this.tasks.submit(
+				sessionFile, cwd, command, sessionEnvExtra(env));
+		} catch (exc) {
+			if (!(exc instanceof DaemonUnavailable) || !exc.ambiguous) {
+				// Daemon unreachable (contact never established) or a
+				// deterministic refusal: the command never started in
+				// the daemon, so local fallback is safe and exclusive.
+				return this.localBash.exec(command, cwd, { onData, signal, timeout, env });
 			}
-		},
+			// Ambiguous: the ticket may already be running. Adopt a
+			// matching recent ticket instead of re-running locally.
+			const adopted = await adoptRecentShellTicket(
+				this.tasks, sessionFile, command);
+			if (adopted === null) {
+				onData(Buffer.from(
+					`[pi-daemon submit outcome unknown; NOT re-running ` +
+					`locally to avoid duplication - check daemon_tasks ` +
+					`list to locate the ticket]
+`));
+				return { exitCode: null };
+			}
+			id = adopted;
+		}
+		const deadline = Date.now() + (timeout ?? this.waitBoundSeconds()) * 1000;
+		// One abort listener for the whole call: when the user aborts,
+		// the race resolves null and the ticket is cancelled daemon-side.
+		const aborted = new Promise<null>((resolve) => {
+			if (!signal) return;
+			if (signal.aborted) resolve(null);
+			else signal.addEventListener("abort", () => resolve(null), { once: true });
+		});
+		let ticket: Ticket | null = null;
+		while (ticket === null || ticket.status === "running") {
+			const remaining = Math.max(1, Math.min(
+				WAIT_CHUNK_SECONDS,
+				(deadline - Date.now()) / 1000,
+			));
+			ticket = await Promise.race([
+				this.tasks.client.wait(id, remaining),
+				aborted.then(() => null),
+			]);
+			if (ticket === null) {
+				// User abort: kill the daemon-side process too.
+				await this.tasks.cancel(id).catch(() => {});
+				throw new Error("aborted");
+			}
+			if (ticket.status === "running" && Date.now() >= deadline) {
+				// Hand off: the ticket keeps running in the daemon,
+				// the agent is freed now and notified on completion.
+				let partial = "";
+				try {
+					partial = await this.tasks.client.outputAll(id);
+				} catch {
+					// partial output is best-effort
+				}
+				this.tasks.armDelivery(id, command);
+				onData(Buffer.from(
+					`${partial}
+[pi-daemon ticket ${id} still running: ` +
+					`continuing in the background; the full result will ` +
+					`be delivered here when it finishes ` +
+					`(daemon_tasks result ${id} fetches it sooner)]
+`,
+				));
+				return { exitCode: null };
+			}
+		}
+		let output = "";
+		try {
+			output = await this.tasks.client.outputAll(id);
+		} catch {
+			// output fetch is best-effort; the exit code still stands
+		}
+		if (ticket.status === "lost") {
+			output += `\n[pi-daemon ticket ${id} was interrupted ` +
+				`(daemon restart); re-run if it is safe to repeat]`;
+		}
+		onData(Buffer.from(output));
+		return { exitCode: ticket.exit };
 	};
 }
 export default function (pi: ExtensionAPI) {
@@ -927,105 +1047,17 @@ export default function (pi: ExtensionAPI) {
 	const localBash: BashOperations = createLocalBashOperations();
 
 	const disabled = () => process.env.PI_OFFLOAD === "off";
-	const waitBoundSeconds = () => {
-		const raw = Number(process.env.PI_OFFLOAD_WAIT);
-		return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_WAIT_SECONDS;
-	};
 
 	// -- transparent bash offloading -------------------------------------
+	// The offload backend lives in the OffloadedBash class (module level);
+	// this bootstrap composes it with the local fallback and the daemon.
+	const backend = new OffloadedBash(localBash, tasks);
 
-	const offloadOps: BashOperations = {
-		exec: async (command, cwd, { onData, signal, timeout, env }) => {
-			if (disabled()) {
-				return localBash.exec(command, cwd, { onData, signal, timeout, env });
-			}
-			const sessionFile =
-				typeof env?.PI_SESSION_FILE === "string" ? env.PI_SESSION_FILE : null;
-			let id: string;
-			try {
-				id = await tasks.submit(
-					sessionFile, cwd, command, sessionEnvExtra(env));
-			} catch (exc) {
-				if (!(exc instanceof DaemonUnavailable) || !exc.ambiguous) {
-					// Daemon unreachable (contact never established) or a
-					// deterministic refusal: the command never started in
-					// the daemon, so local fallback is safe and exclusive.
-					return localBash.exec(command, cwd, { onData, signal, timeout, env });
-				}
-				// Ambiguous: the ticket may already be running. Adopt a
-				// matching recent ticket instead of re-running locally.
-				const adopted = await adoptRecentShellTicket(
-					tasks, sessionFile, command);
-				if (adopted === null) {
-					onData(Buffer.from(
-						`[pi-daemon submit outcome unknown; NOT re-running ` +
-						`locally to avoid duplication - check daemon_tasks ` +
-						`list to locate the ticket]\n`));
-					return { exitCode: null };
-				}
-				id = adopted;
-			}
-			const deadline = Date.now() + (timeout ?? waitBoundSeconds()) * 1000;
-			// One abort listener for the whole call: when the user aborts,
-			// the race resolves null and the ticket is cancelled daemon-side.
-			const aborted = new Promise<null>((resolve) => {
-				if (!signal) return;
-				if (signal.aborted) resolve(null);
-				else signal.addEventListener("abort", () => resolve(null), { once: true });
-			});
-			let ticket: Ticket | null = null;
-			while (ticket === null || ticket.status === "running") {
-				const remaining = Math.max(1, Math.min(
-					WAIT_CHUNK_SECONDS,
-					(deadline - Date.now()) / 1000,
-				));
-				ticket = await Promise.race([
-					tasks.client.wait(id, remaining),
-					aborted.then(() => null),
-				]);
-				if (ticket === null) {
-					// User abort: kill the daemon-side process too.
-					await tasks.cancel(id).catch(() => {});
-					throw new Error("aborted");
-				}
-				if (ticket.status === "running" && Date.now() >= deadline) {
-					// Hand off: the ticket keeps running in the daemon,
-					// the agent is freed now and notified on completion.
-					let partial = "";
-					try {
-						partial = await tasks.client.outputAll(id);
-					} catch {
-						// partial output is best-effort
-					}
-					tasks.armDelivery(id, command);
-					onData(Buffer.from(
-						`${partial}\n[pi-daemon ticket ${id} still running: ` +
-						`continuing in the background; the full result will ` +
-						`be delivered here when it finishes ` +
-						`(daemon_tasks result ${id} fetches it sooner)]\n`,
-					));
-					return { exitCode: null };
-				}
-			}
-			let output = "";
-			try {
-				output = await tasks.client.outputAll(id);
-			} catch {
-				// output fetch is best-effort; the exit code still stands
-			}
-			if (ticket.status === "lost") {
-				output += `\n[pi-daemon ticket ${id} was interrupted ` +
-					`(daemon restart); re-run if it is safe to repeat]`;
-			}
-			onData(Buffer.from(output));
-			return { exitCode: ticket.exit };
-		},
-	};
 
 	// bash tool override: same schema, renderers, prompt snippet, and
 	// result shape as the built-in; only the execution backend changes,
 	// plus one guideline telling agents about the background hand-off.
-	const bashTool = createBashTool(process.cwd(), { operations: offloadOps });
+	const bashTool = createBashTool(process.cwd(), { operations: backend });
 	Object.assign(bashTool, {
 		promptGuidelines: [
 			"You can inspect PI_* environment variables for current model and session details.",
@@ -1217,7 +1249,9 @@ export default function (pi: ExtensionAPI) {
 				cmdCtx.ui?.notify?.("daemon-subagents requires the interactive TUI", "warning");
 				return;
 			}
-			await new DaemonSubagentsBrowser(makeSubagentsData(tasks)).run(cmdCtx.ui);
+			await new DaemonSubagentsBrowser(
+				new AdoptedSubagentsSource(tasks.client, tasks.sessionKey()),
+			).run(cmdCtx.ui);
 		},
 	});
 
