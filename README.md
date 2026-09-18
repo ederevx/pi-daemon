@@ -141,9 +141,12 @@ bash scripts/uninstall.sh
 
 ```
 pi/
-  extensions/daemon.ts       # /bg: instant detach when hosted, handover otherwise
+  extensions/daemon.ts       # /bg: instant detach when hosted, handover otherwise;
+                             # + relays the daemon's extension-update diff to
+                             #   the agent after an in-place reload
   extensions/offload.ts      # ticket-based command offloading + daemon_tasks tool
-  bin/pi-rc                         # client: tickets, agents, bridge, start/attach/detach/announce/ls/which/stop
+  bin/pi-rc                  # client: tickets, agents, bridge, input, extensions-reload,
+                             # start/attach/detach/announce/ls/which/stop
   daemon/pi-daemon                      # stdlib Python PTY host daemon + ticket/agent runners
   daemon/pi-agent-entry.mjs             # pi-compatible front: delegation interception
   systemd/pi-daemon.service

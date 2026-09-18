@@ -132,6 +132,28 @@ TICKET_OUTPUT_MAX = 4 << 20  # per-ticket captured output bound
 TICKET_CHUNK = 256 << 10     # max output bytes per ticket-output reply
 TICKET_MAX_RUNNING = 32      # soft cap; further submits get too-busy
 TICKET_MAX_WAIT = 600.0      # cap on a single ticket-wait round trip
+# Extension-reload watch: roots whose changes trigger `/reload` in every
+# hosted conversation session (pi re-scans extensions, skills, prompts,
+# themes and context files in place), plus the poll interval and the
+# minimum gap between reloads so bursts of edits coalesce into one. The
+# in-session daemon extension reads EXT_DIFF_PATH after a reload and
+# relays the file-level diff to the agent once it settles.
+EXT_WATCH_ENABLED = os.environ.get("PI_PTYD_EXT_WATCH", "1") != "0"
+EXT_WATCH_INTERVAL = float(os.environ.get("PI_PTYD_EXT_WATCH_INTERVAL",
+										  "3.0"))
+EXT_WATCH_DEBOUNCE = float(os.environ.get("PI_PTYD_EXT_WATCH_DEBOUNCE",
+										   "4.0"))
+_default_watch_roots = [
+	os.path.join(os.path.expanduser("~/.pi/agent"), "extensions"),
+	os.path.join(os.path.expanduser("~/.pi/agent"), "npm"),
+	os.path.join(os.path.expanduser("~/.pi/agent"), "git"),
+	os.path.join(os.path.expanduser("~/.pi/agent"), "settings.json"),
+]
+EXT_WATCH_ROOTS = [p for p in os.environ.get(
+	"PI_PTYD_EXT_WATCH_ROOTS", os.pathsep.join(_default_watch_roots)
+).split(os.pathsep) if p]
+EXT_SNAPSHOT_PATH = os.path.join(REG_DIR, "extensions-snapshot.json")
+EXT_DIFF_PATH = os.path.join(REG_DIR, "extensions-diff.json")
 # Agent tickets (headless `pi --mode json` subagent delegations) share
 # the same store and GC, with their own running cap and a much larger
 # output cap: the NDJSON event stream is relayed verbatim and a severed
@@ -176,6 +198,7 @@ CLEAR_SEQ = b"\x1b[H\x1b[2J\x1b[m"
 _WIRE_COMMANDS = ("ping", "start", "detach", "resize", "list", "which",
 				  "whichall", "state", "stop", "handover", "carry", "resume",
 				  "announce", "handoff-target",
+				  "input", "extensions-reload",
 				  "ticket-submit", "ticket-wait", "ticket-output",
 				  "ticket-list", "ticket-cancel", "ticket-remove",
 				  "tickets-reset",
@@ -234,6 +257,70 @@ def bad_request():
 
 def err(error):
 	return {"ok": False, "error": error}
+
+
+def ext_root_fingerprint(roots):
+	"""{(abs_path): (mtime_ns, size)} for every file under roots; missing
+	paths are skipped and directories are walked. Cheap per-poll change
+	detection for the extension-reload watcher. Values are int tuples so
+	the on-disk snapshot round-trips exactly (JSON arrays become tuples
+	again on read)."""
+	fp = {}
+	for root in roots:
+		try:
+			if os.path.isfile(root):
+				st = os.stat(root)
+				fp[os.path.abspath(root)] = (st.st_mtime_ns, st.st_size)
+			elif os.path.isdir(root):
+				for dirpath, _dirs, files in os.walk(root):
+					for fn in files:
+						path = os.path.join(dirpath, fn)
+						try:
+							st = os.stat(path)
+						except OSError:
+							continue
+						fp[path] = (st.st_mtime_ns, st.st_size)
+		except OSError:
+			continue
+	return fp
+
+
+def ext_diff_files(old, new):
+	"""File-level diff between two fingerprints: added / removed / changed
+	absolute paths, each sorted."""
+	added = sorted(set(new) - set(old))
+	removed = sorted(set(old) - set(new))
+	changed = sorted(p for p in set(old) & set(new) if old[p] != new[p])
+	return {"added": added, "removed": removed, "changed": changed}
+
+
+def _read_ext_snapshot():
+	"""Last-known extension fingerprint, or None before any baseline.
+	JSON turns the stored mtime/size tuples into arrays; fold them back
+	into tuples so the comparison on read is exact."""
+	try:
+		with open(EXT_SNAPSHOT_PATH) as f:
+			rec = json.load(f)
+		fp = rec.get("fingerprint")
+		if not isinstance(fp, dict):
+			return None
+		return {k: tuple(v) for k, v in fp.items()}
+	except (OSError, ValueError):
+		return None
+
+
+def _write_ext_snapshot(fp, diff):
+	tmp = EXT_SNAPSHOT_PATH + ".tmp"
+	with open(tmp, "w") as f:
+		json.dump({"fingerprint": fp, "diff": diff}, f)
+	os.replace(tmp, EXT_SNAPSHOT_PATH)
+
+
+def _write_ext_diff(diff):
+	tmp = EXT_DIFF_PATH + ".tmp"
+	with open(tmp, "w") as f:
+		json.dump(diff, f)
+	os.replace(tmp, EXT_DIFF_PATH)
 
 
 def _exit_abnormal(status):
@@ -2672,6 +2759,64 @@ class Control:
 			return err("no-ticket")
 		return {"ok": True, "ticket": rec}
 
+	def input(self, req):
+		"""Write raw text into a hosted session's PTY master (the same path
+		the attach bridge uses), e.g. to type a slash command into its TUI."""
+		name = req.get("name")
+		text = req.get("text")
+		if not isinstance(name, str) or not isinstance(text, str):
+			return bad_request()
+		sess = self.daemon.table.get(name)
+		if sess is None:
+			return err("no-session")
+		data = text.encode("utf-8", "replace")
+		try:
+			os.write(sess.master_fd, data)
+		except OSError as exc:
+			return err("write-failed: %s" % exc)
+		return {"ok": True, "bytes": len(data)}
+
+	def extensions_reload(self, req):
+		"""Type /reload into every hosted conversation session so pi
+		re-scans extensions, skills, prompts, themes and context files in
+		place. When the extension roots actually changed, the file-level
+		diff is persisted for the in-session extension to relay to the
+		agent once it settles. force=1 reloads even without changes."""
+		force = bool(req.get("force"))
+		prev_fp = _read_ext_snapshot()
+		fp = ext_root_fingerprint(EXT_WATCH_ROOTS)
+		diff = ext_diff_files(prev_fp, fp) if prev_fp else \
+			{"added": [], "removed": [], "changed": []}
+		_write_ext_snapshot(fp, diff)
+		if not force and prev_fp and not any(diff.values()):
+			return {"ok": True, "reloaded": [], "skipped": [],
+					"unchanged": True}
+		reloaded, skipped = [], []
+		for sess in self.daemon.table.snapshot():
+			if self._session_reloadable(sess):
+				try:
+					os.write(sess.master_fd, b"/reload\r")
+				except OSError:
+					skipped.append(sess.name)
+				else:
+					reloaded.append(sess.name)
+			else:
+				skipped.append(sess.name)
+		if any(diff.values()):
+			_write_ext_diff(diff)
+		return {"ok": True, "reloaded": reloaded, "skipped": skipped,
+				"diff": diff}
+
+	@staticmethod
+	def _session_reloadable(sess):
+		"""An interactive hosted pi that announced a conversation file: its
+		TUI can accept /reload in place. The live spawn argv carries no
+		--session for `start`ed sessions (the file arrives via announce),
+		so the announced file is the reliable marker. Ephemeral json-mode
+		workers announce nothing and have no TUI to reload."""
+		argv = sess.argv or []
+		return bool(sess.file) and "--no-session" not in argv
+
 	def shutdown(self, _req):
 		t = threading.Thread(target=self.daemon.shutdown, daemon=True)
 		t.start()
@@ -2691,8 +2836,36 @@ def _dir_base(dir_):
 _BRIDGE_HANDOFF = object()
 
 
+def ext_watch_loop(daemon, stop_event):
+	"""Poll the extension roots; on change, reload every hosted session
+	(once per EXT_WATCH_DEBOUNCE window) so updated extensions go live in
+	place. Seeds the baseline from the snapshot file so a daemon restart
+	does not retrigger."""
+	if not EXT_WATCH_ENABLED:
+		return
+	prev_fp = _read_ext_snapshot()
+	if prev_fp is None:
+		prev_fp = ext_root_fingerprint(EXT_WATCH_ROOTS)
+		_write_ext_snapshot(prev_fp, None)
+	last_reload = 0.0
+	while not stop_event.wait(EXT_WATCH_INTERVAL):
+		fp = ext_root_fingerprint(EXT_WATCH_ROOTS)
+		if fp == prev_fp:
+			continue
+		prev_fp = fp
+		now = time.monotonic()
+		if now - last_reload < EXT_WATCH_DEBOUNCE:
+			continue
+		log("extension roots changed; reloading hosted sessions")
+		daemon.control.extensions_reload({})
+		last_reload = now
+
+
 def main():
 	daemon = Daemon(Registry(REG_PATH))
+	threading.Thread(target=ext_watch_loop,
+					 args=(daemon, daemon.shutdown_event),
+					 daemon=True).start()
 	return daemon.serve()
 
 
