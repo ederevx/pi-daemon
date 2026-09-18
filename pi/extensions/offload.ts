@@ -187,6 +187,15 @@ export class TicketClient {
 		}
 		if (result.code !== 0) {
 			const detail = (result.stderr || result.stdout || "").trim();
+			// A silent nonzero exit is an abnormal client death (signal,
+			// OOM) whose request may already have landed daemon-side:
+			// treat it as ambiguous so the caller never re-runs the
+			// command locally behind a duplicate ticket.
+			if (!detail) {
+				throw new DaemonUnavailable(
+					`pi-rc exit ${result.code} without output (abnormal death)`,
+					true);
+			}
 			throw new DaemonUnavailable(detail || `pi-rc exit ${result.code}`);
 		}
 		return result.stdout || "";

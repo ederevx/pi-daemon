@@ -404,12 +404,23 @@ class TicketStore:
 			return dict(rec)
 
 	def mark_interrupted(self):
-		# Daemon restart: subprocesses died with the old process, so a
-		# ticket can never finish. Logs survive for inspection until GC.
+		# Daemon restart: subprocesses spawned with start_new_session
+		# survive a hard kill of this process, so before declaring the
+		# tickets lost, kill their process groups. A revived session's
+		# replay of the same command is then a single fresh execution,
+		# never a shadow twin of a still-running orphan. Logs survive
+		# for inspection until GC.
 		with self.lock:
 			changed = False
 			for rec in self._tickets.values():
 				if rec.get("status") == "running":
+					pid = rec.get("pid")
+					if pid:
+						try:
+							os.killpg(pid, signal.SIGKILL)
+						except OSError:
+							# already exited (or the group vanished)
+							pass
 					rec["status"] = "lost"
 					rec["finished"] = time.time()
 					rec["error"] = "interrupted by daemon restart"
@@ -548,6 +559,7 @@ class TicketRunner:
 			env=env if env else os.environ.copy(),
 			stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
 			stderr=subprocess.STDOUT, start_new_session=True, bufsize=0)
+		rec["pid"] = proc.pid
 		rec = self.store.add(rec)
 		with self._lock:
 			self._procs[tid] = proc
@@ -556,6 +568,20 @@ class TicketRunner:
 		log("ticket-submit '%s' session '%s' in %s"
 			% (tid, session, cwd))
 		return rec
+
+	def find_running(self, session, cwd, command):
+		# Replay suppression: an identical (session, cwd, command) ticket
+		# that is still running is the same logical request re-emitted
+		# (soft-compaction continuation, crash-resume replay) - a session
+		# runs one blocking shell ticket at a time, so a concurrent twin
+		# is never an independent second request. Reuse it instead of
+		# executing the command twice.
+		for rec in self.store.snapshot(session, "shell"):
+			if (rec.get("status") == "running"
+					and rec.get("cwd") == cwd
+					and rec.get("command") == command):
+				return rec
+		return None
 
 	def wait(self, tid, timeout):
 		deadline = time.time() + max(0.0, min(float(timeout or 0), TICKET_MAX_WAIT))
@@ -810,6 +836,7 @@ class AgentTicketRunner:
 			argv, cwd=cwd, env=env_run,
 			stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
 			stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
+		rec["pid"] = proc.pid
 		rec = self.store.add(rec)
 		with self._lock:
 			self._procs[tid] = proc
@@ -2399,6 +2426,13 @@ class Control:
 									and all(isinstance(k, str) and isinstance(v, str)
 										for k, v in env.items())):
 			return bad_request()
+		# Replay guard: a re-emitted identical command (compaction
+		# continuation, crash-resume replay) joins the running ticket
+		# instead of spawning a duplicate execution.
+		existing = self.daemon.tickets.find_running(session, dir_, command)
+		if existing is not None:
+			return {"ok": True, "id": existing["id"],
+					"ticket": existing, "reused": True}
 		if self.daemon.tickets.running_count() >= TICKET_MAX_RUNNING:
 			return err("too-busy")
 		try:
