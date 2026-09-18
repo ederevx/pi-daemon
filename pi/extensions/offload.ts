@@ -71,6 +71,23 @@ const DEFAULT_WAIT_SECONDS = 120;
 /** Longest single ticket-wait round trip, in seconds. */
 const WAIT_CHUNK_SECONDS = 300;
 
+export interface TicketCost {
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	total?: number;
+}
+
+export interface TicketUsage {
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	totalTokens?: number;
+	cost?: TicketCost;
+}
+
 /** One ticket record as the daemon stores and returns it. */
 export interface Ticket {
 	id: string;
@@ -89,6 +106,14 @@ export interface Ticket {
 	term: number | null;
 	truncated: boolean;
 	error: string | null;
+	usage?: TicketUsage;
+	cost?: TicketCost;
+	input?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	totalTokens?: number;
+	final_message?: string;
+	output?: string;
 }
 
 /** Error thrown when the daemon cannot be reached or misbehaves.
@@ -104,13 +129,17 @@ class DaemonUnavailable extends Error {
 
 /** Formats one completed ticket + its output as agent-facing text. */
 function formatResult(ticket: Ticket, output: string): string {
+	const cost = ticket.cost?.total ?? ticket.usage?.cost?.total;
+	const costStr = typeof cost === "number" && cost > 0 ? ` · $${cost.toFixed(4)}` : "";
+	const tokens = ticket.totalTokens ?? ticket.usage?.totalTokens;
+	const tokStr = typeof tokens === "number" && tokens > 0 ? ` · ${tokens} tok` : "";
 	const header = [
 		`ticket ${ticket.id} ${ticket.status}`,
 		ticket.exit !== null ? `exit ${ticket.exit}` : null,
 		ticket.error ? `(${ticket.error})` : null,
 	]
 		.filter(Boolean)
-		.join(" ");
+		.join(" ") + costStr + tokStr;
 	if (!output) return header;
 	const truncation = truncateTail(output, {
 		maxLines: DEFAULT_MAX_LINES,
@@ -241,6 +270,23 @@ export class TicketClient {
 			throw new DaemonUnavailable("malformed ticket record");
 		}
 		return ticket;
+	}
+
+	/** Fetches the final output text and usage from the daemon. */
+	async getOutput(id: string): Promise<{
+		ok: boolean;
+		id: string;
+		status: string;
+		exit: number | null;
+		output: string;
+		usage?: TicketUsage;
+	}> {
+		const out = await this.run(["ticket-output", id, "--json"]);
+		try {
+			return JSON.parse(out.trim());
+		} catch {
+			return { ok: true, id, status: "unknown", exit: null, output: out };
+		}
 	}
 
 	/** Reads the whole output log in bounded chunks. */
@@ -438,7 +484,12 @@ class DaemonTasks {
 		if (this.agentFetched.has(ticket.id)) return;
 		let output = "";
 		try {
-			output = await this.client.agentOutput(ticket.id);
+			const res = await this.client.getOutput(ticket.id);
+			output = res.output;
+			if (res.usage) {
+				ticket.usage = res.usage;
+				ticket.cost = res.usage.cost;
+			}
 		} catch {
 			// keep the card even when the output fetch failed
 		}
@@ -956,12 +1007,16 @@ function agentStatusLine(ticket: Ticket, now: number): string {
 		}
 		parts.push(`${Math.max(1, Math.round(now - (ticket.started ?? ticket.created)))}s`);
 	} else {
-		if (ticket.exit !== null) parts.push(`exit ${ticket.exit}`);
+		if (ticket.exit !== null && ticket.exit !== undefined) parts.push(`exit ${ticket.exit}`);
 		if (ticket.finished) {
 			parts.push(`${Math.round(ticket.finished - (ticket.started ?? ticket.created))}s`);
 		}
 	}
 	if (ticket.detached) parts.push("adopted");
+	const cost = ticket.cost?.total ?? ticket.usage?.cost?.total;
+	if (typeof cost === "number" && cost > 0) parts.push(`$${cost.toFixed(4)}`);
+	const tokens = ticket.totalTokens ?? ticket.usage?.totalTokens;
+	if (typeof tokens === "number" && tokens > 0) parts.push(`${tokens} tok`);
 	return parts.join(" \u00b7 ");
 }
 
@@ -1337,7 +1392,7 @@ export default function (pi: ExtensionAPI) {
 					const m = agentRowMeta(t);
 					return `${t.id} ${m.name} - ${agentStatusLine(t, now)} - ${m.task}`;
 				});
-			return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { tickets } };
 		},
 	});
 	pi.registerTool({
@@ -1380,15 +1435,20 @@ export default function (pi: ExtensionAPI) {
 				if (ticket.status === "running") {
 					ticket = await tasks.client.wait(params.ticket, bound);
 				}
+				if (ticket.status === "running") {
+					const refreshed = await tasks.status(params.ticket);
+					if (refreshed.status !== "running") ticket = refreshed;
+				}
 			} finally {
 				tasks.setSessionState("busy");
 			}
 			if (ticket.status === "running") {
 				const meta = agentRowMeta(ticket);
+				const statusLine = `ticket ${ticket.id} running (turns ${ticket.turns ?? 0})`;
 				return {
 					content: [{
 						type: "text",
-						text: `ticket ${ticket.id} still running after ${bound}s: `
+						text: `${statusLine}\nticket ${ticket.id} still running after ${bound}s: `
 							+ `subagent ${meta.name} - ${meta.task}\n` +
 							`Call daemon_subagent_wait again to keep blocking, or continue ` +
 							`and the result will be delivered when it finishes.`,
@@ -1396,9 +1456,28 @@ export default function (pi: ExtensionAPI) {
 					details: { ticket },
 				};
 			}
-			const output = await tasks.client.agentOutput(params.ticket);
+			let fullOutput = "";
+			try {
+				const res = await tasks.client.getOutput(params.ticket);
+				fullOutput = res.output;
+				if (res.usage) {
+					ticket.usage = res.usage;
+					ticket.cost = res.usage.cost;
+				}
+			} catch {
+				fullOutput = ticket.final_message || ticket.output || "";
+			}
+			const code = ticket.exit ?? 0;
+			const term = ticket.term ? ` (signal ${ticket.term})` : "";
+			const err = ticket.error ? ` (${ticket.error})` : "";
+			const cost = ticket.cost?.total ?? ticket.usage?.cost?.total;
+			const costStr = typeof cost === "number" && cost > 0 ? ` · $${cost.toFixed(4)}` : "";
+			const tokens = ticket.totalTokens ?? ticket.usage?.totalTokens;
+			const tokStr = typeof tokens === "number" && tokens > 0 ? ` · ${tokens} tok` : "";
+			const header = `ticket ${ticket.id} ${ticket.status} exit ${code}${term}${err}${costStr}${tokStr}`;
+			const text = fullOutput || "(no output)";
 			return {
-				content: [{ type: "text", text: formatResult(ticket, output) }],
+				content: [{ type: "text", text: `${header}\n${text}` }],
 				details: { ticket },
 			};
 		},

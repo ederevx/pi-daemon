@@ -38,6 +38,8 @@ import {
 	sessionKeyOf,
 	TicketClient,
 	type Ticket,
+	type TicketCost,
+	type TicketUsage,
 } from "./offload.ts";
 import {
 	AssistantMessageComponent,
@@ -85,6 +87,9 @@ export interface AdoptedSubagent {
 	turns?: number;
 	max_turns?: number;
 	cwd?: string;
+	usage?: TicketUsage;
+	cost?: TicketCost;
+	totalTokens?: number;
 }
 
 export interface DaemonSubagentsData {
@@ -107,8 +112,22 @@ class AdoptedSubagentsSource implements DaemonSubagentsData {
 		private readonly session: string,
 	) {}
 
-	list(): Promise<AdoptedSubagent[]> {
-		return this.client.agentList(this.session).then((tickets) => tickets.map((t) => this.map(t)));
+	async list(): Promise<AdoptedSubagent[]> {
+		try {
+			const tickets = await this.client.agentList(this.session);
+			const out: AdoptedSubagent[] = [];
+			for (const t of tickets) {
+				if (!t || typeof t !== "object" || !t.id) continue;
+				try {
+					out.push(this.map(t));
+				} catch {
+					/* guard against a corrupt ticket object */
+				}
+			}
+			return out;
+		} catch {
+			return [];
+		}
 	}
 
 	transcript(id: string): Promise<string> {
@@ -127,15 +146,18 @@ class AdoptedSubagentsSource implements DaemonSubagentsData {
 		const meta = agentRowMeta(ticket);
 		return {
 			id: ticket.id,
-			agent: meta.name || "subagent",
-			task: meta.task,
-			status: ticket.status,
-			started: ticket.started ?? ticket.created,
+			agent: meta?.name || "subagent",
+			task: meta?.task || "",
+			status: ticket.status || "unknown",
+			started: ticket.started ?? ticket.created ?? 0,
 			finished: ticket.finished ?? undefined,
 			exit: ticket.exit,
 			turns: ticket.turns,
 			max_turns: ticket.max_turns,
 			cwd: ticket.cwd,
+			usage: ticket.usage,
+			cost: ticket.cost ?? ticket.usage?.cost,
+			totalTokens: ticket.totalTokens ?? ticket.usage?.totalTokens,
 		};
 	}
 }
@@ -194,15 +216,21 @@ function formatElapsed(ms: number): string {
 
 /** One-line status in the /subagents selector value-column shape. */
 function statusOf(t: AdoptedSubagent): string {
+	if (!t) return "unknown";
 	const turns = t.turns ?? 0;
-	if (t.status === "running") return `running (${turns} turn${turns === 1 ? "" : "s"})`;
-	if (t.status === "failed" || t.status === "cancelled") return t.status;
-	return `finished (${turns} turn${turns === 1 ? "" : "s"})`;
+	const cost = t.cost?.total ?? t.usage?.cost?.total;
+	const costStr = typeof cost === "number" && cost > 0 ? ` · $${cost.toFixed(4)}` : "";
+	if (t.status === "running") return `running (${turns} turn${turns === 1 ? "" : "s"})${costStr}`;
+	if (t.status === "failed" || t.status === "cancelled") return `${t.status}${costStr}`;
+	return `finished (${turns} turn${turns === 1 ? "" : "s"})${costStr}`;
 }
 
 function elapsedOf(t: AdoptedSubagent): string {
+	if (!t) return "";
+	const start = t.started ?? 0;
+	if (!start) return "";
 	const endMs = t.finished && t.finished > 0 ? t.finished * 1000 : Date.now();
-	return formatElapsed(endMs - t.started * 1000);
+	return formatElapsed(Math.max(0, Math.round(endMs - start * 1000)));
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +404,8 @@ export class DaemonSubagentsDock {
 	}
 
 	private groupRows(tickets: AdoptedSubagent[]): SelectorRow[] {
-		const newestFirst = [...tickets].sort((a, b) => b.started - a.started);
+		const safeTickets = (tickets || []).filter((t) => t && typeof t === "object");
+		const newestFirst = [...safeTickets].sort((a, b) => (b.started ?? 0) - (a.started ?? 0));
 		const grouped = [
 			{ title: "Active", entries: newestFirst.filter((t) => t.status === "running") },
 			{ title: "Inactive", entries: newestFirst.filter((t) => t.status !== "running") },
@@ -391,9 +420,13 @@ export class DaemonSubagentsDock {
 	// ------------------------------------------------------------------
 
 	render(width: number): string[] {
-		if (this.rows.length === 0) return this.empty.render(width);
-		const lines = [...this.border.render(width), ...this.renderBody(width), ...this.border.render(width)];
-		return lines;
+		try {
+			if (this.rows.length === 0) return this.empty.render(width);
+			const lines = [...this.border.render(width), ...this.renderBody(width), ...this.border.render(width)];
+			return lines;
+		} catch {
+			return this.empty.render(width);
+		}
 	}
 
 	invalidate(): void {}
@@ -444,7 +477,21 @@ export class DaemonSubagentsDock {
 	}
 
 	private renderBody(width: number): string[] {
-		const maxLabelWidth = Math.min(36, Math.max(...this.rows.map((r) => visibleWidth(this.labelOf(r.entry)))));
+		let maxLabelWidth = 10;
+		try {
+			const widths = this.rows.map((r) => {
+				try {
+					return r?.entry ? visibleWidth(this.labelOf(r.entry)) : 0;
+				} catch {
+					return 0;
+				}
+			});
+			if (widths.length > 0) {
+				maxLabelWidth = Math.min(36, Math.max(...widths));
+			}
+		} catch {
+			maxLabelWidth = 20;
+		}
 		const maxVisible = Math.min(this.rows.length, 10);
 		const startIndex = Math.max(
 			0,
@@ -455,32 +502,37 @@ export class DaemonSubagentsDock {
 		this.rowMap = [];
 		let prevGroup = "";
 		for (let i = startIndex; i < endIndex; i++) {
-			const row = this.rows[i];
-			if (row.groupTitle !== prevGroup) {
-				if (prevGroup !== "") lines.push("");
-				lines.push(
-					this.widthSafe.truncate(
-						this.theme.fg("accent", this.theme.bold(`${row.groupTitle} (${row.groupCount})`)),
-						width,
-					),
+			try {
+				const row = this.rows[i];
+				if (!row || !row.entry) continue;
+				if (row.groupTitle !== prevGroup) {
+					if (prevGroup !== "") lines.push("");
+					lines.push(
+						this.widthSafe.truncate(
+							this.theme.fg("accent", this.theme.bold(`${row.groupTitle} (${row.groupCount})`)),
+							width,
+						),
+					);
+					prevGroup = row.groupTitle;
+				}
+				const isSelected = i === this.selected;
+				const prefix = isSelected ? this.st.cursor : "  ";
+				const label = this.labelOf(row.entry);
+				const labelPadded = label + " ".repeat(Math.max(0, maxLabelWidth - visibleWidth(label)));
+				const separator = "  ";
+				const usedWidth = visibleWidth(prefix) + maxLabelWidth + visibleWidth(separator);
+				const valueMaxWidth = Math.max(0, width - usedWidth - 2);
+				const valueText = this.st.value(
+					this.widthSafe.truncate(statusOf(row.entry), valueMaxWidth, ""),
+					isSelected,
 				);
-				prevGroup = row.groupTitle;
+				lines.push(
+					this.widthSafe.truncate(prefix + this.st.label(labelPadded, isSelected) + separator + valueText, width),
+				);
+				this.rowMap.push({ y: lines.length, index: i });
+			} catch {
+				/* try/catch isolation around the rows that map ticket objects */
 			}
-			const isSelected = i === this.selected;
-			const prefix = isSelected ? this.st.cursor : "  ";
-			const label = this.labelOf(row.entry);
-			const labelPadded = label + " ".repeat(Math.max(0, maxLabelWidth - visibleWidth(label)));
-			const separator = "  ";
-			const usedWidth = visibleWidth(prefix) + maxLabelWidth + visibleWidth(separator);
-			const valueMaxWidth = Math.max(0, width - usedWidth - 2);
-			const valueText = this.st.value(
-				this.widthSafe.truncate(statusOf(row.entry), valueMaxWidth, ""),
-				isSelected,
-			);
-			lines.push(
-				this.widthSafe.truncate(prefix + this.st.label(labelPadded, isSelected) + separator + valueText, width),
-			);
-			this.rowMap.push({ y: lines.length, index: i });
 		}
 		if (startIndex > 0 || endIndex < this.rows.length) {
 			lines.push(this.st.hint(this.widthSafe.truncate(`  (${this.selected + 1}/${this.rows.length})`, width - 2, "")));
@@ -695,25 +747,29 @@ export class DaemonSubagentsDetailView {
 	// ------------------------------------------------------------------
 
 	render(width: number): string[] {
-		const rows = this.tui.terminal.rows;
-		const windowHeight = this.windowHeight();
-		const widthChanged = this.cachedWidth !== width;
-		this.ensureItems();
-		if (widthChanged) this.resetLines(width, windowHeight);
-		this.syncLines();
-		this.growToWindow(windowHeight);
-		this.clampScroll(windowHeight);
+		try {
+			const rows = this.tui.terminal.rows;
+			const windowHeight = this.windowHeight();
+			const widthChanged = this.cachedWidth !== width;
+			this.ensureItems();
+			if (widthChanged) this.resetLines(width, windowHeight);
+			this.syncLines();
+			this.growToWindow(windowHeight);
+			this.clampScroll(windowHeight);
 
-		const out: string[] = [];
-		out.push(this.widthSafe.truncate(this.titleLine(width, windowHeight), width));
-		this.chrome.appendTop(out, width, rows);
-		this.appendContentWindow(out, windowHeight);
-		if (this.tookLayoutRoot) {
-			this.chrome.statsBorder(out, width, this.statsLine(width));
-		} else {
-			out.push(this.widthSafe.truncate(this.statsLine(width), width));
+			const out: string[] = [];
+			out.push(this.widthSafe.truncate(this.titleLine(width, windowHeight), width));
+			this.chrome.appendTop(out, width, rows);
+			this.appendContentWindow(out, windowHeight);
+			if (this.tookLayoutRoot) {
+				this.chrome.statsBorder(out, width, this.statsLine(width));
+			} else {
+				out.push(this.widthSafe.truncate(this.statsLine(width), width));
+			}
+			return this.chrome.clipFrame(out, rows);
+		} catch {
+			return [this.widthSafe.truncate(`[View render error: #${this.entry?.id ?? "?"}]`, width)];
 		}
-		return this.chrome.clipFrame(out, rows);
 	}
 
 	invalidate(): void {
@@ -921,8 +977,15 @@ export class DaemonSubagentsDetailView {
 	}
 
 	private renderItem(i: number): string[] {
-		const raw = (this.items[i] as Component).render(this.cachedWidth as number);
-		return raw.map((line) => this.widthSafe.truncate(line, this.cachedWidth as number));
+		try {
+			const item = this.items[i];
+			if (!item) return [];
+			const raw = (item as Component).render(this.cachedWidth as number);
+			if (!Array.isArray(raw)) return [];
+			return raw.map((line) => this.widthSafe.truncate(line, this.cachedWidth as number));
+		} catch {
+			return ["[render error]"];
+		}
 	}
 
 	private rebuildSpanLines(): void {
@@ -1082,28 +1145,32 @@ class AdoptionNotifier {
 		this.inFlight = true;
 		try {
 			for (const t of await this.client.agentList(this.session)) {
-				if (t.kind !== "agent" || !t.detached || this.seen.has(t.id)) continue;
-				this.seen.add(t.id);
-				// Only fresh adoptions: a ticket that settled before
-				// first sight gets the completion notice only.
-				if (t.status !== "running") continue;
-				if ((t.created ?? 0) < Date.now() / 1000 - ADOPTION_RECENT_SECS) continue;
-				const name = agentRowMeta(t).name || "subagent";
-				this.append("daemon-task", { ticket: t });
-				this.send(
-					{
-						customType: "daemon-task",
-						content: `[daemon] subagent '${name}' adopted and moved to the daemon as ticket ${t.id}; `
-							+ `its result will be delivered when it finishes `
-							+ `(daemon_subagent_wait ${t.id} fetches it sooner)`,
-						display: false,
-						details: { ticket: t },
-					},
-					// Steer, matching the offload watcher: the notice must
-					// reach the agent before its next model call so it does
-					// not read the child's early exit as a failure.
-					{ triggerTurn: true, deliverAs: "steer" },
-				);
+				try {
+					if (!t || t.kind !== "agent" || !t.detached || this.seen.has(t.id)) continue;
+					this.seen.add(t.id);
+					// Only fresh adoptions: a ticket that settled before
+					// first sight gets the completion notice only.
+					if (t.status !== "running") continue;
+					if ((t.created ?? 0) < Date.now() / 1000 - ADOPTION_RECENT_SECS) continue;
+					const name = agentRowMeta(t).name || "subagent";
+					this.append("daemon-task", { ticket: t });
+					this.send(
+						{
+							customType: "daemon-task",
+							content: `[daemon] subagent '${name}' adopted and moved to the daemon as ticket ${t.id}; `
+								+ `its result will be delivered when it finishes `
+								+ `(daemon_subagent_wait ${t.id} fetches it sooner)`,
+							display: false,
+							details: { ticket: t },
+						},
+						// Steer, matching the offload watcher: the notice must
+						// reach the agent before its next model call so it does
+						// not read the child's early exit as a failure.
+						{ triggerTurn: true, deliverAs: "steer" },
+					);
+				} catch {
+					/* guard against individual ticket error */
+				}
 			}
 		} catch {
 			// daemon unreachable or reset: retry next tick
