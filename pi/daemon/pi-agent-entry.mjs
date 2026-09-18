@@ -130,10 +130,13 @@ function bridgeTicket(ticket) {
 
 /** Ambiguous agent-submit recovery: find an agent ticket created recently
  *  whose command ends with our exact pi args, so a lost submit reply
- *  never leads to re-running the delegation. */
-function adoptRecentAgent() {
+ *  never leads to re-running the delegation. Scoped to the owning
+ *  session so a parallel sibling can never be mistaken for ours. */
+function adoptRecentAgent(sessKey) {
 	try {
-		const listed = spawnSync(PI_RC, ["agent-list"], { encoding: "utf8" });
+		const listArgs = ["agent-list"];
+		if (sessKey) listArgs.push(sessKey);
+		const listed = spawnSync(PI_RC, listArgs, { encoding: "utf8" });
 		if (listed.status !== 0) return null;
 		const cutoff = Date.now() / 1000 - 60;
 		const suffix = " " + args.join(" ");
@@ -175,8 +178,18 @@ function offload() {
 	const id = /^ticket (\S+)$/m.exec((submitted.stdout || "").trim());
 	if (submitted.status === 0 && id) return bridgeTicket(id[1]);
 	if (submitted.status === 7) {
-		const adopted = adoptRecentAgent();
-		return adopted ? bridgeTicket(adopted) : null;
+		const adopted = adoptRecentAgent(sessKey);
+		if (adopted) return bridgeTicket(adopted);
+		// The submit's outcome is unknowable: the daemon may already be
+		// running this delegation. Running pi locally would duplicate it,
+		// so refuse instead - the ticket (if it landed) completes in the
+		// daemon and the parent session can see it via daemon-subagents;
+		// if it never started, the caller simply re-invokes.
+		console.error(
+			"pi-agent-entry: submit outcome unknown (connection lost); " +
+			"NOT running the delegation locally to avoid duplication. " +
+			"The daemon may already hold it (see daemon-subagents).");
+		process.exit(3);
 	}
 	return null; // unreachable or deterministically refused: safe to run pi
 }
