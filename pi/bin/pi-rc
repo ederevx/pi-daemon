@@ -86,6 +86,16 @@
 #                                       ticket, wipe the store and all
 #                                       artifacts, restart the id counter
 #                                       (hosted sessions are untouched)
+#   pi-rc input <name> <text...>        type raw text into a hosted
+#                                       session's PTY master (e.g. a slash
+#                                       command); used by extensions-reload
+#   pi-rc extensions-reload [--force]   re-scan extensions, skills,
+#                                       prompts, themes and context files
+#                                       in every hosted conversation
+#                                       session (in-place /reload); the
+#                                       file-level diff is relayed to each
+#                                       agent once it settles; --force
+#                                       reloads even without changes
 #   pi-rc agent-submit [--session <n>] [--cwd <dir>] [--pi <path>]
 #                      [--max-turns <n>] [--env KEY=VALUE] -- <args>...
 #                                      run a headless pi delegation
@@ -163,6 +173,7 @@ DETACH_KEY = b"\x1c"  # Ctrl-\: pop out of an attached session without exiting p
 _COMMANDS = ("which", "whichall", "state", "carry", "resume", "start",
 			 "attach", "announce", "detach", "stop", "handover",
 			 "daemon-start", "daemon-stop",
+			 "input", "extensions-reload",
 			 "ticket-submit", "ticket-wait", "ticket-output",
 			 "ticket-list", "ticket-cancel", "ticket-remove", "tickets-reset",
 			 "agent-submit", "agent-wait", "agent-output",
@@ -923,6 +934,38 @@ def cmd_announce(args, client):
 								   h.get("state", "idle")))
 
 
+def cmd_input(args, client):
+	if len(args) < 2:
+		usage_error("input takes a session name and text to type into it")
+	name, text = args[0], " ".join(args[1:])
+	resp = client.control({"cmd": "input", "name": name, "text": text})
+	if not resp.get("ok"):
+		die("input failed: %s" % resp.get("error"))
+	print("pi-rc: typed %d bytes into '%s'" % (resp.get("bytes", 0), name))
+
+
+def cmd_extensions_reload(args, client):
+	if args not in ([], ["--force"], ["--all"]):
+		usage_error("extensions-reload takes no arguments (or --force)")
+	req = {"cmd": "extensions-reload", "force": args == ["--force"]}
+	resp = client.control(req)
+	if not resp.get("ok"):
+		die("extensions-reload failed: %s" % resp.get("error"))
+	if resp.get("unchanged"):
+		print("pi-rc: extension roots unchanged; nothing to reload")
+		return
+	diff = resp.get("diff") or {}
+	print("pi-rc: reloaded %s" % (resp.get("reloaded") or "no sessions"))
+	if resp.get("skipped"):
+		print("pi-rc: skipped %s" % ", ".join(resp["skipped"]))
+	for p in diff.get("added") or []:
+		print("pi-rc: + %s" % p)
+	for p in diff.get("changed") or []:
+		print("pi-rc: ~ %s" % p)
+	for p in diff.get("removed") or []:
+		print("pi-rc: - %s" % p)
+
+
 def handover_check(client, dir_, file):
 	# client-side preflight mirroring the daemon's target logic: the
 	# directory's primary name when free or held from the same directory,
@@ -1371,6 +1414,7 @@ def main():
 		 "attach": cmd_attach, "announce": cmd_announce,
 		 "detach": cmd_detach, "stop": cmd_stop, "handover": cmd_handover,
 		 "daemon-start": cmd_daemon_start, "daemon-stop": cmd_daemon_stop,
+		 "input": cmd_input, "extensions-reload": cmd_extensions_reload,
 		 "ticket-submit": cmd_ticket_submit, "ticket-wait": cmd_ticket_wait,
 		 "ticket-output": cmd_ticket_output, "ticket-list": cmd_ticket_list,
 		 "ticket-cancel": cmd_ticket_cancel, "ticket-remove": cmd_ticket_remove,
