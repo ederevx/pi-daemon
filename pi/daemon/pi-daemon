@@ -143,6 +143,7 @@ EXT_WATCH_INTERVAL = float(os.environ.get("PI_PTYD_EXT_WATCH_INTERVAL",
 										  "3.0"))
 EXT_WATCH_DEBOUNCE = float(os.environ.get("PI_PTYD_EXT_WATCH_DEBOUNCE",
 										   "4.0"))
+EXT_WATCH_BUSY_RETRIES = 20  # consecutive all-busy polls before giving up
 _default_watch_roots = [
 	os.path.join(os.path.expanduser("~/.pi/agent"), "extensions"),
 	os.path.join(os.path.expanduser("~/.pi/agent"), "npm"),
@@ -2129,12 +2130,12 @@ class Daemon:
 		# announcing session is the one the user is actively looking at,
 		# so it never shuts down while every holder is merely idle at the
 		# prompt: it absorbs them instead, and each of their viewers
-		# follows here. Only a busy holder wins — never touch a working
+		# follows here. Only a non-idle holder wins — never touch a working
 		# agent; the announcer yields to it and shuts down. Holders
 		# already handing off are neither followed nor absorbed. Returns
 		# (handoff, took_over names).
 		busy = [s for s in others
-				if (s.state == "busy" or s.absorbing_until > time.time())
+				if (s.state != "idle" or s.absorbing_until > time.time())
 				and not self.ledger.pending(s.name)]
 		if busy:
 			busy.sort(key=lambda s: s.count_clients() == 0)
@@ -2169,7 +2170,7 @@ class Daemon:
 		# mid-turn.
 		time.sleep(ABSORB_SETTLE)
 		with self.table.lock:
-			if holder.state != "busy":
+			if holder.state == "idle":
 				holder.terminate()
 				return
 			# The holder started working during the settle: it wins
@@ -2188,14 +2189,14 @@ class Daemon:
 				log("absorb spare '%s': announcer '%s' already yielded"
 					% (holder.name, announcer))
 				return
-			if sess.state == "busy":
-				log("absorb aborted '%s' vs busy '%s': both working, left alone"
+			if sess.state != "idle":
+				log("absorb aborted '%s' vs working '%s': both working, left alone"
 					% (announcer, holder.name))
 				return
 			sess.yielded_to = holder.name
 			self.ledger.record(announcer, holder.name)
 			sess.signal_closed()
-			log("absorb yield '%s' -> busy '%s'" % (announcer, holder.name))
+			log("absorb yield '%s' -> working '%s'" % (announcer, holder.name))
 			threading.Thread(target=sess.terminate, daemon=True).start()
 
 
@@ -2351,7 +2352,7 @@ class Control:
 	def state(self, req):
 		name = req.get("name")
 		state = req.get("state")
-		if not (isinstance(name, str) and name) or state not in ("busy", "idle"):
+		if not (isinstance(name, str) and name) or state not in ("busy", "idle", "waiting"):
 			return bad_request()
 		sess = self.daemon.table.get(name)
 		if sess is None:
@@ -2479,7 +2480,7 @@ class Control:
 			target = None
 			new_name = None
 			if holders:
-				holders.sort(key=lambda s: (s.state != "busy",
+				holders.sort(key=lambda s: (s.state == "idle",
 											s.count_clients() == 0))
 				target = holders[0]
 			else:
@@ -2787,23 +2788,38 @@ class Control:
 		fp = ext_root_fingerprint(EXT_WATCH_ROOTS)
 		diff = ext_diff_files(prev_fp, fp) if prev_fp else \
 			{"added": [], "removed": [], "changed": []}
-		_write_ext_snapshot(fp, diff)
 		if not force and prev_fp and not any(diff.values()):
 			return {"ok": True, "reloaded": [], "skipped": [],
 					"unchanged": True}
 		reloaded, skipped = [], []
 		for sess in self.daemon.table.snapshot():
 			if self._session_reloadable(sess):
+				if sess.state != "idle":
+					# Best-effort skip: pi's TUI refuses /reload while a
+					# response is running, and a session parked on a blocking
+					# daemon wait ('waiting') has its turn still open too;
+					# defer this round instead of typing into a session that
+					# would deny it. Applies even with --force.
+					skipped.append({"id": sess.name, "reason": "not-idle"})
+					continue
 				try:
 					os.write(sess.master_fd, b"/reload\r")
 				except OSError:
-					skipped.append(sess.name)
+					skipped.append({"id": sess.name,
+									"reason": "write-failed"})
 				else:
 					reloaded.append(sess.name)
 			else:
-				skipped.append(sess.name)
-		if any(diff.values()):
-			_write_ext_diff(diff)
+				skipped.append({"id": sess.name,
+								"reason": "not-reloadable"})
+		if reloaded:
+			# Stamp/reload stay atomic: persist the snapshot and diff only
+			# when at least one /reload was actually typed. When every
+			# reloadable session was busy, the caller sees zero reloads and
+			# retries the same diff on later polls.
+			_write_ext_snapshot(fp, diff)
+			if any(diff.values()):
+				_write_ext_diff(diff)
 		return {"ok": True, "reloaded": reloaded, "skipped": skipped,
 				"diff": diff}
 
@@ -2813,7 +2829,14 @@ class Control:
 		TUI can accept /reload in place. The live spawn argv carries no
 		--session for `start`ed sessions (the file arrives via announce),
 		so the announced file is the reliable marker. Ephemeral json-mode
-		workers announce nothing and have no TUI to reload."""
+		workers announce nothing and have no TUI to reload.
+
+		Injection contract: a reload may re-scan/reload pi's loaded
+		resources in place, but must never terminate sessions, remove them
+		from the registry/table, or touch conversation files; injections
+		happen only via os.write(sess.master_fd, ...). State-based skipping
+		is best-effort: pi denies a reload typed into a truly-busy session
+		with its own warning."""
 		argv = sess.argv or []
 		return bool(sess.file) and "--no-session" not in argv
 
@@ -2848,17 +2871,39 @@ def ext_watch_loop(daemon, stop_event):
 		prev_fp = ext_root_fingerprint(EXT_WATCH_ROOTS)
 		_write_ext_snapshot(prev_fp, None)
 	last_reload = 0.0
+	busy_rounds = 0
 	while not stop_event.wait(EXT_WATCH_INTERVAL):
 		fp = ext_root_fingerprint(EXT_WATCH_ROOTS)
 		if fp == prev_fp:
 			continue
-		prev_fp = fp
 		now = time.monotonic()
 		if now - last_reload < EXT_WATCH_DEBOUNCE:
 			continue
-		log("extension roots changed; reloading hosted sessions")
-		daemon.control.extensions_reload({})
-		last_reload = now
+		res = daemon.control.extensions_reload({})
+		if res.get("reloaded"):
+			prev_fp = fp
+			last_reload = now
+			busy_rounds = 0
+			log("reloaded %d hosted session(s) after extension change"
+				% len(res["reloaded"]))
+		elif res.get("unchanged"):
+			prev_fp = fp
+			busy_rounds = 0
+		else:
+			# Nothing was typed this round: every reloadable session was
+			# busy (or none existed). Retry the same diff on subsequent
+			# polls until a session is reloadable-idle; give up after
+			# EXT_WATCH_BUSY_RETRIES consecutive all-busy rounds.
+			busy_rounds += 1
+			if busy_rounds >= EXT_WATCH_BUSY_RETRIES:
+				log("extension reload deferred %d polls with all "
+					"sessions busy; giving up" % busy_rounds)
+				prev_fp = fp
+				busy_rounds = 0
+				last_reload = now
+			else:
+				log("extension reload deferred: all hosted sessions busy "
+					"(round %d/%d)" % (busy_rounds, EXT_WATCH_BUSY_RETRIES))
 
 
 def main():

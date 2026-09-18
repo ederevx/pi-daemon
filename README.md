@@ -68,6 +68,17 @@ them, and can uninstall exactly what it installed.
   that conflict with its built-in `app.exit` Ctrl+D binding.) The
   extension also announces each session's file to the daemon so abnormal
   deaths can be revived from the same conversation.
+- **Extension reload watch**: the daemon polls the extension roots
+  (extensions, skills, prompts, themes, context files); on change it
+  types `/reload` into every hosted conversation session so pi re-scans
+  its loaded resources in place, and persists the file-level diff for
+  the in-session daemon extension to relay to the agent once it settles.
+  Sessions that are not idle are skipped instead — busy mid-turn, or
+  parked on a blocking daemon wait (`waiting`) — since pi would deny a
+  reload in either state, and the reload is deferred: it retries on
+  later polls until a session is idle (giving up after 20 consecutive
+  not-idle rounds), and the diff is only stamped once at least one
+  session was actually reloaded.
 - **Command offloading** (`offload` pi extension): every `bash` call is
   rerouted to the daemon as a **ticket** — a daemon-owned shell command
   that outlives the submitting agent. Results are delivered in one go

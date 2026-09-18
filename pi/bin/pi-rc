@@ -849,9 +849,9 @@ def cmd_state(args, client):
 	# Published by the daemon extension: whether the model is
 	# working or idle in this hosted session; surfaced by ls and attach.
 	if len(args) != 2:
-		usage_error("state takes exactly a session name and busy|idle")
-	if args[1] not in ("busy", "idle"):
-		usage_error("state must be busy or idle")
+		usage_error("state takes exactly a session name and busy|idle|waiting")
+	if args[1] not in ("busy", "idle", "waiting"):
+		usage_error("state must be busy, idle, or waiting")
 	session = session_name(args[0])
 	resp = client.control({"cmd": "state", "name": session, "state": args[1]})
 	if not resp.get("ok"):
