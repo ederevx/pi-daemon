@@ -30,6 +30,7 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,8) else 1)' || {
 
 dest_extension="$pi_home/extensions/daemon.ts"
 dest_offload="$pi_home/extensions/offload.ts"
+dest_subagents="$pi_home/extensions/dsubagents-views.ts"
 dest_front="$local_bin/pi-agent-entry.mjs"
 dest_helper="$local_bin/pi-rc"
 dest_daemon="$local_bin/pi-daemon"
@@ -49,6 +50,7 @@ install_to() {
 
 install_to 644 "$repo_root/pi/extensions/daemon.ts" "$dest_extension"
 install_to 644 "$repo_root/pi/extensions/offload.ts" "$dest_offload"
+install_to 644 "$repo_root/pi/extensions/dsubagents-views.ts" "$dest_subagents"
 install_to 755 "$repo_root/pi/bin/pi-rc" "$dest_helper"
 install_to 755 "$repo_root/pi/daemon/pi-daemon" "$dest_daemon"
 
@@ -88,7 +90,7 @@ sed "s|@REAL_ENTRY@|$real_entry|" "$repo_root/pi/daemon/pi-agent-entry.mjs" \
 mv -f "$dest_front.tmp.$$" "$dest_front"
 chmod 755 "$dest_front"
 
-owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_extension" "$dest_offload" "$dest_front" "$dest_unit")
+owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_extension" "$dest_offload" "$dest_subagents" "$dest_front" "$dest_unit")
 {
   printf '{\n'
   printf '  "version": 1,\n'
@@ -119,7 +121,8 @@ echo "  daemon:    $dest_daemon"
 echo "  launcher:  $dest_helper"
 echo "  pi wrap:   $dest_wrapper"
 echo "  extension: $dest_extension"
-echo "  offload:   $dest_offload"
+echo "  offload:   $dest_offload
+  subagents: $dest_subagents"
 echo "  pi front:  $dest_front"
 echo "  unit:      $dest_unit"
 echo "  manifest:  $manifest"

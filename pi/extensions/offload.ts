@@ -43,6 +43,11 @@ import {
 	type BashOperations,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
+import {
+	DaemonSubagentsBrowser,
+	type AdoptedSubagent,
+	type DaemonSubagentsData,
+} from "./dsubagents-views.ts";
 import { Type } from "typebox";
 import {
 	Box,
@@ -858,216 +863,38 @@ function agentStatusLine(ticket: Ticket, now: number): string {
  *  /subagents selector (#<id> <name> label + live status value), plus an
  *  expandable task/output tail. Enter expands, c cancels/removes, Esc
  *  closes. Live-polls once a second while mounted. */
-class DaemonSubagentsDock {
-	private readonly st = getSettingsListTheme();
-	private readonly border = new DynamicBorder((s: string) => this.theme?.fg("border", s) ?? s);
-	private readonly client: TicketClient;
-	private readonly session: string;
-	private rows: TaskRow[] = [];
-	private readonly meta = new Map<string, { name: string; task: string }>();
-	private selected = 0;
-	private expandedId: string | null = null;
-	private readonly outputs = new Map<string, string>();
-	private pollTimer: ReturnType<typeof setTimeout> | undefined;
-	private lastError: string | null = null;
-	private rowMap: { y: number; index: number }[] = [];
-	private tui: TUI | null = null;
-	private theme: { fg: (role: string, text: string) => string } | null = null;
-	private done: ((result: null) => void) | null = null;
-	// Same storm-safety guards as DaemonTasksDock: ui.custom re-invokes
-	// the mount factory per render.
-	private mounted = false;
-	private stopped = false;
-	private pollInFlight = false;
-
-	constructor(client: TicketClient, session: string) {
-		this.client = client;
-		this.session = session;
-	}
-
-	async run(ui: any): Promise<void> {
-		try {
-			await ui.custom((tui: TUI, theme: any, _kb: any, done: (r: null) => void) => {
-				void _kb;
-				this.tui = tui;
-				this.theme = theme;
-				this.done = done;
-				if (!this.mounted) {
-					this.mounted = true;
-					void this.poll();
-				}
-				return this as unknown as Component;
-			});
-		} catch {
-			/* dock unavailable or canceled */
-		} finally {
-			this.stop();
-		}
-	}
-
-	stop(): void {
-		this.stopped = true;
-		if (this.pollTimer) clearTimeout(this.pollTimer);
-		this.pollTimer = undefined;
-	}
-
-	private async poll(): Promise<void> {
-		if (this.stopped || this.pollInFlight) return;
-		this.pollInFlight = true;
-		try {
-			const tickets = await this.client.agentList(this.session);
-			// Latest first, top to bottom.
-			this.rows = tickets
-				.sort((a, b) =>
-					(b.started ?? b.created) - (a.started ?? a.created))
-				.map((ticket) => {
-					if (!this.meta.has(ticket.id)) {
-						this.meta.set(ticket.id, agentRowMeta(ticket));
-					}
-					return { ticket };
-				});
-			this.lastError = null;
-		} catch (err) {
-			this.rows = [];
-			this.lastError = err instanceof Error ? err.message : String(err);
-		} finally {
-			this.pollInFlight = false;
-		}
-		if (this.selected >= this.rows.length) {
-			this.selected = Math.max(0, this.rows.length - 1);
-		}
-		this.tui?.requestRender();
-		if (!this.stopped) {
-			this.pollTimer = setTimeout(() => void this.poll(), 1000);
-		}
-	}
-
-	render(width: number): string[] {
-		const lines = [...this.border.render(width)];
-		if (this.rows.length === 0) {
-			const msg = this.lastError
-				? `  Daemon unreachable: ${this.lastError}`
-				: "  No daemon subagents.";
-			lines.push(this.st.hint(truncateToWidth(msg, width)));
-			lines.push(this.st.hint(truncateToWidth(
-				"  Workers adopted by the daemon appear here while they run.", width)));
-		} else {
-			lines.push(...this.renderBody(width));
-		}
-		lines.push(this.st.hint(truncateToWidth(
-			"  up/down navigate - enter expand - c cancel/remove - esc close (live)", width)));
-		lines.push(...this.border.render(width));
-		return lines;
-	}
-
-	invalidate(): void {}
-
-	handleInput(data: string): void {
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
-			this.stop();
-			this.done?.(null);
-			return;
-		}
-		if (this.rows.length === 0) return;
-		if (matchesKey(data, "up")) {
-			this.selected = (this.selected - 1 + this.rows.length) % this.rows.length;
-		} else if (matchesKey(data, "down")) {
-			this.selected = (this.selected + 1) % this.rows.length;
-		} else if (matchesKey(data, "enter") || data === " ") {
-			const row = this.rows[this.selected];
-			const id = row.ticket.id;
-			if (this.expandedId === id) {
-				this.expandedId = null;
-			} else {
-				this.expandedId = id;
-				if (!this.outputs.has(id)) {
-					void this.client.agentOutput(id).then((output) => {
-						this.outputs.set(id, output);
-						this.tui?.requestRender();
-					}).catch(() => this.poll());
-				}
-			}
-		} else if (data === "c") {
-			const row = this.rows[this.selected];
-			const action = row.ticket.status === "running"
-				? this.client.cancel(row.ticket.id)
-				: this.client.remove(row.ticket.id);
-			void action.catch(() => undefined).then(() => this.poll());
-			return;
-		} else return;
-		this.tui?.requestRender();
-	}
-
-	handleMouse(event: TuiMouseEvent): { handled: boolean } {
-		if (this.rows.length === 0) return { handled: false };
-		if (event.type === "wheel") {
-			this.selected =
-				(this.selected + (event.wheelDelta && event.wheelDelta < 0 ? -1 : 1)
-					+ this.rows.length) % this.rows.length;
-		} else if (event.type === "press" || event.type === "click") {
-			const row = this.rowMap.find((r) => r.y === event.y);
-			if (!row) return { handled: false };
-			this.selected = row.index;
-		} else return { handled: false };
-		this.tui?.requestRender();
-		return { handled: true };
-	}
-
-	private renderBody(width: number): string[] {
-		const maxVisible = Math.min(this.rows.length, 12);
-		const startIndex = Math.max(
-			0,
-			Math.min(this.selected - Math.floor(maxVisible / 2), this.rows.length - maxVisible),
-		);
-		const endIndex = Math.min(startIndex + maxVisible, this.rows.length);
-		const lines: string[] = [];
-		this.rowMap = [];
-		const now = Date.now() / 1000;
-		for (let i = startIndex; i < endIndex; i++) {
-			const row = this.rows[i];
-			const isSelected = i === this.selected;
-			const prefix = isSelected ? this.st.cursor : "  ";
-			const t = row.ticket;
-			const m = this.meta.get(t.id);
-			const name = m?.name ?? "subagent";
-			const label = `#${t.id} ${name} `;
-			const value = agentStatusLine(t, now);
-			lines.push(truncateToWidth(
-				prefix
-					+ this.st.label(truncateToWidth(label, 42) + "  ", isSelected)
-					+ this.st.value(value, isSelected),
-				width));
-			this.rowMap.push({ y: lines.length, index: i });
-			if (this.expandedId === t.id) {
-				const task = m?.task;
-				if (task) {
-					for (const part of wrapLine(`    ${task}`, width)) {
-						lines.push(this.st.hint(part));
-					}
-				}
-				const output = this.outputs.get(t.id);
-				if (output !== undefined) {
-					const trunc = truncateTail(output, {
-						maxLines: 10, maxBytes: 8 << 10,
-					});
-					for (const line of trunc.content.split("\n")) {
-						for (const part of wrapLine(`    ${line}`, width)) {
-							lines.push(this.st.hint(part));
-						}
-					}
-				} else {
-					lines.push(this.st.hint("    loading output..."));
-				}
-			}
-		}
-		if (startIndex > 0 || endIndex < this.rows.length) {
-			lines.push(this.st.hint(truncateToWidth(
-				`  (${this.selected + 1}/${this.rows.length})`, width)));
-		}
-		return lines;
-	}
+/** Adopted-subagent view of a ticket (the /daemon-subagents data
+ *  source: mapper + adapter over the daemon client). */
+function toAdoptedSubagent(ticket: Ticket): AdoptedSubagent {
+	const meta = agentRowMeta(ticket);
+	return {
+		id: ticket.id,
+		agent: meta.name || "subagent",
+		task: meta.task,
+		status: ticket.status,
+		started: ticket.started ?? ticket.created,
+		finished: ticket.finished ?? undefined,
+		exit: ticket.exit,
+		turns: ticket.turns,
+		max_turns: ticket.max_turns,
+		cwd: ticket.cwd,
+	};
 }
 
+function makeSubagentsData(tasks: DaemonTasks): DaemonSubagentsData {
+	const session = tasks.sessionKey();
+	return {
+		list: async () => (await tasks.client.agentList(session)).map(toAdoptedSubagent),
+		transcript: (id) => tasks.client.agentOutput(id),
+		refresh: async (id) => {
+			try {
+				return toAdoptedSubagent(await tasks.client.wait(id, 0));
+			} catch {
+				return null;
+			}
+		},
+	};
+}
 export default function (pi: ExtensionAPI) {
 	// Detach routing: hand the hosted session key to spawned children
 	// under a name ADP does not strip, so the front can record the
@@ -1384,13 +1211,13 @@ export default function (pi: ExtensionAPI) {
 	// the /subagents row shape. Adopted workers are NOT in /subagents
 	// (their ADP child closed at hand-off) nor in /daemon-tasks.
 	pi.registerCommand("daemon-subagents", {
-		description: "Browse daemon-adopted subagents of this session; cancel, remove",
+		description: "Browse daemon-adopted subagents of this session; open one to watch its activity",
 		handler: async (_args, cmdCtx) => {
 			if (cmdCtx.mode !== "tui") {
 				cmdCtx.ui?.notify?.("daemon-subagents requires the interactive TUI", "warning");
 				return;
 			}
-			await new DaemonSubagentsDock(tasks.client, tasks.sessionKey()).run(cmdCtx.ui);
+			await new DaemonSubagentsBrowser(makeSubagentsData(tasks)).run(cmdCtx.ui);
 		},
 	});
 
