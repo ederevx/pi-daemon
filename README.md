@@ -73,12 +73,15 @@ them, and can uninstall exactly what it installed.
   types `/reload` into every hosted conversation session so pi re-scans
   its loaded resources in place, and persists the file-level diff for
   the in-session daemon extension to relay to the agent once it settles.
-  Sessions that are not idle are skipped instead — busy mid-turn, or
-  parked on a blocking daemon wait (`waiting`) — since pi would deny a
-  reload in either state, and the reload is deferred: it retries on
-  later polls until a session is idle (giving up after 20 consecutive
-  not-idle rounds), and the diff is only stamped once at least one
-  session was actually reloaded.
+  Sessions that are not idle are skipped instead (busy mid-turn, or
+  parked on a blocking daemon wait `waiting`) since pi would deny a
+  reload in either state, and the reload is deferred until a session is
+  idle; the diff is only stamped once at least one session was actually
+  reloaded. The reload is strictly in-place: it only writes into
+  sessions that already exist and never starts or revives one, and a
+  session that dies while processing the injected `/reload` stays dead
+  instead of being respawned, so a broken update cannot cascade into a
+  spawn storm.
 - **Command offloading** (`offload` pi extension): every `bash` call is
   rerouted to the daemon as a **ticket** — a daemon-owned shell command
   that outlives the submitting agent. Results are delivered in one go

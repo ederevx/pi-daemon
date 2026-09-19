@@ -152,6 +152,26 @@ def _main():
         fail("session state", r.stderr)
     else:
         ok("session state busy")
+    # -- reload is strictly in-place: it must never spawn anything ------
+    conv = os.path.join(SCRATCH, "conv-itest.jsonl")
+    open(conv, "w").close()
+    r = pi_rc("announce", "itest", conv)
+    if r.returncode != 0:
+        fail("session announce", r.stderr)
+    else:
+        ok("session announce")
+    pi_rc("state", "itest", "idle")
+    before = pi_rc("list")
+    r = pi_rc("extensions-reload", "--force")
+    if "reloaded pi-itest" not in r.stdout:
+        fail("extensions reload pokes the session", f"{r.stdout!r} {r.stderr!r}")
+    else:
+        ok("extensions reload (in-place)")
+    after = pi_rc("list")
+    if before.stdout.count("pi-itest") != after.stdout.count("pi-itest"):
+        fail("reload spawned a session", after.stdout)
+    else:
+        ok("reload spawned nothing")
     r = pi_rc("which", "/x/no-such.jsonl")
     if r.returncode != 0 or r.stdout.strip() != "":
         fail("which no-holder", f"rc={r.returncode} out={r.stdout!r}")
