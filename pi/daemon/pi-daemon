@@ -41,7 +41,11 @@
 #                                         name is null when none — used by
 #                                         the wrapper's resume guard
 #   stop {name}                           TERM the process group, KILL
-#                                         after a 2s grace, drop entry
+#                                         after a 2s grace, drop entry;
+#                                         when it was the last live holder
+#                                         of its conversation the session
+#                                         file is discarded so it stops
+#                                         showing in pi's /resume picker
 #   handover {file,dir,afterPid}          host a pi session file once the
 #                                         owning process exits
 #   carry {name[,to,argv]}                /new without termination: move
@@ -1541,7 +1545,29 @@ class Daemon:
 		if dropped is not None:
 			self.ledger.repoint_on_drop(dropped)
 		self.registry.drop(sess.name)
+		self._discard_session_file(sess)
 		log("child-exit '%s' pid %d status %s" % (sess.name, sess.pid, code))
+
+	def _discard_session_file(self, sess):
+		# A session the daemon ended itself (an explicit `stop`, or the
+		# idle-reap of a stale detached phantom) is a discard: drop its
+		# conversation file too so it stops surfacing in pi's /resume
+		# picker. Never on a clean user quit (stopping is False - that
+		# stays resumable), and never when another live session still
+		# hosts the same conversation (takeover/absorption of a duplicate
+		# passes the file to its survivor, so it must not be unlinked).
+		if not (sess.stopping and sess.file):
+			return
+		with self.table.lock:
+			remaining = self.table.holders_of(sess.file)
+		if remaining:
+			return
+		try:
+			if os.path.isfile(sess.file):
+				os.unlink(sess.file)
+				log("discard '%s' conversation %s" % (sess.name, sess.file))
+		except OSError as exc:
+			log("discard '%s' conversation failed: %s" % (sess.name, exc))
 
 	def reap_idle_if_due(self, sess):
 		# End a hosted session the daemon should not keep: detached and

@@ -422,6 +422,56 @@ def test_reload_same_file_announce_no_spawn():
         DAEMON.table.remove_if(sess)
 
 
+def test_stop_and_reap_discard_conversation_file():
+    """A session the daemon ends itself (stop, or the idle-reap of a
+    stale detached phantom) drops its conversation file too, so it stops
+    showing up in pi's /resume picker. A clean user quit (stopping is
+    False) keeps the file, and an absorbed duplicate whose conversation
+    still has a live holder keeps it as well (the file passes to its
+    survivor)."""
+
+    def mk(name, file_, stopping):
+        sess = daemon.Session(name, SCRATCH, ["pi"], pid=1, master_fd=-1)
+        sess.file = file_
+        sess.stopping = stopping
+        assert_true(DAEMON.table.put(sess))
+        return sess
+
+    # stop/reap of the sole holder discards the file (/resume cleaned)
+    sole_file = os.path.join(SCRATCH, "discard-sole.jsonl")
+    open(sole_file, "w").close()
+    sole = mk("pi-discard-sole", sole_file, True)
+    DAEMON.drop(sole, 0)
+    assert_true(not os.path.exists(sole_file),
+                "daemon-ended session file removed from /resume")
+    assert_true(DAEMON.table.get("pi-discard-sole") is None)
+
+    # a clean user quit keeps the conversation resumable
+    quit_file = os.path.join(SCRATCH, "quit.jsonl")
+    open(quit_file, "w").close()
+    quit_sess = mk("pi-quit", quit_file, False)
+    DAEMON.drop(quit_sess, 0)
+    assert_true(os.path.exists(quit_file),
+                "clean quit keeps the conversation file")
+
+    # an absorbed duplicate shares its file with a live holder: dropping
+    # it must NOT unlink the conversation the survivor still hosts
+    shared = os.path.join(SCRATCH, "shared.jsonl")
+    open(shared, "w").close()
+    live = mk("pi-live", shared, False)
+    dup = mk("pi-dup", shared, True)   # absorbed holder is marked stopping
+    DAEMON.drop(dup, 0)
+    assert_true(os.path.exists(shared),
+                "absorbed duplicate's shared conversation is not deleted")
+    assert_true(DAEMON.table.get("pi-live") is not None)
+    # when the surviving holder is itself later ended by the daemon, the
+    # now-orphaned conversation is finally discarded
+    live.stopping = True
+    DAEMON.drop(live, 0)
+    assert_true(not os.path.exists(shared),
+                "last holder drop discards the conversation")
+
+
 def _spawn_session(name):
     """A hosted fake session with an announced conversation file."""
     r = DAEMON.control.start(
@@ -595,6 +645,8 @@ def _main():
     ok("reload death is never revived", test_reload_death_not_revived)
     ok("reload same-file re-announce keeps no-spawn guard",
        test_reload_same_file_announce_no_spawn)
+    ok("stop/reap discards the conversation file (/resume)",
+       test_stop_and_reap_discard_conversation_file)
     ok("extensions_reload defers busy sessions (no stamp)",
        test_extensions_reload_deferral)
     ok("watch loop owes busy sessions until idle",
