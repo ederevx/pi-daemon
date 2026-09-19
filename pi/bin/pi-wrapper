@@ -11,7 +11,7 @@
 # ever dies abnormally; only a clean quit (Ctrl+D) or deleting the
 # session ends one for good.
 #
-# The PI_HOSTED guard keeps hosted subagent/worker sessions and nested
+# The PI_HOSTED guard keeps hosted one-shot/worker sessions and nested
 # starts out of the way: anything running inside the daemon already
 # carries PI_HOSTED and execs the real pi untouched. One-shot invocations
 # (-p/--print, --no-session) and help/version stay direct, non-tty stdin
@@ -190,7 +190,7 @@ guard_check() {
 # instead of spawning a duplicate. `pi --new` keeps the old behavior:
 # a fresh conversation in its own new session. Candidates must back a
 # real conversation (a session file on record) so --no-session children
-# — subagent workers share the directory in the listing — are never
+# — workers share the directory in the listing — are never
 # attached. Prints the chosen name, or nothing when a fresh start is
 # wanted (no candidates, or candidates whose files all vanished).
 owned_session() {

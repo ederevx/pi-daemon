@@ -186,7 +186,7 @@ export class RcBackground {
 	/** Publish whether the model is working so other terminals can see
 	 *  the state in `pi-rc ls` and attach notices without attaching.
 	 *  Skipped without a session file: hosted `--no-session` children
-	 *  (subagents, one-shots) inherit this session's name in their env,
+	 *  (one-shots) inherit this session's name in their env,
 	 *  and their start/end would otherwise overwrite the working
 	 *  session's daemon-side state. Fire-and-forget: cosmetic only when
 	 *  the daemon is unreachable. */
@@ -250,8 +250,7 @@ export class RcBackground {
 	}
 
 	/** Take the running pi out of the foreground WITHOUT ever touching
-	 *  the model, handing its saved session to the pi-daemon
-	 *  when hosted subagent/worker sessions are not in play. */
+	 *  the model, handing its saved session to the pi-daemon. */
 	async handover(ctx: any): Promise<void> {
 		const sessionFile: string | null | undefined =
 			ctx?.sessionManager?.getSessionFile?.();

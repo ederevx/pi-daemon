@@ -98,30 +98,6 @@
 #                                       file-level diff is relayed to each
 #                                       agent once it settles; --force
 #                                       reloads even without changes
-#   pi-rc agent-submit [--session <n>] [--cwd <dir>] [--pi <path>]
-#                      [--max-turns <n>] [--env KEY=VALUE] -- <args>...
-#                                      run a headless pi delegation
-#                                      (--mode json -p) as a daemon-owned
-#                                      agent ticket: the daemon spawns and
-#                                      owns the child, copies the system
-#                                      prompt, captures stdout NDJSON and
-#                                      stderr separately, and enforces the
-#                                      turn budget (prints "ticket <id>")
-#   pi-rc agent-wait <id> [timeout]     like ticket-wait for agent tickets
-#   pi-rc agent-output <id> [--json] [off [erhoff]]
-#                                      print the agent's final output text
-#                                      (or JSON record with --json; chunked
-#                                      stdout/stderr when offsets are given)
-#   pi-rc agent-cancel <id>             TERM then KILL a running agent
-#   pi-rc agent-list [session]          agent-kind tickets, JSON lines
-#   pi-rc agent-detach <id>             mark an agent ticket handed off to
-#                                      the daemon so its owner's session
-#                                      notifies on completion
-#   pi-rc agent-bridge <id>             relay an agent ticket's stdout and
-#                                      stderr to this process's streams
-#                                      until it finishes, then exit with
-#                                      the child's exit code (used by the
-#                                      wrapper's interception bridge)
 #   pi-rc handover <file> [dir]         host a specific pi session file in a
 #                                       new detached session; used by /bg
 #                                       outside the host to hand a live
@@ -178,10 +154,7 @@ _COMMANDS = ("which", "whichall", "state", "carry", "resume", "start",
 			 "daemon-start", "daemon-stop",
 			 "input", "extensions-reload",
 			 "ticket-submit", "ticket-wait", "ticket-output",
-			 "ticket-list", "ticket-cancel", "ticket-remove", "tickets-reset",
-			 "agent-submit", "agent-wait", "agent-output",
-			 "agent-cancel", "agent-list", "agent-detach",
-			 "agent-bridge")
+			 "ticket-list", "ticket-cancel", "ticket-remove", "tickets-reset")
 
 
 def die(msg, code=EXIT_USAGE):
@@ -1241,194 +1214,6 @@ def cmd_tickets_reset(_args, client):
 		  % (resp.get("cancelled", 0), resp.get("removed", 0)))
 
 
-# ------------------------------------------------------------- agents
-
-def cmd_agent_submit(args, client):
-	# Hand a headless pi delegation to the daemon as an agent ticket: the
-	# daemon spawns and owns the child. --pi names the entry to exec; the
-	# remaining pi flags and the task positional ride verbatim after --.
-	session_arg = None
-	dir_arg = None
-	pi_path = None
-	max_turns = None
-	env_overrides = []
-	while args:
-		arg = args.pop(0)
-		if arg == "--":
-			break
-		if arg == "--session" and args:
-			session_arg = args.pop(0)
-		elif arg == "--cwd" and args:
-			dir_arg = args.pop(0)
-		elif arg == "--pi" and args:
-			pi_path = args.pop(0)
-		elif arg == "--max-turns" and args:
-			max_turns = args.pop(0)
-		elif arg == "--env" and args:
-			env_overrides.append(args.pop(0))
-		else:
-			usage_error("bad argument %r for 'agent-submit'" % arg)
-	if not pi_path or not args:
-		usage_error("agent-submit needs --pi <path> and -- <pi args...>")
-	if max_turns is not None:
-		try:
-			max_turns = int(max_turns)
-		except ValueError:
-			usage_error("--max-turns must be an integer")
-	session = short_name(session_arg or os.environ.get("PI_HOSTED_SESSION")
-						 or "standalone")
-	dir_ = resolve_dir(dir_arg)
-	env = dict(os.environ)
-	for pair in env_overrides:
-		key, _, value = pair.partition("=")
-		if not key:
-			usage_error("--env needs KEY=VALUE")
-		env[key] = value
-	req = {"cmd": "agent-submit", "session": session, "cwd": dir_,
-		   "pi": pi_path, "args": args, "env": env, "max_turns": max_turns}
-	resp = client.control(req)
-	if not resp.get("ok"):
-		die("agent-submit failed: %s" % resp.get("error"))
-	print("ticket %s" % resp["id"])
-
-
-def cmd_agent_wait(args, client):
-	if len(args) not in (1, 2):
-		usage_error("agent-wait takes an id and an optional timeout")
-	try:
-		timeout = float(args[1]) if len(args) > 1 else 0.0
-	except ValueError:
-		usage_error("agent-wait timeout must be a number")
-	resp = client.control({"cmd": "agent-wait", "id": args[0],
-						   "timeout": timeout},
-						  timeout=CONTROL_TIMEOUT + max(0.0, timeout) + 5.0)
-	if not resp.get("ok"):
-		die("agent-wait failed: %s" % resp.get("error"))
-	print(json.dumps(resp["ticket"]))
-
-
-def cmd_agent_output(args, client):
-	# Without offsets: fetches the ticket's final output text from daemon
-	# control (or full JSON record with --json).
-	# With offsets: stdout chunk since off to stdout, stderr chunk since
-	# erhoff to stderr.
-	if len(args) < 1 or len(args) > 4:
-		usage_error("agent-output takes an id and optional offsets (or --json)")
-	tid = args[0]
-	json_mode = "--json" in args
-	non_flag = [a for a in args[1:] if a != "--json"]
-	if not non_flag:
-		resp = client.control({"cmd": "agent-output", "id": tid})
-		if not resp.get("ok"):
-			die("agent-output failed: %s" % resp.get("error"))
-		if json_mode:
-			print(json.dumps(resp))
-		else:
-			out = resp.get("output", "")
-			if out:
-				sys.stdout.write(out if out.endswith("\n") else out + "\n")
-				sys.stdout.flush()
-	else:
-		offsets = []
-		for raw in non_flag:
-			try:
-				offsets.append(int(raw))
-			except ValueError:
-				usage_error("agent-output offsets must be integers")
-		req = {"cmd": "agent-output", "id": tid,
-			   "offset": offsets[0] if offsets else 0,
-			   "err_offset": offsets[1] if len(offsets) > 1 else 0}
-		resp = client.control(req)
-		if not resp.get("ok"):
-			die("agent-output failed: %s" % resp.get("error"))
-		sys.stdout.buffer.write(base64.b64decode(resp["out"]))
-		sys.stdout.buffer.flush()
-		sys.stderr.buffer.write(base64.b64decode(resp["err"]))
-		sys.stderr.buffer.flush()
-
-
-def cmd_agent_cancel(args, client):
-	if len(args) != 1:
-		usage_error("agent-cancel takes exactly one ticket id")
-	resp = client.control({"cmd": "agent-cancel", "id": args[0]})
-	if not resp.get("ok"):
-		die("agent-cancel failed: %s" % resp.get("error"))
-	print("pi-rc: agent '%s' status %s"
-		  % (args[0], resp["ticket"].get("status", "?")))
-
-
-def cmd_agent_detach(args, client):
-	if len(args) != 1:
-		usage_error("agent-detach takes exactly one ticket id")
-	resp = client.control({"cmd": "agent-detach", "id": args[0]})
-	if not resp.get("ok"):
-		die("agent-detach failed: %s" % resp.get("error"))
-
-
-def cmd_agent_list(args, client):
-	if len(args) > 1:
-		usage_error("agent-list takes an optional session name")
-	req = {"cmd": "ticket-list", "kind": "agent"}
-	if args:
-		req["session"] = args[0]
-	resp = client.control(req)
-	if not resp.get("ok"):
-		die("agent-list failed: %s" % resp.get("error"))
-	for ticket in resp.get("tickets") or []:
-		print(json.dumps(ticket))
-
-
-def cmd_agent_bridge(args, client):
-	# Relay an agent ticket's stdout and stderr to this process's own
-	# streams until the child finishes, then exit with the child's exit
-	# code: the wrapper's interception bridge, byte-faithful to a direct
-	# `pi --mode json -p` run as far as the caller can observe.
-	if len(args) != 1:
-		usage_error("agent-bridge takes exactly one ticket id")
-	tid = args[0]
-	sock = client.connect()
-	sock.settimeout(None)
-	out_off = err_off = 0
-	ticket = None
-	try:
-		while True:
-			send_json(sock, {"cmd": "agent-output", "id": tid,
-							 "offset": out_off, "err_offset": err_off})
-			resp, _ = read_json_line(sock)
-			if not isinstance(resp, dict) or not resp.get("ok"):
-				die("agent-bridge failed: %s"
-					% (resp or {}).get("error", "no response"), EXIT_NO_DAEMON)
-			out = base64.b64decode(resp["out"])
-			err = base64.b64decode(resp["err"])
-			if out:
-				sys.stdout.buffer.write(out)
-				sys.stdout.buffer.flush()
-			if err:
-				sys.stderr.buffer.write(err)
-				sys.stderr.buffer.flush()
-			out_off = resp["out_next"]
-			err_off = resp["err_next"]
-			ticket = resp.get("ticket")
-			if ticket and ticket.get("status") != "running":
-				break
-			time.sleep(0.1)
-	except OSError as exc:
-		die("agent-bridge connection lost: %s" % exc, EXIT_NO_DAEMON)
-	finally:
-		try:
-			sock.close()
-		except OSError:
-			pass
-	status = (ticket or {}).get("status", "lost")
-	code = (ticket or {}).get("exit")
-	term = (ticket or {}).get("term")
-	if code is not None:
-		sys.exit(code if 0 <= code <= 255 else 1)
-	if term:
-		sys.exit(128 + term)
-	sys.exit(0 if status == "done" else 1)
-
-
 # ------------------------------------------------------------------ help
 
 def print_help():
@@ -1466,9 +1251,6 @@ def main():
 		 "ticket-output": cmd_ticket_output, "ticket-list": cmd_ticket_list,
 		 "ticket-cancel": cmd_ticket_cancel, "ticket-remove": cmd_ticket_remove,
 		 "tickets-reset": cmd_tickets_reset,
-		 "agent-submit": cmd_agent_submit, "agent-wait": cmd_agent_wait,
-		 "agent-output": cmd_agent_output, "agent-cancel": cmd_agent_cancel, "agent-detach": cmd_agent_detach,
-		 "agent-list": cmd_agent_list, "agent-bridge": cmd_agent_bridge,
 		 }[cmd](rest, client)
 	elif cmd == "help":
 		print_help()
