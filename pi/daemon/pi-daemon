@@ -956,6 +956,11 @@ class Session:
 		self.file = None       # announced pi session file, for revival
 		self.state = "idle"    # model run state, published by the extension
 		self.stopping = False  # set by an explicit stop: never revive
+		# An in-place /reload was typed into this session: an abnormal
+		# death right after must not be revived into a fresh spawn (a
+		# broken extension update could otherwise respawn every session
+		# it crashed). Cleared by the next announce (session_start).
+		self.reload_injected = False
 		self.spawned_at = time.time()
 		self.carry_to = None   # live Session: viewers move there (loop-side)
 		self.absorbing_until = 0.0
@@ -1510,6 +1515,15 @@ class Daemon:
 		# crash-loop-short lifetimes stay dead.
 		if self.shutdown_event.is_set() or sess.stopping:
 			return
+		if sess.reload_injected:
+			# The session was given an in-place /reload and died right
+			# after: reviving it would turn that reload into a spawned
+			# replacement. Leave it dead; reattach recreates it from its
+			# saved conversation, and announce (session_start) clears the
+			# guard for sessions that survive the reload.
+			log("revive '%s' skipped: died after a reload injection"
+				% sess.name)
+			return
 		if not _exit_abnormal(status):
 			return
 		if time.time() - sess.spawned_at < MIN_REVIVE_LIFE:
@@ -2020,6 +2034,10 @@ class Control:
 			if sess is None:
 				return err("no-session")
 			sess.file = file
+			# Any earlier reload injection completed: the session is back
+			# after its session_start announce, so abnormal deaths are
+			# revivable again.
+			sess.reload_injected = False
 			# Surface other live holders of the same conversation so the
 			# extension can warn about a picker-opened duplicate
 			# immediately.
@@ -2205,7 +2223,14 @@ class Control:
 		re-scans extensions, skills, prompts, themes and context files in
 		place. When the extension roots actually changed, the file-level
 		diff is persisted for the in-session extension to relay to the
-		agent once it settles. force=1 reloads even without changes."""
+		agent once it settles. force=1 reloads even without changes.
+
+		Strictly in-place: this function only writes into sessions that
+		already exist; it never starts, respawns, or revives anything.
+		A session that dies while processing the injected /reload stays
+		dead (reload_injected clears the revival path) instead of being
+		spawned fresh, so a broken update cannot turn one /reload into a
+		spawn storm."""
 		force = bool(req.get("force"))
 		prev_fp = _read_ext_snapshot()
 		fp = ext_root_fingerprint(EXT_WATCH_ROOTS)
@@ -2232,6 +2257,13 @@ class Control:
 									"reason": "write-failed"})
 				else:
 					reloaded.append(sess.name)
+					# No spawn escape: if this session dies while the
+					# injected /reload is being processed (a broken
+					# extension, for example), it stays dead instead of
+					# being revived headless as a fresh spawn. The guard
+					# is cleared when the session announces again after
+					# the reload completes.
+					sess.reload_injected = True
 			else:
 				skipped.append({"id": sess.name,
 								"reason": "not-reloadable"})
