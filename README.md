@@ -158,4 +158,4 @@ Same as the sibling protocol repos: work on a feature branch, validate, land
 through a PR, cut the next tag on the merged HEAD, and reinstall the host
 from that tag before relying on the change.
 
-© 2026 Edrick Sinsuan. Licensed under [CC BY 4.0](LICENSE).
+© 2026 Edrick Sinsuan. Licensed under [MIT](LICENSE).
