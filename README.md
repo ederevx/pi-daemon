@@ -64,8 +64,9 @@ them, and can uninstall exactly what it installed.
   `/bg` never aborts a running operation: if the agent is mid-turn, pi
   prints a notice, waits for the work to settle (retries and queued
   follow-ups included), then shuts down gracefully. Ephemeral
-  (`--no-session`) sessions are refused. (Ctrl+D cannot be rebound: pi refuses extension shortcuts
-  that conflict with its built-in `app.exit` Ctrl+D binding.) The
+  (`--no-session`) sessions are refused. (Ctrl+D cannot be rebound:
+  pi refuses extension shortcuts that conflict with its built-in
+  `app.exit` Ctrl+D binding.) The
   extension also announces each session's file to the daemon so abnormal
   deaths can be revived from the same conversation.
 - **Extension reload watch**: the daemon polls the extension roots
@@ -97,8 +98,8 @@ them, and can uninstall exactly what it installed.
   crashed or restarted session re-arms its pending results on
   `session_start`. The `daemon_tasks` tool exposes the machinery
   explicitly: `submit` (fire-and-forget background command), `result`
-  (one-go fetch), `watch` (live output via partial updates), plus
-  `status`, `list` and `cancel`. When the daemon is unreachable the
+  (one-go fetch), `watch` (live output via partial updates), and
+  `status`, `list`, `cancel`, `remove`, and `reset`. When the daemon is
   bash tool falls back to pi's local execution transparently, and
   `PI_OFFLOAD=off` disables offloading entirely. Tickets are garbage
   collected by the daemon: finished tickets expire after
@@ -139,18 +140,16 @@ bash scripts/uninstall.sh
 
 ```
 pi/
-  extensions/daemon.ts       # /bg: instant detach when hosted, handover otherwise;
-                             # + relays the daemon's extension-update diff to
-                             #   the agent after an in-place reload
-  extensions/offload.ts      # ticket-based command offloading + daemon_tasks tool
-  bin/pi-rc                  # client: tickets, bridge, input, extensions-reload,
-                             # start/attach/detach/announce/ls/which/stop
-  daemon/pi-daemon           # stdlib Python PTY host daemon + shell ticket runners
+  extensions/daemon.ts   # /bg: detach/handover + reload-diff relay
+  extensions/offload.ts  # ticket offloading + daemon_tasks tool
+  bin/pi-rc              # client: tickets, bridge, input, reload,
+                         # start/attach/detach/announce/ls/which/stop
+  daemon/pi-daemon       # stdlib Python PTY host + shell ticket runners
   systemd/pi-daemon.service
 scripts/
-  install.sh                 # manifest-owned install into the agent home
+  install.sh             # manifest-owned install into the agent home
   uninstall.sh
-tests/                       # zero-dependency validation + OOP-enforcement suite
+tests/                   # zero-dependency validation + OOP-enforcement suite
 ```
 
 ## Maintenance conventions

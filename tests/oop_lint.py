@@ -14,7 +14,10 @@ Checks:
      forbidden. Classes may own mutable instance fields.
   2. Python daemon/client (pi/daemon, pi/bin): no module-level mutable
      containers, and every class uses `self.X` (instance-owned) state.
-  3. Subagent feature removal completeness: none of the removed
+  3. Extension formatting (https://pi.dev/docs/latest/extensions): a
+     pi/extensions dir containing only .ts files, each declaring an
+     `export default` entry.
+  4. Subagent feature removal completeness: none of the removed
      feature identifiers appears anywhere in pi/, scripts/, or the
      README.
 """
@@ -149,6 +152,25 @@ def check_no_subagent_residue(root: str) -> None:
             fail(rel, "removed file still exists")
 
 
+def check_extension_format(root: str) -> None:
+    """Per pi.dev/docs/latest/extensions: the extension dir holds only
+    .ts files, each with a default-export entry point."""
+    ext_dir = os.path.join(root, "pi", "extensions")
+    if not os.path.isdir(ext_dir):
+        fail(ext_dir, "missing pi/extensions directory")
+        return
+    for name in sorted(os.listdir(ext_dir)):
+        if name == ".DS_Store":
+            continue
+        path = os.path.join(ext_dir, name)
+        if not name.endswith(".ts"):
+            fail(path, "non-TS file in the extension directory")
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            if not re.search(r"\bexport\s+default\b", f.read()):
+                fail(path, "extension module must declare a default export")
+
+
 def main() -> int:
     ts_files = [
         "pi/extensions/daemon.ts",
@@ -157,14 +179,12 @@ def main() -> int:
     py_files = [
         "pi/daemon/pi-daemon",
         "pi/bin/pi-rc",
-        "pi/bin/pi-wrapper",  # bash, but guarded by the python scanner too
     ]
     for rel in ts_files:
         check_typescript(os.path.join(REPO, rel))
     for rel in py_files:
-        if rel.endswith("pi-wrapper"):
-            continue
         check_python(os.path.join(REPO, rel))
+    check_extension_format(REPO)
     check_no_subagent_residue(REPO)
     if FAILURES:
         for item in FAILURES:
