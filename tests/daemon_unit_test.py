@@ -22,6 +22,7 @@ SCRATCH = tempfile.mkdtemp(
     prefix="pi-daemon-unit-", dir=os.path.expanduser("~/tmp"))
 os.environ["XDG_STATE_HOME"] = os.path.join(SCRATCH, "state")
 os.environ["XDG_RUNTIME_DIR"] = os.path.join(SCRATCH, "runtime")
+os.environ["PI_PTYD_MIN_REVIVE_LIFE"] = "0"
 os.makedirs(os.environ["XDG_STATE_HOME"], exist_ok=True)
 os.makedirs(os.environ["XDG_RUNTIME_DIR"], exist_ok=True)
 
@@ -286,6 +287,67 @@ def test_session_control():
     assert_true(not DAEMON.control.state({"name": name, "state": "loud"}).get("ok"))
 
 
+def test_reload_guard():
+    """A reload injection is strictly in-place: it never spawns a
+    session and it marks a session that dies right after so the revival
+    path cannot turn the reload into a spawned replacement."""
+    name = "pi-reloadtest"
+    r = DAEMON.control.start(
+        {"name": name, "dir": SCRATCH, "argv": ["sh", "-c", "sleep 30"]})
+    assert_true(r.get("ok"), r)
+    file = os.path.join(SCRATCH, "conv-reload.jsonl")
+    open(file, "w").close()
+    assert_true(DAEMON.control.announce(
+        {"name": name, "file": file})["ok"])
+    DAEMON.control.state({"name": name, "state": "idle"})
+    res = DAEMON.control.extensions_reload({"force": True})
+    assert_true(name in res["reloaded"], res)
+    sess = DAEMON.table.get(name)
+    assert_true(sess is not None and sess.reload_injected,
+                "reload sets the guard flag")
+    # exactly one session with that name: nothing was spawned
+    assert_eq(len([s for s in DAEMON.table.snapshot()
+                   if s.name == name]), 1)
+    # announce (session_start) clears the guard after a survived reload
+    assert_true(DAEMON.control.announce(
+        {"name": name, "file": file})["ok"])
+    assert_true(not sess.reload_injected)
+    DAEMON.control.stop({"name": name})
+    assert_true(_drain_session(name))
+
+
+def test_reload_death_not_revived():
+    """An abnormally dying session that was just given a /reload must
+    never be revived into a fresh spawn; without the guard the same
+    death does attempt a spawn."""
+    name = "pi-reloaddeath"
+    file = os.path.join(SCRATCH, "conv-death.jsonl")
+    open(file, "w").close()
+    sess = daemon.Session(name, SCRATCH, ["pi"], pid=1, master_fd=-1)
+    sess.file = file
+    sess.spawned_at = 0.0           # past the (zero) revive life anyway
+    assert_true(DAEMON.table.put(sess))
+    calls = []
+    orig_spawn = DAEMON.spawn
+
+    def recording_spawn(*args, **kwargs):
+        calls.append((args, kwargs))
+        return None
+
+    DAEMON.spawn = recording_spawn
+    try:
+        DAEMON.table.remove_if(sess)    # the relay loop already dropped it
+        sess.reload_injected = True
+        DAEMON.revive(sess, 7 << 8)     # abnormal death (exit 7)
+        assert_eq(calls, [], "reload-dead session is NOT respawned")
+        # the same death without the guard WOULD spawn
+        sess.reload_injected = False
+        DAEMON.revive(sess, 7 << 8)
+        assert_eq(len(calls), 1, "the guard is what blocks the spawn")
+    finally:
+        DAEMON.spawn = orig_spawn
+
+
 def main():
     try:
         return _main()
@@ -302,6 +364,8 @@ def _main():
     ok("ticket control (submit/wait/output/list/remove)", test_ticket_control)
     ok("ticket cancel + reset", test_ticket_cancel_and_reset)
     ok("session control (start/list/state/input/detach/stop)", test_session_control)
+    ok("reload guard (in-place only, no spawn)", test_reload_guard)
+    ok("reload death is never revived", test_reload_death_not_revived)
     print(f"\n{PASS}/{PASS + len(FAIL)} unit tests passed")
     if FAIL:
         print("Failed: " + ", ".join(FAIL))
