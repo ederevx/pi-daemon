@@ -6,7 +6,9 @@
  * module-global state and no leaks across instances.
  */
 
-import { test, assert, assertEq, withEnv } from "./harness.ts";
+import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { test, assert, assertEq, withEnv, scratchDir } from "./harness.ts";
 import { RcBackground, default as factory } from "../../pi/extensions/daemon.ts";
 
 interface ExeResult {
@@ -218,8 +220,11 @@ test("daemon: factory wires the command and events", () => {
 class MockPi {
   readonly commands = new Map<string, unknown>();
   readonly onCalls = new Map<string, number>();
-  on(name: string, _handler: unknown): void {
+  readonly sessionStarters: Array<(event: any) => Promise<void>> = [];
+  readonly messages: string[] = [];
+  on(name: string, handler: any): void {
     this.onCalls.set(name, (this.onCalls.get(name) ?? 0) + 1);
+    if (name === "session_start") this.sessionStarters.push(handler);
   }
   registerCommand(name: string, def: unknown): void {
     this.commands.set(name, def);
@@ -227,5 +232,29 @@ class MockPi {
   async exec(): Promise<ExeResult> {
     return { code: 0, stdout: "", stderr: "", killed: false };
   }
-  async sendUserMessage(): Promise<void> {}
+  async sendUserMessage(text: string): Promise<void> {
+    this.messages.push(text);
+  }
 }
+
+test("daemon: auto /reload is silent and never messages the agent", async () => {
+  const pi = new MockPi();
+  factory(pi as never);
+  // the auto-reload handler is the last session_start listener registered
+  const reloadHandler = pi.sessionStarters[pi.sessionStarters.length - 1];
+  await withEnv({ XDG_STATE_HOME: scratchDir() }, async () => {
+    const diffPath = join(scratchDir(), "pi-pty-host", "extensions-diff.json");
+    mkdirSync(join(scratchDir(), "pi-pty-host"), { recursive: true });
+    writeFileSync(diffPath, JSON.stringify({ added: ["a.ts"], changed: ["b.ts"] }));
+    // the daemon stamped a diff and typed /reload: the reload happens
+    await reloadHandler({ reason: "reload" });
+    // ...but no "Extensions updated" message is injected into the agent
+    assertEq(pi.messages.length, 0, "auto reload must not message the agent");
+    assert(!existsSync(diffPath), "diff stamp consumed silently");
+  });
+  // a manual /reload without a stamp is equally silent
+  await withEnv({ XDG_STATE_HOME: scratchDir() }, async () => {
+    await reloadHandler({ reason: "reload" });
+    assertEq(pi.messages.length, 0, "no stamp, still no message");
+  });
+});

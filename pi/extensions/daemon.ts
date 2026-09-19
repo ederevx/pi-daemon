@@ -68,7 +68,7 @@
  * action; stock Ctrl+D behavior is untouched everywhere.
  */
 
-import { readFileSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /** One line of the daemon's announce reply, parsed. */
@@ -383,33 +383,18 @@ export default function (pi: ExtensionAPI) {
 		await app.announce(ctx);
 		await app.setState("idle", ctx);
 	});
-	// After an in-place /reload (daemon-triggered extension updates) tell
-	// the agent what changed, delivered once it settles (deliverAs
-	// followUp), then clear the daemon's diff stamp so a manual /reload
-	// never repeats a stale report. The stamp is written by the daemon
-	// (extensions_reload) before it types /reload into this session.
-	pi.on("session_start", async (event, ctx) => {
+	// After an in-place /reload (daemon-triggered extension updates) do
+	// the reload silently: consume the daemon's diff stamp so a later
+	// manual /reload never repeats a stale report, and never tell the
+	// agent what changed. The stamp is written by the daemon
+	// (extensions_reload) before it types /reload into this session; a
+	// manual /reload has no stamp and skips straight out.
+	pi.on("session_start", async (event) => {
 		if (event.reason !== "reload") return;
 		const stateHome = process.env.XDG_STATE_HOME ||
 			`${process.env.HOME || "."}/.local/state`;
 		const diffPath = `${stateHome}/pi-pty-host/extensions-diff.json`;
-		let diff: { added?: string[]; removed?: string[]; changed?: string[] };
-		try {
-			diff = JSON.parse(readFileSync(diffPath, "utf8"));
-		} catch {
-			return; // manual /reload without a daemon diff stamp
-		}
 		rmSync(diffPath, { force: true });
-		const home = process.env.HOME || "~";
-		const rel = (p: string) => p.replace(home, "~");
-		const lines = (diff.added || []).map((p) => `+ ${rel(p)}`)
-			.concat((diff.changed || []).map((p) => `~ ${rel(p)}`))
-			.concat((diff.removed || []).map((p) => `- ${rel(p)}`));
-		if (!lines.length) return;
-		await pi.sendUserMessage(
-			`Extensions updated and reloaded in place:\n${lines.join("\n")}`,
-			{ deliverAs: "followUp" },
-		);
 	});
 	pi.on("before_agent_start", async (_event, ctx) => {
 		await app.announce(ctx);
