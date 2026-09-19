@@ -110,7 +110,7 @@ them, and can uninstall exactly what it installed.
 - **Always backgrounded**: a hosted session never dies silently. When
   its pi process dies abnormally (crash, SIGKILL, OOM), the daemon
   revives it headless as `pi --session <file>` under the same name. Only
-  a clean quit (Ctrl+D or `/exit`), an explicit `pi-rc stop`, a daemon
+  a clean quit (Ctrl+D or the `/quit` command), an explicit `pi-rc stop`, a daemon
   shutdown, or a deleted session file ends one for good, and a revived
   pi that dies again within 30 seconds is left dead so a crash loop
   cannot spin the daemon.
