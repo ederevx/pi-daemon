@@ -23,6 +23,15 @@ SCRATCH = tempfile.mkdtemp(
 os.environ["XDG_STATE_HOME"] = os.path.join(SCRATCH, "state")
 os.environ["XDG_RUNTIME_DIR"] = os.path.join(SCRATCH, "runtime")
 os.environ["PI_PTYD_MIN_REVIVE_LIFE"] = "0"
+# The extension-reload watch must never touch the real agent home in
+# tests: point its roots at a scratch dir and run it fast.
+EXT_ROOT = os.path.join(SCRATCH, "ext-root")
+os.makedirs(EXT_ROOT, exist_ok=True)
+with open(os.path.join(EXT_ROOT, "a.ts"), "w") as _f:
+    _f.write("v1")
+os.environ["PI_PTYD_EXT_WATCH_ROOTS"] = EXT_ROOT
+os.environ["PI_PTYD_EXT_WATCH_INTERVAL"] = "0.05"
+os.environ["PI_PTYD_EXT_WATCH_DEBOUNCE"] = "0.0"
 os.makedirs(os.environ["XDG_STATE_HOME"], exist_ok=True)
 os.makedirs(os.environ["XDG_RUNTIME_DIR"], exist_ok=True)
 
@@ -348,6 +357,108 @@ def test_reload_death_not_revived():
         DAEMON.spawn = orig_spawn
 
 
+def _spawn_session(name):
+    """A hosted fake session with an announced conversation file."""
+    r = DAEMON.control.start(
+        {"name": name, "dir": SCRATCH, "argv": ["sh", "-c", "sleep 60"]})
+    assert_true(r.get("ok"), r)
+    file = os.path.join(SCRATCH, "conv-%s.jsonl" % name)
+    open(file, "w").close()
+    assert_true(DAEMON.control.announce(
+        {"name": name, "file": file})["ok"])
+
+
+def test_extensions_reload_deferral():
+    """A round that finds a reloadable session busy must NOT advance
+    the on-disk snapshot: the busy session still owes the reload and
+    retries on later polls instead of silently losing the change."""
+    a, b = "pi-defer-a", "pi-defer-b"
+    _spawn_session(a)
+    _spawn_session(b)
+    DAEMON.control.state({"name": a, "state": "idle"})
+    DAEMON.control.state({"name": b, "state": "busy"})
+    base = daemon.ext_root_fingerprint([EXT_ROOT])
+    daemon._write_ext_snapshot(base, None)
+    before = open(daemon.EXT_SNAPSHOT_PATH, "rb").read()
+    res = DAEMON.control.extensions_reload({"force": True})
+    assert_true(a in res["reloaded"], res)
+    assert_true(b in [s["id"] for s in res["skipped"]], res)
+    assert_true(res["deferred"], "busy session defers the round")
+    after = open(daemon.EXT_SNAPSHOT_PATH, "rb").read()
+    assert_eq(after, before, "snapshot must not advance while deferred")
+    # once the session is idle the same round completes and stamps
+    DAEMON.control.state({"name": b, "state": "idle"})
+    res = DAEMON.control.extensions_reload({"force": True})
+    assert_true(a in res["reloaded"] and b in res["reloaded"], res)
+    assert_true(not res["deferred"], res)
+    DAEMON.control.stop({"name": a})
+    DAEMON.control.stop({"name": b})
+    _drain_session(a)
+    _drain_session(b)
+
+
+def test_ext_watch_loop_owes_busy_sessions():
+    """End-to-end: the automatic watch retries a busy session until it
+    goes idle and only then advances the snapshot, so every hosted
+    session gets exactly one in-place /reload per change."""
+    a, b = "pi-owed-a", "pi-owed-b"
+    _spawn_session(a)
+    _spawn_session(b)
+    DAEMON.control.state({"name": a, "state": "idle"})
+    DAEMON.control.state({"name": b, "state": "busy"})
+    base = daemon.ext_root_fingerprint([EXT_ROOT])
+    daemon._write_ext_snapshot(base, None)
+
+    def wait_until(pred, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if pred():
+                return True
+            time.sleep(0.02)
+        return False
+
+    stop = threading.Event()
+    thread = threading.Thread(target=daemon.ext_watch_loop,
+                              args=(DAEMON, stop), daemon=True)
+    thread.start()
+    sess_a = DAEMON.table.get(a)
+    sess_b = DAEMON.table.get(b)
+    try:
+        # change the watched root: idle A reloads, busy B defers
+        time.sleep(0.02)
+        with open(os.path.join(EXT_ROOT, "a.ts"), "w") as f:
+            f.write("v2-longer-content")
+        changed = daemon.ext_root_fingerprint([EXT_ROOT])
+        assert_true(wait_until(lambda: DAEMON.table.get(a).reload_injected),
+                    "idle session got its reload")
+        assert_true(not sess_b.reload_injected,
+                    "busy session is not reloaded yet")
+        assert_eq(daemon._read_ext_snapshot(), base,
+                  "snapshot not advanced while B is owed")
+        assert_true(not os.path.exists(daemon.EXT_DIFF_PATH),
+                    "no diff stamped while B is owed")
+        # B goes idle: the next poll reloads it and stamps everything
+        DAEMON.control.state({"name": b, "state": "idle"})
+        assert_true(wait_until(lambda: DAEMON.table.get(b).reload_injected),
+                    "busy session got its deferred reload")
+        assert_true(wait_until(
+            lambda: daemon._read_ext_snapshot() == changed),
+            "snapshot advanced once all owed sessions were reloaded")
+        assert_true(wait_until(
+            lambda: os.path.exists(daemon.EXT_DIFF_PATH)),
+            "pending diff was stamped")
+        diff = json.load(open(daemon.EXT_DIFF_PATH))
+        assert_eq(diff["changed"], [os.path.join(EXT_ROOT, "a.ts")])
+    finally:
+        stop.set()
+        thread.join(timeout=5.0)
+        assert_true(not thread.is_alive(), "watch loop stopped cleanly")
+        DAEMON.control.stop({"name": a})
+        DAEMON.control.stop({"name": b})
+        _drain_session(a)
+        _drain_session(b)
+
+
 def main():
     try:
         return _main()
@@ -366,6 +477,10 @@ def _main():
     ok("session control (start/list/state/input/detach/stop)", test_session_control)
     ok("reload guard (in-place only, no spawn)", test_reload_guard)
     ok("reload death is never revived", test_reload_death_not_revived)
+    ok("extensions_reload defers busy sessions (no stamp)",
+       test_extensions_reload_deferral)
+    ok("watch loop owes busy sessions until idle",
+       test_ext_watch_loop_owes_busy_sessions)
     print(f"\n{PASS}/{PASS + len(FAIL)} unit tests passed")
     if FAIL:
         print("Failed: " + ", ".join(FAIL))

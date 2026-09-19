@@ -74,11 +74,14 @@ them, and can uninstall exactly what it installed.
   types `/reload` into every hosted conversation session so pi re-scans
   its loaded resources in place, and persists the file-level diff for
   the in-session daemon extension to relay to the agent once it settles.
-  Sessions that are not idle are skipped instead (busy mid-turn, or
-  parked on a blocking daemon wait `waiting`) since pi would deny a
-  reload in either state, and the reload is deferred until a session is
-  idle; the diff is only stamped once at least one session was actually
-  reloaded. The reload is strictly in-place: it only writes into
+  Sessions that are not idle are skipped for the round instead (busy
+  mid-turn, or parked on a blocking daemon wait `waiting`) since pi
+  would deny a reload in either state; each skipped session stays owed,
+  is retried every poll until it goes idle, and the diff is stamped
+  only once every owed session was reloaded or is gone (never dropped,
+  with newer edits coalescing into the pending diff). A manual
+  `pi-rc extensions-reload` follows the same deferral and the watch
+  finishes its busy sessions. The reload is strictly in-place: it only writes into
   sessions that already exist and never starts or revives one, and a
   session that dies while processing the injected `/reload` stays dead
   instead of being respawned, so a broken update cannot cascade into a
