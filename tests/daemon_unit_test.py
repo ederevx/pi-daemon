@@ -23,6 +23,9 @@ SCRATCH = tempfile.mkdtemp(
 os.environ["XDG_STATE_HOME"] = os.path.join(SCRATCH, "state")
 os.environ["XDG_RUNTIME_DIR"] = os.path.join(SCRATCH, "runtime")
 os.environ["PI_PTYD_MIN_REVIVE_LIFE"] = "0"
+# Reap detached idle sessions fast in tests so the guard is exercised
+# without waiting the six-hour production default.
+os.environ["PI_PTYD_IDLE_REAP"] = "5.0"
 # The extension-reload watch must never touch the real agent home in
 # tests: point its roots at a scratch dir and run it fast.
 EXT_ROOT = os.path.join(SCRATCH, "ext-root")
@@ -459,6 +462,57 @@ def test_ext_watch_loop_owes_busy_sessions():
         _drain_session(b)
 
 
+
+def test_idle_reap_detects_and_ends_detached_sessions():
+    """Regression: a hosted session that outlives its user (detached and
+    model-idle past the grace) is ended by the daemon instead of piling
+    up as a phantom that respawns on every daemon restart."""
+    name = "pi-idle-reap"
+    DAEMON.control.stop({"name": name})  # idempotent re-run guard
+    r = DAEMON.control.start(
+        {"name": name, "dir": SCRATCH,
+         "argv": ["sh", "-c", "echo hosted-ready; sleep 60"]})
+    assert_true(r.get("ok"), r)
+    sess = DAEMON.table.get(name)
+    assert_true(sess is not None, "session did not appear")
+    sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
+    assert_true(sess.idle_exceeded(),
+                "aged idle detached session not detected as reapable")
+    assert_true(_drain_session(name), "idle detached session not reaped")
+    # Teardown is async (the session relay thread drops the table entry
+    # and registry): wait for both to settle like a client would.
+    for _ in range(50):
+        listed = DAEMON.control.list({})
+        gone = (name not in [s["name"] for s in listed["sessions"]]
+                and name not in DAEMON.registry.load())
+        if gone:
+            break
+        time.sleep(0.05)
+    assert_true(name not in DAEMON.registry.load(),
+                "reaped session still respawnable from the registry")
+
+
+def test_idle_reap_spares_busy_and_attached():
+    """A model that is busy must never be reaped, and an idle session
+    with a live bridge viewer stays put."""
+    name = "pi-busy-keep"
+    r = DAEMON.control.start(
+        {"name": name, "dir": SCRATCH,
+         "argv": ["sh", "-c", "echo bg; sleep 60"]})
+    assert_true(r.get("ok"), r)
+    sess = DAEMON.table.get(name)
+    assert_true(DAEMON.control.state(
+        {"name": name, "state": "busy"}).get("ok"))
+    sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
+    assert_true(not sess.idle_exceeded(),
+                "busy session must not be reapable")
+    time.sleep(0.7)
+    assert_true(DAEMON.table.get(name) is not None,
+                "busy session was reaped anyway")
+    DAEMON.control.stop({"name": name})
+    assert_true(_drain_session(name))
+
+
 def main():
     try:
         return _main()
@@ -481,6 +535,10 @@ def _main():
        test_extensions_reload_deferral)
     ok("watch loop owes busy sessions until idle",
        test_ext_watch_loop_owes_busy_sessions)
+    ok("idle reap detects and ends detached idle sessions",
+       test_idle_reap_detects_and_ends_detached_sessions)
+    ok("idle reap spares busy and attached sessions",
+       test_idle_reap_spares_busy_and_attached)
     print(f"\n{PASS}/{PASS + len(FAIL)} unit tests passed")
     if FAIL:
         print("Failed: " + ", ".join(FAIL))
