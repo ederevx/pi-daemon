@@ -169,6 +169,13 @@ MIN_REVIVE_LIFE = float(os.environ.get("PI_PTYD_MIN_REVIVE_LIFE", "30"))
 # daemon instead of piling up as a phantom that respawns on every
 # daemon restart. Zero disables the reap (PI_PTYD_IDLE_REAP=0).
 IDLE_REAP = float(os.environ.get("PI_PTYD_IDLE_REAP", "21600"))
+# A reload injection's no-spawn guard stays armed for this long: a
+# reloaded session that dies within the window is treated as a broken
+# reload and never respawned (the reload stays strictly in-place); once
+# it survives past the grace the guard expires and abnormal deaths are
+# revivable again. Overridable for isolated tests
+# (PI_PTYD_RELOAD_GUARD_GRACE=0).
+RELOAD_GUARD_GRACE = float(os.environ.get("PI_PTYD_RELOAD_GUARD_GRACE", "60"))
 # How long an in-flight absorption makes its announcer look authoritative
 # to concurrent announces, and how long the settle recheck waits before
 # SIGTERMing an absorbed holder.
@@ -967,6 +974,11 @@ class Session:
 		# broken extension update could otherwise respawn every session
 		# it crashed). Cleared by the next announce (session_start).
 		self.reload_injected = False
+		# When the guard was armed (extensions_reload): the survive window
+		# for revival suppression. A death inside [armed_at, armed_at +
+		# RELOAD_GUARD_GRACE) is the reload's fault and stays dead; after
+		# it the session survived the reload and is revivable again.
+		self.reload_injected_at = 0.0
 		self.spawned_at = time.time()
 		self.carry_to = None   # live Session: viewers move there (loop-side)
 		self.absorbing_until = 0.0
@@ -1551,14 +1563,18 @@ class Daemon:
 		if self.shutdown_event.is_set() or sess.stopping:
 			return
 		if sess.reload_injected:
-			# The session was given an in-place /reload and died right
-			# after: reviving it would turn that reload into a spawned
-			# replacement. Leave it dead; reattach recreates it from its
-			# saved conversation, and announce (session_start) clears the
-			# guard for sessions that survive the reload.
-			log("revive '%s' skipped: died after a reload injection"
-				% sess.name)
-			return
+			# The session was given an in-place /reload: an abnormal death
+			# inside the survive grace is the reload's fault (a broken
+			# extension update, for example) and must not be revived into
+			# a fresh spawn. Leave it dead; reattach recreates it from its
+			# saved conversation, and once the grace has elapsed the
+			# session is treated as having survived the reload so normal
+			# crash revival resumes. Cleared by the next announce that
+			# names a different conversation file.
+			if time.time() - sess.reload_injected_at < RELOAD_GUARD_GRACE:
+				log("revive '%s' skipped: died after a reload injection"
+					% sess.name)
+				return
 		if not _exit_abnormal(status):
 			return
 		if time.time() - sess.spawned_at < MIN_REVIVE_LIFE:
@@ -2069,11 +2085,19 @@ class Control:
 			sess = table.get(name)
 			if sess is None:
 				return err("no-session")
+			# Clear the reload guard only when this announce names a
+			# genuinely different conversation file: pi reloads the
+			# extension module during an in-place /reload and re-fires
+			# session_start, which re-announces the SAME file mid-reload.
+			# Clearing there would wipe the no-spawn guard while the
+			# reload is still being applied, so a broken update that
+			# crashes the session would be revived into a fresh spawn.
+			# A changed file is a fresh boot / new conversation, where the
+			# old reload guard is moot.
+			if file != sess.file:
+				sess.reload_injected = False
+				sess.reload_injected_at = 0.0
 			sess.file = file
-			# Any earlier reload injection completed: the session is back
-			# after its session_start announce, so abnormal deaths are
-			# revivable again.
-			sess.reload_injected = False
 			# Surface other live holders of the same conversation so the
 			# extension can warn about a picker-opened duplicate
 			# immediately.
@@ -2315,9 +2339,11 @@ class Control:
 					# injected /reload is being processed (a broken
 					# extension, for example), it stays dead instead of
 					# being revived headless as a fresh spawn. The guard
-					# is cleared when the session announces again after
-					# the reload completes.
+					# stays armed (reload_injected_at) until the session
+					# survives past the reload guard grace or announces a
+					# different conversation file.
 					sess.reload_injected = True
+					sess.reload_injected_at = time.time()
 			else:
 				skipped.append({"id": sess.name,
 								"reason": "not-reloadable"})
