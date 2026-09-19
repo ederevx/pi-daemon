@@ -14,10 +14,13 @@
 # The PI_HOSTED guard keeps hosted one-shot/worker sessions and nested
 # starts out of the way: anything running inside the daemon already
 # carries PI_HOSTED and execs the real pi untouched. One-shot invocations
-# (-p/--print, --no-session) and help/version stay direct, non-tty stdin
-# passes through, and if pi-rc is missing or the service is not running
-# (attach exits nonzero) the wrapper degrades to the real pi so a bare
-# start always works (unhosted; /bg then offers a handover).
+# (-p/--print, --no-session), help/version, and the non-interactive
+# management commands (update/install/remove/uninstall/list/config/auth)
+# pass straight through to the real pi - update especially must run
+# against the installed binary, never inside a hosted session. Non-tty
+# stdin passes through, and if pi-rc is missing or the service is not
+# running (attach exits nonzero) the wrapper degrades to the real pi so
+# a bare start always works (unhosted; /bg then offers a handover).
 #
 # REAL_PI is rewritten to the actual pi binary at install time.
 #
@@ -224,7 +227,7 @@ if [[ -t 0 && -z "${PI_HOSTED:-}" && -x "$PI_RC" ]]; then
 	direct=0
 	for arg in "${args[@]}"; do
 		case "$arg" in
-			-p|--print|--no-session|-h|--help|-v|--version) direct=1; break ;;
+			-p|--print|--no-session|-h|--help|-v|--version|update|install|remove|uninstall|list|config|auth) direct=1; break ;;
 		esac
 	done
 	if [[ $direct -eq 0 ]]; then
