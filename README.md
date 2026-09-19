@@ -24,7 +24,7 @@ them, and can uninstall exactly what it installed.
   the old behavior: a fresh conversation in its own new hosted session
   through `pi-rc attach --new`. The owned-session scan only considers
   sessions with a real conversation file on record, so `--no-session`
-  children (subagent workers share the directory in the listing) are
+  children (one-shot workers share the directory in the listing) are
   never attached. Resume flags (--resume / --continue) ride along into
   the hosted session as pi args. Before attaching, the wrapper resolves
   the target conversation file of a
@@ -47,7 +47,7 @@ them, and can uninstall exactly what it installed.
   match degrades open exactly as before, and plain `pi` starts are
   unaffected. One-shot invocations (`-p`/`--print`, `--no-session`),
   help/version, and non-tty stdin stay direct. The `PI_HOSTED` guard
-  keeps hosted subagent/worker sessions and nested starts out of the way:
+  keeps hosted one-shot/worker sessions and nested starts out of the way:
   anything already inside the daemon execs the real pi untouched. The
   wrapper resolves the real binary at install time and is manifest-owned.
   If `pi-rc` is missing or the service is down, the wrapper degrades to
@@ -103,22 +103,6 @@ them, and can uninstall exactly what it installed.
   capped at 200 (oldest evicted), and each sweep unlinks the expired
   output logs; a daemon restart or shutdown marks running tickets
   `lost` instead of ever claiming a live process.
-- **Subagent interception** (pi-compatible front): hosted sessions and
-  offloaded delegation children run through `pi-agent-entry.mjs`, a
-  daemon-owned front that loads pi's real entry in-process — to any
-  caller (the delegation protocol included) it is pi, and nothing needs
-  to know the daemon exists. Delegation-shaped headless calls
-  (`--mode json -p --no-session`) are handed to the daemon as agent
-  tickets: the daemon spawns and owns the real pi child, captures its
-  stdout NDJSON and stderr separately, enforces the turn budget by
-  counting assistant turns, and the front relays everything back
-  byte-for-byte with the child's exit code — synchronous callers block
-  exactly as before, while the child now survives the parent. Tickets
-  can be cancelled, removed once finished, or wiped entirely with
-  `pi-rc tickets-reset` (cancel all running, wipe the store, restart
-  the id counter; hosted sessions untouched — `pi-rc daemon-stop`
-  remains the full stop). Service down or capacity exhausted → the
-  front runs pi directly, so unoffloaded behavior is byte-identical.
 - **Always backgrounded**: a hosted session never dies silently. When
   its pi process dies abnormally (crash, SIGKILL, OOM), the daemon
   revives it headless as `pi --session <file>` under the same name. Only
@@ -156,14 +140,14 @@ pi/
                              # + relays the daemon's extension-update diff to
                              #   the agent after an in-place reload
   extensions/offload.ts      # ticket-based command offloading + daemon_tasks tool
-  bin/pi-rc                  # client: tickets, agents, bridge, input, extensions-reload,
+  bin/pi-rc                  # client: tickets, bridge, input, extensions-reload,
                              # start/attach/detach/announce/ls/which/stop
-  daemon/pi-daemon                      # stdlib Python PTY host daemon + ticket/agent runners
-  daemon/pi-agent-entry.mjs             # pi-compatible front: delegation interception
+  daemon/pi-daemon           # stdlib Python PTY host daemon + shell ticket runners
   systemd/pi-daemon.service
 scripts/
-  install.sh                        # manifest-owned install into the agent home
+  install.sh                 # manifest-owned install into the agent home
   uninstall.sh
+tests/                       # zero-dependency validation + OOP-enforcement suite
 ```
 
 ## Maintenance conventions

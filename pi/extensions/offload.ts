@@ -95,10 +95,7 @@ export interface Ticket {
 	cwd: string;
 	command: string;
 	status: "running" | "done" | "failed" | "cancelled" | "lost";
-	kind?: "shell" | "agent";
-	detached?: boolean;
-	turns?: number;
-	max_turns?: number;
+	kind?: "shell";
 	created: number;
 	started: number;
 	finished: number | null;
@@ -126,6 +123,7 @@ class DaemonUnavailable extends Error {
 		super(message);
 	}
 }
+
 
 /** Formats one completed ticket + its output as agent-facing text. */
 function formatResult(ticket: Ticket, output: string): string {
@@ -172,9 +170,8 @@ function resolvePiRc(): string {
 	return candidates[candidates.length - 1];
 }
 
-/** The owning session's stable key, shared by the task machinery and the
- *  /daemon-subagents views: the hosted session's short name when hosted,
- *  else the conversation file's stem, else "standalone". */
+/** The owning session's stable key: the hosted session's short name
+ *  when hosted, else the conversation file's stem, else "standalone". */
 export function sessionKeyOf(sessionFile?: string | null): string {
 	const hosted = process.env.PI_HOSTED_SESSION;
 	if (hosted) return hosted.replace(/^pi-/, "");
@@ -334,30 +331,6 @@ export class TicketClient {
 		return this.wait(id, 0);
 	}
 
-	/** Reads a whole agent ticket's stdout log (same bounded loop). */
-	async agentOutput(id: string): Promise<string> {
-		const parts: Buffer[] = [];
-		let offset = 0;
-		for (let i = 0; i < 256; i++) {
-			const out = await this.run(["agent-output", id, String(offset)]);
-			const chunk = Buffer.from(out, "binary");
-			if (chunk.length === 0) break;
-			parts.push(chunk);
-			offset += chunk.length;
-		}
-		return Buffer.concat(parts).toString("utf8");
-	}
-
-	async agentList(session?: string): Promise<Ticket[]> {
-		const args = ["agent-list"];
-		if (session) args.push(session);
-		const out = await this.run(args);
-		return out
-			.trim()
-			.split("\n")
-			.filter(Boolean)
-			.map((line) => JSON.parse(line) as Ticket);
-	}
 }
 
 /**
@@ -389,15 +362,6 @@ class DaemonTasks {
 		this.fetched.add(id);
 	}
 
-	/** Detached-agent delivery state: latest snapshot per detached agent
-	 *  ticket plus the single poller timer (see startAgentWatch). */
-	private agentSeen = new Map<string, Ticket>();
-	private agentWatchTimer: ReturnType<typeof setTimeout> | undefined;
-	private agentWatchInFlight = false;
-
-	/** Agent tickets whose result an explicit wait already consumed; the
-	 *  watcher must not double-deliver their completion steer. */
-	private agentFetched = new Set<string>();
 
 	constructor(
 		exec: TicketClient["exec"],
@@ -428,86 +392,6 @@ class DaemonTasks {
 			this.sessionKey(sessionFile), cwd, command, extraEnv);
 		this.armDelivery(id, command);
 		return id;
-	}
-
-	/** Starts the detached-agent watcher: a single serialized poller that
-	 *  watches this session's agent tickets flagged `detached` (the front
-	 *  marked them "handed off to the daemon") for running -> terminal
-	 *  transitions, then delivers the same one-line card + display:false
-	 *  steer a shell ticket would have produced inline. */
-	startAgentWatch(): void {
-		if (this.agentWatchTimer !== undefined) return;
-		this.agentWatchTimer = setTimeout(
-			() => void this.agentWatchTick(), AGENT_WATCH_TICK_MS);
-	}
-
-	private async agentWatchTick(): Promise<void> {
-		if (this.agentWatchInFlight) return;
-		this.agentWatchInFlight = true;
-		try {
-			let tickets: Ticket[] = [];
-			try {
-				tickets = await this.client.agentList(this.sessionKey());
-			} catch {
-				// daemon unreachable or reset: retry next tick
-			}
-			const current = new Set<string>();
-			for (const t of tickets) {
-				if (t.kind !== "agent" || !t.detached) continue;
-				current.add(t.id);
-				const prev = this.agentSeen.get(t.id);
-				this.agentSeen.set(t.id, t);
-				if (prev !== undefined && prev.status === "running"
-					&& t.status !== "running") {
-					void this.deliverAgentDone(t);
-				}
-			}
-			for (const [id, t] of this.agentSeen) {
-				if (t.status !== "running" && !current.has(id)) {
-					this.agentSeen.delete(id);
-				}
-			}
-		} finally {
-			this.agentWatchInFlight = false;
-			this.agentWatchTimer = setTimeout(
-				() => void this.agentWatchTick(), AGENT_WATCH_TICK_MS);
-		}
-	}
-
-	/** Marks an agent ticket as already consumed by an explicit wait, so
-	 *  the detached-completion watcher skips its steer. */
-	markAgentFetched(id: string): void {
-		this.agentFetched.add(id);
-	}
-
-	private async deliverAgentDone(ticket: Ticket): Promise<void> {
-		if (this.agentFetched.has(ticket.id)) return;
-		let output = "";
-		try {
-			const res = await this.client.getOutput(ticket.id);
-			output = res.output;
-			if (res.usage) {
-				ticket.usage = res.usage;
-				ticket.cost = res.usage.cost;
-			}
-		} catch {
-			// keep the card even when the output fetch failed
-		}
-		const meta = agentRowMeta(ticket);
-		const label = meta.name || meta.task
-			? `subagent ${meta.name}${meta.task ? ` - ${meta.task}` : ""}`
-			: ticket.id;
-		this.append("daemon-task", { ticket });
-		this.send(
-			{
-				customType: "daemon-task",
-				content: `Background task finished (detached): ${label}\n`
-					+ `${formatResult(ticket, output)}`,
-				display: false,
-				details: { ticket },
-			},
-			{ triggerTurn: true, deliverAs: "steer" },
-		);
 	}
 
 	status(id: string): Promise<Ticket> {
@@ -641,9 +525,6 @@ async function adoptRecentShellTicket(
 	}
 }
 
-/** Detached-agent watcher poll cadence. */
-const AGENT_WATCH_TICK_MS = 5000;
-
 /** Character-wrap text to width (0/negative width returns it as-is). */
 function wrapLine(text: string, width: number): string[] {
 	if (width <= 0 || text.length <= width) return [text];
@@ -672,7 +553,7 @@ function sessionEnvExtra(env?: NodeJS.ProcessEnv): Record<string, string> {
 	return extra;
 }
 
-// -- /daemon-tasks dock (derived from the subagents dock interface) ----
+// -- /daemon-tasks dock ----------------------------------------------
 
 interface TaskRow {
 	ticket: Ticket;
@@ -759,8 +640,7 @@ class DaemonTasksDock {
 		if (this.stopped || this.pollInFlight) return;
 		this.pollInFlight = true;
 		try {
-			const tickets = (await this.client.list())
-				.filter((ticket) => ticket.kind !== "agent");
+			const tickets = await this.client.list();
 			// Session tickets first (always visible), then everything
 			// else behind the collapsible global section; each section
 			// newest first, top to bottom.
@@ -957,69 +837,6 @@ class DaemonTasksDock {
 	}
 }
 
-// -- adopted-subagent metadata (names/status), shared with the
-// -- /daemon-subagents views extension and the daemon_subagent_list tool --
-
-/** One-shot label/task derivation for an adopted agent ticket: the tier
- *  worker's profile heading in its prompt copy, else the model name; the
- *  task is the last "Task:" line of the prompt, else the tail of the
- *  recorded command. */
-export function agentRowMeta(ticket: Ticket): { name: string; task: string } {
-	let name = "";
-	let task = "";
-	const promptMatch = /--append-system-prompt\s+(\S+)/.exec(ticket.command);
-	if (promptMatch) {
-		try {
-			const content = fs.readFileSync(promptMatch[1], "utf8");
-			const tier = /^#\s*(quick|bulk|balanced|frontier)\s+worker\b/im
-				.exec(content);
-			if (tier) name = `${tier[1].toLowerCase()}-worker`;
-			for (const line of content.split("\n").reverse()) {
-				const m = /^\s*Task:\s*(.*)/.exec(line);
-				if (m) {
-					task = m[1].trim();
-					break;
-				}
-			}
-		} catch {
-			/* prompt copy already collected */
-		}
-	}
-	if (!name) {
-		const model = /--model\s+(\S+)/.exec(ticket.command);
-		name = model ? (model[1].split(/[/:]/).pop() || "subagent") : "subagent";
-	}
-	if (!task) {
-		const idx = ticket.command.lastIndexOf("Task: ");
-		if (idx >= 0) task = ticket.command.slice(idx + 6).trim();
-	}
-	if (task.length > 80) task = task.slice(0, 77) + "...";
-	return { name, task };
-}
-
-/** Status line in the /subagents selector shape. */
-function agentStatusLine(ticket: Ticket, now: number): string {
-	const parts: string[] = [ticket.status];
-	if (ticket.status === "running") {
-		if (ticket.turns !== undefined) {
-			parts.push(`turns ${ticket.turns}`
-				+ (ticket.max_turns ? `/${ticket.max_turns}` : ""));
-		}
-		parts.push(`${Math.max(1, Math.round(now - (ticket.started ?? ticket.created)))}s`);
-	} else {
-		if (ticket.exit !== null && ticket.exit !== undefined) parts.push(`exit ${ticket.exit}`);
-		if (ticket.finished) {
-			parts.push(`${Math.round(ticket.finished - (ticket.started ?? ticket.created))}s`);
-		}
-	}
-	if (ticket.detached) parts.push("adopted");
-	const cost = ticket.cost?.total ?? ticket.usage?.cost?.total;
-	if (typeof cost === "number" && cost > 0) parts.push(`$${cost.toFixed(4)}`);
-	const tokens = ticket.totalTokens ?? ticket.usage?.totalTokens;
-	if (typeof tokens === "number" && tokens > 0) parts.push(`${tokens} tok`);
-	return parts.join(" \u00b7 ");
-}
-
 /** The offloading bash backend: submits a command to the daemon, waits for
  *  it within the call bound, hands off past the bound (ticket keeps running
  *  daemon-side, delivery armed, agent freed), and always falls back to the
@@ -1135,20 +952,12 @@ class OffloadedBash implements BashOperations {
 	};
 }
 export default function (pi: ExtensionAPI) {
-	// Detach routing: hand the hosted session key to spawned children
-	// under a name ADP does not strip, so the front can record the
-	// owning session on the agent tickets it creates.
-	if (process.env.PI_HOSTED_SESSION && !process.env.PI_PTYD_SESSKEY) {
-		process.env.PI_PTYD_SESSKEY = process.env.PI_HOSTED_SESSION;
-	}
 	const exec = (file: string, args: string[]) => pi.exec(file, args);
 	const tasks = new DaemonTasks(exec, (message, options) => {
 		void pi.sendMessage(message, options);
 	}, (customType, data) => {
 		void pi.appendEntry(customType, data);
 	});
-	tasks.startAgentWatch();
-
 	// Static one-line card; full detail lives in /daemon-tasks.
 	pi.registerEntryRenderer("daemon-task", (entry, _opts, theme) => {
 		const t = (entry.data as { ticket?: Ticket } | undefined)?.ticket;
@@ -1368,118 +1177,4 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
-		name: "daemon_subagent_list",
-		label: "list adopted subagents",
-		description:
-			"List this session's daemon-adopted subagents (agent tickets): " +
-			"id, worker name, status, turns and elapsed. Companion to " +
-			"daemon_subagent_wait. Requires the pi-daemon service.",
-		promptSnippet: "List daemon-adopted subagents",
-		parameters: Type.Object({}),
-		async execute(_t, _p, _s, _o, _c) {
-			if (disabled()) {
-				throw new Error("Command offloading is disabled (PI_OFFLOAD=off)");
-			}
-			const tickets = await tasks.client.agentList(tasks.sessionKey());
-			if (!tickets.length) {
-				return { content: [{ type: "text", text: "No adopted subagents in this session." }], details: {} };
-			}
-			const now = Date.now() / 1000;
-			const lines = tickets
-				.sort((a, b) => (b.started ?? b.created) - (a.started ?? a.created))
-				.map((t) => {
-					const m = agentRowMeta(t);
-					return `${t.id} ${m.name} - ${agentStatusLine(t, now)} - ${m.task}`;
-				});
-			return { content: [{ type: "text", text: lines.join("\n") }], details: { tickets } };
-		},
-	});
-	pi.registerTool({
-		name: "daemon_subagent_wait",
-		label: "wait on adopted subagent",
-		description:
-			"Wait (block) until a daemon-adopted subagent (an agent ticket of " +
-			"this session) finishes and return its full output. Use this when " +
-			"you spawned a subagent that was adopted by the daemon and need its " +
-			"result before continuing to make decisions: it blocks event-driven " +
-			"on the daemon (no sleep/poll loops, no wasted turns). The helper " +
-			"daemon_subagent_list lists this session's adopted subagents. " +
-			"Requires the pi-daemon service.",
-		promptSnippet: "Wait for a daemon-adopted subagent to finish",
-		promptGuidelines: [
-			"When you wait on an adopted subagent, do NOT invent sleep/poll " +
-				"loops to check on it - this tool blocks until it is done and " +
-				"returns the full result in one call. Re-call it to keep " +
-				"waiting; if you do NOT want to wait, just continue and the " +
-				"result is delivered when it finishes.",
-		],
-		parameters: Type.Object({
-			ticket: Type.String({ description: "Adopted subagent ticket id (e.g. \"t-268\")" }),
-			wait: Type.Optional(Type.Number({ description: "Max seconds to block (default 120, cap 600)" })),
-		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (disabled()) {
-				throw new Error("Command offloading is disabled (PI_OFFLOAD=off)");
-			}
-			void ctx;
-			if (!params.ticket) throw new Error("wait needs a ticket id");
-			const bound = Math.min(Math.max(0, Math.floor(params.wait ?? 120)), 600);
-			// The wait consumes the result: stop the detached-completion
-			// watcher from also steering it in.
-			tasks.markAgentFetched(params.ticket);
-			tasks.setSessionState("waiting");
-			let ticket: Ticket;
-			try {
-				ticket = await tasks.status(params.ticket);
-				if (ticket.status === "running") {
-					ticket = await tasks.client.wait(params.ticket, bound);
-				}
-				if (ticket.status === "running") {
-					const refreshed = await tasks.status(params.ticket);
-					if (refreshed.status !== "running") ticket = refreshed;
-				}
-			} finally {
-				tasks.setSessionState("busy");
-			}
-			if (ticket.status === "running") {
-				const meta = agentRowMeta(ticket);
-				const statusLine = `ticket ${ticket.id} running (turns ${ticket.turns ?? 0})`;
-				return {
-					content: [{
-						type: "text",
-						text: `${statusLine}\nticket ${ticket.id} still running after ${bound}s: `
-							+ `subagent ${meta.name} - ${meta.task}\n` +
-							`Call daemon_subagent_wait again to keep blocking, or continue ` +
-							`and the result will be delivered when it finishes.`,
-					}],
-					details: { ticket },
-				};
-			}
-			let fullOutput = "";
-			try {
-				const res = await tasks.client.getOutput(params.ticket);
-				fullOutput = res.output;
-				if (res.usage) {
-					ticket.usage = res.usage;
-					ticket.cost = res.usage.cost;
-				}
-			} catch {
-				fullOutput = ticket.final_message || ticket.output || "";
-			}
-			const code = ticket.exit ?? 0;
-			const term = ticket.term ? ` (signal ${ticket.term})` : "";
-			const err = ticket.error ? ` (${ticket.error})` : "";
-			const cost = ticket.cost?.total ?? ticket.usage?.cost?.total;
-			const costStr = typeof cost === "number" && cost > 0 ? ` · $${cost.toFixed(4)}` : "";
-			const tokens = ticket.totalTokens ?? ticket.usage?.totalTokens;
-			const tokStr = typeof tokens === "number" && tokens > 0 ? ` · ${tokens} tok` : "";
-			const header = `ticket ${ticket.id} ${ticket.status} exit ${code}${term}${err}${costStr}${tokStr}`;
-			const text = fullOutput || "(no output)";
-			return {
-				content: [{ type: "text", text: `${header}\n${text}` }],
-				details: { ticket },
-			};
-		},
-	});
 }
