@@ -936,6 +936,8 @@ def cmd_extensions_reload(args, client):
 		print("pi-rc: reloaded %s" % ", ".join(reloaded))
 	else:
 		print("pi-rc: reloaded no sessions")
+	if resp.get("deferred"):
+		print("pi-rc: reload deferred for busy session(s); the watch retries them")
 	if resp.get("skipped"):
 		kids = []
 		for entry in resp["skipped"]:

@@ -2219,19 +2219,33 @@ class Control:
 		return {"ok": True, "bytes": len(data)}
 
 	def extensions_reload(self, req):
-		"""Type /reload into every hosted conversation session so pi
-		re-scans extensions, skills, prompts, themes and context files in
-		place. When the extension roots actually changed, the file-level
-		diff is persisted for the in-session extension to relay to the
-		agent once it settles. force=1 reloads even without changes.
+		"""Type /reload into hosted conversation sessions so pi re-scans
+		extensions, skills, prompts, themes and context files in place.
+		When the extension roots actually changed, the file-level diff is
+		persisted for the in-session extension to relay to the agent once
+		it settles. force=1 reloads even without changes.
+
+		Optional sessions=[names] narrows the round to exactly those
+		sessions; the automatic watch uses it so every live reloadable
+		session is owed exactly one /reload per change while busy
+		sessions retry in later rounds.
 
 		Strictly in-place: this function only writes into sessions that
 		already exist; it never starts, respawns, or revives anything.
 		A session that dies while processing the injected /reload stays
 		dead (reload_injected clears the revival path) instead of being
 		spawned fresh, so a broken update cannot turn one /reload into a
-		spawn storm."""
+		spawn storm.
+
+		The on-disk snapshot advances only when a full round completes;
+		when any targeted reloadable session was skipped as not-idle, the
+		deferred flag comes back true with the old snapshot (and the
+		pending diff) left on disk so the caller retries rather than
+		silently dropping the change for the busy session."""
 		force = bool(req.get("force"))
+		only = req.get("sessions")
+		if not isinstance(only, (list, tuple, set, frozenset)):
+			only = None
 		prev_fp = _read_ext_snapshot()
 		fp = ext_root_fingerprint(EXT_WATCH_ROOTS)
 		diff = ext_diff_files(prev_fp, fp) if prev_fp else \
@@ -2240,7 +2254,10 @@ class Control:
 			return {"ok": True, "reloaded": [], "skipped": [],
 					"unchanged": True}
 		reloaded, skipped = [], []
+		deferred = False
 		for sess in self.daemon.table.snapshot():
+			if only is not None and sess.name not in only:
+				continue
 			if self._session_reloadable(sess):
 				if sess.state != "idle":
 					# Best-effort skip: pi's TUI refuses /reload while a
@@ -2249,6 +2266,7 @@ class Control:
 					# defer this round instead of typing into a session that
 					# would deny it. Applies even with --force.
 					skipped.append({"id": sess.name, "reason": "not-idle"})
+					deferred = True
 					continue
 				try:
 					os.write(sess.master_fd, b"/reload\r")
@@ -2267,16 +2285,21 @@ class Control:
 			else:
 				skipped.append({"id": sess.name,
 								"reason": "not-reloadable"})
-		if reloaded:
+		if only is None and reloaded and not deferred:
 			# Stamp/reload stay atomic: persist the snapshot and diff only
-			# when at least one /reload was actually typed. When every
-			# reloadable session was busy, the caller sees zero reloads and
-			# retries the same diff on later polls.
+			# when a whole-table round reloaded every targeted reloadable
+			# session. While one is busy, the old snapshot stays on disk so
+			# the watch retries a refreshed diff on later polls and the
+			# busy session still gets its reload. Filtered (watch) rounds
+			# never stamp here: the watch owns that once its owed set is
+			# empty, exactly once per pending change.
 			_write_ext_snapshot(fp, diff)
 			if any(diff.values()):
 				_write_ext_diff(diff)
 		return {"ok": True, "reloaded": reloaded, "skipped": skipped,
-				"diff": diff}
+				"deferred": deferred, "diff": diff,
+				"live": [s.name for s in self.daemon.table.snapshot()
+						 if self._session_reloadable(s)]}
 
 	@staticmethod
 	def _session_reloadable(sess):
@@ -2318,7 +2341,16 @@ def ext_watch_loop(daemon, stop_event):
 	"""Poll the extension roots; on change, reload every hosted session
 	(once per EXT_WATCH_DEBOUNCE window) so updated extensions go live in
 	place. Seeds the baseline from the snapshot file so a daemon restart
-	does not retrigger."""
+	does not retrigger.
+
+	Every live reloadable session is owed exactly one /reload for a
+	pending change. A session that is mid-turn or parked on a blocking
+	daemon wait when its turn comes is retried on later polls (the diff
+	is refreshed from the old snapshot each round, so newer edits
+	supersede the pending one), and the snapshot advances only when
+	every owed session has been reloaded or is gone. Sessions that start
+	after the change boot the new code directly and never join the owed
+	set."""
 	if not EXT_WATCH_ENABLED:
 		return
 	prev_fp = _read_ext_snapshot()
@@ -2326,50 +2358,76 @@ def ext_watch_loop(daemon, stop_event):
 		prev_fp = ext_root_fingerprint(EXT_WATCH_ROOTS)
 		_write_ext_snapshot(prev_fp, None)
 	last_reload = 0.0
+	owed = set()
 	busy_rounds = 0
+	reloaded_count = 0
 	while not stop_event.wait(EXT_WATCH_INTERVAL):
 		fp = ext_root_fingerprint(EXT_WATCH_ROOTS)
-		if fp == prev_fp:
-			continue
 		now = time.monotonic()
-		if now - last_reload < EXT_WATCH_DEBOUNCE:
-			continue
-		res = daemon.control.extensions_reload({})
-		if res.get("reloaded"):
-			prev_fp = fp
-			last_reload = now
-			busy_rounds = 0
-			log("reloaded %d hosted session(s) after extension change"
-				% len(res["reloaded"]))
-		elif res.get("unchanged"):
-			prev_fp = fp
-			busy_rounds = 0
-		else:
-			# Defer while at least one reloadable live session is mid-turn
-			# or waiting on a daemon wait (skipped "not-idle"): keep the OLD
-			# fingerprint and retry the pending diff every poll until the
-			# session goes idle. Never give up: absorbing the fingerprint
-			# without typing /reload would silently lose the change.
-			if any(s.get("reason") == "not-idle"
-					for s in (res.get("skipped") or [])):
-				busy_rounds += 1
-				if busy_rounds == 1 or busy_rounds % 5 == 0:
-					log("extension reload deferred: hosted session(s) "
-						"busy (round %d)" % busy_rounds)
-			else:
-				# No reloadable session exists (none hosted, headless
-				# workers only, or the write failed): nothing can take an
-				# in-place reload, and sessions started from here load the
-				# new code directly. Absorb and persist so the stored
+		if not owed:
+			if fp == prev_fp or now - last_reload < EXT_WATCH_DEBOUNCE:
+				continue
+			# A change arrived (the debounce window closed): every live
+			# session is owed one /reload; extensions_reload drops the
+			# ones that are not reloadable from its live list.
+			owed = {s.name for s in daemon.table.snapshot()}
+			if not owed:
+				# Nothing can take an in-place reload (none hosted,
+				# headless workers only): sessions started from here load
+				# the new code directly. Absorb and persist so the stored
 				# snapshot matches what is live.
-				prev_fp = fp
-				busy_rounds = 0
-				last_reload = now
-				diff = res.get("diff") or {}
+				diff = ext_diff_files(prev_fp, fp) if prev_fp else \
+					{"added": [], "removed": [], "changed": []}
 				_write_ext_snapshot(fp, diff)
 				if any(diff.values()):
 					_write_ext_diff(diff)
+				prev_fp = fp
+				last_reload = now
 				log("extension change absorbed: no hosted session to reload")
+				continue
+			reloaded_count = 0
+		res = daemon.control.extensions_reload(
+			{"sessions": sorted(owed)})
+		if res.get("unchanged"):
+			# A whole-table round (manual pi-rc extensions-reload) already
+			# stamped this change: nothing is owed anymore.
+			prev_fp = fp
+			owed.clear()
+			continue
+		reloaded_count += len(res.get("reloaded", []))
+		owed -= set(res.get("reloaded", []))
+		if res.get("deferred"):
+			# Some owed session is mid-turn or waiting on a daemon wait
+			# (skipped "not-idle"): keep the OLD fingerprint and retry
+			# the pending diff every poll until it goes idle. Never give
+			# up: absorbing the fingerprint without typing /reload would
+			# silently lose the change for the busy session.
+			busy_rounds += 1
+			if busy_rounds == 1 or busy_rounds % 5 == 0:
+				log("extension reload deferred: hosted session(s) "
+					"busy (round %d)" % busy_rounds)
+			continue
+		busy_rounds = 0
+		# Drop owed sessions that are gone or no longer reloadable: a
+		# session that died mid-reload stays dead (reload guard), and one
+		# that stopped or was replaced boots the new code directly at its
+		# next start, so nothing more can (or should) reload it here.
+		owed &= set(res.get("live") or [])
+		# A session whose PTY refused the write cannot be reloaded here
+		# either; it dies and boots the new code on revive instead.
+		for entry in res.get("skipped") or []:
+			if isinstance(entry, dict) \
+					and entry.get("reason") == "write-failed":
+				owed.discard(entry.get("id"))
+		if not owed:
+			diff = res.get("diff") or {}
+			_write_ext_snapshot(fp, diff)
+			if any(diff.values()):
+				_write_ext_diff(diff)
+			prev_fp = fp
+			last_reload = now
+			log("reloaded %d hosted session(s) after extension change"
+				% reloaded_count)
 
 
 def main():
