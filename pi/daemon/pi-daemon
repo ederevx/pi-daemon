@@ -304,7 +304,7 @@ def _write_ext_diff(diff):
 
 def _exit_abnormal(status):
 	# waitpid status of an abnormally dying child (signal or nonzero
-	# code); a clean exit is a deliberate quit (Ctrl+D, /exit) and is
+	# code); a clean exit is a deliberate quit (Ctrl+D, /quit) and is
 	# final.
 	if status and os.WIFSIGNALED(status):
 		return True
