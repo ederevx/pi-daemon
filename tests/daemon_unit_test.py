@@ -320,10 +320,23 @@ def test_reload_guard():
     # exactly one session with that name: nothing was spawned
     assert_eq(len([s for s in DAEMON.table.snapshot()
                    if s.name == name]), 1)
-    # announce (session_start) clears the guard after a survived reload
+    # the reload's own session_start re-announces the SAME file: that
+    # must NOT clear the no-spawn guard (pi reloads the extension module
+    # and re-announces mid-reload; clearing there would let a broken
+    # reload crash revive into a fresh spawn).
     assert_true(DAEMON.control.announce(
         {"name": name, "file": file})["ok"])
-    assert_true(not sess.reload_injected)
+    assert_true(sess.reload_injected,
+                "same-file re-announce must not clear the reload guard")
+    assert_true(sess.reload_injected_at > 0,
+                "guard carries its arm timestamp")
+    # a genuinely different conversation file clears the guard
+    other = os.path.join(SCRATCH, "conv-reload-other.jsonl")
+    open(other, "w").close()
+    assert_true(DAEMON.control.announce(
+        {"name": name, "file": other})["ok"])
+    assert_true(not sess.reload_injected,
+                "changed conversation file clears the reload guard")
     DAEMON.control.stop({"name": name})
     assert_true(_drain_session(name))
 
@@ -349,15 +362,64 @@ def test_reload_death_not_revived():
     DAEMON.spawn = recording_spawn
     try:
         DAEMON.table.remove_if(sess)    # the relay loop already dropped it
+        # armed within the reload survive grace: death is NOT revived
         sess.reload_injected = True
+        sess.reload_injected_at = time.time()
         DAEMON.revive(sess, 7 << 8)     # abnormal death (exit 7)
         assert_eq(calls, [], "reload-dead session is NOT respawned")
         # the same death without the guard WOULD spawn
         sess.reload_injected = False
         DAEMON.revive(sess, 7 << 8)
         assert_eq(len(calls), 1, "the guard is what blocks the spawn")
+        # a session that survived past the reload guard grace is
+        # revivable again: an armed flag without a live arm window must
+        # not suppress a genuinely post-reload crash.
+        sess.reload_injected = True
+        sess.reload_injected_at = time.time() - \
+            daemon.RELOAD_GUARD_GRACE - 1
+        DAEMON.revive(sess, 7 << 8)
+        assert_eq(len(calls), 2, "survivor past the grace is revived")
     finally:
         DAEMON.spawn = orig_spawn
+
+
+def test_reload_same_file_announce_no_spawn():
+    """Regression: the reload's own session_start re-announces the SAME
+    conversation file (pi reloads the extension module mid-reload). That
+    re-announce must not clear the reload guard, or a reloaded session
+    that then dies abnormally would be revived into a fresh spawn - the
+    reload must stay strictly in-place and never spawn anything."""
+    name = "pi-samefile"
+    file_ = os.path.join(SCRATCH, "conv-samefile.jsonl")
+    open(file_, "w").close()
+    sess = daemon.Session(name, SCRATCH, ["pi"], pid=1, master_fd=-1)
+    sess.file = file_
+    sess.spawned_at = 0.0
+    assert_true(DAEMON.table.put(sess))
+    DAEMON.control.state({"name": name, "state": "idle"})
+    sess.reload_injected = True
+    sess.reload_injected_at = time.time()
+    # the reload's own session_start -> extension re-announces same file
+    assert_true(DAEMON.control.announce(
+        {"name": name, "file": file_})["ok"])
+    assert_true(sess.reload_injected,
+                "same-file re-announce keeps the reload guard armed")
+    calls = []
+    orig_spawn = DAEMON.spawn
+
+    def recording_spawn(*args, **kwargs):
+        calls.append((args, kwargs))
+        return None
+
+    DAEMON.spawn = recording_spawn
+    try:
+        DAEMON.table.remove_if(sess)
+        DAEMON.revive(sess, 7 << 8)
+        assert_eq(calls, [], "reloaded session dying after a same-file "
+                             "re-announce is NOT respawned")
+    finally:
+        DAEMON.spawn = orig_spawn
+        DAEMON.table.remove_if(sess)
 
 
 def _spawn_session(name):
@@ -531,6 +593,8 @@ def _main():
     ok("session control (start/list/state/input/detach/stop)", test_session_control)
     ok("reload guard (in-place only, no spawn)", test_reload_guard)
     ok("reload death is never revived", test_reload_death_not_revived)
+    ok("reload same-file re-announce keeps no-spawn guard",
+       test_reload_same_file_announce_no_spawn)
     ok("extensions_reload defers busy sessions (no stamp)",
        test_extensions_reload_deferral)
     ok("watch loop owes busy sessions until idle",
