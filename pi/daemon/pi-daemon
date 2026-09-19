@@ -102,9 +102,9 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import resource
 import select
-import shutil
 import signal
 import socket
 import struct
@@ -154,25 +154,6 @@ EXT_WATCH_ROOTS = [p for p in os.environ.get(
 ).split(os.pathsep) if p]
 EXT_SNAPSHOT_PATH = os.path.join(REG_DIR, "extensions-snapshot.json")
 EXT_DIFF_PATH = os.path.join(REG_DIR, "extensions-diff.json")
-# Agent tickets (headless `pi --mode json` subagent delegations) share
-# the same store and GC, with their own running cap and a much larger
-# output cap: the NDJSON event stream is relayed verbatim and a severed
-# stream would corrupt the result.
-AGENT_MAX_RUNNING = 16
-AGENT_OUTPUT_MAX = 64 << 20
-# Headless pi keeps the process alive after a run settles (background
-# listeners), so the daemon stops the child itself shortly after the
-# agent_settled marker instead of waiting forever for an exit.
-AGENT_SETTLE_GRACE = float(os.environ.get("PI_PTYD_AGENT_GRACE", 3.0))
-AGENT_CHUNK = 256 << 10      # max bytes per stream per agent-output reply
-# The pi-compatible front entry: hosted sessions and offloaded
-# delegation children run through it so argv[1] resolves delegation
-# spawns back to the daemon. Both are overridable for isolated tests.
-AGENT_ENTRY = os.environ.get(
-	"PI_PTYD_AGENT_ENTRY",
-	os.path.join(os.path.dirname(os.path.abspath(__file__)),
-				 "pi-agent-entry.mjs"))
-AGENT_SHIM_DIR = os.path.join(REG_DIR, "pi-shim")
 
 DEFAULT_COLS = 120
 DEFAULT_ROWS = 40
@@ -201,9 +182,7 @@ _WIRE_COMMANDS = ("ping", "start", "detach", "resize", "list", "which",
 				  "input", "extensions-reload",
 				  "ticket-submit", "ticket-wait", "ticket-output",
 				  "ticket-list", "ticket-cancel", "ticket-remove",
-				  "tickets-reset",
-				  "agent-submit", "agent-wait", "agent-output",
-				  "agent-cancel", "agent-detach")
+				  "tickets-reset")
 
 
 def log(msg):
@@ -519,8 +498,8 @@ class TicketStore:
 		return os.path.join(self.log_dir, "%s.log" % tid)
 
 	def artifact_path(self, tid, kind):
-		# "log": command/agent stdout; "err": agent stderr; "prompt":
-		# daemon-side copy of an agent's system prompt file.
+		# Only the merged command/stdout log exists for shell tickets;
+		# the suffix switch is kept for legacy agent artifacts.
 		suffix = {"log": ".log", "err": ".err", "prompt": ".prompt"}[kind]
 		return os.path.join(self.log_dir, "%s%s" % (tid, suffix))
 
@@ -532,8 +511,8 @@ class TicketStore:
 				pass
 
 	def remove(self, tid):
-		# Agents drop finished tickets from the store and disk; running
-		# tickets must be cancelled first (raise ValueError("running")).
+		# Finished tickets drop from the store and disk; running tickets
+		# must be cancelled first (raise ValueError("running")).
 		with self.lock:
 			rec = self._tickets.get(tid)
 			if rec is None:
@@ -606,15 +585,9 @@ class TicketRunner:
 	log per ticket, condition-signalled completion, a periodic GC sweep,
 	and a stop() that reaps children before daemon shutdown persists."""
 
-	def __init__(self, store, shutdown_event, node_path=None, front_path=None):
+	def __init__(self, store, shutdown_event):
 		self.store = store
 		self.shutdown_event = shutdown_event
-		# When node and the pi-compatible front are available, delegation
-		# children spawn through the front (marked PI_DAEMON_AGENT_CHILD so
-		# the front runs pi instead of re-submitting) — its argv[1] keeps
-		# the delegation's own children resolvable back to the daemon.
-		self.node_path = node_path
-		self.front_path = front_path
 		self._lock = threading.Lock()
 		self._procs = {}    # tid -> Popen, under _lock
 		self._stops = {}    # tid -> cancellation reason, under _lock
@@ -827,583 +800,6 @@ class TicketRunner:
 		# Daemon shutdown: TERM every running child, bounded grace, KILL,
 		# then force any record the reader threads lost the race on to
 		# "lost" so the persisted state never claims a live process.
-		with self._lock:
-			procs = list(self._procs.values())
-			tids = list(self._procs.keys())
-			for tid in tids:
-				self._stops.setdefault(tid, "interrupted by daemon shutdown")
-		for proc in procs:
-			try:
-				os.killpg(proc.pid, signal.SIGTERM)
-			except OSError:
-				pass
-		deadline = time.time() + KILL_GRACE
-		while time.time() < deadline:
-			with self._lock:
-				if not self._procs:
-					break
-			time.sleep(0.05)
-		with self._lock:
-			alive = list(self._procs.values())
-		for proc in alive:
-			try:
-				os.killpg(proc.pid, signal.SIGKILL)
-			except OSError:
-				pass
-		for proc in alive:
-			try:
-				proc.wait(timeout=KILL_GRACE)
-			except Exception:
-				pass
-		for tid in tids:
-			rec = self.store.get(tid)
-			if rec is not None and rec["status"] == "running":
-				self.store.update(tid, status="lost", finished=time.time(),
-							  error="interrupted by daemon shutdown")
-
-
-def extract_agent_log(log_path):
-	"""Extract the last complete assistant message text and cumulative usage
-	from an NDJSON agent transcript log. Tolerates missing files or
-	malformed lines."""
-	last_text = None
-	usage_accum = {
-		"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
-		"cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}
-	}
-	has_usage = False
-	if not (log_path and os.path.isfile(log_path)):
-		return None, None
-	try:
-		with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-			for line in f:
-				line = line.strip()
-				if not line:
-					continue
-				try:
-					obj = json.loads(line)
-				except (ValueError, UnicodeDecodeError):
-					continue
-				if not isinstance(obj, dict) or obj.get("type") != "message_end":
-					continue
-				event = obj.get("event") if isinstance(obj.get("event"), dict) else {}
-				msg = event.get("message") if isinstance(event.get("message"), dict) else obj.get("message")
-				if not isinstance(msg, dict):
-					continue
-				if msg.get("role") == "assistant":
-					content = msg.get("content")
-					text = ""
-					if isinstance(content, str):
-						text = content
-					elif isinstance(content, list):
-						texts = [b.get("text") for b in content
-								 if isinstance(b, dict) and b.get("type") == "text"
-								 and isinstance(b.get("text"), str)]
-						text = "".join(texts)
-					if text.strip():
-						last_text = text
-				u = msg.get("usage") if isinstance(msg.get("usage"), dict) \
-					else (obj.get("usage") if isinstance(obj.get("usage"), dict) else None)
-				if isinstance(u, dict):
-					has_usage = True
-					inp = int(u.get("input") or 0)
-					out = int(u.get("output") or 0)
-					cr = int(u.get("cacheRead") or 0)
-					cw = int(u.get("cacheWrite") or 0)
-					tot = int(u.get("totalTokens") or (inp + out + cr + cw))
-					usage_accum["input"] += inp
-					usage_accum["output"] += out
-					usage_accum["cacheRead"] += cr
-					usage_accum["cacheWrite"] += cw
-					usage_accum["totalTokens"] += tot
-					c = u.get("cost") if isinstance(u.get("cost"), dict) else {}
-					usage_accum["cost"]["input"] = round(usage_accum["cost"]["input"] + float(c.get("input") or 0.0), 8)
-					usage_accum["cost"]["output"] = round(usage_accum["cost"]["output"] + float(c.get("output") or 0.0), 8)
-					usage_accum["cost"]["cacheRead"] = round(usage_accum["cost"]["cacheRead"] + float(c.get("cacheRead") or 0.0), 8)
-					usage_accum["cost"]["cacheWrite"] = round(usage_accum["cost"]["cacheWrite"] + float(c.get("cacheWrite") or 0.0), 8)
-					usage_accum["cost"]["total"] = round(usage_accum["cost"]["total"] + float(c.get("total") or 0.0), 8)
-	except OSError:
-		pass
-	return last_text, (usage_accum if has_usage else None)
-
-
-class AgentTicketRunner:
-	"""Runs headless subagent delegations (`pi --mode json -p`) as
-	daemon-owned tickets, sharing the shell TicketStore: the stdout NDJSON
-	event stream and stderr are captured to separate logs (never merged:
-	the wrapper relay frames on NDJSON lines), the system-prompt file is
-	copied daemon-side at submit (the caller's temp copy is deleted when
-	its run ends, while the ticket may outlive it), and the turn budget is
-	enforced by counting assistant message_end events."""
-
-	def __init__(self, store, shutdown_event, node_path=None, front_path=None):
-		self.store = store
-		self.shutdown_event = shutdown_event
-		# When node and the pi-compatible front are available, delegation
-		# children spawn through the front (marked PI_DAEMON_AGENT_CHILD so
-		# the front runs pi instead of re-submitting) — its argv[1] keeps
-		# the delegation's own children resolvable back to the daemon.
-		self.node_path = node_path
-		self.front_path = front_path
-		self._lock = threading.Lock()
-		self._procs = {}    # tid -> Popen, under _lock
-		self._stops = {}    # tid -> cancellation reason, under _lock
-		self._settled = {}  # tid -> settle time, under _lock
-		self._last_output = {}  # tid -> last assistant text, under _lock
-
-	def running_count(self):
-		with self._lock:
-			return len(self._procs)
-
-	def submit(self, session, cwd, pi_path, args, env, max_turns):
-		with self._lock:
-			if len(self._procs) >= AGENT_MAX_RUNNING:
-				return None
-		fp = self._delegation_fp(args, max_turns)
-		with self.store.lock:
-			tid = self.store.alloc_id_locked()
-		# Copy the system prompt daemon-side before acking and repoint the
-		# argv at the copy: the caller's temp file is deleted on cleanup.
-		run_args = list(args)
-		os.makedirs(self.store.log_dir, exist_ok=True)
-		for i, arg in enumerate(run_args):
-			if arg == "--append-system-prompt" and i + 1 < len(run_args):
-				src = run_args[i + 1]
-				if src and os.path.isfile(src):
-					os.makedirs(self.store.log_dir, exist_ok=True)
-					prompt_copy = self.store.artifact_path(tid, "prompt")
-					try:
-						shutil.copyfile(src, prompt_copy)
-						run_args[i + 1] = prompt_copy
-					except OSError as exc:
-						log("agent-submit '%s' prompt copy failed: %s"
-							% (tid, exc))
-				break
-		argv = [pi_path] + run_args
-		env_run = env if env else os.environ.copy()
-		if self.front_path and self.node_path:
-			# Route through the front so the child's own delegation
-			# children resolve back to the daemon; the marker makes the
-			# front run pi instead of re-submitting this same task.
-			argv = [self.node_path, self.front_path] + run_args
-			env_run = dict(env_run)
-			env_run["PI_DAEMON_AGENT_CHILD"] = "1"
-		# A delegation child is a plain worker, not a hosted session: strip
-		# the hosting identity so the child's own daemon extension cannot
-		# announce or publish state against the parent's live session.
-		env_run.pop("PI_HOSTED", None)
-		env_run.pop("PI_HOSTED_SESSION", None)
-		rec = {"id": tid, "kind": "agent", "session": session, "cwd": cwd,
-			   "command": " ".join(argv), "status": "running",
-			   "created": time.time(), "started": time.time(),
-			   "finished": None, "exit": None, "term": None,
-			   "truncated": False, "error": None,
-			   "max_turns": max_turns, "turns": 0, "fp": fp,
-			   "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
-			   "totalTokens": 0,
-			   "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0,
-						"cacheWrite": 0.0, "total": 0.0},
-			   "usage": {"input": 0, "output": 0, "cacheRead": 0,
-						 "cacheWrite": 0, "totalTokens": 0,
-						 "cost": {"input": 0.0, "output": 0.0,
-								  "cacheRead": 0.0, "cacheWrite": 0.0,
-								  "total": 0.0}},
-			   "final_message": None}
-		proc = subprocess.Popen(
-			argv, cwd=cwd, env=env_run,
-			stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-			stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
-		rec["pid"] = proc.pid
-		rec = self.store.add(rec)
-		with self._lock:
-			self._procs[tid] = proc
-		t = threading.Thread(target=self._run, args=(tid, proc), daemon=True)
-		t.start()
-		log("agent-submit '%s' session '%s' in %s" % (tid, session, cwd))
-		return rec
-
-	def _delegation_fp(self, argv, max_turns):
-		"""Stable fingerprint of a delegation request. The only volatile
-		argv element across an identical re-emission is the
-		--append-system-prompt temp path; its payload (the content) is the
-		actual task, so the path is replaced by a hash of that content."""
-		canon = []
-		i = 0
-		n = len(argv)
-		while i < n:
-			a = argv[i]
-			if a == "--append-system-prompt" and i + 1 < n:
-				payload = argv[i + 1]
-				try:
-					with open(payload, "rb") as f:
-						canon.append("prompt:"
-									+ hashlib.sha256(f.read()).hexdigest())
-				except OSError:
-					# Payload missing: hash empty bytes so the fingerprint stays
-					# stable across re-emissions instead of leaking the volatile
-					# path into the digest (and drifting replay matches).
-					canon.append("prompt:" + hashlib.sha256(b"").hexdigest())
-				canon.append(a)
-				i += 2
-				continue
-			canon.append(a)
-			i += 1
-		h = hashlib.sha256()
-		h.update(str(max_turns or 0).encode())
-		for part in canon:
-			h.update(b"\x1f")
-			h.update(part.encode("utf-8", "surrogateescape"))
-		return h.hexdigest()
-
-	def find_running(self, session, cwd, argv, max_turns):
-		"""Replay suppression for delegations: an identical (session, cwd,
-		fingerprint) agent ticket still running is the same delegation
-		re-emitted after a resume or soft-compaction continuation - reuse
-		it instead of executing the delegation twice. Byte-identical
-		requests (same argv, same prompt payload) are deliberately
-		coalesced into one shared run; anything actually distinct (task
-		text, prompt content, agent/model/tools, cwd) has a different
-		fingerprint and still runs independently."""
-		fp = self._delegation_fp(argv, max_turns)
-		for rec in self.store.snapshot(session, "agent"):
-			if (rec.get("status") == "running"
-					and rec.get("cwd") == cwd
-					and rec.get("fp") == fp):
-				return rec
-		return None
-
-	def wait(self, tid, timeout):
-		# Same contract as TicketRunner.wait; the store condition is shared.
-		deadline = time.time() + max(0.0, min(float(timeout or 0), TICKET_MAX_WAIT))
-		with self.store.cond:
-			rec = self.store.get_locked(tid)
-			if rec is None:
-				return None
-			while rec["status"] == "running" and time.time() < deadline:
-				self.store.cond.wait(deadline - time.time())
-				rec = self.store.get_locked(tid)
-				if rec is None:
-					return None
-			return dict(rec)
-
-	def output(self, tid, out_offset, err_offset):
-		rec = self.store.get(tid)
-		if rec is None:
-			return None
-		out = self.store.read_range(self.store.artifact_path(tid, "log"),
-									out_offset, AGENT_CHUNK)
-		err = self.store.read_range(self.store.artifact_path(tid, "err"),
-									err_offset, AGENT_CHUNK)
-		return {"out": out, "err": err}
-
-	def cancel(self, tid):
-		rec = self.store.get(tid)
-		if rec is None:
-			return None
-		if rec["status"] != "running":
-			return rec
-		with self._lock:
-			proc = self._procs.get(tid)
-			if proc is not None and proc.poll() is None:
-				self._stops[tid] = "cancelled"
-				target = proc
-			else:
-				target = None
-		if target is None:
-			self.wait(tid, 5.0)
-			return self.store.get(tid)
-		try:
-			os.killpg(target.pid, signal.SIGTERM)
-		except OSError:
-			pass
-		deadline = time.time() + KILL_GRACE
-		while time.time() < deadline and target.poll() is None:
-			time.sleep(0.05)
-		if target.poll() is None:
-			try:
-				os.killpg(target.pid, signal.SIGKILL)
-			except OSError:
-				pass
-		try:
-			target.wait(timeout=KILL_GRACE)
-		except Exception:
-			pass
-		return self.store.get(tid)
-
-	def _count_event(self, tid, line, max_turns):
-		# One complete stdout line: an assistant message_end is one turn.
-		# Budget exhaustion kills the process group; the record keeps the
-		# flag so the relay can report the real cause.
-		try:
-			obj = json.loads(line.decode("utf-8", "replace"))
-		except (ValueError, UnicodeDecodeError):
-			return
-		if not isinstance(obj, dict) or obj.get("type") != "message_end":
-			return
-		event = obj.get("event") if isinstance(obj.get("event"), dict) else {}
-		message = event.get("message") if isinstance(event.get("message"), dict) \
-			else obj.get("message")
-		if not isinstance(message, dict) or message.get("role") != "assistant":
-			return
-		rec = self.store.get(tid)
-		if rec is None:
-			return
-		turns = int(rec.get("turns") or 0) + 1
-		fields = {"turns": turns}
-
-		# Capture assistant text content
-		content = message.get("content")
-		if isinstance(content, str) and content.strip():
-			with self._lock:
-				self._last_output[tid] = content
-			fields["final_message"] = content
-			fields["output"] = content
-		elif isinstance(content, list):
-			texts = [b.get("text") for b in content
-					 if isinstance(b, dict) and b.get("type") == "text"
-					 and isinstance(b.get("text"), str)]
-			merged = "".join(texts)
-			if merged.strip():
-				with self._lock:
-					self._last_output[tid] = merged
-				fields["final_message"] = merged
-				fields["output"] = merged
-
-		# Aggregate streamed usage
-		u = message.get("usage") if isinstance(message.get("usage"), dict) \
-			else (obj.get("usage") if isinstance(obj.get("usage"), dict) else None)
-		if isinstance(u, dict):
-			inp_delta = int(u.get("input") or 0)
-			out_delta = int(u.get("output") or 0)
-			cr_delta = int(u.get("cacheRead") or 0)
-			cw_delta = int(u.get("cacheWrite") or 0)
-			tot_delta = int(u.get("totalTokens") or (inp_delta + out_delta + cr_delta + cw_delta))
-
-			c = u.get("cost") if isinstance(u.get("cost"), dict) else {}
-			cost_inp_delta = float(c.get("input") or 0.0)
-			cost_out_delta = float(c.get("output") or 0.0)
-			cost_cr_delta = float(c.get("cacheRead") or 0.0)
-			cost_cw_delta = float(c.get("cacheWrite") or 0.0)
-			cost_tot_delta = float(c.get("total") or (cost_inp_delta + cost_out_delta + cost_cr_delta + cost_cw_delta))
-
-			tot_inp = int(rec.get("input") or 0) + inp_delta
-			prev_usage = rec.get("usage") if isinstance(rec.get("usage"), dict) else {}
-			tot_out = int(prev_usage.get("output") or 0) + out_delta
-			tot_cr = int(rec.get("cacheRead") or 0) + cr_delta
-			tot_cw = int(rec.get("cacheWrite") or 0) + cw_delta
-			tot_tokens = int(rec.get("totalTokens") or 0) + tot_delta
-
-			prev_cost = rec.get("cost") if isinstance(rec.get("cost"), dict) else {}
-			cost_accum = {
-				"input": round(float(prev_cost.get("input") or 0.0) + cost_inp_delta, 8),
-				"output": round(float(prev_cost.get("output") or 0.0) + cost_out_delta, 8),
-				"cacheRead": round(float(prev_cost.get("cacheRead") or 0.0) + cost_cr_delta, 8),
-				"cacheWrite": round(float(prev_cost.get("cacheWrite") or 0.0) + cost_cw_delta, 8),
-				"total": round(float(prev_cost.get("total") or 0.0) + cost_tot_delta, 8),
-			}
-			fields["input"] = tot_inp
-			fields["cacheRead"] = tot_cr
-			fields["cacheWrite"] = tot_cw
-			fields["totalTokens"] = tot_tokens
-			fields["cost"] = cost_accum
-			fields["usage"] = {
-				"input": tot_inp,
-				"output": tot_out,
-				"cacheRead": tot_cr,
-				"cacheWrite": tot_cw,
-				"totalTokens": tot_tokens,
-				"cost": cost_accum,
-			}
-
-		if max_turns and turns >= max_turns \
-				and rec.get("status") == "running" \
-				and not rec.get("turn_budget_exhausted"):
-			fields["turn_budget_exhausted"] = True
-			with self._lock:
-				proc = self._procs.get(tid)
-			if proc is not None and proc.poll() is None:
-				try:
-					os.killpg(proc.pid, signal.SIGTERM)
-				except OSError:
-					pass
-				log("agent '%s' turn budget exhausted (%d)"
-					% (tid, max_turns))
-		self.store.update(tid, **fields)
-
-	def _run(self, tid, proc):
-		rec = self.store.get(tid)
-		max_turns = rec.get("max_turns") if rec else None
-		t = threading.Thread(target=self._pump,
-							 args=(tid, proc.stderr), daemon=True)
-		t.start()
-		truncated = False
-		captured = 0
-		logf = None
-		try:
-			logf = open(self.store.artifact_path(tid, "log"), "wb")
-		except OSError as exc:
-			log("agent '%s' log open failed: %s" % (tid, exc))
-		line_buf = b""
-		try:
-			while True:
-				try:
-					chunk = os.read(proc.stdout.fileno(), 65536)
-				except OSError:
-					chunk = b""
-				if not chunk:
-					break
-				if logf is None:
-					truncated = True
-				elif captured < AGENT_OUTPUT_MAX:
-					room = AGENT_OUTPUT_MAX - captured
-					logf.write(chunk[:room])
-					logf.flush()
-					captured += min(len(chunk), room)
-					if len(chunk) > room:
-						truncated = True
-						logf.close()
-						logf = None
-				else:
-					truncated = True
-				line_buf += chunk
-				while b"\n" in line_buf:
-					line, line_buf = line_buf.split(b"\n", 1)
-					self._count_event(tid, line, max_turns)
-					self._note_settled(tid, line)
-		finally:
-			if logf is not None:
-				logf.close()
-			try:
-				proc.stdout.close()
-			except OSError:
-				pass
-			code = proc.wait()
-		self._finish(tid, code, truncated)
-
-	def _note_settled(self, tid, line):
-		# The stream ends with {"type":"agent_settled"} once the run is
-		# complete. pi does not exit on its own after that marker (it
-		# keeps background listeners alive), so arm the settle-kill once:
-		# after a short grace the child is stopped and the ticket is
-		# finished as a normal completion instead of hanging "running".
-		try:
-			obj = json.loads(line.decode("utf-8", "replace"))
-		except (ValueError, UnicodeDecodeError):
-			return
-		if not isinstance(obj, dict) or obj.get("type") != "agent_settled":
-			return
-		with self._lock:
-			if self._settled.get(tid):
-				return
-			self._settled[tid] = time.time()
-			proc = self._procs.get(tid)
-		if proc is None or proc.poll() is not None:
-			return
-
-		def killer():
-			time.sleep(AGENT_SETTLE_GRACE)
-			with self._lock:
-				settled = tid in self._settled
-				target = self._procs.get(tid) if settled else None
-			if target is None or target.poll() is not None:
-				return
-			try:
-				os.killpg(target.pid, signal.SIGTERM)
-			except OSError:
-				pass
-			deadline = time.time() + KILL_GRACE
-			while time.time() < deadline and target.poll() is None:
-				time.sleep(0.05)
-			if target.poll() is None:
-				try:
-					os.killpg(target.pid, signal.SIGKILL)
-				except OSError:
-					pass
-
-		threading.Thread(target=killer, daemon=True).start()
-
-	def _pump(self, tid, stream):
-		# Stderr drain: separate log, never merged with the NDJSON stream.
-		captured = 0
-		logf = None
-		try:
-			logf = open(self.store.artifact_path(tid, "err"), "wb")
-		except OSError as exc:
-			log("agent '%s' err log open failed: %s" % (tid, exc))
-		try:
-			while True:
-				try:
-					chunk = os.read(stream.fileno(), 65536)
-				except OSError:
-					chunk = b""
-				if not chunk:
-					break
-				if logf is None:
-					continue
-				if captured < AGENT_OUTPUT_MAX:
-					room = AGENT_OUTPUT_MAX - captured
-					logf.write(chunk[:room])
-					logf.flush()
-					captured += min(len(chunk), room)
-		finally:
-			if logf is not None:
-				logf.close()
-			try:
-				stream.close()
-			except OSError:
-				pass
-
-	def mark_detached(self, tid):
-		# The owner's bridge handed this ticket off to the daemon: the
-		# owner's session extension watches terminal transitions of
-		# detached tickets to deliver the completion notification.
-		rec = self.store.get(tid)
-		if rec is None or rec.get("detached"):
-			return rec
-		self.store.update(tid, detached=True)
-		return self.store.get(tid)
-
-	def _finish(self, tid, code, truncated):
-		with self._lock:
-			self._procs.pop(tid, None)
-			reason = self._stops.pop(tid, None)
-			settled = self._settled.pop(tid, None) is not None
-			last_text = self._last_output.pop(tid, None)
-		fields = {"status": "done" if code == 0 else "failed",
-				  "exit": code if code >= 0 else None,
-				  "term": -code if code < 0 else None,
-				  "finished": time.time(), "truncated": truncated}
-		if reason is not None:
-			fields["status"] = "cancelled"
-			fields["error"] = reason
-		elif settled:
-			# The run completed; we stopped the lingering process. A
-			# termination after settle is a normal completion, not a
-			# failure: report exit 0 with the signal noted.
-			fields["status"] = "done"
-			fields["exit"] = 0
-		rec = self.store.get(tid)
-		final_text = last_text or (rec.get("final_message") if rec else None)
-		log_path = self.store.artifact_path(tid, "log")
-		if not final_text or (rec and not rec.get("usage")):
-			extracted_text, extracted_usage = extract_agent_log(log_path)
-			if not final_text and extracted_text:
-				final_text = extracted_text
-			if extracted_usage and rec and not rec.get("usage"):
-				fields["usage"] = extracted_usage
-				fields["cost"] = extracted_usage.get("cost")
-				fields["input"] = extracted_usage.get("input")
-				fields["cacheRead"] = extracted_usage.get("cacheRead")
-				fields["cacheWrite"] = extracted_usage.get("cacheWrite")
-				fields["totalTokens"] = extracted_usage.get("totalTokens")
-		if final_text:
-			fields["final_message"] = final_text
-			fields["output"] = final_text
-		self.store.update(tid, **fields)
-		log("agent-done '%s' status %s" % (tid, fields["status"]))
-
-	def stop(self):
-		# Daemon shutdown: identical contract to TicketRunner.stop.
 		with self._lock:
 			procs = list(self._procs.values())
 			tids = list(self._procs.keys())
@@ -1848,10 +1244,9 @@ class Session:
 class SessionSpawner:
 	"""Fork/exec of hosted pi children onto fresh PTYs."""
 
-	def __init__(self, table, registry, owner=None, shim_dir=None):
+	def __init__(self, table, registry, owner=None):
 		self.table = table
 		self.registry = registry
-		self.shim_dir = shim_dir
 		# owner: the Daemon, injected after construction (the relay loop
 		# needs its drop/revive).
 		self.owner = owner
@@ -1888,41 +1283,6 @@ class SessionSpawner:
 		t.start()
 		return sess
 
-	@staticmethod
-	def _write_pi_shim(shim_dir, node_path, front_path, real_pi):
-		# A `pi` that launches the front, placed first on hosted children's
-		# PATH: every pi resolution inside a hosted session — the session
-		# start command, revive/handover spawns, agent delegations, plain
-		# `pi` shell calls — lands on the daemon's front, whose argv[1]
-		# brings delegation spawns back to the daemon. The shim execs the
-		# real pi when node or the front is unusable, so the daemon can
-		# never block access to pi. Unhosted contexts never see this PATH
-		# and keep resolving the installed wrapper.
-		try:
-			os.makedirs(shim_dir, exist_ok=True)
-			shim = os.path.join(shim_dir, "pi")
-			with open(shim, "w") as f:
-				f.write(
-					"#!/usr/bin/env bash\n"
-					"# pi-daemon's hosted-session pi shim: prefer the\n"
-					"# daemon's pi front; if the front or node is unusable,\n"
-					"# exec the real pi so the daemon can never block\n"
-					"# access to pi.\n"
-					"front=%s\n"
-					"node_bin=%s\n"
-					"real_pi=%s\n"
-					"if [[ -x \"$node_bin\" && -r \"$front\" ]]; then\n"
-					"\texec \"$node_bin\" \"$front\" \"$@\"\n"
-					"fi\n"
-					"exec \"$real_pi\" \"$@\"\n"
-					% (json.dumps(front_path), json.dumps(node_path),
-					   json.dumps(real_pi)))
-			os.chmod(shim, 0o755)
-			return shim_dir
-		except OSError as exc:
-			log("pi shim setup failed: %s" % exc)
-			return None
-
 	def _exec_child(self, name, dir_, argv, slave, cols, rows):
 		try:
 			os.setsid()
@@ -1946,9 +1306,6 @@ class SessionSpawner:
 				"PI_HOSTED": "1",
 				"PI_HOSTED_SESSION": name,
 			})
-			if self.shim_dir:
-				env["PATH"] = (self.shim_dir + os.pathsep
-							   + env.get("PATH", ""))
 			os.execvpe(argv[0], argv, env)
 		except Exception as exc:
 			try:
@@ -1967,39 +1324,9 @@ class Daemon:
 		self.table = SessionTable()
 		self.ledger = HandoffLedger()
 		self.shutdown_event = threading.Event()
-		# The pi-compatible front: hosted children get a PATH-shimmed `pi`
-		# and offloaded delegation children get the front directly, both
-		# only when node, the front entry, and a real-pi fallback are all
-		# actually resolvable — the shim and the front must never become a
-		# single point of failure for reaching pi.
-		self.node_path = shutil.which("node")
-		front = AGENT_ENTRY
-		self.front_path = front if (self.node_path and front
-									and os.path.isfile(front)) else None
-		self.real_pi_path = None
-		if self.front_path:
-			skip = {AGENT_SHIM_DIR,
-					os.path.join(os.path.expanduser("~"), ".local", "bin")}
-			skip = {os.path.realpath(x) for x in skip}
-			for dir_ in os.environ.get("PATH", "").split(os.pathsep):
-				if not dir_ or os.path.realpath(dir_) in skip:
-					continue
-				cand = os.path.join(dir_, "pi")
-				if os.path.isfile(cand) and os.access(cand, os.X_OK):
-					self.real_pi_path = cand
-					break
-		shim_dir = None
-		if self.front_path and self.real_pi_path:
-			shim_dir = SessionSpawner._write_pi_shim(
-				AGENT_SHIM_DIR, self.node_path, self.front_path,
-				self.real_pi_path)
-		self.spawner = SessionSpawner(self.table, registry, owner=self,
-									  shim_dir=shim_dir)
+		self.spawner = SessionSpawner(self.table, registry, owner=self)
 		self.tickets = TicketRunner(
 			TicketStore(TICKETS_PATH, TICKET_LOG_DIR), self.shutdown_event)
-		self.agents = AgentTicketRunner(
-			self.tickets.store, self.shutdown_event,
-			self.node_path, self.front_path)
 		self.control = Control(self)
 
 	# -- control socket ------------------------------------------------------
@@ -2119,7 +1446,6 @@ class Daemon:
 		self.shutdown_event.set()
 		log("shutdown")
 		self.tickets.stop()
-		self.agents.stop()
 		sessions = self.table.snapshot()
 		for sess in sessions:
 			try:
@@ -2765,9 +2091,7 @@ class Control:
 		rec = self.daemon.tickets.store.get(tid)
 		if rec is None:
 			return err("no-ticket")
-		runner = (self.daemon.agents if rec.get("kind") == "agent"
-				  else self.daemon.tickets)
-		res = runner.wait(tid, timeout)
+		res = self.daemon.tickets.wait(tid, timeout)
 		if res is None:
 			return err("no-ticket")
 		return {"ok": True, "ticket": res}
@@ -2796,22 +2120,13 @@ class Control:
 			return err("no-ticket")
 		output_text = rec.get("final_message") or rec.get("output")
 		usage = rec.get("usage")
-		kind = rec.get("kind", "shell")
 		log_path = self.daemon.tickets.store.artifact_path(tid, "log")
-		if kind == "agent":
-			if not output_text or not usage:
-				extracted_text, extracted_usage = extract_agent_log(log_path)
-				if not output_text and extracted_text:
-					output_text = extracted_text
-				if not usage and extracted_usage:
-					usage = extracted_usage
-		else:
-			if not output_text and os.path.isfile(log_path):
-				try:
-					with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-						output_text = f.read()
-				except OSError:
-					output_text = ""
+		if not output_text and os.path.isfile(log_path):
+			try:
+				with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+					output_text = f.read()
+			except OSError:
+				output_text = ""
 		return {"ok": True, "id": tid, "status": rec.get("status"),
 				"exit": rec.get("exit"), "output": output_text or "",
 				"usage": usage}
@@ -2821,7 +2136,7 @@ class Control:
 		if session is not None and not isinstance(session, str):
 			return bad_request()
 		kind = req.get("kind")
-		if kind is not None and kind not in ("shell", "agent"):
+		if kind is not None and kind != "shell":
 			return bad_request()
 		return {"ok": True,
 				"tickets": self.daemon.tickets.store.snapshot(session, kind)}
@@ -2833,9 +2148,7 @@ class Control:
 		rec = self.daemon.tickets.store.get(tid)
 		if rec is None:
 			return err("no-ticket")
-		runner = (self.daemon.agents if rec.get("kind") == "agent"
-				  else self.daemon.tickets)
-		rec = runner.cancel(tid)
+		rec = self.daemon.tickets.cancel(tid)
 		if rec is None:
 			return err("no-ticket")
 		return {"ok": True, "ticket": rec}
@@ -2856,110 +2169,19 @@ class Control:
 
 	def tickets_reset(self, _req):
 		# Kill the ticketing service state for a reset: cancel every
-		# running ticket (shell and agent), wipe the persisted store and
-		# every artifact, restart the id counter. Hosted sessions and the
-		# rest of the daemon are untouched; a full stop remains
-		# `shutdown` / pi-rc daemon-stop.
+		# running ticket, wipe the persisted store and every artifact,
+		# restart the id counter. Hosted sessions and the rest of the
+		# daemon are untouched; a full stop remains `shutdown` /
+		# pi-rc daemon-stop.
 		cancelled = 0
 		for rec in self.daemon.tickets.store.snapshot():
 			if rec.get("status") != "running":
 				continue
-			runner = (self.daemon.agents if rec.get("kind") == "agent"
-					  else self.daemon.tickets)
-			runner.cancel(rec["id"])
+			self.daemon.tickets.cancel(rec["id"])
 			cancelled += 1
 		removed = self.daemon.tickets.store.reset()
 		log("tickets-reset: cancelled %d, removed %d" % (cancelled, removed))
 		return {"ok": True, "cancelled": cancelled, "removed": removed}
-
-	# -- agent tickets (headless subagent delegations) ---------------------
-
-	def agent_submit(self, req):
-		session = req.get("session")
-		dir_ = req.get("cwd")
-		pi_path = req.get("pi")
-		args = req.get("args")
-		env = req.get("env")
-		max_turns = req.get("max_turns")
-		if not (isinstance(session, str) and session
-				and isinstance(dir_, str) and os.path.isabs(dir_)
-				and os.path.isdir(dir_)
-				and isinstance(pi_path, str) and pi_path
-				and isinstance(args, list) and args
-				and all(isinstance(a, str) for a in args)):
-			return bad_request()
-		if env is not None and not (isinstance(env, dict)
-									and all(isinstance(k, str) and isinstance(v, str)
-										for k, v in env.items())):
-			return bad_request()
-		if max_turns is not None \
-				and not (isinstance(max_turns, int) and max_turns > 0):
-			return bad_request()
-		# Replay suppression: an identical delegation already running in
-		# this session is the same request re-emitted after a resume or
-		# compaction continuation; hand the existing ticket back instead
-		# of executing the delegation twice (the front bridges it).
-		existing = self.daemon.agents.find_running(
-			session, dir_, args, max_turns)
-		if existing is not None:
-			return {"ok": True, "id": existing["id"],
-					"ticket": existing, "deduped": True}
-		if self.daemon.agents.running_count() >= AGENT_MAX_RUNNING:
-			return err("too-busy")
-		try:
-			rec = self.daemon.agents.submit(session, dir_, pi_path, args,
-											env, max_turns)
-		except OSError as exc:
-			log("agent-submit failed: %s" % exc)
-			return err("spawn-failed")
-		if rec is None:
-			return err("too-busy")
-		return {"ok": True, "id": rec["id"], "ticket": rec}
-
-	def agent_wait(self, req):
-		return self.ticket_wait(req)
-
-	def agent_detach(self, req):
-		tid = req.get("id")
-		if not (isinstance(tid, str) and tid):
-			return bad_request()
-		rec = self.daemon.agents.mark_detached(tid)
-		if rec is None:
-			return err("no-ticket")
-		return {"ok": True, "ticket": rec}
-
-	def agent_output(self, req):
-		tid = req.get("id")
-		if not (isinstance(tid, str) and tid):
-			return bad_request()
-		offset = req.get("offset")
-		err_offset = req.get("err_offset")
-		if offset is not None or err_offset is not None:
-			try:
-				out_offset = int(offset or 0)
-				e_offset = int(err_offset or 0)
-			except (TypeError, ValueError):
-				return bad_request()
-			if out_offset < 0 or e_offset < 0:
-				return bad_request()
-			out = self.daemon.agents.output(tid, out_offset, e_offset)
-			if out is None:
-				return err("no-ticket")
-			return {"ok": True, "ticket": self.daemon.agents.store.get(tid),
-					"out_next": out["out"][1], "out_size": out["out"][2],
-					"out": base64.b64encode(out["out"][3]).decode(),
-					"err_next": out["err"][1], "err_size": out["err"][2],
-					"err": base64.b64encode(out["err"][3]).decode()}
-		return self.ticket_output(req)
-
-	def agent_cancel(self, req):
-		tid = req.get("id")
-		if not (isinstance(tid, str) and tid):
-			return bad_request()
-		rec = self.daemon.agents.cancel(tid)
-		if rec is None:
-			return err("no-ticket")
-		return {"ok": True, "ticket": rec}
 
 	def input(self, req):
 		"""Write raw text into a hosted session's PTY master (the same path
@@ -3029,8 +2251,8 @@ class Control:
 		"""An interactive hosted pi that announced a conversation file: its
 		TUI can accept /reload in place. The live spawn argv carries no
 		--session for `start`ed sessions (the file arrives via announce),
-		so the announced file is the reliable marker. Ephemeral json-mode
-		workers announce nothing and have no TUI to reload.
+		so the announced file is the reliable marker. Ephemeral
+		--no-session runs announce nothing and have no TUI to reload.
 
 		Injection contract: a reload may re-scan/reload pi's loaded
 		resources in place, but must never terminate sessions, remove them
