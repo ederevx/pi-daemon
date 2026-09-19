@@ -164,6 +164,11 @@ REAP_TICK = 0.5
 # treated as a crash-loop symptom rather than a lost background session.
 # Overridable for isolated tests (PI_PTYD_MIN_REVIVE_LIFE=0).
 MIN_REVIVE_LIFE = float(os.environ.get("PI_PTYD_MIN_REVIVE_LIFE", "30"))
+# A hosted session that is detached (no bridge viewers) and whose model
+# has been idle (extension state "idle") for this long is ended by the
+# daemon instead of piling up as a phantom that respawns on every
+# daemon restart. Zero disables the reap (PI_PTYD_IDLE_REAP=0).
+IDLE_REAP = float(os.environ.get("PI_PTYD_IDLE_REAP", "21600"))
 # How long an in-flight absorption makes its announcer look authoritative
 # to concurrent announces, and how long the settle recheck waits before
 # SIGTERMing an absorbed holder.
@@ -955,6 +960,7 @@ class Session:
 		self.lock = threading.Lock()
 		self.file = None       # announced pi session file, for revival
 		self.state = "idle"    # model run state, published by the extension
+		self.last_activity = time.time()
 		self.stopping = False  # set by an explicit stop: never revive
 		# An in-place /reload was typed into this session: an abnormal
 		# death right after must not be revived into a fresh spawn (a
@@ -972,11 +978,27 @@ class Session:
 		with self.lock:
 			return len(self.clients)
 
+	def touch_activity(self):
+		# Any viewer or model-state activity keeps the session alive.
+		self.last_activity = time.time()
+
+	def idle_exceeded(self, now=None):
+		# True when the daemon should end this session on its own: a
+		# detached session whose model has been idle past the reap
+		# grace. Busy or attached sessions are never reapable.
+		if IDLE_REAP <= 0:
+			return False
+		if self.state != "idle" or self.count_clients() > 0:
+			return False
+		now = time.time() if now is None else now
+		return now - self.last_activity > IDLE_REAP
+
 	def install_client(self, client, initial=b""):
 		# Control-side: install a new bridge client. Returns the client
 		# count after the join.
 		with self.lock:
 			self.clients[client] = bytearray(initial)
+			self.touch_activity()
 			return len(self.clients)
 
 	def take_clients(self):
@@ -1002,6 +1024,7 @@ class Session:
 		# Control-side detach: signal every bridge socket without closing;
 		# the session loop observes the EOFs and does the pinned closes
 		# itself, so no recycled fd can be caught mid-flight.
+		self.touch_activity()
 		with self.lock:
 			clients = list(self.clients)
 		for c in clients:
@@ -1125,6 +1148,7 @@ class Session:
 		to_master = bytearray()
 		dead_input = False
 		while True:
+			daemon.reap_idle_if_due(self)
 			carry_to = self.carry_to
 			if carry_to is not None:
 				self._transfer_viewers(carry_to)
@@ -1507,6 +1531,17 @@ class Daemon:
 		self.registry.drop(sess.name)
 		log("child-exit '%s' pid %d status %s" % (sess.name, sess.pid, code))
 
+	def reap_idle_if_due(self, sess):
+		# End a hosted session the daemon should not keep: detached and
+		# model-idle past the grace. An explicit stop path (never
+		# revived) removes it from the table and registry; a session
+		# with a viewer or a running model is never touched.
+		if not sess.idle_exceeded():
+			return
+		log("reap '%s' ended: detached and idle past %ss"
+			% (sess.name, IDLE_REAP))
+		sess.terminate()
+
 	def revive(self, sess, status):
 		# Backgrounding must always happen unless the user ended the
 		# session themselves: re-host an abnormally dying pi from its
@@ -1869,6 +1904,7 @@ class Control:
 		if sess is None:
 			return err("no-session")
 		sess.state = state
+		sess.touch_activity()
 		return {"ok": True}
 
 	def stop(self, req):
