@@ -654,11 +654,12 @@ class TicketRunner:
 			   "started": time.time(), "finished": None, "exit": None,
 			   "term": None, "truncated": False, "error": None}
 		os.makedirs(self.store.log_dir, exist_ok=True)
-		argv = PROCESS.shell_command(command)
+		run_env = env if env else os.environ.copy()
+		argv = PROCESS.shell_command(command, run_env.get("PI_SHELL"))
 		extra = PROCESS.group_kwargs()
 		proc = subprocess.Popen(
 			argv, cwd=cwd,
-			env=env if env else os.environ.copy(),
+			env=run_env,
 			stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
 			stderr=subprocess.STDOUT, bufsize=0, **extra)
 		rec["pid"] = proc.pid

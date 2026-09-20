@@ -40,6 +40,7 @@ import {
 	DEFAULT_MAX_LINES,
 	DynamicBorder,
 	getSettingsListTheme,
+	getShellConfig,
 	type BashOperations,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -324,6 +325,9 @@ class DaemonTasks {
 	/** ticket id -> live watcher; owning object mutates this only. */
 	private watchers = new Map<string, { stopped: boolean }>();
 
+	/** Pi's shell, resolved once; the daemon runs the ticket in it. */
+	private readonly shell = piShell();
+
 	/** Tickets whose result was already fetched by an explicit call. */
 	private fetched = new Set<string>();
 
@@ -360,8 +364,11 @@ class DaemonTasks {
 	async submit(sessionFile: string | null, cwd: string, command: string,
 		extraEnv: Record<string, string> = {},
 	): Promise<string> {
+		const env = this.shell
+			? { ...extraEnv, PI_SHELL: this.shell }
+			: extraEnv;
 		const id = await this.client.submit(
-			this.sessionKey(sessionFile), cwd, command, extraEnv);
+			this.sessionKey(sessionFile), cwd, command, env);
 		this.armDelivery(id, command);
 		return id;
 	}
@@ -505,6 +512,17 @@ function wrapLine(text: string, width: number): string[] {
 		out.push(text.slice(i, i + width));
 	}
 	return out;
+}
+
+/** Pi's own shell, or empty when it cannot be resolved. An offloaded
+ *  command must run in the same shell the local bash tool would, so the
+ *  owner resolves this once and sends it to the daemon as PI_SHELL. */
+function piShell(): string {
+	try {
+		return getShellConfig().shell;
+	} catch {
+		return "";
+	}
 }
 
 /** The session env vars the offloaded command should inherit beyond the
