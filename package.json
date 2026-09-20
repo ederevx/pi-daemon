@@ -1,0 +1,44 @@
+{
+  "name": "pi-daemon",
+  "version": "2.8.0",
+  "type": "module",
+  "description": "Persistent background PTY host for the pi coding agent: hosted TUI sessions that survive terminal exit, SSH logout, and reboot.",
+  "license": "MIT",
+  "author": "Edrick Sinsuan <evcsinsuan@gmail.com>",
+  "homepage": "https://github.com/ederevx/pi-daemon",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ederevx/pi-daemon.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ederevx/pi-daemon/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "daemon",
+    "pty",
+    "background"
+  ],
+  "files": [
+    "pi/extensions/",
+    "pi/daemon/",
+    "pi/bin/",
+    "pi/lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./pi/extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  }
+}

@@ -32,6 +32,8 @@ dest_extension="$pi_home/extensions/daemon.ts"
 dest_offload="$pi_home/extensions/offload.ts"
 dest_helper="$local_bin/pi-rc"
 dest_daemon="$local_bin/pi-daemon"
+dest_platform="$local_bin/pi_platform.py"
+dest_conpty="$local_bin/pi_conpty.py"
 dest_unit="$systemd_dir/pi-daemon.service"
 dest_wrapper="$local_bin/pi"
 
@@ -50,6 +52,10 @@ install_to 644 "$repo_root/pi/extensions/daemon.ts" "$dest_extension"
 install_to 644 "$repo_root/pi/extensions/offload.ts" "$dest_offload"
 install_to 755 "$repo_root/pi/bin/pi-rc" "$dest_helper"
 install_to 755 "$repo_root/pi/daemon/pi-daemon" "$dest_daemon"
+# The OS-agnostic seam module and its lazy Windows ConPTY backend ship
+# next to the scripts so both find pi_platform.py on sys.path.
+install_to 644 "$repo_root/pi/lib/pi_platform.py" "$dest_platform"
+install_to 644 "$repo_root/pi/lib/pi_conpty.py" "$dest_conpty"
 
 # The real pi binary must be resolved by PATH while skipping the
 # wrapper's own directory and the daemon's hosted-session shim. An install
@@ -79,7 +85,7 @@ sed "s|@REAL_PI@|$real_pi|" "$repo_root/pi/bin/pi-wrapper" > "$dest_wrapper.tmp.
 mv -f "$dest_wrapper.tmp.$$" "$dest_wrapper"
 chmod 755 "$dest_wrapper"
 
-owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_extension" "$dest_offload" "$dest_unit")
+owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_extension" "$dest_offload" "$dest_unit" "$dest_platform" "$dest_conpty")
 {
   printf '{\n'
   printf '  "version": 1,\n'
@@ -107,6 +113,8 @@ systemctl --user enable --now pi-daemon.service
 
 echo "install: ok"
 echo "  daemon:    $dest_daemon"
+echo "  platform:  $dest_platform"
+echo "  conpty:    $dest_conpty"
 echo "  launcher:  $dest_helper"
 echo "  pi wrap:   $dest_wrapper"
 echo "  extension: $dest_extension"

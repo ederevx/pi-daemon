@@ -638,6 +638,37 @@ def test_idle_reap_spares_busy_and_attached():
     assert_true(_drain_session(name))
 
 
+# --- platform seams -------------------------------------------------------
+
+def test_platform_seams():
+    plat = daemon.pi_platform
+    # POSIX layout honors XDG; Windows layout uses LOCALAPPDATA/TEMP.
+    posix = plat.RuntimeLayout(environ={"XDG_RUNTIME_DIR": "/run/x",
+                                        "XDG_STATE_HOME": "/state/x"},
+                               platform="linux")
+    assert_eq(posix.endpoint_path(), "/run/x/pi-pty-host.sock")
+    assert_eq(posix.registry_path(), "/state/x/pi-pty-host/sessions.json")
+    win = plat.RuntimeLayout(
+        environ={"LOCALAPPDATA": "C:\\Users\\x\\AppData\\Local",
+                 "TEMP": "C:\\Temp"}, platform="win32")
+    assert_true(win.endpoint_path().endswith("pi-pty-host.sock"))
+    assert_true("pi-daemon" in win.endpoint_path())
+    assert_true("pi-pty-host" in win.registry_path())
+    # The token handshake is the transport's only authentication.
+    hs = plat.ControlHandshake("tok")
+    assert_true(hs.validate({"cmd": "hello", "token": "tok"}))
+    assert_true(not hs.validate({"cmd": "hello", "token": "bad"}))
+    assert_true(not hs.validate({"cmd": "list"}))
+    assert_eq(hs.ack().get("ok"), True)
+    assert_eq(hs.reject().get("error"), "bad-handshake")
+    # The POSIX PTY child satisfies the seam used by the relay loop.
+    child = plat.PosixPtyChild(123, -1)
+    assert_eq(child.pid, 123)
+    assert_eq(child.output_handle(), -1)
+    # 123 is not our child: ChildProcessError means "nothing to reap".
+    assert_eq(child.wait_nohang(), (True, 0))
+
+
 def main():
     try:
         return _main()
@@ -668,6 +699,8 @@ def _main():
        test_idle_reap_detects_and_ends_detached_sessions)
     ok("idle reap spares busy and attached sessions",
        test_idle_reap_spares_busy_and_attached)
+    ok("platform seams (layout, handshake, posix pty child)",
+       test_platform_seams)
     print(f"\n{PASS}/{PASS + len(FAIL)} unit tests passed")
     if FAIL:
         print("Failed: " + ", ".join(FAIL))

@@ -68,13 +68,234 @@
  * action; stock Ctrl+D behavior is untouched everywhere.
  */
 
-import { rmSync } from "node:fs";
+import {
+	closeSync,
+	existsSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	rmSync,
+} from "node:fs";
+import { createConnection } from "node:net";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+/** Directory of this extension module, when loaded as an ES module. */
+function moduleDir(): string {
+	try {
+		return dirname(fileURLToPath(import.meta.url));
+	} catch {
+		return "";
+	}
+}
+
+/** A bundled repo path relative to the extension, or "" when absent. */
+function bundledPath(relative: string): string {
+	const here = moduleDir();
+	if (!here) return "";
+	const candidate = join(here, relative);
+	return existsSync(candidate) ? candidate : "";
+}
+
+/** pi-rc: the package-bundled pi/bin/pi-rc next to the extension, else
+ *  the installed ~/.local/bin/pi-rc. */
+function resolvePiRc(): string {
+	const bundled = bundledPath(join("..", "bin", "pi-rc"));
+	if (bundled) return bundled;
+	return join(process.env.HOME || homedir(), ".local", "bin", "pi-rc");
+}
+
+/** The daemon script: bundled pi/daemon/pi-daemon, else installed. */
+function resolveDaemon(): string {
+	const bundled = bundledPath(join("..", "daemon", "pi-daemon"));
+	if (bundled) return bundled;
+	return join(process.env.HOME || homedir(), ".local", "bin", "pi-daemon");
+}
+
+/** The control endpoint file, mirroring pi_platform.RuntimeLayout. */
+function endpointPath(): string {
+	if (process.env.XDG_RUNTIME_DIR) {
+		return join(process.env.XDG_RUNTIME_DIR, "pi-pty-host.sock");
+	}
+	if (process.platform === "win32") {
+		const base = process.env.TEMP || process.env.TMP || homedir();
+		return join(base, "pi-daemon", "pi-pty-host.sock");
+	}
+	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+	return join("/run/user", String(uid), "pi-pty-host.sock");
+}
+
+/** The daemon's state home for the log path, mirroring RuntimeLayout. */
+function stateHome(): string {
+	if (process.env.XDG_STATE_HOME) return process.env.XDG_STATE_HOME;
+	if (process.platform === "win32" && process.env.LOCALAPPDATA) {
+		return process.env.LOCALAPPDATA;
+	}
+	return join(process.env.HOME || homedir(), ".local", "state");
+}
+
+/** Resolve a Python interpreter without a platform branch. */
+function resolvePython(): string {
+	if (process.env.PYTHON) return process.env.PYTHON;
+	for (const candidate of ["python3", "python", "py"]) {
+		try {
+			const probe = spawnSync(candidate, ["--version"], {
+				stdio: "ignore",
+				windowsHide: true,
+			});
+			if (probe.status === 0) return candidate;
+		} catch {
+			// try the next candidate
+		}
+	}
+	return "python3";
+}
+
+/** The windowless Python twin of an interpreter, or the base name. */
+function resolveWindowlessPython(): string {
+	const base = process.env.PYTHON || "python";
+	const candidates = [base, "pythonw", "pythonw3", "pyw"];
+	for (const candidate of candidates) {
+		try {
+			const probe = spawnSync(candidate, ["-c", "pass"], {
+				stdio: "ignore",
+				windowsHide: true,
+			});
+			if (probe.status === 0) return candidate;
+		} catch {
+			// try the next candidate
+		}
+	}
+	return base;
+}
 
 /** One line of the daemon's announce reply, parsed. */
 interface Handoff {
 	name: string;
 	state: string;
+}
+
+/** Holds a control connection open until this pi exits: the daemon hosts
+ *  the handed-over session when the connection reaches EOF, so liveness
+ *  is connection-based and never a pid probe. */
+export class HandoverHold {
+	private readonly path: string;
+	private socket: ReturnType<typeof createConnection> | null = null;
+
+	constructor(path: string = endpointPath()) {
+		this.path = path;
+	}
+
+	/** Send the hold handover and resolve true once the daemon has
+	 *  registered it. The connection stays open; its later close (this
+	 *  process exiting) is the daemon's host signal. */
+	async open(file: string, dir: string): Promise<boolean> {
+		let endpoint: { host?: string; port?: number; token?: string };
+		try {
+			endpoint = JSON.parse(readFileSync(this.path, "utf8"));
+		} catch {
+			return false;
+		}
+		if (!endpoint.host || !endpoint.port) return false;
+		return await new Promise<boolean>((resolve) => {
+			const sock = createConnection({
+				host: endpoint.host,
+				port: endpoint.port,
+			});
+			this.socket = sock;
+			let buffer = "";
+			let phase = "hello";
+			let settled = false;
+			const finish = (value: boolean): void => {
+				if (settled) return;
+				settled = true;
+				if (!value) {
+					this.socket = null;
+					try {
+						sock.destroy();
+					} catch {
+						// already gone
+					}
+				}
+				resolve(value);
+			};
+			sock.setNoDelay(true);
+			sock.on("connect", () => {
+				sock.write(JSON.stringify({ cmd: "hello",
+					token: endpoint.token }) + "\n");
+			});
+			sock.on("data", (chunk: Buffer) => {
+				buffer += String(chunk);
+				while (buffer.includes("\n")) {
+					const index = buffer.indexOf("\n");
+					const line = buffer.slice(0, index);
+					buffer = buffer.slice(index + 1);
+					if (!line.trim()) continue;
+					let msg: { ok?: boolean };
+					try {
+						msg = JSON.parse(line);
+					} catch {
+						finish(false);
+						return;
+					}
+					if (phase === "hello") {
+						if (!msg.ok) {
+							finish(false);
+							return;
+						}
+						phase = "handover";
+						sock.write(JSON.stringify({ cmd: "handover",
+							file, dir, hold: true }) + "\n");
+						continue;
+					}
+					finish(Boolean(msg.ok));
+					return;
+				}
+			});
+			sock.on("error", () => finish(false));
+		});
+	}
+}
+
+/** Keeps the daemon reachable on platforms without a service manager.
+ *  On POSIX the systemd unit owns it, so this is a no-op there. */
+export class DaemonSupervisor {
+	private readonly daemonPath: string;
+	private starting = false;
+
+	constructor(daemonPath: string = resolveDaemon()) {
+		this.daemonPath = daemonPath;
+	}
+
+	async ensure(): Promise<void> {
+		if (process.platform !== "win32") return;
+		if (existsSync(endpointPath())) return;
+		if (this.starting) return;
+		this.starting = true;
+		try {
+			const logDir = join(stateHome(), "pi-pty-host");
+			mkdirSync(logDir, { recursive: true });
+			const log = openSync(join(logDir, "daemon.log"), "a");
+			try {
+				const child = spawn(resolveWindowlessPython(),
+					[this.daemonPath], {
+						detached: true,
+						windowsHide: true,
+						stdio: ["ignore", log, log],
+					});
+				child.unref();
+			} finally {
+				closeSync(log);
+			}
+		} catch {
+			// Best-effort: an unreachable daemon only costs /bg + revive.
+		} finally {
+			this.starting = false;
+		}
+	}
 }
 
 export class RcBackground {
@@ -83,13 +304,30 @@ export class RcBackground {
 	private announced: string | null = null;
 
 	private readonly piRc: string;
+	private readonly hold: HandoverHold;
+	private readonly supervisor: DaemonSupervisor;
 
 	/** The only mutable dependency, injected: how to run pi-rc. */
 	private readonly exec: (file: string, args: string[]) => Promise<any>;
 
-	constructor(exec: (file: string, args: string[]) => Promise<any>) {
+	constructor(
+		exec: (file: string, args: string[]) => Promise<any>,
+		hold: HandoverHold = new HandoverHold(),
+		supervisor: DaemonSupervisor = new DaemonSupervisor(),
+	) {
 		this.exec = exec;
-		this.piRc = `${process.env.HOME || "."}/.local/bin/pi-rc`;
+		this.hold = hold;
+		this.supervisor = supervisor;
+		this.piRc = resolvePiRc();
+	}
+
+	/** Run pi-rc through the OS launcher: POSIX execs the shebang'd
+	 *  script directly, Windows needs the Python interpreter. */
+	private runPiRc(args: string[]): Promise<any> {
+		if (process.platform === "win32") {
+			return this.exec(resolvePython(), [this.piRc, ...args]);
+		}
+		return this.exec(this.piRc, args);
 	}
 
 	/** PI_HOSTED_SESSION is the full daemon name ("pi-<base>"); pi-rc's
@@ -107,6 +345,12 @@ export class RcBackground {
 	 *  takeover, its resolution of the duplicate. No-op outside hosting
 	 *  and for ephemeral sessions; failures are retried on the next
 	 *  prompt (the announced marker is only set on success). */
+	/** Ensure the daemon is reachable. No-op on POSIX (systemd owns it);
+	 *  on Windows it starts the windowless detached daemon. */
+	async ensureDaemon(): Promise<void> {
+		await this.supervisor.ensure();
+	}
+
 	async announce(ctx: any): Promise<void> {
 		const session = this.hostedSession();
 		if (!session) return;
@@ -114,7 +358,7 @@ export class RcBackground {
 			ctx?.sessionManager?.getSessionFile?.();
 		if (!file || file === this.announced) return;
 		try {
-			const result = await this.exec(this.piRc,
+			const result = await this.runPiRc(
 				["announce", session, file, "--takeover"]);
 			if (result.code !== 0) return;
 			this.announced = file;
@@ -195,7 +439,7 @@ export class RcBackground {
 		if (!session) return;
 		if (ctx && !ctx?.sessionManager?.getSessionFile?.()) return;
 		try {
-			await this.exec(this.piRc, ["state", session, state]);
+			await this.runPiRc( ["state", session, state]);
 		} catch {
 			// State display is best-effort.
 		}
@@ -209,7 +453,7 @@ export class RcBackground {
 	async detach(ctx: any): Promise<void> {
 		const session = this.hostedSession();
 		if (!session) return;
-		const result = await this.exec(this.piRc, ["detach", session]);
+		const result = await this.runPiRc( ["detach", session]);
 		if (result.code !== 0 && !result.killed) {
 			ctx?.ui?.notify?.(
 				`Detach failed: ${(result.stderr || result.stdout || "").trim() || `exit ${result.code}`}`,
@@ -270,7 +514,7 @@ export class RcBackground {
 		// is taken by another conversation); "hosted:<name>" (with exit 3)
 		// means this session is already hosted — attach instead of
 		// duplicating it. Exit 4 means the daemon is unreachable.
-		const check = await this.exec(this.piRc,
+		const check = await this.runPiRc(
 			["handover", sessionFile, dir, "--check"]);
 		const verdict = (check.stdout || "").trim();
 		const match = /^(target|hosted):(.+)$/.exec(verdict);
@@ -290,23 +534,20 @@ export class RcBackground {
 		}
 		const name = match[2];
 
-		// The daemon replies immediately with the verdict and backgrounds
-		// its own wait-for-exit-then-host thread: once this pi exits, it
-		// hosts the exact session file as `pi --session <file>`, resuming
-		// the conversation idle at the prompt. No setsid helper is needed.
-		const spawn = await this.exec(this.piRc, [
-			"handover",
-			sessionFile,
-			dir,
-			"--after-exit",
-			String(process.pid),
-		]);
-		if (spawn.code !== 0) {
-			ctx?.ui?.notify?.(
-				`Handover failed: ${(spawn.stderr || spawn.stdout || "").trim() || `exit ${spawn.code}`}`,
-				"warning",
-			);
-			return;
+		// Register the handover with the daemon and keep the connection
+		// open: its EOF when this pi exits is the daemon's host signal
+		// (connection liveness, never a pid probe). Fall back to a
+		// short-lived pi-rc that holds the same connection itself when the
+		// endpoint file is not reachable.
+		const held = await this.hold.open(sessionFile, dir);
+		if (!held) {
+			void this.runPiRc( [
+				"handover",
+				sessionFile,
+				dir,
+				"--after-exit",
+				String(process.pid),
+			]);
 		}
 
 		ctx?.ui?.notify?.(
@@ -350,11 +591,11 @@ export class RcBackground {
 				const target = event.targetSessionFile;
 				const current = ctx?.sessionManager?.getSessionFile?.();
 				if (!target || target === current) return { cancel: true };
-				const result = await this.exec(this.piRc,
+				const result = await this.runPiRc(
 					["resume", session, target]);
 				if (result.code !== 0) return;
 			} else {
-				const result = await this.exec(this.piRc, ["carry", session]);
+				const result = await this.runPiRc( ["carry", session]);
 				if (result.code !== 0) return;
 			}
 		} catch {
@@ -380,6 +621,7 @@ export default function (pi: ExtensionAPI) {
 	// their own session_start). The announced-file guard keeps repeats
 	// free. The first prompt is also where a turn begins: report busy.
 	pi.on("session_start", async (_event, ctx) => {
+		await app.ensureDaemon();
 		await app.announce(ctx);
 		await app.setState("idle", ctx);
 	});
