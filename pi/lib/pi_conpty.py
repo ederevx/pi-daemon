@@ -39,9 +39,6 @@ _PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
 
 _WAIT_OBJECT_0 = 0x00000000
 
-_EVENT_KEY = 0x0001
-_EVENT_WINDOW_BUFFER_SIZE = 0x0004
-
 _GENERIC_READ = 0x80000000
 _GENERIC_WRITE = 0x40000000
 _FILE_SHARE_READ = 0x00000001
@@ -53,15 +50,19 @@ _ENABLE_PROCESSED_INPUT = 0x0001
 _ENABLE_LINE_INPUT = 0x0002
 _ENABLE_ECHO_INPUT = 0x0004
 _ENABLE_WINDOW_INPUT = 0x0008
+_ENABLE_QUICK_EDIT_MODE = 0x0040
+_ENABLE_EXTENDED_FLAGS = 0x0080
 _ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
 _ENABLE_PROCESSED_OUTPUT = 0x0001
 _ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+_CONSOLE_CP_UTF8 = 65001
 
 DEFAULT_COLS = 80
 DEFAULT_ROWS = 24
 
 _READ_CHUNK = 65536
-_CONSOLE_EVENTS = 64
+_PUMP_TICK = 0.1
 _KILL_TICK = 0.05
 
 
@@ -129,57 +130,6 @@ class _PROCESS_INFORMATION(ctypes.Structure):
         ("hThread", wintypes.HANDLE),
         ("dwProcessId", wintypes.DWORD),
         ("dwThreadId", wintypes.DWORD),
-    ]
-
-
-class _KEY_EVENT_RECORD(ctypes.Structure):
-    """Win32 KEY_EVENT_RECORD."""
-
-    _fields_ = [
-        ("bKeyDown", wintypes.BOOL),
-        ("wRepeatCount", wintypes.WORD),
-        ("wVirtualKeyCode", wintypes.WORD),
-        ("wVirtualScanCode", wintypes.WORD),
-        ("UnicodeChar", wintypes.WCHAR),
-        ("dwControlKeyState", wintypes.DWORD),
-    ]
-
-
-class _MOUSE_EVENT_RECORD(ctypes.Structure):
-    """Win32 MOUSE_EVENT_RECORD (sizes the input-record union)."""
-
-    _fields_ = [
-        ("dwMousePosition", _COORD),
-        ("dwButtonState", wintypes.DWORD),
-        ("dwControlKeyState", wintypes.DWORD),
-        ("dwEventFlags", wintypes.DWORD),
-    ]
-
-
-class _WINDOW_BUFFER_SIZE_RECORD(ctypes.Structure):
-    """Win32 WINDOW_BUFFER_SIZE_RECORD."""
-
-    _fields_ = [
-        ("dwSize", _COORD),
-    ]
-
-
-class _INPUT_EVENT(ctypes.Union):
-    """Win32 INPUT_RECORD Event union."""
-
-    _fields_ = [
-        ("KeyEvent", _KEY_EVENT_RECORD),
-        ("MouseEvent", _MOUSE_EVENT_RECORD),
-        ("WindowBufferSizeEvent", _WINDOW_BUFFER_SIZE_RECORD),
-    ]
-
-
-class _INPUT_RECORD(ctypes.Structure):
-    """Win32 INPUT_RECORD."""
-
-    _fields_ = [
-        ("EventType", wintypes.WORD),
-        ("Event", _INPUT_EVENT),
     ]
 
 
@@ -276,14 +226,20 @@ class _Kernel32:
         lib.GetConsoleScreenBufferInfo.argtypes = [
             wintypes.HANDLE, pointer(_CONSOLE_SCREEN_BUFFER_INFO)]
         lib.GetConsoleScreenBufferInfo.restype = wintypes.BOOL
-        lib.PeekConsoleInputW.argtypes = [
-            wintypes.HANDLE, pointer(_INPUT_RECORD), wintypes.DWORD,
-            pointer(wintypes.DWORD)]
-        lib.PeekConsoleInputW.restype = wintypes.BOOL
-        lib.ReadConsoleInputW.argtypes = [
-            wintypes.HANDLE, pointer(_INPUT_RECORD), wintypes.DWORD,
-            pointer(wintypes.DWORD)]
-        lib.ReadConsoleInputW.restype = wintypes.BOOL
+        lib.WriteFile.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+            pointer(wintypes.DWORD), ctypes.c_void_p]
+        lib.WriteFile.restype = wintypes.BOOL
+        lib.FlushConsoleInputBuffer.argtypes = [wintypes.HANDLE]
+        lib.FlushConsoleInputBuffer.restype = wintypes.BOOL
+        lib.GetConsoleCP.argtypes = []
+        lib.GetConsoleCP.restype = wintypes.UINT
+        lib.SetConsoleCP.argtypes = [wintypes.UINT]
+        lib.SetConsoleCP.restype = wintypes.BOOL
+        lib.GetConsoleOutputCP.argtypes = []
+        lib.GetConsoleOutputCP.restype = wintypes.UINT
+        lib.SetConsoleOutputCP.argtypes = [wintypes.UINT]
+        lib.SetConsoleOutputCP.restype = wintypes.BOOL
 
 
 def _raise_last_error(message):
@@ -637,7 +593,17 @@ class WindowsPtyBackend:
 
 
 class WindowsConsole:
-    """Raw CONIN$/CONOUT$ seam for the Windows pi-rc attach client."""
+    """Raw CONIN$/CONOUT$ seam for the Windows pi-rc attach client.
+
+    ReadFile on CONIN$ with ENABLE_VIRTUAL_TERMINAL_INPUT turns every key
+    (arrows, function keys, Ctrl combos) into xterm-style VT bytes, which
+    is exactly what the hosted pi expects. A daemon reader thread pumps
+    those bytes into a socketpair so the select-based relay can watch one
+    select-able fd (Windows select only accepts sockets). A console input
+    handle is waitable, so the pump uses WaitForSingleObject with a short
+    bound and stops cleanly. Resize is not delivered by ReadFile, so
+    take_resize polls the CONOUT$ window size.
+    """
 
     def __init__(self):
         self._api = None
@@ -645,7 +611,13 @@ class WindowsConsole:
         self._out_handle = None
         self._saved_in_mode = None
         self._saved_out_mode = None
-        self._input_buf = bytearray()
+        self._saved_in_cp = None
+        self._saved_out_cp = None
+        self._input_sock = None
+        self._reader_sock = None
+        self._reader_thread = None
+        self._stop = threading.Event()
+        self._last_size = None
 
     # -- TerminalMode interface -------------------------------------------
 
@@ -659,29 +631,60 @@ class WindowsConsole:
             "CONIN$", _GENERIC_READ | _GENERIC_WRITE)
         self._out_handle = self._open_console(
             "CONOUT$", _GENERIC_READ | _GENERIC_WRITE)
+        self._apply_console_modes(lib)
+        self._apply_utf8_codepage(lib)
+        lib.FlushConsoleInputBuffer(self._in_handle)
+        self._last_size = self._query_size()
+        self._start_pump()
+
+    def _apply_console_modes(self, lib):
         self._saved_in_mode = self._get_mode(self._in_handle)
         self._saved_out_mode = self._get_mode(self._out_handle)
-        in_mode = (self._saved_in_mode
-                   & ~(_ENABLE_LINE_INPUT | _ENABLE_ECHO_INPUT
-                       | _ENABLE_PROCESSED_INPUT)
-                   | _ENABLE_WINDOW_INPUT
+        raw = ~(_ENABLE_LINE_INPUT | _ENABLE_ECHO_INPUT
+                | _ENABLE_PROCESSED_INPUT | _ENABLE_WINDOW_INPUT
+                | _ENABLE_QUICK_EDIT_MODE)
+        in_mode = ((self._saved_in_mode & raw)
+                   | _ENABLE_EXTENDED_FLAGS
                    | _ENABLE_VIRTUAL_TERMINAL_INPUT)
         out_mode = (self._saved_out_mode | _ENABLE_PROCESSED_OUTPUT
                     | _ENABLE_VIRTUAL_TERMINAL_PROCESSING)
         self._set_mode(self._in_handle, in_mode)
         self._set_mode(self._out_handle, out_mode)
 
+    def _apply_utf8_codepage(self, lib):
+        # ReadFile/WriteFile speak the console code page; UTF-8 keeps the
+        # bytes pi's ConPTY emits and the VT input sequences intact.
+        self._saved_in_cp = lib.GetConsoleCP()
+        self._saved_out_cp = lib.GetConsoleOutputCP()
+        lib.SetConsoleCP(_CONSOLE_CP_UTF8)
+        lib.SetConsoleOutputCP(_CONSOLE_CP_UTF8)
+
     def restore(self):
+        self._stop_pump()
         if self._in_handle is not None and self._saved_in_mode is not None:
             self._set_mode(self._in_handle, self._saved_in_mode)
             self._saved_in_mode = None
         if self._out_handle is not None and self._saved_out_mode is not None:
             self._set_mode(self._out_handle, self._saved_out_mode)
             self._saved_out_mode = None
+        self._restore_codepage()
         self._close_console()
 
+    def _restore_codepage(self):
+        if self._api is None:
+            return
+        if self._saved_in_cp is not None:
+            self._api.lib.SetConsoleCP(self._saved_in_cp)
+            self._saved_in_cp = None
+        if self._saved_out_cp is not None:
+            self._api.lib.SetConsoleOutputCP(self._saved_out_cp)
+            self._saved_out_cp = None
+
     def size(self):
-        if self._out_handle is None:
+        return self._query_size()
+
+    def _query_size(self):
+        if self._out_handle is None or self._api is None:
             return (0, 0)
         info = _CONSOLE_SCREEN_BUFFER_INFO()
         if not self._api.lib.GetConsoleScreenBufferInfo(
@@ -691,43 +694,85 @@ class WindowsConsole:
         rows = info.srWindow.Bottom - info.srWindow.Top + 1
         return (cols, rows)
 
-    # -- resize + input ---------------------------------------------------
+    # -- input pump --------------------------------------------------------
 
-    def poll_resize(self):
-        """Drain pending console input; True if a buffer-size event seen."""
-        if self._in_handle is None:
-            return False
-        peek = (_INPUT_RECORD * _CONSOLE_EVENTS)()
-        seen = wintypes.DWORD(0)
-        if not self._api.lib.PeekConsoleInputW(
-                self._in_handle, peek, _CONSOLE_EVENTS,
-                ctypes.byref(seen)):
-            return False
-        if seen.value == 0:
-            return False
-        records = (_INPUT_RECORD * seen.value)()
-        got = wintypes.DWORD(0)
-        if not self._api.lib.ReadConsoleInputW(
-                self._in_handle, records, seen.value, ctypes.byref(got)):
-            return False
-        resized = False
-        for index in range(got.value):
-            record = records[index]
-            if record.EventType == _EVENT_WINDOW_BUFFER_SIZE:
-                resized = True
-            elif record.EventType == _EVENT_KEY:
-                self._buffer_key(record.Event.KeyEvent)
-        return resized
+    def _start_pump(self):
+        self._stop.clear()
+        self._input_sock, self._reader_sock = socket.socketpair()
+        self._input_sock.setblocking(False)
+        self._reader_thread = threading.Thread(
+            target=self._pump_loop, daemon=True)
+        self._reader_thread.start()
 
-    def _buffer_key(self, key):
-        char = key.UnicodeChar
-        if key.bKeyDown and char:
-            self._input_buf.extend(char.encode("utf-8", "replace"))
+    def _pump_loop(self):
+        buffer = ctypes.create_string_buffer(_READ_CHUNK)
+        while not self._stop.is_set():
+            wait = self._api.lib.WaitForSingleObject(
+                self._in_handle, int(_PUMP_TICK * 1000))
+            if wait != _WAIT_OBJECT_0:
+                continue
+            read = wintypes.DWORD(0)
+            ok = self._api.lib.ReadFile(
+                self._in_handle, buffer, _READ_CHUNK,
+                ctypes.byref(read), None)
+            if not ok or read.value == 0:
+                break
+            try:
+                self._reader_sock.sendall(buffer.raw[:read.value])
+            except OSError:
+                break
+        try:
+            self._reader_sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    def _stop_pump(self):
+        self._stop.set()
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=1.0)
+            self._reader_thread = None
+        for name in ("_input_sock", "_reader_sock"):
+            sock = getattr(self, name)
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                setattr(self, name, None)
+
+    def input_fd(self):
+        if self._input_sock is None:
+            return None
+        return self._input_sock.fileno()
 
     def read_input(self, limit=_READ_CHUNK):
-        take = bytes(self._input_buf[:limit])
-        del self._input_buf[:len(take)]
-        return take
+        if self._input_sock is None:
+            return None
+        try:
+            return self._input_sock.recv(limit)
+        except (BlockingIOError, InterruptedError):
+            return None
+        except OSError:
+            return b""
+
+    def take_resize(self):
+        current = self._query_size()
+        if current == (0, 0) or current == self._last_size:
+            return False
+        self._last_size = current
+        return True
+
+    def write_output(self, data):
+        if self._out_handle is None or self._api is None:
+            return None
+        buffer = ctypes.create_string_buffer(data, len(data))
+        written = wintypes.DWORD(0)
+        ok = self._api.lib.WriteFile(
+            self._out_handle, buffer, len(data),
+            ctypes.byref(written), None)
+        if not ok:
+            return None
+        return int(written.value)
 
     # -- handles ----------------------------------------------------------
 

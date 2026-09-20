@@ -110,7 +110,6 @@
 #   pi-rc daemon-stop                   stop the daemon and every hosted
 #                                       session
 
-import atexit
 import base64
 import hashlib
 import json
@@ -154,6 +153,7 @@ DEFAULT_ROWS = 40
 CONTROL_TIMEOUT = 5.0    # seconds per control round-trip; never hang
 DAEMON_START_WAIT = 2.0  # seconds to wait for the socket after spawning
 MAX_BUF = 1 << 20        # per-direction bridge buffer bound (backpressure)
+RELAY_TICK = 0.1         # select bound: lets Windows poll for resize
 
 EXIT_OK = 0
 EXIT_USAGE = 1
@@ -341,155 +341,122 @@ def find_daemon():
 	return None
 
 
-def restore_tty(saved):
-	# POSIX-only (the attach bridge is not implemented on Windows yet);
-	# the lazy import keeps control-plane commands importable there.
-	import termios
-	try:
-		termios.tcsetattr(0, termios.TCSADRAIN, saved)
-	except termios.error:
-		pass
-
-
 class Bridge:
-	"""Raw byte relay between our tty and the daemon bridge; the only
-	unbounded phase, and the tty is restored on every exit path. run()
-	returns a short status word for the caller to report after the tty is
-	restored (the user must be able to tell they left the TUI)."""
+	"""Raw byte relay between the terminal seam and the daemon bridge; the
+	only unbounded phase, and the terminal is restored on every exit path.
+	run() returns a short status word for the caller to report after the
+	terminal is restored (the user must be able to tell they left the
+	TUI)."""
 
-	def __init__(self, client, sock, session, initial=b""):
+	def __init__(self, client, sock, session, initial=b"", terminal=None):
 		self.client = client
 		self.sock = sock
 		self.session = session
 		self.initial = initial
+		self.terminal = (pi_platform.select_terminal_mode()
+						 if terminal is None else terminal)
 		self.status = "lost"
 
 	def run(self):
-		import termios
-		saved = termios.tcgetattr(0)
-		atexit.register(restore_tty, saved)
-		wake_r, wake_w = os.pipe()
-		winch = [False]
-		prev_winch = (signal.getsignal(signal.SIGWINCH)
-					  if hasattr(signal, "SIGWINCH") else None)
-		self._install_signal_handlers(wake_w, winch)
-		os.set_blocking(0, False)
-		os.set_blocking(1, False)
+		self.terminal.enter()
+		prev = self._install_exit_handlers()
 		self.sock.setblocking(False)
 		try:
-			self._raw_mode()
-			self._relay(wake_r, winch)
+			self._relay()
 		finally:
-			restore_tty(saved)
-			if hasattr(signal, "SIGWINCH"):
-				signal.signal(signal.SIGWINCH, prev_winch)
-			os.close(wake_r)
-			os.close(wake_w)
+			self.terminal.restore()
+			self._restore_exit_handlers(prev)
 			self.sock.close()
 		return self.status
 
-	def _install_signal_handlers(self, wake_w, winch):
-		def on_winch(_signum, _frame):
-			# only flag it here; all daemon work happens in the main loop
-			winch[0] = True
-			try:
-				os.write(wake_w, b"x")
-			except OSError:
-				pass
+	def _install_exit_handlers(self):
+		# turn lethal signals into a normal unwind so the terminal is
+		# restored; resize belongs to the terminal seam
+		prev = {}
 
 		def on_term(_signum, _frame):
-			# turn lethal signals into a normal unwind so the tty is
-			# restored
 			raise SystemExit(0)
 
-		if hasattr(signal, "SIGWINCH"):
-			signal.signal(signal.SIGWINCH, on_winch)
-		signal.signal(signal.SIGTERM, on_term)
-		if hasattr(signal, "SIGHUP"):
-			signal.signal(signal.SIGHUP, on_term)
+		for name in ("SIGTERM", "SIGHUP"):
+			if hasattr(signal, name):
+				prev[name] = signal.getsignal(getattr(signal, name))
+				signal.signal(getattr(signal, name), on_term)
+		return prev
 
-	def _raw_mode(self):
-		import termios
-		attrs = termios.tcgetattr(0)
-		attrs[0] &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK
-					  | termios.ISTRIP | termios.IXON)
-		attrs[1] &= ~termios.OPOST
-		attrs[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG
-					  | termios.IEXTEN)
-		attrs[6][termios.VMIN] = 1
-		attrs[6][termios.VTIME] = 0
-		termios.tcsetattr(0, termios.TCSANOW, attrs)
+	def _restore_exit_handlers(self, prev):
+		for name, handler in prev.items():
+			signal.signal(getattr(signal, name), handler)
 
 	def _resize(self):
 		# the bridge connection is raw bytes; resize rides a second
 		# short-lived control connection
 		try:
-			cols, rows = tty_size(0)
+			cols, rows = self.terminal.size()
+			if cols <= 0 or rows <= 0:
+				return
 			self.client.control({"cmd": "resize", "name": self.session,
 								 "cols": cols, "rows": rows})
 		except (OSError, SystemExit):
 			pass
 
-	def _relay(self, wake_r, winch):
+	def _relay(self):
 		to_sock = bytearray()
 		to_tty = bytearray(self.initial)
+		in_fd = self.terminal.input_fd()
+		wake_fd = self.terminal.wake_fd()
+		out_fd = self.terminal.writable_fd()
 		while True:
-			if winch[0]:
-				winch[0] = False
+			if self.terminal.take_resize():
 				self._resize()
-			rlist = [wake_r]
-			if len(to_sock) < MAX_BUF:
-				rlist.append(0)
+			rlist = []
+			if wake_fd is not None:
+				rlist.append(wake_fd)
+			if in_fd is not None and len(to_sock) < MAX_BUF:
+				rlist.append(in_fd)
 			if len(to_tty) < MAX_BUF:
 				rlist.append(self.sock)
 			wlist = []
 			if to_sock:
 				wlist.append(self.sock)
-			if to_tty:
-				wlist.append(1)
+			if to_tty and out_fd is not None:
+				wlist.append(out_fd)
 			try:
-				rl, wl, _ = select.select(rlist, wlist, [])
+				rl, wl, _ = select.select(rlist, wlist, [], RELAY_TICK)
 			except OSError:
 				# a polled fd vanished; nothing left to relay
 				break
-			if wake_r in rl:
-				try:
-					os.read(wake_r, 4096)
-				except OSError:
-					pass
-			if not self._pump_stdin(rl, to_sock):
+			if not self._pump_input(rl, in_fd, to_sock):
 				break
 			if not self._pump_socket(rl, to_tty):
 				break
 			if not self._drain_to_socket(wl, to_sock):
 				break
-			if not self._drain_to_tty(wl, to_tty):
+			if not self._drain_to_tty(wl, out_fd, to_tty):
 				break
+			if to_tty and out_fd is None:
+				# Windows console output is not select-able; write directly
+				if not self._write_direct(to_tty):
+					break
 		if to_tty:
 			self._final_flush(to_tty)
 
-	def _pump_stdin(self, ready, to_sock):
-		if 0 not in ready:
+	def _pump_input(self, ready, in_fd, to_sock):
+		if in_fd is None or in_fd not in ready:
 			return True
-		try:
-			data = os.read(0, 65536)
-		except (BlockingIOError, InterruptedError):
+		data = self.terminal.read_input(65536)
+		if data is None:
 			return True
-		except OSError:
-			self.status = "detached"
-			return False
 		if data == b"":
-			# EOF on stdin: detach; the session keeps running
+			# EOF on input: detach; the session keeps running
 			self.status = "detached"
 			return False
-		if data:
-			# Ctrl-\ pops out: keep the hosted pi running, hand the
-			# terminal back, and never forward the key to the TUI
-			if DETACH_KEY in data:
-				to_sock += data[:data.index(DETACH_KEY)]
-				self.status = "detached"
-				return False
-			to_sock += data
+		# Ctrl-\ pops out: keep the hosted pi running, hand the
+		# terminal back, and never forward the key to the TUI
+		if DETACH_KEY in data:
+			to_sock += data[:data.index(DETACH_KEY)]
+			self.status = "detached"
+			return False
+		to_sock += data
 		return True
 
 	def _pump_socket(self, ready, to_tty):
@@ -525,35 +492,32 @@ class Bridge:
 			return False
 		return True
 
-	def _drain_to_tty(self, ready, to_tty):
-		if 1 not in ready or not to_tty:
+	def _drain_to_tty(self, ready, out_fd, to_tty):
+		if out_fd is None or out_fd not in ready or not to_tty:
 			return True
-		try:
-			sent = os.write(1, to_tty[:65536])
-			del to_tty[:sent]
-		except (BlockingIOError, InterruptedError):
-			pass
-		except OSError:
+		return self._write_direct(to_tty)
+
+	def _write_direct(self, to_tty):
+		sent = self.terminal.write_output(bytes(to_tty[:65536]))
+		if sent is None:
 			self.status = "lost"
 			return False
+		if sent:
+			del to_tty[:sent]
 		return True
 
 	def _final_flush(self, to_tty):
 		# flush whatever the child produced before the bridge ended so the
 		# final frame is not dropped
-		try:
-			self.sock.setblocking(True)
-		except OSError:
-			pass
 		deadline = time.monotonic() + 2.0
 		while to_tty and time.monotonic() < deadline:
-			try:
-				sent = os.write(1, to_tty[:65536])
-				del to_tty[:sent]
-			except (BlockingIOError, InterruptedError):
-				time.sleep(0.05)
-			except OSError:
+			sent = self.terminal.write_output(bytes(to_tty[:65536]))
+			if sent is None:
 				break
+			if sent:
+				del to_tty[:sent]
+			else:
+				time.sleep(0.05)
 
 
 class AttachFlow:
@@ -1123,11 +1087,6 @@ def cmd_attach(args, client):
 		i += 1
 	if fresh_new and (name is not None or dir_arg is not None):
 		usage_error("--new takes only [-- <pi args...>]")
-	if sys.platform.startswith("win"):
-		# The control plane works on Windows; the raw attach bridge still
-		# needs the Console input/output seam wired into Bridge.
-		die("attach is not implemented on Windows yet; manage the session "
-			"with 'pi-rc list'/'pi-rc stop' and background with /bg")
 	if not os.isatty(0):
 		die("attach requires a terminal on stdin; run 'pi-rc attach' "
 			"inside a tty (see pi-rc help)")

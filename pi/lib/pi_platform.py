@@ -523,7 +523,15 @@ def _winsize_pack(cols, rows):
 
 
 class TerminalMode:
-    """Raw terminal + resize-event seam for the pi-rc attach bridge."""
+    """Raw terminal + resize seam for the pi-rc attach bridge.
+
+    The bridge selects on `input_fd()` (and `wake_fd()` when the platform
+    needs a separate wakeup) and writes through `write_output()`. A
+    platform whose output fd is not select-able (Windows console handles)
+    returns None from `writable_fd()`, and the bridge writes directly.
+    Resize is a flag (`take_resize()`), backed on POSIX by SIGWINCH and on
+    Windows by polling the console window size.
+    """
 
     def enter(self):
         raise NotImplementedError
@@ -534,18 +542,78 @@ class TerminalMode:
     def size(self):
         raise NotImplementedError
 
+    def input_fd(self):
+        raise NotImplementedError
+
+    def wake_fd(self):
+        return None
+
+    def writable_fd(self):
+        return None
+
+    def read_input(self, limit):
+        raise NotImplementedError
+
+    def write_output(self, data):
+        raise NotImplementedError
+
+    def take_resize(self):
+        return False
+
+    def close(self):
+        self.restore()
+
 
 class PosixTerminal(TerminalMode):
     """POSIX raw mode over fd 0 plus a self-pipe for SIGWINCH."""
 
-    def __init__(self, fd=0):
+    def __init__(self, fd=0, out_fd=1):
         self.fd = fd
+        self.out_fd = out_fd
         self.saved = None
+        self.saved_blocking = None
+        self.saved_out_blocking = None
+        self.wake_read = None
+        self.wake_write = None
+        self.resized = False
+        self.prev_winch = None
+        self.winch_installed = False
 
     def enter(self):
+        self._make_wake_pipe()
+        self._install_winch()
+        import termios
+        self.saved = termios.tcgetattr(self.fd)
+        self.saved_blocking = os.get_blocking(self.fd)
+        self.saved_out_blocking = os.get_blocking(self.out_fd)
+        os.set_blocking(self.fd, False)
+        os.set_blocking(self.out_fd, False)
+        self._raw_mode()
+
+    def _make_wake_pipe(self):
+        self.wake_read, self.wake_write = os.pipe()
+        os.set_blocking(self.wake_read, False)
+        os.set_blocking(self.wake_write, False)
+
+    def _install_winch(self):
+        if not hasattr(signal, "SIGWINCH"):
+            return
+        self.prev_winch = signal.getsignal(signal.SIGWINCH)
+        signal.signal(signal.SIGWINCH, self._on_winch)
+        self.winch_installed = True
+
+    def _on_winch(self, _signum, _frame):
+        # Signal handlers must stay tiny: flag the resize and wake the
+        # select loop; all daemon/terminal work happens on the main loop.
+        self.resized = True
+        try:
+            os.write(self.wake_write, b"x")
+        except OSError:
+            pass
+
+    def _raw_mode(self):
         import termios
         attrs = termios.tcgetattr(self.fd)
-        self.saved = attrs
         attrs[0] &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK
                       | termios.ISTRIP | termios.IXON)
         attrs[1] &= ~termios.OPOST
@@ -556,14 +624,39 @@ class PosixTerminal(TerminalMode):
         termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
 
     def restore(self):
-        if self.saved is None:
-            return
-        import termios
-        try:
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
-        except termios.error:
-            pass
-        self.saved = None
+        if self.saved is not None:
+            import termios
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+            except termios.error:
+                pass
+            self.saved = None
+        if self.saved_blocking is not None:
+            try:
+                os.set_blocking(self.fd, self.saved_blocking)
+            except OSError:
+                pass
+            self.saved_blocking = None
+        if self.saved_out_blocking is not None:
+            try:
+                os.set_blocking(self.out_fd, self.saved_out_blocking)
+            except OSError:
+                pass
+            self.saved_out_blocking = None
+        if self.winch_installed:
+            signal.signal(signal.SIGWINCH, self.prev_winch)
+            self.winch_installed = False
+        self._close_wake_pipe()
+
+    def _close_wake_pipe(self):
+        for name in ("wake_read", "wake_write"):
+            fd = getattr(self, name)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                setattr(self, name, None)
 
     def size(self):
         try:
@@ -571,6 +664,47 @@ class PosixTerminal(TerminalMode):
             return (sz.columns, sz.lines)
         except OSError:
             return (0, 0)
+
+    def input_fd(self):
+        return self.fd
+
+    def wake_fd(self):
+        return self.wake_read
+
+    def writable_fd(self):
+        return self.out_fd
+
+    def read_input(self, limit):
+        try:
+            return os.read(self.fd, limit)
+        except (BlockingIOError, InterruptedError):
+            return None
+        except OSError:
+            return b""
+
+    def write_output(self, data):
+        try:
+            return os.write(self.out_fd, data)
+        except (BlockingIOError, InterruptedError):
+            return 0
+        except OSError:
+            return None
+
+    def take_resize(self):
+        self._drain_wake_pipe()
+        if self.resized:
+            self.resized = False
+            return True
+        return False
+
+    def _drain_wake_pipe(self):
+        if self.wake_read is None:
+            return
+        try:
+            while os.read(self.wake_read, 4096):
+                pass
+        except (BlockingIOError, InterruptedError, OSError):
+            pass
 
 
 def select_pty_backend(platform=None):
