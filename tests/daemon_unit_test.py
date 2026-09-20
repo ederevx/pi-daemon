@@ -11,7 +11,9 @@ in os._exit and would kill the test process).
 import importlib.util
 import json
 import os
+import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -669,6 +671,116 @@ def test_platform_seams():
     assert_eq(child.wait_nohang(), (True, 0))
 
 
+class _RecordingClient:
+    """Stand-in control client: records resize requests, never dials."""
+
+    def __init__(self):
+        self.requests = []
+
+    def control(self, req, timeout=None):
+        self.requests.append(req)
+        return {"ok": True}
+
+
+def _relay_until(fd_read, want, deadline):
+    got = b""
+    while want not in got and time.time() < deadline:
+        ready, _w, _e = select.select([fd_read], [], [], 0.1)
+        if not ready:
+            continue
+        try:
+            chunk = os.read(fd_read, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        got += chunk
+    assert_true(want in got, "relay missing %r (got %r)" % (want, got))
+
+
+def test_terminal_seam():
+    plat = daemon.pi_platform
+    assert_true(isinstance(plat.select_terminal_mode("linux"),
+                           plat.PosixTerminal))
+    master, slave = os.openpty()
+    term = plat.PosixTerminal(fd=slave, out_fd=slave)
+    try:
+        term.enter()
+        os.write(master, b"seam-in")
+        _relay_until(term.input_fd(), b"seam-in", time.time() + 3)
+        term.write_output(b"seam-out")
+        _relay_until(master, b"seam-out", time.time() + 3)
+        os.kill(os.getpid(), signal.SIGWINCH)
+        resized = False
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if term.take_resize():
+                resized = True
+                break
+            time.sleep(0.02)
+        assert_true(resized, "SIGWINCH did not set the resize flag")
+    finally:
+        term.restore()
+        os.close(master)
+        os.close(slave)
+
+
+def test_bridge_relay():
+    # The bridge installs signal handlers, so it must run on the main
+    # thread; a driver thread feeds both directions and then detaches.
+    import fcntl
+    import struct
+    import termios
+    plat = daemon.pi_platform
+    master, slave = os.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ,
+                struct.pack("HHHH", 24, 80, 0, 0))
+    daemon_side, bridge_side = socket.socketpair()
+    client = _RecordingClient()
+    bridge = pi_rc.Bridge(client, bridge_side, "pi-relay",
+                          initial=b"",
+                          terminal=plat.PosixTerminal(fd=slave, out_fd=slave))
+    errors = []
+
+    def drive():
+        try:
+            daemon_side.sendall(b"daemon-hello")
+            _relay_until(master, b"daemon-hello", time.time() + 3)
+            os.write(master, b"typed-hello")
+            _relay_until(daemon_side.fileno(), b"typed-hello",
+                         time.time() + 3)
+            os.kill(os.getpid(), signal.SIGWINCH)
+            deadline = time.time() + 2
+            while time.time() < deadline and not any(
+                    req.get("cmd") == "resize" for req in client.requests):
+                time.sleep(0.02)
+            os.write(master, pi_rc.DETACH_KEY)
+        except Exception as exc:  # surfaced after the bridge returns
+            errors.append(exc)
+
+    driver = threading.Thread(target=drive, daemon=True)
+    driver.start()
+    try:
+        status = bridge.run()
+        driver.join(timeout=3)
+        assert_eq(errors, [])
+        assert_eq(status, "detached")
+        assert_true(any(req.get("cmd") == "resize"
+                        for req in client.requests), "resize not relayed")
+    finally:
+        driver.join(timeout=1)
+        for fd in (master, slave):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        for sock in (daemon_side, bridge_side):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
 def main():
     try:
         return _main()
@@ -701,6 +813,10 @@ def _main():
        test_idle_reap_spares_busy_and_attached)
     ok("platform seams (layout, handshake, posix pty child)",
        test_platform_seams)
+    ok("terminal seam (raw mode, io, SIGWINCH resize)",
+       test_terminal_seam)
+    ok("bridge relay (daemon<->tty, detach key)",
+       test_bridge_relay)
     print(f"\n{PASS}/{PASS + len(FAIL)} unit tests passed")
     if FAIL:
         print("Failed: " + ", ".join(FAIL))
