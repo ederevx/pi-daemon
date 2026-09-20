@@ -115,12 +115,13 @@ function resolveDaemon(): string {
 	return join(process.env.HOME || homedir(), ".local", "bin", "pi-daemon");
 }
 
-/** The control endpoint file, mirroring pi_platform.RuntimeLayout. */
-export function endpointPath(): string {
+/** The control endpoint file, mirroring pi_platform.RuntimeLayout.
+ *  `platform` is injectable so the Windows branches are testable. */
+export function endpointPath(platform: string = process.platform): string {
 	if (process.env.XDG_RUNTIME_DIR) {
 		return join(process.env.XDG_RUNTIME_DIR, "pi-pty-host.sock");
 	}
-	if (process.platform === "win32") {
+	if (platform === "win32") {
 		const base = process.env.TEMP || process.env.TMP || homedir();
 		return join(base, "pi-daemon", "pi-pty-host.sock");
 	}
@@ -129,9 +130,9 @@ export function endpointPath(): string {
 }
 
 /** The daemon's state home for the log path, mirroring RuntimeLayout. */
-export function stateHome(): string {
+export function stateHome(platform: string = process.platform): string {
 	if (process.env.XDG_STATE_HOME) return process.env.XDG_STATE_HOME;
-	if (process.platform === "win32") {
+	if (platform === "win32") {
 		return process.env.LOCALAPPDATA || homedir();
 	}
 	return join(process.env.HOME || homedir(), ".local", "state");
@@ -351,7 +352,7 @@ export class RcBackground {
 	private readonly hold: HandoverHold;
 	private readonly supervisor: DaemonSupervisor;
 
-	/** The only mutable dependency, injected: how to run pi-rc. */
+	/** Owns the OS launcher for pi-rc, built from the injected exec. */
 	private readonly runner: ProcessRunner;
 
 	constructor(

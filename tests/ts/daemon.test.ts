@@ -7,6 +7,7 @@
  */
 
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { test, assert, assertEq, withEnv, scratchDir } from "./harness.ts";
 import {
@@ -79,6 +80,24 @@ test("daemon: layout helpers honor the XDG overrides", async () => {
   await withEnv({ XDG_RUNTIME_DIR: runtime, XDG_STATE_HOME: state }, () => {
     assertEq(endpointPath(), join(runtime, "pi-pty-host.sock"));
     assertEq(stateHome(), state);
+  });
+});
+
+test("daemon: win32 layout mirrors RuntimeLayout", async () => {
+  const local = "C:\\Users\\x\\AppData\\Local";
+  const temp = "C:\\Temp";
+  await withEnv({
+    XDG_RUNTIME_DIR: undefined,
+    XDG_STATE_HOME: undefined,
+    LOCALAPPDATA: local,
+    TEMP: temp,
+  }, () => {
+    assertEq(stateHome("win32"), local);
+    assertEq(endpointPath("win32"),
+      join(temp, "pi-daemon", "pi-pty-host.sock"));
+  });
+  await withEnv({ LOCALAPPDATA: undefined, TEMP: undefined }, () => {
+    assertEq(stateHome("win32"), homedir());
   });
 });
 
