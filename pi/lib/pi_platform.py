@@ -81,6 +81,14 @@ class RuntimeLayout:
                     or os.path.expanduser("~"))
         return os.path.expanduser("~/.local/state")
 
+    def agent_home(self):
+        # The pi agent home: PI_CODING_AGENT_DIR wins, matching install.sh
+        # and the pi runtime, else the conventional ~/.pi/agent.
+        explicit = self.environ.get("PI_CODING_AGENT_DIR")
+        if explicit:
+            return explicit
+        return os.path.expanduser("~/.pi/agent")
+
     def registry_dir(self):
         return os.path.join(self.state_home(), "pi-pty-host")
 
@@ -272,6 +280,31 @@ class ProcessControl:
             os.killpg(pid, signal.SIGKILL)
         except OSError:
             pass
+
+    def resume_command(self):
+        """argv that resumes the latest pi conversation, else starts one.
+
+        POSIX has sh; Windows gets the same fallback through cmd.exe.
+        """
+        if self.platform.startswith("win"):
+            return ["cmd", "/c", "pi -c || pi"]
+        return ["sh", "-c", "pi -c || exec pi"]
+
+    def shell_command(self, command):
+        """argv that runs one shell command string on this platform."""
+        if self.platform.startswith("win"):
+            return [os.environ.get("COMSPEC", "cmd.exe"), "/c", command]
+        return ["bash", "-c", command]
+
+    def group_kwargs(self):
+        """subprocess kwargs that put the child in its own group.
+
+        POSIX gets a new session (so a killpg reaps the command tree);
+        Windows reaps through taskkill /T and needs none.
+        """
+        if self.platform.startswith("win"):
+            return {}
+        return {"start_new_session": True}
 
     def _posix_terminate(self, pid, grace):
         try:

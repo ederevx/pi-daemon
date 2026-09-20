@@ -656,6 +656,19 @@ def test_platform_seams():
     assert_true(win.endpoint_path().endswith("pi-pty-host.sock"))
     assert_true("pi-daemon" in win.endpoint_path())
     assert_true("pi-pty-host" in win.registry_path())
+    # The agent home honors PI_CODING_AGENT_DIR, else ~/.pi/agent.
+    agent = plat.RuntimeLayout(environ={"PI_CODING_AGENT_DIR": "/agent/x"},
+                               platform="linux")
+    assert_eq(agent.agent_home(), "/agent/x")
+    # Shell and resume launchers live in the seam, not in callers.
+    lin = plat.ProcessControl(platform="linux")
+    assert_eq(lin.resume_command(), ["sh", "-c", "pi -c || exec pi"])
+    assert_eq(lin.shell_command("echo hi"), ["bash", "-c", "echo hi"])
+    assert_eq(lin.group_kwargs(), {"start_new_session": True})
+    winp = plat.ProcessControl(platform="win32")
+    assert_eq(winp.resume_command(), ["cmd", "/c", "pi -c || pi"])
+    assert_eq(winp.shell_command("echo hi")[1:], ["/c", "echo hi"])
+    assert_eq(winp.group_kwargs(), {})
     # The token handshake is the transport's only authentication.
     hs = plat.ControlHandshake("tok")
     assert_true(hs.validate({"cmd": "hello", "token": "tok"}))

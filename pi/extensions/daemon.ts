@@ -102,7 +102,7 @@ function bundledPath(relative: string): string {
 
 /** pi-rc: the package-bundled pi/bin/pi-rc next to the extension, else
  *  the installed ~/.local/bin/pi-rc. */
-function resolvePiRc(): string {
+export function resolvePiRc(): string {
 	const bundled = bundledPath(join("..", "bin", "pi-rc"));
 	if (bundled) return bundled;
 	return join(process.env.HOME || homedir(), ".local", "bin", "pi-rc");
@@ -116,7 +116,7 @@ function resolveDaemon(): string {
 }
 
 /** The control endpoint file, mirroring pi_platform.RuntimeLayout. */
-function endpointPath(): string {
+export function endpointPath(): string {
 	if (process.env.XDG_RUNTIME_DIR) {
 		return join(process.env.XDG_RUNTIME_DIR, "pi-pty-host.sock");
 	}
@@ -129,10 +129,10 @@ function endpointPath(): string {
 }
 
 /** The daemon's state home for the log path, mirroring RuntimeLayout. */
-function stateHome(): string {
+export function stateHome(): string {
 	if (process.env.XDG_STATE_HOME) return process.env.XDG_STATE_HOME;
-	if (process.platform === "win32" && process.env.LOCALAPPDATA) {
-		return process.env.LOCALAPPDATA;
+	if (process.platform === "win32") {
+		return process.env.LOCALAPPDATA || homedir();
 	}
 	return join(process.env.HOME || homedir(), ".local", "state");
 }
@@ -194,6 +194,26 @@ function resolveWindowlessPython(): string {
 		}
 	}
 	return base;
+}
+
+/** Launches a bundled Python console script through the OS launcher:
+ *  POSIX execs the shebang'd file directly, while Windows has no shebang
+ *  and must exec the (windowless) interpreter with the file as its first
+ *  argument. One seam so every extension launches scripts identically. */
+export class ProcessRunner {
+	constructor(
+		private readonly exec: (file: string, args: string[]) => Promise<any>,
+		private readonly platform: string = process.platform,
+		private readonly interpreter: () => string = resolveWindowlessPython,
+	) {}
+
+	/** Run `file` with `args` under this platform's launcher. */
+	run(file: string, args: string[]): Promise<any> {
+		if (this.platform === "win32") {
+			return this.exec(this.interpreter(), [file, ...args]);
+		}
+		return this.exec(file, args);
+	}
 }
 
 /** One line of the daemon's announce reply, parsed. */
@@ -332,28 +352,22 @@ export class RcBackground {
 	private readonly supervisor: DaemonSupervisor;
 
 	/** The only mutable dependency, injected: how to run pi-rc. */
-	private readonly exec: (file: string, args: string[]) => Promise<any>;
+	private readonly runner: ProcessRunner;
 
 	constructor(
 		exec: (file: string, args: string[]) => Promise<any>,
 		hold: HandoverHold = new HandoverHold(),
 		supervisor: DaemonSupervisor = new DaemonSupervisor(),
 	) {
-		this.exec = exec;
+		this.runner = new ProcessRunner(exec);
 		this.hold = hold;
 		this.supervisor = supervisor;
 		this.piRc = resolvePiRc();
 	}
 
-	/** Run pi-rc through the OS launcher: POSIX execs the shebang'd
-	 *  script directly, Windows needs the Python interpreter. */
+	/** Run pi-rc through the shared OS launcher. */
 	private runPiRc(args: string[]): Promise<any> {
-		if (process.platform === "win32") {
-			// The windowless twin keeps each short-lived pi-rc call from
-			// flashing a console; pi pipes its stdio, so output still lands.
-			return this.exec(resolveWindowlessPython(), [this.piRc, ...args]);
-		}
-		return this.exec(this.piRc, args);
+		return this.runner.run(this.piRc, args);
 	}
 
 	/** PI_HOSTED_SESSION is the full daemon name ("pi-<base>"); pi-rc's
@@ -659,9 +673,8 @@ export default function (pi: ExtensionAPI) {
 	// manual /reload has no stamp and skips straight out.
 	pi.on("session_start", async (event) => {
 		if (event.reason !== "reload") return;
-		const stateHome = process.env.XDG_STATE_HOME ||
-			`${process.env.HOME || "."}/.local/state`;
-		const diffPath = `${stateHome}/pi-pty-host/extensions-diff.json`;
+		const diffPath = join(stateHome(), "pi-pty-host",
+			"extensions-diff.json");
 		rmSync(diffPath, { force: true });
 	});
 	pi.on("before_agent_start", async (_event, ctx) => {

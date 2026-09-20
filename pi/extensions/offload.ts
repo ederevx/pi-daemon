@@ -54,9 +54,7 @@ import {
 	type TUI,
 	type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { ProcessRunner, resolvePiRc } from "./daemon.ts";
 
 /** pi-rc exit codes: 4 = unreachable before any request landed (safe to
  *  run the task locally); 7 = the request was sent but the outcome is
@@ -150,26 +148,6 @@ function formatResult(ticket: Ticket, output: string): string {
 	return `${header}\n${text}`;
 }
 
-/** The pi-rc binary to shell out to: a repo-checkout sibling wins (so a
- *  working tree validates against its own client), then the installed
- *  copy the installer manages. */
-function resolvePiRc(): string {
-	const here = path.dirname(fileURLToPath(import.meta.url));
-	const candidates = [
-		path.join(here, "..", "bin", "pi-rc"),
-		`${process.env.HOME || "."}/.local/bin/pi-rc`,
-	];
-	for (const candidate of candidates) {
-		try {
-			fs.accessSync(candidate, fs.constants.X_OK);
-			return candidate;
-		} catch {
-			// try the next candidate
-		}
-	}
-	return candidates[candidates.length - 1];
-}
-
 /** The owning session's stable key: the hosted session's short name
  *  when hosted, else the conversation file's stem, else "standalone". */
 export function sessionKeyOf(sessionFile?: string | null): string {
@@ -182,26 +160,20 @@ export function sessionKeyOf(sessionFile?: string | null): string {
 
 /** The pi-rc subprocess surface: one method per client command. */
 export class TicketClient {
-	private readonly exec: (
-		file: string,
-		args: string[],
-	) => Promise<{ code: number; stdout: string; stderr: string; killed: boolean }>;
-
+	private readonly runner: ProcessRunner;
 	private readonly piRc: string;
 
-	constructor(
-		exec: TicketClient["exec"],
-	) {
-		this.exec = exec;
+	constructor(runner: ProcessRunner) {
+		this.runner = runner;
 		this.piRc = resolvePiRc();
 	}
 
 	/** Runs pi-rc and returns its stdout; throws DaemonUnavailable on an
 	 *  unreachable daemon (exit 4) or a failed spawn. */
 	private async run(args: string[], timeoutSeconds?: number): Promise<string> {
-		let result: Awaited<ReturnType<TicketClient["exec"]>>;
+		let result: Awaited<ReturnType<ProcessRunner["run"]>>;
 		try {
-			result = await this.exec(this.piRc, args);
+			result = await this.runner.run(this.piRc, args);
 		} catch (exc) {
 			throw new DaemonUnavailable(`pi-rc failed: ${String(exc)}`);
 		}
@@ -250,7 +222,7 @@ export class TicketClient {
 	 *  best-effort: never throws, cosmetic when the daemon is down. */
 	async setState(session: string, state: string): Promise<void> {
 		try {
-			await this.exec(this.piRc, ["state", session, state]);
+			await this.runner.run(this.piRc, ["state", session, state]);
 		} catch {
 			// State display is best-effort.
 		}
@@ -364,11 +336,11 @@ class DaemonTasks {
 
 
 	constructor(
-		exec: TicketClient["exec"],
+		runner: ProcessRunner,
 		send: DaemonTasks["send"],
 		append: DaemonTasks["append"],
 	) {
-		this.client = new TicketClient(exec);
+		this.client = new TicketClient(runner);
 		this.send = send;
 		this.append = append;
 	}
@@ -950,7 +922,7 @@ class OffloadedBash implements BashOperations {
 }
 export default function (pi: ExtensionAPI) {
 	const exec = (file: string, args: string[]) => pi.exec(file, args);
-	const tasks = new DaemonTasks(exec, (message, options) => {
+	const tasks = new DaemonTasks(new ProcessRunner(exec), (message, options) => {
 		void pi.sendMessage(message, options);
 	}, (customType, data) => {
 		void pi.appendEntry(customType, data);
