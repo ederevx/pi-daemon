@@ -592,6 +592,49 @@ class WindowsPtyBackend:
         return child
 
 
+class _Utf8Chunker:
+    """Holds back an incomplete trailing UTF-8 sequence across writes.
+
+    WriteFile on CONOUT$ with the UTF-8 code page decodes each call, so a
+    multi-byte character split across two relay chunks would be mangled.
+    feed() returns the bytes up to the last complete character and keeps
+    the remainder (at most three bytes) for the next call.
+    """
+
+    def __init__(self):
+        self.pending = b""
+
+    def feed(self, data):
+        buf = self.pending + data
+        cut = self._complete_prefix_length(buf)
+        self.pending = buf[cut:]
+        return buf[:cut]
+
+    def _complete_prefix_length(self, buf):
+        if not buf:
+            return 0
+        index = len(buf) - 1
+        limit = max(0, len(buf) - 4)
+        while index > limit and (buf[index] & 0xC0) == 0x80:
+            index -= 1
+        expected = self._sequence_length(buf[index])
+        if expected == 0 or index + expected <= len(buf):
+            return len(buf)
+        return index
+
+    @staticmethod
+    def _sequence_length(lead):
+        if lead < 0x80:
+            return 1
+        if 0xC0 <= lead < 0xE0:
+            return 2
+        if 0xE0 <= lead < 0xF0:
+            return 3
+        if 0xF0 <= lead < 0xF8:
+            return 4
+        return 0
+
+
 class WindowsConsole:
     """Raw CONIN$/CONOUT$ seam for the Windows pi-rc attach client.
 
@@ -618,6 +661,7 @@ class WindowsConsole:
         self._reader_thread = None
         self._stop = threading.Event()
         self._last_size = None
+        self._chunker = _Utf8Chunker()
 
     # -- TerminalMode interface -------------------------------------------
 
@@ -705,6 +749,9 @@ class WindowsConsole:
         self._reader_thread.start()
 
     def _pump_loop(self):
+        # Capture the socket in a local: _stop_pump closes and clears the
+        # field, and the pump must never dereference a cleared attribute.
+        reader_sock = self._reader_sock
         buffer = ctypes.create_string_buffer(_READ_CHUNK)
         while not self._stop.is_set():
             wait = self._api.lib.WaitForSingleObject(
@@ -718,11 +765,11 @@ class WindowsConsole:
             if not ok or read.value == 0:
                 break
             try:
-                self._reader_sock.sendall(buffer.raw[:read.value])
+                reader_sock.sendall(buffer.raw[:read.value])
             except OSError:
                 break
         try:
-            self._reader_sock.shutdown(socket.SHUT_WR)
+            reader_sock.shutdown(socket.SHUT_WR)
         except OSError:
             pass
 
@@ -775,14 +822,19 @@ class WindowsConsole:
     def write_output(self, data):
         if self._out_handle is None or self._api is None:
             return None
-        buffer = ctypes.create_string_buffer(data, len(data))
-        written = wintypes.DWORD(0)
-        ok = self._api.lib.WriteFile(
-            self._out_handle, buffer, len(data),
-            ctypes.byref(written), None)
-        if not ok:
-            return None
-        return int(written.value)
+        # Consume all input; the chunker holds any incomplete trailing
+        # UTF-8 sequence for the next call so a split character is not
+        # decoded across two WriteFile calls.
+        chunk = self._chunker.feed(data)
+        if chunk:
+            buffer = ctypes.create_string_buffer(chunk, len(chunk))
+            written = wintypes.DWORD(0)
+            ok = self._api.lib.WriteFile(
+                self._out_handle, buffer, len(chunk),
+                ctypes.byref(written), None)
+            if not ok:
+                return None
+        return len(data)
 
     # -- handles ----------------------------------------------------------
 
