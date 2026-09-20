@@ -45,13 +45,13 @@ class FakePi {
   readonly entries: Array<{ kind: string; data: unknown }> = [];
   readonly tools = new Map<string, { name: string; execute?: unknown }>();
   readonly commands = new Map<string, unknown>();
-  readonly execCalls: string[][] = [];
+  readonly execCalls: Array<{ file: string; args: string[] }> = [];
   private readonly wait300 = new Map<string, number>();
 
   constructor(private readonly daemonDown = false) {}
 
-  async exec(_file: string, args: string[]): Promise<ExeResult> {
-    this.execCalls.push(args);
+  async exec(file: string, args: string[]): Promise<ExeResult> {
+    this.execCalls.push({ file, args });
     if (this.daemonDown) return { code: 4, stdout: "", stderr: "down", killed: false };
     const cmd = args[0];
     if (cmd === "ticket-submit") return ok("ticket t-1\n");
@@ -191,6 +191,14 @@ test("offload: bash tool falls back to local execution when the daemon is down",
   const text = out.content.map((b) => (b as { text: string }).text).join("\n");
   assertMatches(text, /fallback-works/);
   assert(pi.execCalls.length > 0, "pi-rc was attempted first");
+  // The file argument is the seam that broke Windows: on POSIX it is the
+  // shebang'd pi-rc, on Windows it must be the Python interpreter (the
+  // Windows branch is covered directly by the daemon.test ProcessRunner
+  // test). The old client ignored `file` and hid the ENOENT.
+  if (process.platform !== "win32") {
+    assert(/(^|[\\/])pi-rc$/.test(pi.execCalls[0].file),
+      `POSIX must exec pi-rc directly, got ${pi.execCalls[0].file}`);
+  }
 });
 
 test("offload: PI_OFFLOAD=off runs bash locally without any daemon traffic", async () => {

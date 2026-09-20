@@ -11,6 +11,9 @@ import { join } from "node:path";
 import { test, assert, assertEq, withEnv, scratchDir } from "./harness.ts";
 import {
   RcBackground,
+  ProcessRunner,
+  endpointPath,
+  stateHome,
   windowlessCandidates,
   default as factory,
 } from "../../pi/extensions/daemon.ts";
@@ -53,6 +56,31 @@ class ExecScript {
     };
   }
 }
+
+test("daemon: ProcessRunner prepends the interpreter on win32 only", () => {
+  const calls: Array<{ file: string; args: string[] }> = [];
+  const exec = async (file: string, args: string[]) => {
+    calls.push({ file, args });
+    return { code: 0, stdout: "", stderr: "", killed: false };
+  };
+  const win = new ProcessRunner(exec, "win32", () => "pythonw.exe");
+  void win.run("C:/repo/pi/bin/pi-rc", ["state", "a", "b"]);
+  assertEq(calls[0].file, "pythonw.exe");
+  assertEq(calls[0].args.join(" "), "C:/repo/pi/bin/pi-rc state a b");
+  const posix = new ProcessRunner(exec, "linux", () => "pythonw.exe");
+  void posix.run("/repo/pi/bin/pi-rc", ["ls"]);
+  assertEq(calls[1].file, "/repo/pi/bin/pi-rc");
+  assertEq(calls[1].args.join(" "), "ls");
+});
+
+test("daemon: layout helpers honor the XDG overrides", async () => {
+  const runtime = join(scratchDir(), "layout-runtime");
+  const state = join(scratchDir(), "layout-state");
+  await withEnv({ XDG_RUNTIME_DIR: runtime, XDG_STATE_HOME: state }, () => {
+    assertEq(endpointPath(), join(runtime, "pi-pty-host.sock"));
+    assertEq(stateHome(), state);
+  });
+});
 
 type TestCtx = {
   sessionManager: { getSessionFile: () => string | null };

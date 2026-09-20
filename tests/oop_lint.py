@@ -174,17 +174,19 @@ def check_extension_format(root: str) -> None:
                 fail(path, "extension module must declare a default export")
 
 
+def _relative_files(directory: str, suffix: str) -> list[str]:
+    """Repo-relative paths of `directory` entries ending in `suffix`."""
+    base = os.path.join(REPO, directory)
+    return [f"{directory}/{name}" for name in sorted(os.listdir(base))
+            if name.endswith(suffix)]
+
+
 def main() -> int:
-    ts_files = [
-        "pi/extensions/daemon.ts",
-        "pi/extensions/offload.ts",
-    ]
-    py_files = [
-        "pi/daemon/pi-daemon",
-        "pi/bin/pi-rc",
-        "pi/lib/pi_platform.py",
-        "pi/lib/pi_conpty.py",
-    ]
+    # Glob so a newly added extension or seam module is covered without
+    # editing this list; the two extension-less scripts are explicit.
+    ts_files = _relative_files("pi/extensions", ".ts")
+    py_files = (["pi/daemon/pi-daemon", "pi/bin/pi-rc"]
+                + _relative_files("pi/lib", ".py"))
     for rel in ts_files:
         check_typescript(os.path.join(REPO, rel))
     for rel in py_files:

@@ -165,11 +165,12 @@ EXT_WATCH_INTERVAL = float(os.environ.get("PI_PTYD_EXT_WATCH_INTERVAL",
 										  "3.0"))
 EXT_WATCH_DEBOUNCE = float(os.environ.get("PI_PTYD_EXT_WATCH_DEBOUNCE",
 										   "4.0"))
+_agent_home = LAYOUT.agent_home()
 _default_watch_roots = [
-	os.path.join(os.path.expanduser("~/.pi/agent"), "extensions"),
-	os.path.join(os.path.expanduser("~/.pi/agent"), "npm"),
-	os.path.join(os.path.expanduser("~/.pi/agent"), "git"),
-	os.path.join(os.path.expanduser("~/.pi/agent"), "settings.json"),
+	os.path.join(_agent_home, "extensions"),
+	os.path.join(_agent_home, "npm"),
+	os.path.join(_agent_home, "git"),
+	os.path.join(_agent_home, "settings.json"),
 ]
 EXT_WATCH_ROOTS = [p for p in os.environ.get(
 	"PI_PTYD_EXT_WATCH_ROOTS", os.pathsep.join(_default_watch_roots)
@@ -653,12 +654,8 @@ class TicketRunner:
 			   "started": time.time(), "finished": None, "exit": None,
 			   "term": None, "truncated": False, "error": None}
 		os.makedirs(self.store.log_dir, exist_ok=True)
-		if os.name == "nt":
-			argv = [os.environ.get("COMSPEC", "cmd.exe"), "/c", command]
-			extra = {}
-		else:
-			argv = ["bash", "-c", command]
-			extra = {"start_new_session": True}
+		argv = PROCESS.shell_command(command)
+		extra = PROCESS.group_kwargs()
 		proc = subprocess.Popen(
 			argv, cwd=cwd,
 			env=env if env else os.environ.copy(),
