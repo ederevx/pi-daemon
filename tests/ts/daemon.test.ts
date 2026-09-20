@@ -30,10 +30,17 @@ class ExecScript {
   ) {}
 
   async run(_file: string, args: string[]): Promise<ExeResult> {
-    this.calls.push(args);
+    // Windows runs pi-rc through the Python interpreter, so the script
+    // path leads the args there; drop it so tests assert commands
+    // uniformly on every platform.
+    const logical =
+      args.length > 0 && /(^|[\\/])pi-rc$/.test(args[0])
+        ? args.slice(1)
+        : args;
+    this.calls.push(logical);
     const spec = this.responses[Math.min(this.index, this.responses.length - 1)];
     this.index++;
-    const r = typeof spec === "function" ? spec(args) : spec;
+    const r = typeof spec === "function" ? spec(logical) : spec;
     return {
       code: r.code ?? 0,
       stdout: r.stdout ?? "",
@@ -67,8 +74,15 @@ function ctx(): TestCtx {
 
 /** Runs fn with a hosted-session env and awaits the body. */
 async function hosted(session: string, fn: () => Promise<void>): Promise<void> {
+  // Point the endpoint at a scratch path so the handover hold never
+  // reaches a real daemon running on the test host.
   await withEnv(
-    { PI_HOSTED_SESSION: session, PI_HOSTED: session ? "1" : "", HOME: "/home/x" },
+    {
+      PI_HOSTED_SESSION: session,
+      PI_HOSTED: session ? "1" : "",
+      HOME: "/home/x",
+      XDG_RUNTIME_DIR: join(scratchDir(), "runtime"),
+    },
     fn,
   );
 }

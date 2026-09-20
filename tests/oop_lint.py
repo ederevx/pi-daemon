@@ -179,6 +179,8 @@ def main() -> int:
     py_files = [
         "pi/daemon/pi-daemon",
         "pi/bin/pi-rc",
+        "pi/lib/pi_platform.py",
+        "pi/lib/pi_conpty.py",
     ]
     for rel in ts_files:
         check_typescript(os.path.join(REPO, rel))

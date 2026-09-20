@@ -51,25 +51,49 @@ def pi_rc(*args, timeout=30):
                           capture_output=True, text=True, timeout=timeout)
 
 
+def read_endpoint():
+    # The runtime endpoint file carries {host, port, token}; the control
+    # transport is loopback TCP with a mandatory hello handshake.
+    with open(SOCK) as fh:
+        return json.load(fh)
+
+
+def control_socket(endpoint):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect((endpoint["host"], endpoint["port"]))
+    s.sendall(json.dumps({"cmd": "hello",
+                          "token": endpoint["token"]}).encode() + b"\n")
+    buf = b""
+    while b"\n" not in buf:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    reply = json.loads(buf.split(b"\n", 1)[0])
+    if not reply.get("ok"):
+        raise OSError("handshake failed")
+    return s
+
+
 def socket_alive():
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(1)
-        s.connect(SOCK)
+        s = control_socket(read_endpoint())
         s.close()
         return True
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
 def wire(req):
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(5)
-    s.connect(SOCK)
+    s = control_socket(read_endpoint())
     s.sendall(json.dumps(req).encode() + b"\n")
     buf = b""
     while b"\n" not in buf:
-        buf += s.recv(65536)
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
     s.close()
     return json.loads(buf.split(b"\n", 1)[0])
 

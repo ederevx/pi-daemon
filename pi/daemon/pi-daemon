@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # pi-ptyd — PTY host daemon for detached pi TUI sessions.
 #
-# The systemd user service runs this daemon as a persistent host for live
-# pi TUI sessions, each on its own PTY (replacing the tmux server used by
-# pi-rc). Clients talk JSON lines over a unix control socket; attach
-# switches the connection into a raw byte bridge with the PTY. Sessions
+# The service runs this daemon as a persistent host for live pi TUI
+# sessions, each on its own PTY (replacing the tmux server used by
+# pi-rc). Clients talk JSON lines over a loopback-TCP control endpoint
+# (127.0.0.1 with a random token published in the runtime endpoint file,
+# the pi-teams teamd pattern); attach switches the connection into a raw
+# byte bridge with the PTY. Sessions
 # are recorded in a registry file so they survive a daemon restart; every
 # recorded session is respawned at startup. A pi started outside the
 # daemon hands its saved session over through the handover request, the
@@ -98,34 +100,50 @@
 # output logs. A daemon restart or shutdown interrupts running tickets
 # (status "lost"); their logs survive until GC.
 #
-# Env: XDG_RUNTIME_DIR (control socket), XDG_STATE_HOME (registry and
-# ticket state).
+# Env: XDG_RUNTIME_DIR (control endpoint), XDG_STATE_HOME (registry and
+# ticket state); on Windows those fall back to %TEMP%/%LOCALAPPDATA%.
 
 import base64
-import fcntl
 import hashlib
 import json
 import os
 import re
-import resource
 import select
 import signal
 import socket
-import struct
 import subprocess
 import sys
 import threading
 import time
-import termios
 
-UID = os.getuid()
-RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % UID
-STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-SOCK_PATH = os.path.join(RUNTIME_DIR, "pi-pty-host.sock")
-REG_DIR = os.path.join(STATE_HOME, "pi-pty-host")
-REG_PATH = os.path.join(REG_DIR, "sessions.json")
-TICKETS_PATH = os.path.join(REG_DIR, "tickets.json")
-TICKET_LOG_DIR = os.path.join(REG_DIR, "tickets")
+
+def _platform_path():
+	# The platform seam ships next to the installed scripts and under
+	# pi/lib in the repo; either location is put on sys.path so the lazy
+	# `from pi_conpty import ...` inside it resolves too.
+	here = os.path.dirname(os.path.abspath(__file__))
+	for cand in (here, os.path.join(here, os.pardir, "lib")):
+		cand = os.path.abspath(cand)
+		if os.path.isfile(os.path.join(cand, "pi_platform.py")):
+			return cand
+	return here
+
+
+sys.path.insert(0, _platform_path())
+import pi_platform
+
+# Control transport: loopback TCP with a random-token hello handshake;
+# the ephemeral port and token are published in the runtime endpoint
+# file (XDG_RUNTIME_DIR on POSIX, %LOCALAPPDATA%/%TEMP% on Windows).
+LAYOUT = pi_platform.RuntimeLayout()
+ENDPOINT = pi_platform.EndpointFile(LAYOUT.endpoint_path())
+PROCESS = pi_platform.ProcessControl()
+SOCK_PATH = LAYOUT.endpoint_path()
+REG_DIR = LAYOUT.registry_dir()
+REG_PATH = LAYOUT.registry_path()
+TICKETS_PATH = LAYOUT.tickets_path()
+TICKET_LOG_DIR = LAYOUT.ticket_log_dir()
+LOG_PATH = LAYOUT.daemon_log_path()
 # Finished tickets expire after TICKET_TTL seconds and the finished set
 # is capped at TICKET_MAX_FINISHED (oldest evicted). Both TTL and the
 # sweep interval are overridable for isolated tests.
@@ -206,17 +224,6 @@ def log(msg):
 	with LOG_LOCK:
 		sys.stderr.write("pi-daemon: %s\n" % msg)
 		sys.stderr.flush()
-
-
-def set_winsize(fd, cols, rows):
-	fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-
-
-def child_sigwinch(pid):
-	try:
-		os.killpg(pid, signal.SIGWINCH)
-	except OSError:
-		pass
 
 
 def kill_socket(client):
@@ -518,11 +525,7 @@ class TicketStore:
 				if rec.get("status") == "running":
 					pid = rec.get("pid")
 					if pid:
-						try:
-							os.killpg(pid, signal.SIGKILL)
-						except OSError:
-							# already exited (or the group vanished)
-							pass
+						PROCESS.signal_kill(pid)
 					rec["status"] = "lost"
 					rec["finished"] = time.time()
 					rec["error"] = "interrupted by daemon restart"
@@ -650,11 +653,17 @@ class TicketRunner:
 			   "started": time.time(), "finished": None, "exit": None,
 			   "term": None, "truncated": False, "error": None}
 		os.makedirs(self.store.log_dir, exist_ok=True)
+		if os.name == "nt":
+			argv = [os.environ.get("COMSPEC", "cmd.exe"), "/c", command]
+			extra = {}
+		else:
+			argv = ["bash", "-c", command]
+			extra = {"start_new_session": True}
 		proc = subprocess.Popen(
-			["bash", "-c", command], cwd=cwd,
+			argv, cwd=cwd,
 			env=env if env else os.environ.copy(),
 			stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-			stderr=subprocess.STDOUT, start_new_session=True, bufsize=0)
+			stderr=subprocess.STDOUT, bufsize=0, **extra)
 		rec["pid"] = proc.pid
 		rec = self.store.add(rec)
 		with self._lock:
@@ -745,18 +754,12 @@ class TicketRunner:
 			# final update lands within a moment; wait for it.
 			self.wait(tid, 5.0)
 			return self.store.get(tid)
-		try:
-			os.killpg(target.pid, signal.SIGTERM)
-		except OSError:
-			pass
+		PROCESS.signal_term(target.pid)
 		deadline = time.time() + KILL_GRACE
 		while time.time() < deadline and target.poll() is None:
 			time.sleep(0.05)
 		if target.poll() is None:
-			try:
-				os.killpg(target.pid, signal.SIGKILL)
-			except OSError:
-				pass
+			PROCESS.signal_kill(target.pid)
 		try:
 			target.wait(timeout=KILL_GRACE)
 		except Exception:
@@ -842,10 +845,7 @@ class TicketRunner:
 			for tid in tids:
 				self._stops.setdefault(tid, "interrupted by daemon shutdown")
 		for proc in procs:
-			try:
-				os.killpg(proc.pid, signal.SIGTERM)
-			except OSError:
-				pass
+			PROCESS.signal_term(proc.pid)
 		deadline = time.time() + KILL_GRACE
 		while time.time() < deadline:
 			with self._lock:
@@ -855,10 +855,7 @@ class TicketRunner:
 		with self._lock:
 			alive = list(self._procs.values())
 		for proc in alive:
-			try:
-				os.killpg(proc.pid, signal.SIGKILL)
-			except OSError:
-				pass
+			PROCESS.signal_kill(proc.pid)
 		for proc in alive:
 			try:
 				proc.wait(timeout=KILL_GRACE)
@@ -981,12 +978,18 @@ class Session:
 	"""One hosted pi: its PTY, its bridge viewers, and the relay loop
 	that owns the master fd."""
 
-	def __init__(self, name, dir_, argv, pid, master_fd):
+	def __init__(self, name, dir_, argv, pid, master_fd, child=None):
 		self.name = name
 		self.dir = dir_
 		self.argv = list(argv)
 		self.pid = pid
 		self.master_fd = master_fd
+		# The PTY seam owns every OS-specific fd/handle operation. A
+		# caller that only exercises the session bookkeeping (unit
+		# tests) may omit it; the POSIX child is then a thin adapter
+		# over the raw pid/fd it was given.
+		self.child = (child if child is not None
+					  else pi_platform.PosixPtyChild(pid, master_fd, PROCESS))
 		self.clients = {}      # bridge sockets -> per-client output buffer
 		self.lock = threading.Lock()
 		self.file = None       # announced pi session file, for revival
@@ -1087,19 +1090,14 @@ class Session:
 	# -- child process / PTY -------------------------------------------------
 
 	def winsize(self):
-		try:
-			pack = fcntl.ioctl(self.master_fd, termios.TIOCGWINSZ,
-							   struct.pack("HHHH", 0, 0, 0, 0))
-			rows, cols = struct.unpack("HHHH", pack)[:2]
-		except OSError:
-			rows, cols = 0, 0
+		rows, cols = self.child.get_winsize()
 		if not (rows > 0 and cols > 0):
 			rows, cols = DEFAULT_ROWS, DEFAULT_COLS
 		return rows, cols
 
 	def resize(self, cols, rows):
-		set_winsize(self.master_fd, cols, rows)
-		child_sigwinch(self.pid)
+		self.child.set_winsize(cols, rows)
+		self.child.signal_winch()
 
 	def nudge_repaint(self, cols, rows):
 		# pi's TUI only repaints when the winsize actually changes (Node
@@ -1109,37 +1107,16 @@ class Session:
 		# change and the child redraws its whole frame. Callers must have
 		# installed the client first: the full-frame repaint pi produces
 		# from the resize is forwarded exclusively to installed clients.
-		try:
-			if rows > 1:
-				set_winsize(self.master_fd, cols, rows - 1)
-			else:
-				set_winsize(self.master_fd, max(cols - 1, 1), rows)
-			time.sleep(0.05)
-		except OSError:
-			pass
-		try:
-			set_winsize(self.master_fd, cols, rows)
-		except OSError:
-			pass
-		child_sigwinch(self.pid)
+		if rows > 1:
+			self.child.set_winsize(cols, rows - 1)
+		else:
+			self.child.set_winsize(max(cols - 1, 1), rows)
+		time.sleep(0.05)
+		self.child.set_winsize(cols, rows)
+		self.child.signal_winch()
 
 	def kill_and_wait(self, grace):
-		try:
-			os.killpg(self.pid, signal.SIGTERM)
-		except OSError:
-			pass
-		deadline = time.time() + grace
-		while time.time() < deadline:
-			try:
-				if os.waitpid(self.pid, os.WNOHANG)[0] == self.pid:
-					return
-			except ChildProcessError:
-				return
-			time.sleep(0.1)
-		try:
-			os.killpg(self.pid, signal.SIGKILL)
-		except OSError:
-			pass
+		self.child.kill_tree(grace)
 
 	def terminate(self, grace=KILL_GRACE):
 		# Mark before the first signal lands so the exit path never
@@ -1178,21 +1155,19 @@ class Session:
 		# (interleaved, like a shared tmux pane). Per-client output buffers
 		# keep one slow viewer from stalling the others or the child; a
 		# client that falls too far behind loses its bridge instead.
-		master = self.master_fd
+		master = self.child.output_handle()
 		pid = self.pid
 		name = self.name
 		to_master = bytearray()
 		dead_input = False
+		status = 0
 		while True:
 			daemon.reap_idle_if_due(self)
 			carry_to = self.carry_to
 			if carry_to is not None:
 				self._transfer_viewers(carry_to)
-			try:
-				reaped = os.waitpid(pid, os.WNOHANG)
-			except ChildProcessError:
-				reaped = (pid, 0)
-			if reaped[0] == pid:
+			reaped, status = self.child.wait_nohang()
+			if reaped:
 				break
 			clients = self._snapshot()
 			rlist = []
@@ -1219,17 +1194,19 @@ class Session:
 			to_master = self._relay_client_input(clients, r, to_master)
 			dead_input = self._relay_child_output(clients, r, dead_input)
 			if master in w:
-				try:
-					sent = os.write(master, bytes(to_master[:65536]))
-					del to_master[:sent]
-				except OSError:
+				written = self.child.write_input(bytes(to_master[:65536]))
+				if written:
+					del to_master[:written]
+				else:
+					# The pty refused the chunk (closed or dead). Drop it so
+					# the always-writable master cannot spin the loop.
 					del to_master[:]
 			self._flush_clients(clients, w)
 		# Child gone: flush whatever is still buffered per client, drop
 		# every bridge, then tear the session down and decide on revival.
 		self.close_bridge()
-		daemon.drop(self, reaped[1])
-		daemon.revive(self, reaped[1])
+		daemon.drop(self, status)
+		daemon.revive(self, status)
 
 	def _snapshot(self):
 		# Snapshot {socket: outbuf}; the session loop is the only writer
@@ -1255,13 +1232,9 @@ class Session:
 		return to_master
 
 	def _relay_child_output(self, clients, ready, dead_input):
-		if self.master_fd not in ready:
+		if self.child.output_handle() not in ready:
 			return dead_input
-		try:
-			data = os.read(self.master_fd, 65536)
-		except OSError:
-			# EIO is the normal PTY read failure after child exit.
-			data = b""
+		data = self.child.read_output(65536)
 		if data:
 			stalled = []
 			with self.lock:
@@ -1307,77 +1280,51 @@ class Session:
 
 
 class SessionSpawner:
-	"""Fork/exec of hosted pi children onto fresh PTYs."""
+	"""Spawns hosted pi children through the platform PTY backend."""
 
-	def __init__(self, table, registry, owner=None):
+	def __init__(self, table, registry, owner=None, backend=None):
 		self.table = table
 		self.registry = registry
 		# owner: the Daemon, injected after construction (the relay loop
 		# needs its drop/revive).
 		self.owner = owner
+		# Resolved on first spawn so the control plane starts even when
+		# no PTY backend is available for this platform.
+		self._backend = backend
+
+	def backend(self):
+		if self._backend is None:
+			self._backend = pi_platform.select_pty_backend()
+		return self._backend
 
 	def spawn(self, name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS,
 			  verb="start", registry_argv=None, refuse_if_exists=False):
-		master, slave = os.openpty()
-		set_winsize(slave, cols, rows)
-		pid = os.fork()
-		if pid == 0:
-			self._exec_child(name, dir_, argv, slave, cols, rows)
-		os.close(slave)
-		sess = Session(name, dir_, argv, pid, master)
+		env = os.environ.copy()
+		env.update({
+			"TERM": "xterm-256color",
+			"COLORTERM": "truecolor",
+			"COLUMNS": str(cols),
+			"LINES": str(rows),
+			"PI_HOSTED": "1",
+			"PI_HOSTED_SESSION": name,
+		})
+		child = self.backend().spawn(argv, dir_, env, cols, rows)
+		sess = Session(name, dir_, argv, child.pid,
+					   getattr(child, "master_fd", -1), child=child)
 		if not self.table.put(sess, refuse_if_exists=refuse_if_exists):
-			# Lost a race for the name: kill and reap our child so
-			# nothing is left behind, and leave the existing session
-			# untouched.
-			try:
-				os.kill(pid, signal.SIGTERM)
-			except OSError:
-				pass
-			try:
-				os.waitpid(pid, 0)
-			except OSError:
-				pass
-			os.close(master)
+			# Lost a race for the name: kill our child so nothing is left
+			# behind, and leave the existing session untouched.
+			child.kill_tree(KILL_GRACE)
+			child.close()
 			log("%s '%s' skipped: name taken during spawn" % (verb, name))
 			return None
 		self.registry.add(name, dir_,
 						  list(registry_argv) if registry_argv else list(argv))
-		log("%s '%s' pid %d in %s" % (verb, name, pid, dir_))
+		log("%s '%s' pid %d in %s" % (verb, name, child.pid, dir_))
 		t = threading.Thread(target=sess.relay_loop, args=(self.owner,),
 							 daemon=True)
 		t.start()
 		return sess
-
-	def _exec_child(self, name, dir_, argv, slave, cols, rows):
-		try:
-			os.setsid()
-			fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
-			os.dup2(slave, 0)
-			os.dup2(slave, 1)
-			os.dup2(slave, 2)
-			# the session's directory is the child's working directory,
-			# like the tmux era's new-session -c <dir>
-			os.chdir(dir_)
-			maxfd = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-			if maxfd == resource.RLIM_INFINITY or maxfd > 65536:
-				maxfd = 65536
-			os.closerange(3, maxfd)
-			env = os.environ.copy()
-			env.update({
-				"TERM": "xterm-256color",
-				"COLORTERM": "truecolor",
-				"COLUMNS": str(cols),
-				"LINES": str(rows),
-				"PI_HOSTED": "1",
-				"PI_HOSTED_SESSION": name,
-			})
-			os.execvpe(argv[0], argv, env)
-		except Exception as exc:
-			try:
-				sys.stderr.write("pi-daemon: exec failed for %s: %s\n" % (name, exc))
-			except Exception:
-				pass
-			os._exit(127)
 
 
 class Daemon:
@@ -1386,6 +1333,12 @@ class Daemon:
 	def __init__(self, registry, sock_path=SOCK_PATH):
 		self.registry = registry
 		self.sock_path = sock_path
+		self.endpoint = pi_platform.EndpointFile(sock_path)
+		self.token = os.urandom(16).hex()
+		self.handshake = pi_platform.ControlHandshake(self.token)
+		self.server = pi_platform.ControlServer(self.endpoint)
+		self.handover_lock = threading.Lock()
+		self.handover_wait = {}
 		self.table = SessionTable()
 		self.ledger = HandoffLedger()
 		self.shutdown_event = threading.Event()
@@ -1397,39 +1350,28 @@ class Daemon:
 	# -- control socket ------------------------------------------------------
 
 	def serve(self):
-		if os.getuid() == 0:
+		if hasattr(os, "getuid") and os.getuid() == 0:
 			log("refusing to run as root")
 			return 1
 		signal.signal(signal.SIGTERM, _on_signal)
 		signal.signal(signal.SIGINT, _on_signal)
 		try:
-			os.unlink(self.sock_path)
-		except FileNotFoundError:
-			pass
+			self.server.bind(self.token)
 		except OSError as exc:
-			log("cannot unlink stale socket %s: %s" % (self.sock_path, exc))
+			log("cannot bind control endpoint %s: %s"
+				% (self.sock_path, exc))
 			return 1
-		srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-		try:
-			srv.bind(self.sock_path)
-			os.chmod(self.sock_path, 0o600)
-			srv.listen(16)
-		except OSError as exc:
-			log("cannot bind %s: %s" % (self.sock_path, exc))
-			return 1
-		log("listening on %s (registry %s)" % (self.sock_path,
-											   self.registry.path))
+		log("listening on %s:%d (endpoint %s, registry %s)"
+			% (self.server.host, self.server.port, self.sock_path,
+			   self.registry.path))
 		self.respawn_from_registry()
 		self.tickets.start()
 		try:
-			self._accept_loop(srv)
+			self._accept_loop(self.server)
 		except SystemExit:
 			pass
 		finally:
-			try:
-				srv.close()
-			except OSError:
-				pass
+			self.server.close()
 		if not self.shutdown_event.is_set():
 			self.shutdown()
 		return 0
@@ -1453,6 +1395,8 @@ class Daemon:
 		try:
 			conn.settimeout(10)
 			reader = LineReader(conn)
+			if not self._handshake(conn, reader):
+				return
 			while not self.shutdown_event.is_set():
 				try:
 					line = reader.readline()
@@ -1478,6 +1422,7 @@ class Daemon:
 				log("control connection error: %r" % (exc,))
 		finally:
 			if not handed_off:
+				self.connection_closed(conn)
 				try:
 					conn.close()
 				except OSError:
@@ -1500,6 +1445,11 @@ class Daemon:
 			return None
 		if cmd == "shutdown":
 			return self.control.shutdown(req)
+		if cmd == "handover":
+			# handover needs the connection itself: with hold, the
+			# daemon hosts the session when this connection reaches EOF
+			# (the handing-over process exited), never by pid probing.
+			return self.control.handover(req, conn)
 		if cmd in _WIRE_COMMANDS:
 			# wire names use dashes; methods use underscores
 			return getattr(self.control, cmd.replace("-", "_"))(req)
@@ -1513,38 +1463,24 @@ class Daemon:
 		self.tickets.stop()
 		sessions = self.table.snapshot()
 		for sess in sessions:
-			try:
-				os.killpg(sess.pid, signal.SIGTERM)
-			except OSError:
-				pass
+			PROCESS.signal_term(sess.pid)
 		deadline = time.time() + KILL_GRACE
 		while time.time() < deadline:
 			alive = False
 			for sess in sessions:
-				try:
-					if os.waitpid(sess.pid, os.WNOHANG)[0] == 0:
-						alive = True
-				except ChildProcessError:
-					pass
+				reaped, _ = sess.child.wait_nohang()
+				if not reaped:
+					alive = True
 			if not alive:
 				break
 			time.sleep(0.1)
 		for sess in sessions:
-			try:
-				os.killpg(sess.pid, signal.SIGKILL)
-			except OSError:
-				pass
+			PROCESS.signal_kill(sess.pid)
 		for sess in sessions:
 			sess.signal_closed()
-			try:
-				os.close(sess.master_fd)
-			except OSError:
-				pass
+			sess.child.close()
 		self.registry.write({})
-		try:
-			os.unlink(self.sock_path)
-		except OSError:
-			pass
+		self.endpoint.remove()
 		os._exit(0)
 
 	# -- session lifecycle -----------------------------------------------------
@@ -1554,13 +1490,30 @@ class Daemon:
 		return self.spawner.spawn(name, dir_, argv, cols, rows, verb,
 								  registry_argv, refuse_if_exists)
 
+	def _handshake(self, conn, reader):
+		# Mandatory first line: the random-token hello that authenticates
+		# the loopback connection before any wire command is served.
+		try:
+			line = reader.readline()
+		except (ValueError, OSError):
+			return False
+		if line is None:
+			return False
+		try:
+			msg = json.loads(line.decode())
+		except (ValueError, UnicodeDecodeError):
+			send_json(conn, self.handshake.reject())
+			return False
+		if not self.handshake.validate(msg):
+			send_json(conn, self.handshake.reject())
+			return False
+		send_json(conn, self.handshake.ack())
+		return True
+
 	def drop(self, sess, code):
 		sess.carry_to = None
 		sess.signal_closed()
-		try:
-			os.close(sess.master_fd)
-		except OSError:
-			pass
+		sess.child.close()
 		dropped = self.table.remove_if(sess)
 		if dropped is not None:
 			self.ledger.repoint_on_drop(dropped)
@@ -1698,16 +1651,32 @@ class Daemon:
 		digest = hashlib.sha256(file.encode()).hexdigest()[:6]
 		return "pi-%s-%s" % (base, digest)
 
-	def handover_thread(self, target, dir_, file, after_pid, message=None):
-		# Wait for the handing-over pi to exit, then host its session file.
-		if after_pid:
-			while not self.shutdown_event.is_set():
-				try:
-					os.kill(after_pid, 0)
-				except OSError:
-					break
-				time.sleep(0.2)
-			time.sleep(0.5)
+	def register_handover(self, conn, target, dir_, file, message):
+		# A handover request parks on its control connection: the client
+		# holds the connection until the handing-over pi exits, so EOF is
+		# the exit signal (connection-EOF liveness). Never a pid probe.
+		# Clear the read timeout: a held handover socket must stay idle
+		# until the handing-over process really exits, not be torn down
+		# by the 10s control-connection timeout.
+		conn.settimeout(None)
+		with self.handover_lock:
+			self.handover_wait[conn] = (target, dir_, file, message)
+
+	def connection_closed(self, conn):
+		with self.handover_lock:
+			pending = self.handover_wait.pop(conn, None)
+		if pending is None:
+			return
+		target, dir_, file, message = pending
+		threading.Thread(target=self.host_handover,
+						 args=(target, dir_, file, message),
+						 daemon=True).start()
+
+	def host_handover(self, target, dir_, file, message=None):
+		# The held control connection reached EOF, so the handing-over pi
+		# has exited; a short settle lets its session file finish flushing
+		# before the daemon resumes it under `pi --session <file>`.
+		time.sleep(0.3)
 		if self.shutdown_event.is_set():
 			return
 		if not os.path.isfile(file):
@@ -1980,10 +1949,11 @@ class Control:
 		# The session thread drops the entry once the reap lands.
 		return {"ok": True}
 
-	def handover(self, req):
+	def handover(self, req, conn=None):
 		file = req.get("file")
 		dir_ = req.get("dir")
 		after_pid = req.get("afterPid")
+		hold = bool(req.get("hold"))
 		message = req.get("message")  # legacy; unused by the current client
 		if not (isinstance(file, str) and file and isinstance(dir_, str) and dir_):
 			return bad_request()
@@ -2000,11 +1970,17 @@ class Control:
 			# Held by a session resuming this exact file already.
 			log("handover '%s' already hosted" % target)
 			return {"ok": True, "verdict": "hosted:%s" % target}
-		t = threading.Thread(
-			target=self.daemon.handover_thread,
-			args=(target, dir_, file, after_pid, message),
-			daemon=True)
-		t.start()
+		if conn is not None and (hold or after_pid is not None):
+			# The client holds this connection until it exits; the daemon
+			# hosts the session when the connection closes.
+			self.daemon.register_handover(conn, target, dir_, file, message)
+			return {"ok": True, "verdict": "target:%s" % target}
+		# No held connection: host now (or once this request's own
+		# connection closes, for a client that does not wait).
+		threading.Thread(
+			target=self.daemon.host_handover,
+			args=(target, dir_, file, message),
+			daemon=True).start()
 		return {"ok": True, "verdict": "target:%s" % target}
 
 	def carry(self, req):

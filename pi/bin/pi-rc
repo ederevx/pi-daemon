@@ -120,14 +120,34 @@ import signal
 import socket
 import subprocess
 import sys
-import termios
 import time
 
-UID = os.getuid()
-RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % UID
-SOCK_PATH = os.path.join(RUNTIME_DIR, "pi-pty-host.sock")
-STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-LOG_PATH = os.path.join(STATE_HOME, "pi-pty-host", "daemon.log")
+
+def _platform_path():
+	# The platform seam ships next to the installed scripts and under
+	# pi/lib in the repo; either location is put on sys.path so the lazy
+	# Windows imports inside it resolve too.
+	here = os.path.dirname(os.path.abspath(__file__))
+	for cand in (here, os.path.join(here, os.pardir, "lib")):
+		cand = os.path.abspath(cand)
+		if os.path.isfile(os.path.join(cand, "pi_platform.py")):
+			return cand
+	return here
+
+
+sys.path.insert(0, _platform_path())
+import pi_platform
+
+# Runtime paths and the control transport are platform seams: POSIX uses
+# XDG_RUNTIME_DIR + a loopback TCP endpoint file; Windows uses
+# %LOCALAPPDATA%/%TEMP%. The .sock name is kept so no state migration is
+# needed (its contents are now {host, port, token}).
+LAYOUT = pi_platform.RuntimeLayout()
+ENDPOINT = pi_platform.EndpointFile(LAYOUT.endpoint_path())
+PROCESS = pi_platform.ProcessControl()
+SOCK_PATH = LAYOUT.endpoint_path()
+STATE_HOME = LAYOUT.state_home()
+LOG_PATH = LAYOUT.daemon_log_path()
 
 DEFAULT_COLS = 120
 DEFAULT_ROWS = 40
@@ -252,22 +272,23 @@ def read_json_line(sock):
 
 
 class DaemonClient:
-	"""Short-lived control connections to the pi-ptyd socket."""
+	"""Short-lived control connections to the daemon endpoint."""
 
 	def __init__(self, sock_path=SOCK_PATH):
 		self.sock_path = sock_path
+		self.control_client = pi_platform.ControlClient(
+			pi_platform.EndpointFile(sock_path))
 
 	def connect(self, timeout=CONTROL_TIMEOUT):
-		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-		sock.settimeout(timeout)
+		# The endpoint file carries the loopback host/port and the token
+		# for the mandatory hello handshake; a missing or refused endpoint
+		# means the daemon is not running.
 		try:
-			sock.connect(self.sock_path)
+			return self.control_client.connect(timeout)
 		except OSError:
-			sock.close()
 			die("background service is not running "
 				"(systemctl --user start pi-daemon)",
 				EXIT_NO_DAEMON)
-		return sock
 
 	def control(self, req, timeout=None):
 		# one JSON-line round-trip on a short-lived control connection;
@@ -287,29 +308,34 @@ class DaemonClient:
 		return resp
 
 	def alive(self):
-		probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 		try:
-			probe.connect(self.sock_path)
-			return True
+			probe = self.control_client.connect(CONTROL_TIMEOUT)
 		except OSError:
 			return False
-		finally:
-			probe.close()
+		probe.close()
+		return True
 
 
 def find_daemon():
 	here = os.path.dirname(os.path.realpath(__file__))
-	cand = os.path.join(here, "pi-ptyd")
-	if os.path.isfile(cand):
-		return cand
-	# fallback: repo layout <repo>/pi/bin/pi-rc -> <repo>/pi/ptyd/pi-ptyd
-	cand = os.path.join(os.path.dirname(here), "ptyd", "pi-ptyd")
-	if os.path.isfile(cand):
-		return cand
+	# installed layout: the daemon next to pi-rc; repo layout:
+	# <repo>/pi/bin/pi-rc -> <repo>/pi/daemon/pi-daemon.
+	candidates = [
+		os.path.join(here, "pi-daemon"),
+		os.path.join(here, "pi-ptyd"),
+		os.path.join(os.path.dirname(here), "daemon", "pi-daemon"),
+		os.path.join(os.path.dirname(here), "ptyd", "pi-ptyd"),
+	]
+	for cand in candidates:
+		if os.path.isfile(cand):
+			return cand
 	return None
 
 
 def restore_tty(saved):
+	# POSIX-only (the attach bridge is not implemented on Windows yet);
+	# the lazy import keeps control-plane commands importable there.
+	import termios
 	try:
 		termios.tcsetattr(0, termios.TCSADRAIN, saved)
 	except termios.error:
@@ -330,11 +356,13 @@ class Bridge:
 		self.status = "lost"
 
 	def run(self):
+		import termios
 		saved = termios.tcgetattr(0)
 		atexit.register(restore_tty, saved)
 		wake_r, wake_w = os.pipe()
 		winch = [False]
-		prev_winch = signal.getsignal(signal.SIGWINCH)
+		prev_winch = (signal.getsignal(signal.SIGWINCH)
+					  if hasattr(signal, "SIGWINCH") else None)
 		self._install_signal_handlers(wake_w, winch)
 		os.set_blocking(0, False)
 		os.set_blocking(1, False)
@@ -344,7 +372,8 @@ class Bridge:
 			self._relay(wake_r, winch)
 		finally:
 			restore_tty(saved)
-			signal.signal(signal.SIGWINCH, prev_winch)
+			if hasattr(signal, "SIGWINCH"):
+				signal.signal(signal.SIGWINCH, prev_winch)
 			os.close(wake_r)
 			os.close(wake_w)
 			self.sock.close()
@@ -364,11 +393,14 @@ class Bridge:
 			# restored
 			raise SystemExit(0)
 
-		signal.signal(signal.SIGWINCH, on_winch)
+		if hasattr(signal, "SIGWINCH"):
+			signal.signal(signal.SIGWINCH, on_winch)
 		signal.signal(signal.SIGTERM, on_term)
-		signal.signal(signal.SIGHUP, on_term)
+		if hasattr(signal, "SIGHUP"):
+			signal.signal(signal.SIGHUP, on_term)
 
 	def _raw_mode(self):
+		import termios
 		attrs = termios.tcgetattr(0)
 		attrs[0] &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK
 					  | termios.ISTRIP | termios.IXON)
@@ -705,11 +737,11 @@ def cmd_daemon_start(_args, client):
 	os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 	logf = open(LOG_PATH, "ab")
 	try:
-		# detach fully: own session, output only to the daemon log
-		subprocess.Popen(
-			["python3", daemon],
-			stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
-			start_new_session=True)
+		# Detach fully: own session, output only to the daemon log. On
+		# Windows the interpreter is its windowless twin so no console
+		# flashes.
+		PROCESS.launch_detached(
+			[PROCESS.windowless_python(sys.executable), daemon], logf)
 	finally:
 		logf.close()
 	deadline = time.time() + DAEMON_START_WAIT
@@ -1019,23 +1051,43 @@ def cmd_handover(args, client):
 	req = {"cmd": "handover", "file": file, "dir": dir_}
 	if after_pid is not None:
 		req["afterPid"] = after_pid
+		req["hold"] = True
 	if message:
 		req["message"] = message
-	resp = client.control(req)
+	sock = client.connect()
+	try:
+		send_json(sock, req)
+		resp, _ = read_json_line(sock)
+	except OSError as exc:
+		sock.close()
+		die("handover failed: %s" % exc, EXIT_AMBIGUOUS)
+	if resp is None:
+		sock.close()
+		die("daemon closed the connection without a response",
+			EXIT_AMBIGUOUS)
 	if not resp.get("ok"):
+		sock.close()
 		die("handover failed: %s" % resp.get("error"))
 	verdict = resp.get("verdict") or ""
 	kind, _, session = verdict.partition(":")
 	if kind == "hosted":
+		sock.close()
 		sys.stderr.write(
 			"pi-rc: '%s' already hosts this session "
 			"(attach: pi-rc attach %s)\n" % (session, short_name(session)))
 		sys.exit(EXIT_HOSTED)
 	if kind != "target":
+		sock.close()
 		die("unexpected handover verdict: %s" % verdict)
 	print("pi-rc: hosting '%s' resumed from %s (attach: pi-rc attach %s; "
 		  "background: /bg)"
 		  % (session, os.path.basename(file), short_name(session)))
+	if after_pid is not None:
+		# Hold the control connection open until the handing-over pi has
+		# exited; closing it is the daemon's exit signal and it hosts the
+		# session then. No pid probe is involved.
+		PROCESS.wait_for_parent_exit(after_pid)
+	sock.close()
 
 
 def cmd_attach(args, client):
