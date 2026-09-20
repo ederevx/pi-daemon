@@ -781,6 +781,23 @@ def test_bridge_relay():
                 pass
 
 
+def test_terminal_contract():
+    # Both terminal implementations must satisfy every method the bridge
+    # drives. WindowsConsole cannot inherit TerminalMode across the
+    # pi_conpty boundary, so duck-typing is the only guard; a missing
+    # wake_fd/writable_fd crashed Windows attach once already.
+    sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
+    import importlib
+    conpty = importlib.import_module("pi_conpty")
+    plat = daemon.pi_platform
+    required = ("enter", "restore", "size", "input_fd", "wake_fd",
+                "writable_fd", "read_input", "write_output", "take_resize")
+    for mode in (plat.PosixTerminal(), conpty.WindowsConsole()):
+        for name in required:
+            assert_true(callable(getattr(mode, name, None)),
+                        "%s missing %s" % (type(mode).__name__, name))
+
+
 def main():
     try:
         return _main()
@@ -817,6 +834,8 @@ def _main():
        test_terminal_seam)
     ok("bridge relay (daemon<->tty, detach key)",
        test_bridge_relay)
+    ok("terminal contract (both implementations)",
+       test_terminal_contract)
     print(f"\n{PASS}/{PASS + len(FAIL)} unit tests passed")
     if FAIL:
         print("Failed: " + ", ".join(FAIL))
