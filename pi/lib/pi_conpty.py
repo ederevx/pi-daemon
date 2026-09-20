@@ -328,11 +328,11 @@ class WindowsPtyChild:
             self._output_write = None
             si_ex, attr_buf = self._make_startupinfo(lib)
             self._create_process(lib, argv, cwd, env, si_ex, attr_buf)
+            self._open_master_fd()
+            self._start_reader()
         except Exception:
             self.close()
             raise
-        self._open_master_fd()
-        self._start_reader()
 
     def _make_pipes(self, lib):
         h_in_read = wintypes.HANDLE()
@@ -342,11 +342,13 @@ class WindowsPtyChild:
         if not lib.CreatePipe(ctypes.byref(h_in_read),
                               ctypes.byref(h_in_write), None, 0):
             _raise_last_error("CreatePipe(input)")
+        # Store each pipe as it is created so a later failure's close()
+        # releases the handles already opened.
+        self._input_read = h_in_read.value
+        self._input_write = h_in_write.value
         if not lib.CreatePipe(ctypes.byref(h_out_read),
                               ctypes.byref(h_out_write), None, 0):
             _raise_last_error("CreatePipe(output)")
-        self._input_read = h_in_read.value
-        self._input_write = h_in_write.value
         self._output_read = h_out_read.value
         self._output_write = h_out_write.value
 
@@ -369,9 +371,11 @@ class WindowsPtyChild:
         if not lib.InitializeProcThreadAttributeList(
                 pointer, 1, 0, ctypes.byref(size)):
             _raise_last_error("InitializeProcThreadAttributeList")
+        # lpValue must be the HPCON value itself, not a pointer to it;
+        # a byref here silently detaches the child from the pseudoconsole.
         update_ok = lib.UpdateProcThreadAttribute(
             pointer, 0, _PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-            ctypes.byref(self._hpc), ctypes.sizeof(wintypes.HANDLE),
+            self._hpc, ctypes.sizeof(wintypes.HANDLE),
             None, None)
         if not update_ok:
             lib.DeleteProcThreadAttributeList(pointer)
@@ -595,6 +599,11 @@ class WindowsPtyChild:
         if self._input_write is not None and self._api is not None:
             self._api.lib.CloseHandle(self._input_write)
         self._input_write = None
+        if self._input_read is not None and self._api is not None:
+            try:
+                self._api.lib.CloseHandle(self._input_read)
+            except Exception:
+                pass
         self._input_read = None
 
     def _close_process_handles(self):

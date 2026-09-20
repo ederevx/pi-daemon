@@ -154,11 +154,35 @@ function resolvePython(): string {
 	return "python3";
 }
 
-/** The windowless Python twin of an interpreter, or the base name. */
+/** The GUI-subsystem twin candidates for a Python interpreter, in
+ *  preference order. Mirrors pi-teams' WindowlessPython mapping so a
+ *  detached daemon never flashes a console window on Windows. */
+export function windowlessCandidates(interpreter: string): string[] {
+	const lower = interpreter.toLowerCase();
+	const candidates: string[] = [];
+	if (lower.endsWith("python.exe")) {
+		candidates.push(
+			interpreter.slice(0, -"python.exe".length) + "pythonw.exe");
+	} else if (lower.endsWith("python3.exe")) {
+		candidates.push(
+			interpreter.slice(0, -"python3.exe".length) + "pythonw.exe");
+	}
+	if (lower === "python" || lower === "python.exe") {
+		candidates.push("pythonw");
+	}
+	if (lower === "py" || lower === "py.exe") candidates.push("pyw");
+	candidates.push("pythonw");
+	return candidates;
+}
+
+/** The windowless Python to launch the detached daemon with: the
+ *  GUI-subsystem twin of the resolved interpreter first, then the
+ *  windowless names, then the interpreter itself as a last resort. */
 function resolveWindowlessPython(): string {
-	const base = process.env.PYTHON || "python";
-	const candidates = [base, "pythonw", "pythonw3", "pyw"];
-	for (const candidate of candidates) {
+	if (process.platform !== "win32") return resolvePython();
+	const base = resolvePython();
+	for (const candidate of windowlessCandidates(base)) {
+		if (candidate === base) continue;
 		try {
 			const probe = spawnSync(candidate, ["-c", "pass"], {
 				stdio: "ignore",
@@ -325,7 +349,9 @@ export class RcBackground {
 	 *  script directly, Windows needs the Python interpreter. */
 	private runPiRc(args: string[]): Promise<any> {
 		if (process.platform === "win32") {
-			return this.exec(resolvePython(), [this.piRc, ...args]);
+			// The windowless twin keeps each short-lived pi-rc call from
+			// flashing a console; pi pipes its stdio, so output still lands.
+			return this.exec(resolveWindowlessPython(), [this.piRc, ...args]);
 		}
 		return this.exec(this.piRc, args);
 	}
