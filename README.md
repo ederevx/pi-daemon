@@ -99,7 +99,9 @@ them, and can uninstall exactly what it installed.
   assigned to the owning session (hosted session name, else the
   conversation file stem), so `daemon_tasks list` shows them and a
   crashed or restarted session re-arms its pending results on
-  `session_start`. The `daemon_tasks` tool exposes the machinery
+  `session_start`. The ticket id carries a short session segment
+  (`t-<seg>-<n>`), so a task names the session it belongs to at a
+  glance without a separate lookup. The `daemon_tasks` tool exposes the machinery
   explicitly: `submit` (fire-and-forget background command), `result`
   (one-go fetch), `watch` (live output via partial updates), and
   `status`, `list`, `cancel`, `remove`, and `reset`. When the daemon is

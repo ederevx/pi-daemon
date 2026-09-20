@@ -110,8 +110,11 @@ def test_ticket_store():
     with store.lock:
         t1 = store.alloc_id_locked()
         t2 = store.alloc_id_locked()
+        t3 = store.alloc_id_locked("host-5e9a")
     assert_eq(t1, "t-1")
     assert_eq(t2, "t-2")
+    # A session segment rides the id; the counter still makes it unique.
+    assert_eq(t3, "t-5e9a-3")
     rec = {"id": t1, "kind": "shell", "status": "running", "command": "x",
            "cwd": "/x", "session": "s", "created": 1.0, "started": 1.0}
     store.add(rec)
@@ -264,7 +267,7 @@ def test_ticket_cancel_and_reset():
     # counter restarted
     r2 = DAEMON.control.ticket_submit(
         {"session": "s1", "cwd": SCRATCH, "command": "printf x"})
-    assert_eq(r2["id"], "t-1")
+    assert_eq(r2["id"], "t-s1-1")
     DAEMON.control.ticket_remove({"id": r2["id"]})
 
 

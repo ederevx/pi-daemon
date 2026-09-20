@@ -8,6 +8,7 @@
  */
 
 import { test, assert, assertEq, assertMatches, scratchDir, waitFor, withEnv } from "./harness.ts";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { sessionKeyOf, default as factory } from "../../pi/extensions/offload.ts";
 
 interface ExeResult {
@@ -223,6 +224,37 @@ test("offload: sessionKeyOf derives the stable owning key", () => {
   });
   withEnv({ PI_HOSTED_SESSION: undefined, PI_SESSION_FILE: undefined }, () => {
     assertEq(sessionKeyOf(null), "standalone");
+  });
+});
+
+test("offload: /daemon-tasks scopes to the command context's session file", async () => {
+  // A non-hosted session has no PI_SESSION_FILE env, so the dock must
+  // take its identity from the command context; otherwise it looks for
+  // the session's tickets under "standalone" and never finds them.
+  await withEnv({ PI_HOSTED_SESSION: undefined, PI_SESSION_FILE: undefined }, async () => {
+    const pi = mount(new FakePi());
+    const def = pi.commands.get("daemon-tasks") as {
+      handler: (args: string, ctx: unknown) => Promise<void>;
+    };
+    assert(typeof def?.handler === "function", "daemon-tasks handler present");
+    initTheme("dark");
+    let dock: { sessionKey?: string } | undefined;
+    const ui = {
+      custom: (
+        factory: (tui: unknown, theme: unknown, kb: unknown, done: (r: null) => void) => unknown,
+      ) => {
+        dock = factory({ requestRender() {} }, null, {}, () => {}) as typeof dock;
+        return Promise.resolve();
+      },
+      notify() {},
+    };
+    await def.handler("", {
+      mode: "tui",
+      ui,
+      sessionManager: { getSessionFile: () => "/x/abc.jsonl" },
+    });
+    assert(dock !== undefined, "dock mounted");
+    assertEq(dock!.sessionKey, "abc");
   });
 });
 
