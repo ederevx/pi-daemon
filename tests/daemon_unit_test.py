@@ -670,7 +670,7 @@ def test_platform_seams():
     winp = plat.ProcessControl(platform="win32")
     assert_eq(winp.resume_command()[-2:], ["-c", "pi -c || exec pi"])
     assert_eq(winp.shell_command("echo hi")[-2:], ["-c", "echo hi"])
-    assert_eq(winp.group_kwargs(), {})
+    assert_true("creationflags" in winp.group_kwargs())
     pinned = plat.ProcessControl(platform="win32",
                                  environ={"PI_SHELL": sys.executable})
     assert_eq(pinned.shell_command("echo hi"),

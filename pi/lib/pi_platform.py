@@ -330,13 +330,17 @@ class ProcessControl:
         return [self.shell_path(shell) or "sh", "-c", command]
 
     def group_kwargs(self):
-        """subprocess kwargs that put the child in its own group.
+        """subprocess kwargs for a detached command child.
 
-        POSIX gets a new session (so a killpg reaps the command tree);
-        Windows reaps through taskkill /T and needs none.
+        POSIX gets its own session so a killpg reaps the tree; Windows
+        gets CREATE_NO_WINDOW so a console child (cmd or bash) never
+        opens a visible console window, mirroring pi-teams' windowsHide
+        on every spawn.
         """
         if self.platform.startswith("win"):
-            return {}
+            import subprocess
+            return {"creationflags":
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)}
         return {"start_new_session": True}
 
     def _posix_terminate(self, pid, grace):
