@@ -146,6 +146,16 @@ def test_ticket_store():
     assert_eq(count, 1)
     with store.lock:
         assert_eq(store.alloc_id_locked(), "t-1")
+    # Snapshot is oldest-first even though ids now carry a session segment
+    # and are not numerically sortable across sessions.
+    store.add({"id": "t-zzz-9", "kind": "shell", "status": "done",
+               "command": "z", "cwd": "/x", "session": "order",
+               "created": 20.0})
+    store.add({"id": "t-aaa-10", "kind": "shell", "status": "done",
+               "command": "a", "cwd": "/x", "session": "order",
+               "created": 10.0})
+    assert_eq([r["id"] for r in store.snapshot("order", "shell")],
+              ["t-aaa-10", "t-zzz-9"])
     # read_range bounds
     log = store.log_path("t-1")
     os.makedirs(store.log_dir, exist_ok=True)
