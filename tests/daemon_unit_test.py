@@ -781,14 +781,18 @@ def test_bridge_relay():
                 pass
 
 
+def _conpty():
+    sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
+    import importlib
+    return importlib.import_module("pi_conpty")
+
+
 def test_terminal_contract():
     # Both terminal implementations must satisfy every method the bridge
     # drives. WindowsConsole cannot inherit TerminalMode across the
     # pi_conpty boundary, so duck-typing is the only guard; a missing
     # wake_fd/writable_fd crashed Windows attach once already.
-    sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
-    import importlib
-    conpty = importlib.import_module("pi_conpty")
+    conpty = _conpty()
     plat = daemon.pi_platform
     required = ("enter", "restore", "size", "input_fd", "wake_fd",
                 "writable_fd", "read_input", "write_output", "take_resize")
@@ -796,6 +800,46 @@ def test_terminal_contract():
         for name in required:
             assert_true(callable(getattr(mode, name, None)),
                         "%s missing %s" % (type(mode).__name__, name))
+
+
+def test_utf8_chunker():
+    # A multi-byte character split across relay chunks must be held back
+    # rather than decoded twice by WriteFile on the UTF-8 console.
+    chunker = _conpty()._Utf8Chunker()
+    assert_eq(chunker.feed(b"ab"), b"ab")
+    assert_eq(chunker.feed(b"\xc3"), b"")
+    assert_eq(chunker.feed(b"\xa9cd"), b"\xc3\xa9cd")
+    assert_eq(chunker.feed(b"x\xe2\x82"), b"x")
+    assert_eq(chunker.feed(b"\xac!"), b"\xe2\x82\xac!")
+    assert_eq(chunker.feed(b"\xff"), b"\xff")
+
+
+class _BoomTerminal:
+    """Terminal whose enter() fails after the seam is opened."""
+
+    def __init__(self):
+        self.restored = False
+
+    def enter(self):
+        raise OSError("boom")
+
+    def restore(self):
+        self.restored = True
+
+
+def test_bridge_enter_failure_restores():
+    term = _BoomTerminal()
+    daemon_side, bridge_side = socket.socketpair()
+    bridge = pi_rc.Bridge(None, bridge_side, "pi-x", terminal=term)
+    raised = False
+    try:
+        bridge.run()
+    except OSError:
+        raised = True
+    finally:
+        daemon_side.close()
+    assert_true(raised, "enter failure did not propagate")
+    assert_true(term.restored, "restore not called after enter failed")
 
 
 def main():
@@ -836,6 +880,9 @@ def _main():
        test_bridge_relay)
     ok("terminal contract (both implementations)",
        test_terminal_contract)
+    ok("utf-8 chunker (split sequences held back)", test_utf8_chunker)
+    ok("bridge restores terminal when enter fails",
+       test_bridge_enter_failure_restores)
     print(f"\n{PASS}/{PASS + len(FAIL)} unit tests passed")
     if FAIL:
         print("Failed: " + ", ".join(FAIL))

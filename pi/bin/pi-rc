@@ -358,10 +358,12 @@ class Bridge:
 		self.status = "lost"
 
 	def run(self):
-		self.terminal.enter()
 		prev = self._install_exit_handlers()
-		self.sock.setblocking(False)
 		try:
+			# enter() is inside the guard: a half-entered terminal (raw
+			# mode, wake pipe, console modes/CP) must still be restored.
+			self.terminal.enter()
+			self.sock.setblocking(False)
 			self._relay()
 		finally:
 			self.terminal.restore()
