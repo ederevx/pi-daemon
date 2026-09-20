@@ -774,11 +774,8 @@ class DaemonTasksDock {
 		// toggles it).
 		const header = (title: string, count: number, section: "session" | "global") => {
 			const caret = section === "global" ? (this.globalExpanded ? "\u25bc" : "\u25b6") : "\u25cf";
-			const suffix = section === "global"
-				? (this.globalExpanded ? "  (tab folds)" : "  (tab expands)")
-				: "";
 			lines.push(truncateToWidth(
-				"  " + this.st.label(`${caret} ${title} (${count})${suffix}`, false), width));
+				"  " + this.st.label(`${caret} ${title} (${count})`, false), width));
 			this.headerMap.push({ y: lines.length, section });
 		};
 		let globalHeaderDone = this.sessionRows.length === 0;
@@ -1173,7 +1170,14 @@ export default function (pi: ExtensionAPI) {
 				cmdCtx.ui?.notify?.("daemon-tasks requires the interactive TUI", "warning");
 				return;
 			}
-			await new DaemonTasksDock(tasks.client, sessionKeyOf(null)).run(cmdCtx.ui);
+			// Identity comes from the command context, not the shell-only
+			// PI_SESSION_FILE env: a non-hosted session has no env key, so
+			// the dock would otherwise look for its tickets under
+			// "standalone" while the tool listed them under the file stem.
+			await new DaemonTasksDock(
+				tasks.client,
+				sessionKeyOf(cmdCtx.sessionManager?.getSessionFile?.()),
+			).run(cmdCtx.ui);
 		},
 	});
 

@@ -443,12 +443,29 @@ class TicketStore:
 			os.fsync(f.fileno())
 		os.replace(tmp, self.path)
 
-	def alloc_id_locked(self):
+	def alloc_id_locked(self, session=None):
 		# Caller holds the lock: ids must strictly increase across the
 		# whole persisted history, so the counter rides the same file.
-		tid = "t-%d" % self._next
+		# A short session segment rides the id itself (t-<seg>-<n>) so a
+		# ticket names the session it belongs to without a separate
+		# lookup; the global counter keeps ids unique across sessions.
+		n = self._next
 		self._next += 1
-		return tid
+		seg = self._session_segment(session)
+		if seg:
+			return "t-%s-%d" % (seg, n)
+		return "t-%d" % n
+
+	@staticmethod
+	def _session_segment(session):
+		# The trailing token of the session key (hosted ``ederevx-5e9a``
+		# -> ``5e9a``, a conversation file stem -> its UUID tail) is short,
+		# stable, and usually unique. The record still stores the full key
+		# for exact filtering; the id segment is for identification.
+		if not session:
+			return ""
+		raw = str(session).rsplit("-", 1)[-1]
+		return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in raw)
 
 	def add(self, rec):
 		with self.lock:
@@ -623,7 +640,7 @@ class TicketRunner:
 			if len(self._procs) >= TICKET_MAX_RUNNING:
 				return None
 		with self.store.lock:
-			tid = self.store.alloc_id_locked()
+			tid = self.store.alloc_id_locked(session)
 		rec = {"id": tid, "kind": "shell", "session": session, "cwd": cwd,
 			   "command": command,
 			   "status": "running", "created": time.time(),

@@ -13,9 +13,9 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def step(name, args):
+def step(name, cmd):
     print(f"== {name} ==")
-    proc = subprocess.run([sys.executable, *args], cwd=REPO)
+    proc = subprocess.run(cmd, cwd=REPO)
     print()
     if proc.returncode != 0:
         print(f"{name}: FAILED ({proc.returncode})")
@@ -27,11 +27,14 @@ def step(name, args):
 def main():
     all_ok = True
     all_ok &= step("OOP + removal lint",
-                   ["tests/oop_lint.py"])
+                   [sys.executable, "tests/oop_lint.py"])
+    all_ok &= step("extension tests (TS)",
+                   ["node", "--experimental-strip-types",
+                    "--experimental-transform-types", "tests/ts/run.ts"])
     all_ok &= step("daemon unit tests",
-                   ["tests/daemon_unit_test.py"])
+                   [sys.executable, "tests/daemon_unit_test.py"])
     all_ok &= step("daemon integration test",
-                   ["tests/daemon_integration_test.py"])
+                   [sys.executable, "tests/daemon_integration_test.py"])
     if not all_ok:
         return 1
     print("all pi-daemon tests passed")
