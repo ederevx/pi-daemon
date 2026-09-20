@@ -745,6 +745,16 @@ class WindowsConsole:
             return None
         return self._input_sock.fileno()
 
+    def wake_fd(self):
+        # Resize has no separate wakeup: the bridge polls take_resize on
+        # every select timeout.
+        return None
+
+    def writable_fd(self):
+        # Console output handles are not select-able on Windows; the
+        # bridge writes directly through write_output.
+        return None
+
     def read_input(self, limit=_READ_CHUNK):
         if self._input_sock is None:
             return None
