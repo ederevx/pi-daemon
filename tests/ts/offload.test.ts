@@ -9,7 +9,8 @@
 
 import { test, assert, assertEq, assertMatches, scratchDir, waitFor, withEnv } from "./harness.ts";
 import { initTheme } from "@earendil-works/pi-coding-agent";
-import { sessionKeyOf, default as factory } from "../../pi/extensions/offload.ts";
+import { sessionKeyOf, TicketClient, default as factory } from "../../pi/extensions/offload.ts";
+import { ProcessRunner } from "../../pi/extensions/daemon.ts";
 
 interface ExeResult {
   code: number;
@@ -221,6 +222,23 @@ test("offload: PI_OFFLOAD=off runs bash locally without any daemon traffic", asy
     assertMatches(text, /direct-ok/);
     assertEq(pi.execCalls.length, 0, "no pi-rc calls when offloading is off");
   });
+});
+
+test("offload: TicketClient routes pi-rc through the win32 interpreter", async () => {
+  const calls: Array<{ file: string; args: string[] }> = [];
+  const runner = new ProcessRunner(
+    async (file, args) => {
+      calls.push({ file, args });
+      return { code: 0, stdout: "", stderr: "", killed: false };
+    },
+    "win32",
+    () => "pythonw.exe",
+  );
+  await new TicketClient(runner).setState("sess", "busy");
+  assertEq(calls.length, 1);
+  assertEq(calls[0].file, "pythonw.exe");
+  assert(/(^|[\\/])pi-rc$/.test(calls[0].args[0]),
+    `interpreter must receive the pi-rc script, got ${calls[0].args[0]}`);
 });
 
 test("offload: sessionKeyOf derives the stable owning key", () => {
