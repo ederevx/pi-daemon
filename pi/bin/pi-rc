@@ -219,6 +219,15 @@ def resolve_dir(dir_arg):
 	return os.path.realpath(dir_)
 
 
+def resume_argv():
+	# Start a hosted session resuming the latest conversation, falling
+	# back to a fresh one when nothing is resumable. POSIX uses sh;
+	# Windows has no sh, so cmd.exe supplies the same fallback.
+	if sys.platform.startswith("win"):
+		return ["cmd", "/c", "pi -c || pi"]
+	return ["sh", "-c", "pi -c || exec pi"]
+
+
 def tty_size(fd=0):
 	# size of the controlling tty; callers without one get the default
 	try:
@@ -599,7 +608,7 @@ class AttachFlow:
 		return resp, rest
 
 	def _recreate(self, sock):
-		argv = ["sh", "-c", "pi -c || exec pi"]
+		argv = resume_argv()
 		send_json(sock, {"cmd": "start", "name": self.session,
 						 "dir": self.dir_, "argv": argv,
 						 "cols": self.cols, "rows": self.rows})
@@ -732,7 +741,7 @@ def cmd_daemon_start(_args, client):
 		return
 	daemon = find_daemon()
 	if daemon is None:
-		die("cannot find the pi-ptyd daemon script next to %s"
+		die("cannot find the pi-daemon script next to %s"
 			% os.path.realpath(__file__))
 	os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 	logf = open(LOG_PATH, "ab")
@@ -783,7 +792,7 @@ def cmd_start(args, client):
 	session = session_for(name, dir_)
 	# default command resumes the latest pi session on disk so
 	# conversations survive the hosted process dying; --fresh starts empty
-	argv = ["pi"] if fresh else ["sh", "-c", "pi -c || exec pi"]
+	argv = ["pi"] if fresh else resume_argv()
 	cols, rows = tty_size(0)
 	resp = client.control({"cmd": "start", "name": session, "dir": dir_,
 						   "argv": argv, "cols": cols, "rows": rows})
@@ -1114,6 +1123,11 @@ def cmd_attach(args, client):
 		i += 1
 	if fresh_new and (name is not None or dir_arg is not None):
 		usage_error("--new takes only [-- <pi args...>]")
+	if sys.platform.startswith("win"):
+		# The control plane works on Windows; the raw attach bridge still
+		# needs the Console input/output seam wired into Bridge.
+		die("attach is not implemented on Windows yet; manage the session "
+			"with 'pi-rc list'/'pi-rc stop' and background with /bg")
 	if not os.isatty(0):
 		die("attach requires a terminal on stdin; run 'pi-rc attach' "
 			"inside a tty (see pi-rc help)")

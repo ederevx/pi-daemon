@@ -9,7 +9,11 @@
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { test, assert, assertEq, withEnv, scratchDir } from "./harness.ts";
-import { RcBackground, default as factory } from "../../pi/extensions/daemon.ts";
+import {
+  RcBackground,
+  windowlessCandidates,
+  default as factory,
+} from "../../pi/extensions/daemon.ts";
 
 interface ExeResult {
   code: number;
@@ -271,4 +275,19 @@ test("daemon: auto /reload is silent and never messages the agent", async () => 
     await reloadHandler({ reason: "reload" });
     assertEq(pi.messages.length, 0, "no stamp, still no message");
   });
+});
+
+test("daemon: windowless python prefers the GUI-subsystem twin", async () => {
+  // A console interpreter would flash a window when the detached daemon
+  // starts; the GUI-subsystem twin must lead the candidate list.
+  assertEq(
+    windowlessCandidates("C:\\Python311\\python.exe")[0],
+    "C:\\Python311\\pythonw.exe",
+    "python.exe maps to its pythonw twin",
+  );
+  assertEq(windowlessCandidates("python3.exe")[0], "pythonw.exe",
+    "python3.exe maps to pythonw.exe");
+  assertEq(windowlessCandidates("py.exe")[0], "pyw", "py.exe maps to pyw");
+  assert(windowlessCandidates("python").includes("pythonw"),
+    "bare python offers pythonw");
 });
