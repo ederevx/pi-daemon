@@ -131,9 +131,12 @@ REMOVED_FILES = [
 
 
 def check_no_subagent_residue(root: str) -> None:
-    for dirpath, _dirs, files in os.walk(root):
-        if "/.git" in dirpath or "/tests" in dirpath:
-            continue
+    for dirpath, dirs, files in os.walk(root):
+        # Prune by path component, not a literal prefix: on Windows the
+        # separator is "\\", so a "/.git" substring check would scan
+        # tests/ (which intentionally contains the removed identifiers)
+        # and fail the lint on every Windows run.
+        dirs[:] = [d for d in dirs if d not in (".git", "tests")]
         for name in files:
             path = os.path.join(dirpath, name)
             if path.endswith((".pyc", ".map")):
