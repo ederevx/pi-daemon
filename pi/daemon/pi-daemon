@@ -488,7 +488,10 @@ class TicketStore:
 					if (session is None or r.get("session") == session)
 					and (kind is None
 						 or r.get("kind", "shell") == kind)]
-		return sorted(recs, key=lambda r: r["id"])
+		# Oldest first. The id carries a session segment, so it is no
+		# longer numerically ordered across sessions; creation time is the
+		# true order, with the id as a stable tiebreaker.
+		return sorted(recs, key=lambda r: (r.get("created", 0), r.get("id", "")))
 
 	def update(self, tid, **fields):
 		# Mutate, persist, and broadcast under one lock; the broadcast
