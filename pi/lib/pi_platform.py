@@ -61,6 +61,14 @@ class RuntimeLayout:
     def is_windows(self):
         return self.platform.startswith("win")
 
+    def _join(self, *parts):
+        # Path syntax follows the declared platform, not the host, so the
+        # seam stays honest when a platform is injected for tests.
+        import ntpath
+        import posixpath
+        module = ntpath if self.is_windows() else posixpath
+        return module.join(*parts)
+
     def runtime_dir(self):
         explicit = self.environ.get("XDG_RUNTIME_DIR")
         if explicit:
@@ -68,7 +76,7 @@ class RuntimeLayout:
         if self.is_windows():
             base = (self.environ.get("TEMP") or self.environ.get("TMP")
                     or os.path.expanduser("~"))
-            return os.path.join(base, "pi-daemon")
+            return self._join(base, "pi-daemon")
         uid = os.getuid() if hasattr(os, "getuid") else 0
         return "/run/user/%d" % uid
 
@@ -90,29 +98,29 @@ class RuntimeLayout:
         return os.path.expanduser("~/.pi/agent")
 
     def registry_dir(self):
-        return os.path.join(self.state_home(), "pi-pty-host")
+        return self._join(self.state_home(), "pi-pty-host")
 
     def endpoint_path(self):
-        return os.path.join(self.runtime_dir(), "pi-pty-host.sock")
+        return self._join(self.runtime_dir(), "pi-pty-host.sock")
 
     def registry_path(self):
-        return os.path.join(self.registry_dir(), "sessions.json")
+        return self._join(self.registry_dir(), "sessions.json")
 
     def tickets_path(self):
-        return os.path.join(self.registry_dir(), "tickets.json")
+        return self._join(self.registry_dir(), "tickets.json")
 
     def ticket_log_dir(self):
-        return os.path.join(self.registry_dir(), "tickets")
+        return self._join(self.registry_dir(), "tickets")
 
     def daemon_log_path(self):
-        return os.path.join(self.registry_dir(), "daemon.log")
+        return self._join(self.registry_dir(), "daemon.log")
 
     def ext_snapshot_path(self):
-        return os.path.join(self.registry_dir(),
-                            "extensions-snapshot.json")
+        return self._join(self.registry_dir(),
+                          "extensions-snapshot.json")
 
     def ext_diff_path(self):
-        return os.path.join(self.registry_dir(), "extensions-diff.json")
+        return self._join(self.registry_dir(), "extensions-diff.json")
 
 
 class EndpointFile:
@@ -246,8 +254,9 @@ class ControlClient:
 class ProcessControl:
     """One portable terminate/kill-tree path and terminal signalling."""
 
-    def __init__(self, platform=None):
+    def __init__(self, platform=None, environ=None):
         self.platform = sys.platform if platform is None else platform
+        self.environ = os.environ if environ is None else environ
 
     def terminate_tree(self, pid, grace):
         if self.platform.startswith("win"):
@@ -284,17 +293,41 @@ class ProcessControl:
     def resume_command(self):
         """argv that resumes the latest pi conversation, else starts one.
 
-        POSIX has sh; Windows gets the same fallback through cmd.exe.
+        One shell path on every platform: bash runs `pi -c` and `exec`
+        replaces it with the interactive pi, so the PTY hosts pi itself.
         """
-        if self.platform.startswith("win"):
-            return ["cmd", "/c", "pi -c || pi"]
-        return ["sh", "-c", "pi -c || exec pi"]
+        return self.shell_command("pi -c || exec pi")
 
-    def shell_command(self, command):
-        """argv that runs one shell command string on this platform."""
-        if self.platform.startswith("win"):
-            return [os.environ.get("COMSPEC", "cmd.exe"), "/c", command]
-        return ["bash", "-c", command]
+    def shell_path(self, explicit=None):
+        """A bash path usable on every platform, resolved once.
+
+        One candidate order serves every platform: an explicit path (pi
+        hands over the shell its settings chose, delivered as PI_SHELL),
+        then bash on PATH, then the conventional install locations
+        (`%ProgramFiles%\\Git\\bin\\bash.exe` and `/bin/bash`), so no
+        platform owns a separate code path. Empty when none exists.
+        """
+        import shutil
+        candidates = [explicit, self.environ.get("PI_SHELL"),
+                      shutil.which("bash"), shutil.which("bash.exe")]
+        for base in (self.environ.get("ProgramFiles"),
+                     self.environ.get("ProgramFiles(x86)")):
+            if base:
+                candidates.append(os.path.join(base, "Git", "bin", "bash.exe"))
+        candidates.append("/bin/bash")
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate):
+                return candidate
+        return ""
+
+    def shell_command(self, command, shell=None):
+        """argv that runs one command string in bash on every platform.
+
+        Bash is resolved the same way everywhere, so an offloaded command
+        runs in the shell pi's local bash tool would have used. The bare
+        `sh` name is the single fallback, matching pi's own last resort.
+        """
+        return [self.shell_path(shell) or "sh", "-c", command]
 
     def group_kwargs(self):
         """subprocess kwargs that put the child in its own group.
