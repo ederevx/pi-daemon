@@ -2,6 +2,9 @@
   "name": "pi-daemon",
   "version": "2.8.0",
   "type": "module",
+  "scripts": {
+    "postinstall": "node scripts/postinstall.mjs"
+  },
   "description": "Persistent background PTY host for the pi coding agent: hosted TUI sessions that survive terminal exit, SSH logout, and reboot.",
   "license": "MIT",
   "author": "Edrick Sinsuan <evcsinsuan@gmail.com>",
@@ -25,6 +28,7 @@
     "pi/daemon/",
     "pi/bin/",
     "pi/lib/",
+    "scripts/",
     "README.md",
     "LICENSE"
   ],
