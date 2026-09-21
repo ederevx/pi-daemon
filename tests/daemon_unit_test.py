@@ -788,6 +788,16 @@ def test_platform_seams():
     assert_eq(hs.reject().get("error"), "bad-handshake")
 
 
+class _RecordingControl:
+    """Stand-in ProcessControl: records SIGWINCH deliveries."""
+
+    def __init__(self):
+        self.winches = []
+
+    def signal_winch(self, pid):
+        self.winches.append(pid)
+
+
 def test_posix_pty_child():
     # POSIX-only: PosixPtyChild reaps through os.waitpid/os.WNOHANG.
     plat = daemon.pi_platform
@@ -796,6 +806,25 @@ def test_posix_pty_child():
     assert_eq(child.output_handle(), -1)
     # 123 is not our child: ChildProcessError means "nothing to reap".
     assert_eq(child.wait_nohang(), (True, 0))
+
+    # Repaint nudge: pi redraws only on a real winsize change, so a
+    # resize at the current size must toggle one row and restore it,
+    # signaling at both ends, exactly like the Windows child.
+    ctrl = _RecordingControl()
+    child = plat.PosixPtyChild(123, -1, control=ctrl)
+    sizes = []
+    child.get_winsize = lambda: (24, 80)
+    child.set_winsize = lambda cols, rows: sizes.append((cols, rows))
+    child.signal_winch()
+    assert_eq(sizes, [(80, 23), (80, 24)])
+    assert_eq(ctrl.winches, [123, 123])
+
+    # An unreadable winsize cannot be toggled: signal once and stop.
+    ctrl.winches = []
+    child.get_winsize = lambda: (0, 0)
+    child.signal_winch()
+    assert_eq(sizes, [(80, 23), (80, 24)])
+    assert_eq(ctrl.winches, [123])
 
 
 class _RecordingClient:
