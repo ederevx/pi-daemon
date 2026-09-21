@@ -70,6 +70,25 @@ class WindowsConPtyTest(unittest.TestCase):
             child.terminate(2)
             child.close()
 
+    def test_winsize_tracks_resize(self):
+        child = self._spawn_echo()
+        try:
+            self.assertEqual(child.get_winsize(), (24, 80))
+            self.assertTrue(child.resize(100, 30))
+            self.assertEqual(child.get_winsize(), (30, 100))
+        finally:
+            child.terminate(2)
+            child.close()
+
+    def test_exit_abnormal_codes(self):
+        child = self._spawn_echo()
+        try:
+            self.assertFalse(child.exit_abnormal(0))
+            self.assertTrue(child.exit_abnormal(1))
+        finally:
+            child.terminate(2)
+            child.close()
+
     def test_available(self):
         from pi_conpty import WindowsPtyBackend
         self.assertTrue(WindowsPtyBackend.available())
