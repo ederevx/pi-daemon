@@ -36,6 +36,7 @@ dest_platform="$local_bin/pi_platform.py"
 dest_conpty="$local_bin/pi_conpty.py"
 dest_unit="$systemd_dir/pi-daemon.service"
 dest_wrapper="$local_bin/pi"
+dest_wrapper_cmd="$local_bin/pi.cmd"
 
 mkdir -p "$pi_home/extensions" "$local_bin" "$systemd_dir" "$state_dir"
 
@@ -84,8 +85,11 @@ mv -f "$dest_unit.tmp.$$" "$dest_unit"
 sed "s|@REAL_PI@|$real_pi|" "$repo_root/pi/bin/pi-wrapper" > "$dest_wrapper.tmp.$$"
 mv -f "$dest_wrapper.tmp.$$" "$dest_wrapper"
 chmod 755 "$dest_wrapper"
+# Windows resolves a bare `pi` through pi.cmd; it delegates to the same bash
+# wrapper, so the guarding logic is not duplicated per platform.
+install_to 755 "$repo_root/pi/bin/pi-wrapper.cmd" "$dest_wrapper_cmd"
 
-owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_extension" "$dest_offload" "$dest_unit" "$dest_platform" "$dest_conpty")
+owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_wrapper_cmd" "$dest_extension" "$dest_offload" "$dest_unit" "$dest_platform" "$dest_conpty")
 {
   printf '{\n'
   printf '  "version": 1,\n'
@@ -104,12 +108,18 @@ owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_extension" "$dest_of
 } > "$manifest.tmp"
 mv "$manifest.tmp" "$manifest"
 
-systemctl --user daemon-reload
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user daemon-reload
 # Enabled by default, matching the codex-remote-control pattern. Linger
 # makes the user manager start at boot; already-enabled linger is a no-op.
 loginctl enable-linger "${USER:-$(id -un)}" 2>/dev/null || \
   echo "install: warning — could not enable linger; the service starts at login only"
 systemctl --user enable --now pi-daemon.service
+else
+  # No systemd (for example Windows/Git Bash): the daemon extension starts
+  # the daemon on demand, so no unit is needed here.
+  echo "install: systemd not present; the daemon starts on demand"
+fi
 
 echo "install: ok"
 echo "  daemon:    $dest_daemon"
@@ -117,6 +127,7 @@ echo "  platform:  $dest_platform"
 echo "  conpty:    $dest_conpty"
 echo "  launcher:  $dest_helper"
 echo "  pi wrap:   $dest_wrapper"
+echo "  pi cmd:    $dest_wrapper_cmd"
 echo "  extension: $dest_extension"
 echo "  offload:   $dest_offload"
 echo "  unit:      $dest_unit"
