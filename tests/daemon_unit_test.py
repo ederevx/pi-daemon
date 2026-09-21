@@ -675,6 +675,12 @@ def test_platform_seams():
                                  environ={"PI_SHELL": sys.executable})
     assert_eq(pinned.shell_command("echo hi"),
               [sys.executable, "-c", "echo hi"])
+    # A launched `pi` is wrapped so the shell resolves the shim (Windows
+    # cannot CreateProcess a bare `pi`) and `"$@"` keeps paths verbatim.
+    assert_eq(pinned.pi_argv(["--session", "C:\\x"])[-2:],
+              ["--session", "C:\\x"])
+    assert_eq(pinned.pi_argv()[2], 'exec pi "$@"')
+    assert_eq(pinned.pi_argv()[3], "pi")
     # The token handshake is the transport's only authentication.
     hs = plat.ControlHandshake("tok")
     assert_true(hs.validate({"cmd": "hello", "token": "tok"}))

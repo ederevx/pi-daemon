@@ -1586,8 +1586,8 @@ class Daemon:
 			return
 		try:
 			spawned = self.spawn(sess.name, sess.dir,
-								 ["pi", "--session", file], verb="revive",
-								 refuse_if_exists=True)
+								 PROCESS.pi_argv(["--session", file]),
+								 verb="revive", refuse_if_exists=True)
 		except OSError as exc:
 			log("revive '%s' failed: %s" % (sess.name, exc))
 			return
@@ -1683,13 +1683,14 @@ class Daemon:
 		if self.table.get(target) is not None:
 			log("handover '%s' skipped: name already hosted" % target)
 			return
-		argv = ["pi", "--session", file]
-		registry_argv = list(argv)
+		args = ["--session", file]
+		registry_argv = PROCESS.pi_argv(args)
 		if message:
 			# Legacy hook kept for protocol compatibility; the
 			# daemon extension no longer sends a continuation
 			# prompt, so hosted handovers start idle at the prompt.
-			argv.append(message)
+			args = args + [message]
+		argv = PROCESS.pi_argv(args)
 		try:
 			spawned = self.spawn(target, dir_, argv, verb="handover",
 								 registry_argv=registry_argv,
@@ -2020,7 +2021,13 @@ class Control:
 		spawned = None
 		if target is None:
 			try:
-				spawned = self.daemon.spawn(new_name, dir_, argv or ["pi"],
+				# A bare `pi` is a shell shim Windows cannot exec
+				# directly; route a default or `pi ...` argv through the
+				# shell seam so the name resolves on every platform.
+				spawn_argv = argv or PROCESS.pi_argv()
+				if argv and argv[0] == "pi":
+					spawn_argv = PROCESS.pi_argv(argv[1:])
+				spawned = self.daemon.spawn(new_name, dir_, spawn_argv,
 											cols, rows, verb="carry",
 											refuse_if_exists=True)
 			except OSError as exc:
@@ -2076,10 +2083,10 @@ class Control:
 		spawned = None
 		if target is None:
 			try:
-				spawned = self.daemon.spawn(new_name, sess.dir,
-											["pi", "--session", file],
-											cols, rows, verb="resume",
-											refuse_if_exists=True)
+				spawned = self.daemon.spawn(
+					new_name, sess.dir,
+					PROCESS.pi_argv(["--session", file]),
+					cols, rows, verb="resume", refuse_if_exists=True)
 			except OSError as exc:
 				log("resume '%s' failed: %s" % (name, exc))
 				return err("spawn-failed")
@@ -2131,7 +2138,8 @@ class Control:
 			if req.get("takeover") and others:
 				handoff, took_over = self.daemon.resolve_takeover(
 					sess, others)
-		self.daemon.registry.set_argv(name, ["pi", "--session", file])
+		self.daemon.registry.set_argv(name,
+							  PROCESS.pi_argv(["--session", file]))
 		log("announce '%s' -> %s" % (name, file))
 		return {"ok": True, "alsoLive": also, "handoff": handoff,
 				"tookOver": took_over}

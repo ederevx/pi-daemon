@@ -531,7 +531,7 @@ class AttachFlow:
 		# invocation and always a fresh conversation unless the caller
 		# passed pi's own resume flags through pi_args.
 		base = session_base(os.path.basename(self.dir_))
-		argv = ["pi"] + pi_args
+		argv = PROCESS.pi_argv(pi_args)
 		sock = self.client.connect()
 		for _ in range(8):
 			self.session = unique_session_name(base, os.getpid(),
@@ -749,7 +749,7 @@ def cmd_start(args, client):
 	session = session_for(name, dir_)
 	# default command resumes the latest pi session on disk so
 	# conversations survive the hosted process dying; --fresh starts empty
-	argv = ["pi"] if fresh else PROCESS.resume_command()
+	argv = PROCESS.pi_argv() if fresh else PROCESS.resume_command()
 	cols, rows = tty_size(0)
 	resp = client.control({"cmd": "start", "name": session, "dir": dir_,
 						   "argv": argv, "cols": cols, "rows": rows})
