@@ -94,11 +94,51 @@ class WindowsConPtyTest(unittest.TestCase):
         self.assertTrue(WindowsPtyBackend.available())
 
 
+class Win32InputModeFilterTest(unittest.TestCase):
+    """Unit coverage for the ConPTY Win32 Input Mode request filter."""
+
+    def setUp(self):
+        from pi_conpty import _Win32InputModeFilter
+        self.filter = _Win32InputModeFilter()
+
+    def test_strips_enable_in_one_chunk(self):
+        data = b"before\x1b[?9001hafter"
+        self.assertEqual(self.filter.feed(data), b"beforeafter")
+
+    def test_strips_disable_in_one_chunk(self):
+        data = b"before\x1b[?9001lafter"
+        self.assertEqual(self.filter.feed(data), b"beforeafter")
+
+    def test_strips_split_at_every_offset(self):
+        for seq in (b"\x1b[?9001h", b"\x1b[?9001l"):
+            for cut in range(len(seq) + 1):
+                filt = self._new_filter()
+                out = filt.feed(seq[:cut]) + filt.feed(seq[cut:])
+                self.assertEqual(out, b"",
+                                 "split at %d leaked %r" % (cut, out))
+
+    def test_forwards_other_sequences(self):
+        data = b"\x1b[?25l\x1b[2J\x1b[?2004h"
+        self.assertEqual(self.filter.feed(data), data)
+
+    def test_forwards_unfinished_non_match(self):
+        self.assertEqual(self.filter.feed(b"\x1b[?900"), b"")
+        self.assertEqual(self.filter.feed(b"x"), b"\x1b[?900x")
+
+    def _new_filter(self):
+        from pi_conpty import _Win32InputModeFilter
+        return _Win32InputModeFilter()
+
+
 def main():
     if sys.platform != "win32":
         print("conpty: skipped (non-Windows)")
         return 0
-    suite = unittest.TestLoader().loadTestsFromTestCase(WindowsConPtyTest)
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite([
+        loader.loadTestsFromTestCase(WindowsConPtyTest),
+        loader.loadTestsFromTestCase(Win32InputModeFilterTest),
+    ])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 
