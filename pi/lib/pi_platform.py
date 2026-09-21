@@ -320,6 +320,18 @@ class ProcessControl:
                 return candidate
         return ""
 
+    def pi_argv(self, args=()):
+        """argv that launches the bundled `pi` with `args` on every
+        platform.
+
+        `pi` is a shell shim, not a program a Windows CreateProcess can
+        resolve by name, so start it through the shell seam: the shell
+        finds `pi`, `exec` replaces itself with it, and `"$@"` passes the
+        arguments verbatim (a Windows path is never mangled).
+        """
+        shell = self.shell_path() or "sh"
+        return [shell, "-c", 'exec pi "$@"', "pi", *args]
+
     def shell_command(self, command, shell=None):
         """argv that runs one command string in bash on every platform.
 

@@ -615,32 +615,49 @@ export class RcBackground {
 		}
 	}
 
-	/** /new and /resume must never terminate or abort the session: pi's
-	 *  in-process switch tears the current session down
+	/** /new and /resume must never terminate or abort a hosted session:
+	 *  pi's in-process switch tears the current session down
 	 *  (session.abort()). In a hosted session, cancel the switch and
 	 *  carry instead — /new onto a fresh hosted session, /resume onto a
 	 *  live holder of the picked conversation or a fresh session
-	 *  resuming the file. Outside hosting — or when the daemon is
-	 *  unreachable — pi's native behavior applies untouched. */
+	 *  resuming the file. If the daemon cannot do it, keep the session
+	 *  and say why: a hosted /resume is never allowed to abort. Outside
+	 *  hosting, pi's native behavior applies untouched. */
 	async beforeSwitch(event: any, ctx: any): Promise<{ cancel: boolean } | void> {
 		const reason = event?.reason;
 		if (reason !== "new" && reason !== "resume") return;
 		const session = this.hostedSession();
 		if (!session) return;
 		try {
+			let failure: string | undefined;
 			if (reason === "resume") {
 				const target = event.targetSessionFile;
 				const current = ctx?.sessionManager?.getSessionFile?.();
-				if (!target || target === current) return { cancel: true };
-				const result = await this.runPiRc(
-					["resume", session, target]);
-				if (result.code !== 0) return;
+				if (target && target !== current) {
+					const result = await this.runPiRc(
+						["resume", session, target]);
+					if (result.code !== 0) {
+						failure = (result.stderr || "").trim()
+							|| `pi-rc resume exit ${result.code}`;
+					}
+				}
 			} else {
-				const result = await this.runPiRc( ["carry", session]);
-				if (result.code !== 0) return;
+				const result = await this.runPiRc(["carry", session]);
+				if (result.code !== 0) {
+					failure = (result.stderr || "").trim()
+						|| `pi-rc carry exit ${result.code}`;
+				}
 			}
-		} catch {
-			return;
+			if (failure) {
+				ctx?.ui?.notify?.(
+					`Could not carry this hosted session (${failure}); ` +
+					"staying here instead of aborting it.", "warning");
+			}
+		} catch (err) {
+			ctx?.ui?.notify?.(
+				`Daemon unreachable for ${reason} ` +
+				`(${err instanceof Error ? err.message : String(err)}); ` +
+				"staying here instead of aborting this session.", "warning");
 		}
 		return { cancel: true };
 	}
