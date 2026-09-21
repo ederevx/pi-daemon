@@ -56,8 +56,14 @@ PASS = 0
 FAIL = []
 
 
-def ok(name, fn):
+def ok(name, fn, posix_only=False, windows_only=False):
     global PASS
+    if posix_only and os.name == "nt":
+        print("  skip " + name + " (POSIX only)")
+        return
+    if windows_only and os.name != "nt":
+        print("  skip " + name + " (Windows only)")
+        return
     try:
         fn()
         PASS += 1
@@ -688,7 +694,11 @@ def test_platform_seams():
     assert_true(not hs.validate({"cmd": "list"}))
     assert_eq(hs.ack().get("ok"), True)
     assert_eq(hs.reject().get("error"), "bad-handshake")
-    # The POSIX PTY child satisfies the seam used by the relay loop.
+
+
+def test_posix_pty_child():
+    # POSIX-only: PosixPtyChild reaps through os.waitpid/os.WNOHANG.
+    plat = daemon.pi_platform
     child = plat.PosixPtyChild(123, -1)
     assert_eq(child.pid, 123)
     assert_eq(child.output_handle(), -1)
@@ -879,12 +889,13 @@ def _main():
     ok("registry round-trip", test_registry)
     ok("ticket store lifecycle", test_ticket_store)
     ok("extension fingerprint/diff", test_ext_fingerprint)
-    ok("exit classification", test_exit_classification)
+    ok("exit classification", test_exit_classification, posix_only=True)
     ok("ticket control (submit/wait/output/list/remove)", test_ticket_control)
     ok("ticket cancel + reset", test_ticket_cancel_and_reset)
     ok("session control (start/list/state/input/detach/stop)", test_session_control)
     ok("reload guard (in-place only, no spawn)", test_reload_guard)
-    ok("reload death is never revived", test_reload_death_not_revived)
+    ok("reload death is never revived", test_reload_death_not_revived,
+       posix_only=True)
     ok("reload same-file re-announce keeps no-spawn guard",
        test_reload_same_file_announce_no_spawn)
     ok("stop/reap discards the conversation file (/resume)",
@@ -897,12 +908,13 @@ def _main():
        test_idle_reap_detects_and_ends_detached_sessions)
     ok("idle reap spares busy and attached sessions",
        test_idle_reap_spares_busy_and_attached)
-    ok("platform seams (layout, handshake, posix pty child)",
+    ok("platform seams (layout, handshake, shell)",
        test_platform_seams)
+    ok("posix pty child seam", test_posix_pty_child, posix_only=True)
     ok("terminal seam (raw mode, io, SIGWINCH resize)",
-       test_terminal_seam)
+       test_terminal_seam, posix_only=True)
     ok("bridge relay (daemon<->tty, detach key)",
-       test_bridge_relay)
+       test_bridge_relay, posix_only=True)
     ok("terminal contract (both implementations)",
        test_terminal_contract)
     ok("utf-8 chunker (split sequences held back)", test_utf8_chunker)
