@@ -4,7 +4,8 @@ it through the REAL pi-rc client over its unix socket, plus raw wire
 requests where pi-rc does not expose an argv override (session start).
 
 Covers: daemon boot, ticket submit/wait/output/list/cancel/reset, session
-start/list/state/input/detach/stop, protocol failures, and clean shutdown.
+start/list/state/input/detach/stop, owned-session and --here dir matching,
+protocol failures, and clean shutdown.
 """
 
 import base64
@@ -46,8 +47,8 @@ def ok(name):
     print("  ok   " + name)
 
 
-def pi_rc(*args, timeout=30):
-    return subprocess.run([sys.executable, PI_RC, *args], env=ENV,
+def pi_rc(*args, timeout=30, cwd=None):
+    return subprocess.run([sys.executable, PI_RC, *args], env=ENV, cwd=cwd,
                           capture_output=True, text=True, timeout=timeout)
 
 
@@ -184,6 +185,23 @@ def _main():
         fail("session announce", r.stderr)
     else:
         ok("session announce")
+    r = pi_rc("owned", cwd=SCRATCH)
+    if r.stdout.strip() != "itest":
+        fail("owned session for cwd", f"out={r.stdout!r} err={r.stderr!r}")
+    else:
+        ok("owned session for cwd")
+    r = pi_rc("ls", "--here", cwd=SCRATCH)
+    if "itest" not in r.stdout:
+        fail("ls --here filters by cwd", r.stdout)
+    else:
+        ok("ls --here filters by cwd")
+    elsewhere = os.path.join(SCRATCH, "elsewhere")
+    os.makedirs(elsewhere, exist_ok=True)
+    r = pi_rc("owned", cwd=elsewhere)
+    if r.stdout.strip():
+        fail("owned empty in another dir", r.stdout)
+    else:
+        ok("owned empty in another dir")
     pi_rc("state", "itest", "idle")
     before = pi_rc("list")
     r = pi_rc("extensions-reload", "--force")

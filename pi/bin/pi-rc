@@ -52,7 +52,17 @@
 #                                       (Ctrl-\ inside an attached session
 #                                       detaches your terminal the same way
 #                                       without touching the hosted pi)
-#   pi-rc ls                            list hosted sessions
+#   pi-rc ls [--here]                   list hosted sessions; --here keeps
+#                                       only those whose directory is this
+#                                       process's own cwd (compared natively,
+#                                       never by the caller's path spelling)
+#   pi-rc owned                         print the directory's daemon-owned
+#                                       session: this cwd, newest real
+#                                       conversation file, busy preferred on
+#                                       a tie; empty when none. Used by the pi
+#                                       wrapper so it compares no paths in
+#                                       shell (Git Bash reports /c/... while
+#                                       the daemon records C:\...)
 #   pi-rc which <file>                  print the short name of the live
 #                                       hosted session backing that pi
 #                                       session file (empty output, exit 0
@@ -169,7 +179,7 @@ USAGE_LINE = "usage: pi-rc <command> [args]; run 'pi-rc help' for details"
 DETACH_KEY = b"\x1c"  # Ctrl-\: pop out of an attached session without exiting pi
 
 # Commands served by main(); ls has a list alias.
-_COMMANDS = ("which", "whichall", "state", "carry", "resume", "start",
+_COMMANDS = ("which", "whichall", "owned", "state", "carry", "resume", "start",
 			 "attach", "announce", "detach", "stop", "handover",
 			 "daemon-start", "daemon-stop",
 			 "input", "extensions-reload",
@@ -783,9 +793,23 @@ def cmd_detach(args, client):
 	print("pi-rc: detached '%s'" % session)
 
 
-def cmd_ls(_args, client):
+def cmd_ls(args, client):
+	# --here filters to this process's own directory using the same
+	# native realpath comparison the daemon uses, so no caller ever
+	# compares path spellings itself (a shell may report "/c/..." where
+	# the daemon recorded "C:\..." on Windows).
+	here = False
+	for arg in args:
+		if arg == "--here":
+			here = True
+		else:
+			usage_error("ls takes only --here")
 	resp = client.control({"cmd": "list"})
 	sessions = resp.get("sessions") or []
+	if here:
+		cwd = os.getcwd()
+		sessions = [s for s in sessions
+					if same_dir(s.get("dir", ""), cwd)]
 	if not sessions:
 		print("pi-rc: no hosted sessions")
 		return
@@ -799,6 +823,44 @@ def cmd_ls(_args, client):
 		print("%s\t%s\tpid %d\t%s\t%s\t%s"
 			  % (short_name(s.get("name", "")), s.get("dir", ""),
 				 s.get("pid", 0), marker, state, file))
+
+
+def pick_owned_session(sessions, cwd):
+	# Pure selection for cmd_owned: the newest real conversation file among
+	# sessions whose dir is cwd (native realpath comparison), busy preferred
+	# on a tie. Returns the session mapping, or None when none qualifies.
+	newest = None
+	newest_mtime = None
+	for s in sessions:
+		if not same_dir(s.get("dir", ""), cwd):
+			continue
+		file = s.get("file")
+		if not file or file == "-":
+			continue
+		try:
+			mtime = os.path.getmtime(file)
+		except OSError:
+			continue
+		state = s.get("state") or "idle"
+		if (newest is None or mtime > newest_mtime
+				or (mtime == newest_mtime and state == "busy")):
+			newest = s
+			newest_mtime = mtime
+	return newest
+
+
+def cmd_owned(args, client):
+	# The directory's daemon-owned session: a live session whose directory
+	# is this process's own cwd (native realpath), backing a real
+	# conversation file, newest first, busy preferred on a tie. Silent
+	# when none. The wrapper delegates here so path comparison stays on
+	# one OS-agnostic implementation (same_dir) instead of shell strings.
+	if args:
+		usage_error("owned takes no arguments")
+	resp = client.control({"cmd": "list"})
+	newest = pick_owned_session(resp.get("sessions") or [], os.getcwd())
+	if newest is not None:
+		print(short_name(newest.get("name", "")))
 
 
 def cmd_which(args, client):
@@ -1271,7 +1333,8 @@ def main():
 	if cmd in ("ls", "list"):
 		cmd_ls(rest, client)
 	elif cmd in _COMMANDS:
-		{"which": cmd_which, "whichall": cmd_whichall, "state": cmd_state,
+		{"which": cmd_which, "whichall": cmd_whichall, "owned": cmd_owned,
+		 "state": cmd_state,
 		 "carry": cmd_carry, "resume": cmd_resume, "start": cmd_start,
 		 "attach": cmd_attach, "announce": cmd_announce,
 		 "detach": cmd_detach, "stop": cmd_stop, "handover": cmd_handover,
