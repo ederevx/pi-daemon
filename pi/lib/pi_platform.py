@@ -474,6 +474,16 @@ class PtyChild:
     def signal_winch(self):
         pass
 
+    def exit_abnormal(self, status):
+        """Whether a reaped status is an abnormal death.
+
+        The child owns its exit-status encoding: a POSIX waitpid status
+        versus a raw Windows exit code. A nonzero code is abnormal on
+        both; PosixPtyChild refines this with the wait-status macros so
+        signal deaths stay distinct from clean quits.
+        """
+        return bool(status)
+
     def wait_nohang(self):
         raise NotImplementedError
 
@@ -532,6 +542,13 @@ class PosixPtyChild(PtyChild):
 
     def signal_winch(self):
         self.control.signal_winch(self.pid)
+
+    def exit_abnormal(self, status):
+        if status and os.WIFSIGNALED(status):
+            return True
+        if status and os.WIFEXITED(status):
+            return os.WEXITSTATUS(status) != 0
+        return False
 
     def wait_nohang(self):
         try:

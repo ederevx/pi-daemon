@@ -209,17 +209,50 @@ def test_ext_fingerprint():
 # --- exit classification --------------------------------------------------
 
 def test_exit_classification():
-    # normal exit 0 -> not abnormal
-    p = subprocess.run(["sh", "-c", "exit 0"])
-    assert_true(not daemon._exit_abnormal(p.returncode if p.returncode < 256 else 0))
-    # nonzero exit -> abnormal
-    p = subprocess.run(["sh", "-c", "exit 7"])
-    assert_true(daemon._exit_abnormal((7 << 8) & 0xFFFF))
-    # signal death -> abnormal
+    # The child owns the status encoding: the POSIX seam refines a
+    # waitpid status (signal or nonzero exit); a clean quit is final.
+    child = daemon.pi_platform.PosixPtyChild(123, -1)
+    assert_true(not child.exit_abnormal(0))
+    assert_true(child.exit_abnormal((7 << 8) & 0xFFFF))
     proc = subprocess.Popen(["sh", "-c", "kill -TERM $$"])
     _, status = os.waitpid(proc.pid, 0)
-    assert_true(daemon._exit_abnormal(status))
     assert_true(os.WIFSIGNALED(status))
+    assert_true(child.exit_abnormal(status))
+
+
+def test_exit_seam():
+    # Every backend exposes exit_abnormal; the base default (nonzero) is
+    # what the Windows backend uses, and the daemon must not classify
+    # status itself.
+    base = daemon.pi_platform.PtyChild()
+    assert_true(not base.exit_abnormal(0))
+    assert_true(base.exit_abnormal(1))
+    assert_true(not hasattr(daemon, "_exit_abnormal"),
+                "exit classification belongs to the child seam")
+
+
+class _RecordingChild(daemon.pi_platform.PtyChild):
+    """Stand-in PTY child: records the resize/repaint calls it receives."""
+
+    def __init__(self):
+        self.sizes = []
+        self.winches = 0
+
+    def set_winsize(self, cols, rows):
+        self.sizes.append((cols, rows))
+
+    def signal_winch(self):
+        self.winches += 1
+
+
+def test_resize_delegates():
+    # Session.resize applies the size and asks the child to repaint; the
+    # platform child owns how that repaint is delivered.
+    child = _RecordingChild()
+    sess = daemon.Session("pi-resize", SCRATCH, ["pi"], 123, -1, child=child)
+    sess.resize(100, 30)
+    assert_eq(child.sizes, [(100, 30)])
+    assert_eq(child.winches, 1)
 
 
 # --- in-process daemon control (tickets + sessions) -----------------------
@@ -890,6 +923,8 @@ def _main():
     ok("ticket store lifecycle", test_ticket_store)
     ok("extension fingerprint/diff", test_ext_fingerprint)
     ok("exit classification", test_exit_classification, posix_only=True)
+    ok("exit seam (base + daemon delegation)", test_exit_seam)
+    ok("session resize delegates to the child", test_resize_delegates)
     ok("ticket control (submit/wait/output/list/remove)", test_ticket_control)
     ok("ticket cancel + reset", test_ticket_cancel_and_reset)
     ok("session control (start/list/state/input/detach/stop)", test_session_control)

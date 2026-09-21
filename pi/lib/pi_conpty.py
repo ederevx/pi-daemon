@@ -64,6 +64,10 @@ DEFAULT_ROWS = 24
 _READ_CHUNK = 65536
 _PUMP_TICK = 0.1
 _KILL_TICK = 0.05
+# ConPTY repaint nudge: a resize event only reaches the child when the
+# pseudoconsole size really changes, so signal_winch toggles one cell and
+# waits this long before restoring the real size.
+_REPAINT_TICK = 0.05
 
 
 # -- ctypes structures (module-private helpers) ----------------------------
@@ -268,6 +272,10 @@ class WindowsPtyChild:
         self._reaped = False
         self._exit_code = 0
         self._closed = False
+        # The ConPTY has no queryable size, so the child remembers the
+        # size it was spawned with and last resized to.
+        self._cols = DEFAULT_COLS
+        self._rows = DEFAULT_ROWS
 
     # -- spawn -------------------------------------------------------------
 
@@ -286,6 +294,7 @@ class WindowsPtyChild:
             self._create_process(lib, argv, cwd, env, si_ex, attr_buf)
             self._open_master_fd()
             self._start_reader()
+            self._cols, self._rows = cols, rows
         except Exception:
             self.close()
             raise
@@ -434,6 +443,7 @@ class WindowsPtyChild:
         if result < 0:
             raise OSError("ResizePseudoConsole failed: 0x%08X"
                           % (result & 0xFFFFFFFF))
+        self._cols, self._rows = cols, rows
         return True
 
     def set_winsize(self, cols, rows):
@@ -443,10 +453,25 @@ class WindowsPtyChild:
             pass
 
     def get_winsize(self):
-        return (0, 0)
+        return (self._rows, self._cols)
 
     def signal_winch(self):
-        pass
+        # A pseudoconsole reports a resize to its child only when the
+        # size actually changes, so an attach or resize at the current
+        # size would stay silent. Toggle one cell, then restore the real
+        # size, so the child always sees a change and repaints.
+        cols, rows = self._cols, self._rows
+        if rows > 1:
+            self.set_winsize(cols, rows - 1)
+        else:
+            self.set_winsize(max(cols - 1, 1), rows)
+        time.sleep(_REPAINT_TICK)
+        self.set_winsize(cols, rows)
+
+    def exit_abnormal(self, status):
+        # GetExitCodeProcess hands back the raw exit code; nonzero means
+        # the child died abnormally (a clean quit is 0).
+        return bool(status)
 
     def wait_nohang(self):
         if self._reaped:
