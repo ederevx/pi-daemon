@@ -326,17 +326,6 @@ def _write_ext_diff(diff):
 	os.replace(tmp, EXT_DIFF_PATH)
 
 
-def _exit_abnormal(status):
-	# waitpid status of an abnormally dying child (signal or nonzero
-	# code); a clean exit is a deliberate quit (Ctrl+D, /quit) and is
-	# final.
-	if status and os.WIFSIGNALED(status):
-		return True
-	if status and os.WIFEXITED(status):
-		return os.WEXITSTATUS(status) != 0
-	return False
-
-
 def _on_signal(_signum, _frame):
 	raise SystemExit(0)
 
@@ -1094,22 +1083,12 @@ class Session:
 		return rows, cols
 
 	def resize(self, cols, rows):
-		self.child.set_winsize(cols, rows)
-		self.child.signal_winch()
-
-	def nudge_repaint(self, cols, rows):
-		# pi's TUI only repaints when the winsize actually changes (Node
-		# fires the resize event on a change), so a reattach at the same
-		# size would stay silent until the user types or resizes. Nudge the
-		# size by one line first so the final size is always seen as a
-		# change and the child redraws its whole frame. Callers must have
-		# installed the client first: the full-frame repaint pi produces
-		# from the resize is forwarded exclusively to installed clients.
-		if rows > 1:
-			self.child.set_winsize(cols, rows - 1)
-		else:
-			self.child.set_winsize(max(cols - 1, 1), rows)
-		time.sleep(0.05)
+		# Apply the size and ask the child to repaint at it. The repaint
+		# mechanism belongs to the child: POSIX delivers SIGWINCH, Windows
+		# toggles the pseudoconsole size so it emits a resize event even
+		# when the size did not change. Callers must have installed the
+		# client first: the full-frame repaint pi produces is forwarded
+		# exclusively to installed clients.
 		self.child.set_winsize(cols, rows)
 		self.child.signal_winch()
 
@@ -1272,7 +1251,7 @@ class Session:
 			with carry_to.lock:
 				carry_to.clients[client] = bytearray(CLEAR_SEQ)
 		rows, cols = self.winsize()
-		carry_to.nudge_repaint(cols, rows)
+		carry_to.resize(cols, rows)
 		log("carried '%s' -> '%s' (%d viewers)"
 			% (self.name, carry_to.name, len(moved)))
 
@@ -1572,7 +1551,7 @@ class Daemon:
 				log("revive '%s' skipped: died after a reload injection"
 					% sess.name)
 				return
-		if not _exit_abnormal(status):
+		if not sess.child.exit_abnormal(status):
 			return
 		if time.time() - sess.spawned_at < MIN_REVIVE_LIFE:
 			log("revive '%s' skipped: lived under %ss"
@@ -1862,7 +1841,7 @@ class Control:
 			log("attach '%s' %dx%d (%d clients)" % (name, cols, rows, nclients))
 		else:
 			log("attach '%s' %dx%d" % (name, cols, rows))
-		sess.nudge_repaint(cols, rows)
+		sess.resize(cols, rows)
 		# Response already sent above; tell conn_thread the connection is
 		# now the bridge and must not be read or written again.
 		return None, True
