@@ -1084,11 +1084,11 @@ class Session:
 
 	def resize(self, cols, rows):
 		# Apply the size and ask the child to repaint at it. The repaint
-		# mechanism belongs to the child: POSIX delivers SIGWINCH, Windows
-		# toggles the pseudoconsole size so it emits a resize event even
-		# when the size did not change. Callers must have installed the
-		# client first: the full-frame repaint pi produces is forwarded
-		# exclusively to installed clients.
+		# mechanism belongs to the child: both seams force a real size
+		# change (POSIX toggles the PTY size around SIGWINCH, Windows the
+		# pseudoconsole size) because pi redraws only on a change. Callers
+		# must have installed the client first: the full-frame repaint pi
+		# produces is forwarded exclusively to installed clients.
 		self.child.set_winsize(cols, rows)
 		self.child.signal_winch()
 
