@@ -220,12 +220,17 @@ def resolve_dir(dir_arg):
 
 
 def tty_size(fd=0):
-	# size of the controlling tty; callers without one get the default
-	try:
-		sz = os.get_terminal_size(fd)
-		return sz.columns, sz.lines
-	except OSError:
-		return DEFAULT_COLS, DEFAULT_ROWS
+	# Size of the controlling tty; callers without one get the default.
+	# Windows resolves fd 0 to the console *input* handle, which
+	# GetConsoleScreenBufferInfo rejects, so fall through to stdout/stderr
+	# (both real console handles) before giving up. POSIX keeps fd 0.
+	for candidate in dict.fromkeys((fd, 1, 2)):
+		try:
+			sz = os.get_terminal_size(candidate)
+			return sz.columns, sz.lines
+		except OSError:
+			continue
+	return DEFAULT_COLS, DEFAULT_ROWS
 
 
 def same_dir(a, b):
@@ -398,6 +403,11 @@ class Bridge:
 		in_fd = self.terminal.input_fd()
 		wake_fd = self.terminal.wake_fd()
 		out_fd = self.terminal.writable_fd()
+		# Push the terminal's real size once on entry: the attach request's
+		# size can be stale (and Windows fd 0 cannot report it), while
+		# take_resize only fires on a later change. Without this the hosted
+		# TUI stays at the size it was created with until the user resizes.
+		self._resize()
 		while True:
 			if self.terminal.take_resize():
 				self._resize()

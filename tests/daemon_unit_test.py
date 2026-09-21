@@ -220,6 +220,27 @@ def test_exit_classification():
     assert_true(child.exit_abnormal(status))
 
 
+def test_tty_size_fallback():
+    # Windows fd 0 is the console input handle, which cannot report a
+    # size; tty_size must fall through to stdout/stderr before the default.
+    real = pi_rc.os.get_terminal_size
+    seen = []
+
+    def fake(fd):
+        seen.append(fd)
+        if fd == 0:
+            raise OSError("fd 0 is not a screen buffer")
+        return os.terminal_size((123, 45))
+
+    pi_rc.os.get_terminal_size = fake
+    try:
+        assert_eq(pi_rc.tty_size(0), (123, 45))
+        assert_eq(seen[0], 0)
+        assert_true(1 in seen, "did not fall through to stdout")
+    finally:
+        pi_rc.os.get_terminal_size = real
+
+
 def test_exit_seam():
     # Every backend exposes exit_abnormal; the base default (nonzero) is
     # what the Windows backend uses, and the daemon must not classify
@@ -924,6 +945,7 @@ def _main():
     ok("extension fingerprint/diff", test_ext_fingerprint)
     ok("exit classification", test_exit_classification, posix_only=True)
     ok("exit seam (base + daemon delegation)", test_exit_seam)
+    ok("tty size falls through to stdout", test_tty_size_fallback)
     ok("session resize delegates to the child", test_resize_delegates)
     ok("ticket control (submit/wait/output/list/remove)", test_ticket_control)
     ok("ticket cancel + reset", test_ticket_cancel_and_reset)
