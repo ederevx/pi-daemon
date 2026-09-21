@@ -127,6 +127,22 @@ them, and can uninstall exactly what it installed.
 
 ## Install
 
+### As a pi package
+
+```bash
+pi install git:github.com/ederevx/pi-daemon@v2.9.9
+```
+
+`npm install` runs `scripts/postinstall.mjs`, which provisions the
+systemd user unit, the `pi-rc` client, the `pi` wrapper, the daemon, and
+the seam modules to the same manual paths, while the extensions load
+from the package clone. Updating the pinned ref re-runs it. Extension
+copies a prior manual install owned are removed so only one loader
+source remains. Restart the service to adopt a new daemon binary:
+`systemctl --user restart pi-daemon`.
+
+### Manually
+
 ```bash
 bash scripts/install.sh
 ```

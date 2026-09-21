@@ -35,6 +35,8 @@ def main():
                    [sys.executable, "tests/daemon_unit_test.py"])
     all_ok &= step("daemon integration test",
                    [sys.executable, "tests/daemon_integration_test.py"])
+    all_ok &= step("install script tests",
+                   [sys.executable, "tests/install_test.py"])
     all_ok &= step("ConPTY backend (skips off Windows)",
                    [sys.executable, "tests/conpty_test.py"])
     if not all_ok:
