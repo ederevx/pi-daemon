@@ -96,6 +96,44 @@ def test_names():
     assert_true(len(name) > len("pi-base-"), "hash suffix present")
 
 
+def test_owned_selection():
+    base = os.path.join(SCRATCH, "owned")
+    other = os.path.join(SCRATCH, "owned-other")
+    os.makedirs(base, exist_ok=True)
+    os.makedirs(other, exist_ok=True)
+
+    def touch(name, mtime):
+        path = os.path.join(base, name)
+        with open(path, "w") as f:
+            f.write("x")
+        os.utime(path, (mtime, mtime))
+        return path
+
+    old = touch("old.jsonl", 1000)
+    new = touch("new.jsonl", 2000)
+    sessions = [
+        {"name": "pi-a", "dir": base, "file": old, "state": "busy"},
+        {"name": "pi-b", "dir": base, "file": new, "state": "idle"},
+        {"name": "pi-c", "dir": other, "file": new, "state": "busy"},
+        {"name": "pi-d", "dir": base, "file": "-", "state": "busy"},
+        {"name": "pi-e", "dir": base,
+         "file": os.path.join(base, "missing.jsonl"), "state": "busy"},
+    ]
+    picked = pi_rc.pick_owned_session(sessions, base)
+    assert_true(picked is not None, "a candidate was picked")
+    assert_eq(picked["name"], "pi-b", "newest same-dir real file wins")
+    tie = touch("tie.jsonl", 3000)
+    tied = [
+        {"name": "pi-x", "dir": base, "file": tie, "state": "idle"},
+        {"name": "pi-y", "dir": base, "file": tie, "state": "busy"},
+    ]
+    assert_eq(pi_rc.pick_owned_session(tied, base)["name"], "pi-y",
+              "busy wins an mtime tie")
+    assert_true(pi_rc.pick_owned_session(
+        [{"name": "pi-c", "dir": other, "file": new, "state": "busy"}],
+        base) is None, "no same-dir candidate")
+
+
 # --- registry -------------------------------------------------------------
 
 def test_registry():
@@ -940,6 +978,8 @@ def main():
 
 def _main():
     ok("pi-rc name helpers", test_names)
+    ok("owned-session selection (native dir, newest, busy tie)",
+       test_owned_selection)
     ok("registry round-trip", test_registry)
     ok("ticket store lifecycle", test_ticket_store)
     ok("extension fingerprint/diff", test_ext_fingerprint)
