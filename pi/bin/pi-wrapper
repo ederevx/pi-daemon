@@ -66,17 +66,31 @@ guard_attach() {
 # Prints the absolute session file, or nothing when the target cannot be
 # determined outside pi (findMostRecentSession comes from pi's own
 # session-manager.js, located by walking up from the real pi binary).
+# Both the cwd (process.cwd()) and the pi install layout are resolved
+# natively and by candidate layout, never from a shell-spelled path, so
+# this is identical on POSIX and Windows (Git Bash passes "/c/..." where
+# pi recorded "C:\\...", and npm installs a shim beside node_modules
+# rather than a symlink into the package).
 guard_resolve_file() {
 	node --input-type=module -e '
 import { closeSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
-const [mode, arg, cwd] = process.argv.slice(2);
-let dir = dirname(realpathSync(process.argv[1])), sm = null;
-for (let i = 0; i < 8 && dir !== dirname(dir); i++) {
-	try { sm = join(dir, "dist", "core", "session-manager.js"); statSync(sm); break; }
-	catch { sm = null; dir = dirname(dir); }
+const [mode, arg] = process.argv.slice(2);
+const cwd = process.cwd();
+const SM_RELS = [
+	["dist", "core", "session-manager.js"],
+	["node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "session-manager.js"],
+	["lib", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "session-manager.js"],
+];
+let sm = null, probe = dirname(realpathSync(process.argv[1]));
+for (let i = 0; i < 8 && probe !== dirname(probe) && !sm; i++) {
+	for (const rel of SM_RELS) {
+		const cand = join(probe, ...rel);
+		try { statSync(cand); sm = cand; break; } catch { /* try next layout */ }
+	}
+	probe = dirname(probe);
 }
 if (!sm) process.exit(0);
 const { findMostRecentSession } = await import(pathToFileURL(sm).href);
@@ -113,7 +127,7 @@ if (mode === "continue") {
 	} catch { file = null; }
 }
 process.stdout.write(file || "");
-' "$REAL_PI" "$1" "$2" "$(pwd -P)" 2>/dev/null || true
+' "$REAL_PI" "$1" "$2" 2>/dev/null || true
 }
 
 # Guard entry: attach when the requested resume flags target a live hosted
@@ -143,14 +157,13 @@ guard_check() {
 		# otherwise warn that the picker may duplicate a live session and
 		# degrade open — daemon's post-resume notice catches that.
 		local -a names=() files=() states=()
-		local name dir _pid _marker state file
-		while IFS=$'\t' read -r name dir _pid _marker state file; do
-			[[ $dir == "$(pwd -P)" ]] || continue
+		local name _dir _pid _marker state file
+		while IFS=$'\t' read -r name _dir _pid _marker state file; do
 			if [[ -z $file || $file == "-" ]]; then
 				file="-"
 			fi
 			names+=("$name"); files+=("$file"); states+=("$state")
-		done < <("$PI_RC" ls 2>/dev/null)
+		done < <("$PI_RC" ls --here 2>/dev/null)
 		if (( ${#names[@]} == 1 )); then
 			guard_attach "${names[0]}" || return 1
 			return 0
@@ -197,17 +210,11 @@ guard_check() {
 # attached. Prints the chosen name, or nothing when a fresh start is
 # wanted (no candidates, or candidates whose files all vanished).
 owned_session() {
-	local name dir _pid _marker state file newest="" newest_file="" f
-	while IFS=$'\t' read -r name dir _pid _marker state file; do
-		[[ $dir == "$(pwd -P)" && -n $file && $file != "-" ]] || continue
-		[[ -f $file ]] || continue
-		f=$(stat -c %Y -- "$file" 2>/dev/null) || continue
-		if [[ -z $newest_file || $f -gt $newest_file \
-			|| ( $f -eq $newest_file && $state == busy ) ]]; then
-			newest=$name; newest_file=$f
-		fi
-	done < <("$PI_RC" ls 2>/dev/null)
-	printf '%s' "$newest"
+	# The daemon resolves the directory match with the same native
+	# realpath comparison it uses (pi-rc owned), so the wrapper never
+	# compares path spellings: a shell may report "/c/..." while the
+	# daemon recorded "C:\\..." on Windows.
+	"$PI_RC" owned 2>/dev/null || true
 }
 
 # A wrapper-level flag, not a pi flag: force a fresh conversation in a
