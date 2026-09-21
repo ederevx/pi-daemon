@@ -26,6 +26,11 @@ import socket
 import sys
 import time
 
+# A repaint nudge waits this long between toggling the PTY size and
+# restoring it, so the child processes the intermediate size change
+# before the real one.
+_REPAINT_TICK = 0.05
+
 
 def send_json(sock, obj):
     """Write one JSON line to a control socket."""
@@ -472,7 +477,13 @@ class PtyChild:
         return (0, 0)
 
     def signal_winch(self):
-        pass
+        """Ask the child to repaint.
+
+        A TUI redraws only when its winsize really changes, so an
+        implementation must force one even when the requested size
+        equals the current size: POSIX toggles the PTY size around
+        SIGWINCH, Windows toggles the pseudoconsole size.
+        """
 
     def exit_abnormal(self, status):
         """Whether a reaped status is an abnormal death.
@@ -541,6 +552,25 @@ class PosixPtyChild(PtyChild):
         return (rows, cols)
 
     def signal_winch(self):
+        # A bare SIGWINCH is not enough: Node emits the tty resize event
+        # that drives pi's repaint only when the winsize really changes,
+        # so a resize or attach at the current size would stay silent.
+        # Toggle one row, pause, then restore the real size, so the child
+        # always sees a change and redraws its whole frame. The Windows
+        # child does the same through the pseudoconsole, so the daemon
+        # carries no OS branch for the repaint.
+        rows, cols = self.get_winsize()
+        if rows <= 0 or cols <= 0:
+            # The winsize is unknown (ioctl failed): nothing to toggle.
+            self.control.signal_winch(self.pid)
+            return
+        if rows > 1:
+            self.set_winsize(cols, rows - 1)
+        else:
+            self.set_winsize(max(cols - 1, 1), rows)
+        self.control.signal_winch(self.pid)
+        time.sleep(_REPAINT_TICK)
+        self.set_winsize(cols, rows)
         self.control.signal_winch(self.pid)
 
     def exit_abnormal(self, status):
