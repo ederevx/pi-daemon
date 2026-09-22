@@ -200,7 +200,12 @@ class ControlServer:
 
     def bind(self, token):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if sys.platform == "win32":
+            # Windows SO_REUSEADDR permits double binds, which let a stale
+            # probe steal the endpoint; claim the port exclusively instead.
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             srv.bind((self.host, 0))
             srv.listen(16)
