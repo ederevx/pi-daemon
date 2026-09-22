@@ -316,6 +316,13 @@ class ProcessControl:
         then bash on PATH, then the conventional install locations
         (`%ProgramFiles%\\Git\\bin\\bash.exe` and `/bin/bash`), so no
         platform owns a separate code path. Empty when none exists.
+
+        A candidate that is the WSL launcher (`bash.exe` in the Windows
+        system directory) is rejected: it runs the command inside the
+        default Linux distro, where the Windows-hosted pi chain does not
+        exist, so any session started through it dies with 127. This is
+        the only bash a native-Windows PATH resolves, so it must fall
+        through to the next candidate instead.
         """
         import shutil
         candidates = [explicit, self.environ.get("PI_SHELL"),
@@ -326,9 +333,46 @@ class ProcessControl:
                 candidates.append(os.path.join(base, "Git", "bin", "bash.exe"))
         candidates.append("/bin/bash")
         for candidate in candidates:
-            if candidate and os.path.isfile(candidate):
+            if candidate and os.path.isfile(candidate) \
+                    and not self._is_wsl_stub(candidate):
                 return candidate
         return ""
+
+    def _is_wsl_stub(self, path):
+        """Whether a bash candidate is the WSL launcher stub.
+
+        Windows ships `bash.exe` beside cmd.exe in the system directory
+        as the WSL entry point; it execs into the default Linux distro.
+        A hosted session needs a Windows-side bash whose children can
+        reach the Windows pi wrapper, npm shim, and node, so the stub is
+        never an acceptable resolution and the next candidate wins.
+        Applies to every candidate including an explicit override: the
+        stub cannot host a Windows session at all, so honoring it would
+        only guarantee a 127.
+        """
+        root = self._env_value("SystemRoot", "windir")
+        if not root:
+            return False
+        probe = os.path.normcase(os.path.abspath(path))
+        for sub in ("System32", "Sysnative"):
+            stub = os.path.normcase(os.path.abspath(
+                os.path.join(root, sub, "bash.exe")))
+            if probe == stub:
+                return True
+        return False
+
+    def _env_value(self, *names):
+        """First environ value matching any name, case-insensitively.
+
+        os.environ is a case-insensitive mapping, but a copied plain
+        dict (as the daemon passes) is not, and the block's casing is
+        not under our control.
+        """
+        lowered = {name.lower() for name in names}
+        for key, value in self.environ.items():
+            if key.lower() in lowered:
+                return value
+        return None
 
     def pi_argv(self, args=()):
         """argv that launches the bundled `pi` with `args` on every
