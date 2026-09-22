@@ -170,8 +170,10 @@ export class TicketClient {
 	}
 
 	/** Runs pi-rc and returns its stdout; throws DaemonUnavailable on an
-	 *  unreachable daemon (exit 4) or a failed spawn. */
-	private async run(args: string[], timeoutSeconds?: number): Promise<string> {
+	 *  unreachable daemon (exit 4) or a failed spawn. The daemon caps a
+	 *  ticket-wait round trip itself (TICKET_MAX_WAIT), so no
+	 *  client-side timeout is layered on top. */
+	private async run(args: string[]): Promise<string> {
 		let result: Awaited<ReturnType<ProcessRunner["run"]>>;
 		try {
 			result = await this.runner.run(this.piRc, args);
@@ -233,7 +235,7 @@ export class TicketClient {
 	async wait(id: string, timeoutSeconds: number): Promise<Ticket> {
 		const args = ["ticket-wait", id];
 		if (timeoutSeconds > 0) args.push(String(timeoutSeconds));
-		const out = await this.run(args, timeoutSeconds + 15);
+		const out = await this.run(args);
 		const line = out.trim().split("\n")[0] || "";
 		const ticket = JSON.parse(line) as Ticket;
 		if (!ticket || typeof ticket.id !== "string") {
@@ -473,13 +475,17 @@ class DaemonTasks {
 		}
 	}
 
-	/** session_shutdown: stop in-process watchers; the tickets keep
-	 *  running daemon-side and a later session_start re-arms. */
+	/** session_shutdown: stop in-process watchers and drop the consumed
+	 *  markers; the tickets keep running daemon-side and a later
+	 *  session_start re-arms. The markers only exist to silence live
+	 *  delivery watchers, so keeping them across a shutdown would let
+	 *  the set grow without bound over a long-lived session. */
 	stopWatching(): void {
 		for (const watcher of this.watchers.values()) {
 			watcher.stopped = true;
 		}
 		this.watchers.clear();
+		this.fetched.clear();
 	}
 }
 
@@ -878,46 +884,59 @@ class OffloadedBash implements BashOperations {
 		const deadline = Date.now() + (timeout ?? this.waitBoundSeconds()) * 1000;
 		// One abort listener for the whole call: when the user aborts,
 		// the race resolves null and the ticket is cancelled daemon-side.
+		// The listener is removed when the call ends so a completed exec
+		// never leaves a dangling abort handler on the signal.
+		let removeAbortListener = (): void => {};
 		const aborted = new Promise<null>((resolve) => {
 			if (!signal) return;
-			if (signal.aborted) resolve(null);
-			else signal.addEventListener("abort", () => resolve(null), { once: true });
+			if (signal.aborted) {
+				resolve(null);
+				return;
+			}
+			const onAbort = (): void => resolve(null);
+			signal.addEventListener("abort", onAbort, { once: true });
+			removeAbortListener = () =>
+				signal.removeEventListener("abort", onAbort);
 		});
 		let ticket: Ticket | null = null;
-		while (ticket === null || ticket.status === "running") {
-			const remaining = Math.max(1, Math.min(
-				WAIT_CHUNK_SECONDS,
-				(deadline - Date.now()) / 1000,
-			));
-			ticket = await Promise.race([
-				this.tasks.client.wait(id, remaining),
-				aborted.then(() => null),
-			]);
-			if (ticket === null) {
-				// User abort: kill the daemon-side process too.
-				await this.tasks.cancel(id).catch(() => {});
-				throw new Error("aborted");
-			}
-			if (ticket.status === "running" && Date.now() >= deadline) {
-				// Hand off: the ticket keeps running in the daemon,
-				// the agent is freed now and notified on completion.
-				let partial = "";
-				try {
-					partial = await this.tasks.client.outputAll(id);
-				} catch {
-					// partial output is best-effort
-				}
-				this.tasks.armDelivery(id, command);
-				onData(Buffer.from(
-					`${partial}
-[pi-daemon ticket ${id} still running: ` +
-					`continuing in the background; the full result will ` +
-					`be delivered here when it finishes ` +
-					`(daemon_tasks result ${id} fetches it sooner)]
-`,
+		try {
+			while (ticket === null || ticket.status === "running") {
+				const remaining = Math.max(1, Math.min(
+					WAIT_CHUNK_SECONDS,
+					(deadline - Date.now()) / 1000,
 				));
-				return { exitCode: null };
+				ticket = await Promise.race([
+					this.tasks.client.wait(id, remaining),
+					aborted.then(() => null),
+				]);
+				if (ticket === null) {
+					// User abort: kill the daemon-side process too.
+					await this.tasks.cancel(id).catch(() => {});
+					throw new Error("aborted");
+				}
+				if (ticket.status === "running" && Date.now() >= deadline) {
+					// Hand off: the ticket keeps running in the daemon,
+					// the agent is freed now and notified on completion.
+					let partial = "";
+					try {
+						partial = await this.tasks.client.outputAll(id);
+					} catch {
+						// partial output is best-effort
+					}
+					this.tasks.armDelivery(id, command);
+					onData(Buffer.from(
+						`${partial}
+[pi-daemon ticket ${id} still running: ` +
+						`continuing in the background; the full result will ` +
+						`be delivered here when it finishes ` +
+						`(daemon_tasks result ${id} fetches it sooner)]
+`,
+					));
+					return { exitCode: null };
+				}
 			}
+		} finally {
+			removeAbortListener();
 		}
 		// The inline wait consumed the result: bash itself delivers the
 		// output as the tool result, so the delivery watcher armed by
