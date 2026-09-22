@@ -170,6 +170,15 @@ class EndpointFile:
         except OSError:
             pass
 
+    def remove_if(self, host, port, token):
+        """Unlink the endpoint file only while it still publishes our
+        own coordinates: a dying daemon must never delete the file a
+        successor has already published over it."""
+        data = self.read()
+        if (data.get("host") == host and data.get("port") == port
+                and data.get("token") == token):
+            self.remove()
+
 
 class ControlHandshake:
     """Validates the mandatory hello line of a control connection."""
