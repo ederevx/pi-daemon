@@ -635,6 +635,13 @@ class DaemonRoster:
 					continue
 				self.remove(int(key))
 				if outcome == "stopped":
+					if not _wait_peer_dead(rec, timeout):
+						# The peer acknowledged the shutdown but its exit
+						# teardown is still running (or it lied): the boot
+						# must not proceed beside a live older daemon,
+						# whose exit cleanup would race the newcomer's
+						# endpoint publish. Kill it by its roster pid.
+						_force_kill_peer(int(key))
 					stopped += 1
 					log("roster: shut down older daemon pid %s" % key)
 				else:
@@ -671,6 +678,52 @@ def _peer_shutdown(rec, timeout):
 		return "unreachable"
 	finally:
 		kill_socket(sock)
+
+
+def _wait_peer_dead(rec, timeout):
+	"""Poll a stopped peer's control port until it refuses connections
+	(bounded by timeout): the graceful ack only promises the shutdown is
+	under way, and the boot must not publish its endpoint until the peer
+	- whose exit cleanup removes the shared endpoint file - is gone.
+	Returns True once the port is dead, False if it still accepts."""
+	deadline = time.time() + timeout
+	while True:
+		sock = None
+		try:
+			sock = socket.create_connection(
+				(str(rec.get("host")), int(rec.get("port"))), 0.2)
+		except (ConnectionRefusedError, TimeoutError, OSError):
+			return True
+		finally:
+			if sock is not None:
+				kill_socket(sock)
+		if time.time() >= deadline:
+			return False
+		time.sleep(0.05)
+
+
+def _force_kill_peer(pid, grace=KILL_GRACE):
+	"""Kill a lingering peer by the pid it published in the roster:
+	TERM, a bounded reap wait, then KILL. Best effort - a peer that
+	vanishes mid-kill or cannot be signalled just logs."""
+	if not pid or not hasattr(os, "kill"):
+		return
+	log("roster: peer pid %d lingers after shutdown; killing" % pid)
+	try:
+		os.kill(pid, signal.SIGTERM)
+	except OSError:
+		return
+	deadline = time.time() + grace
+	while time.time() < deadline:
+		try:
+			os.kill(pid, 0)
+		except OSError:
+			return
+		time.sleep(0.05)
+	try:
+		os.kill(pid, signal.SIGKILL)
+	except OSError:
+		pass
 
 
 class TicketStore:
@@ -1728,6 +1781,12 @@ class Daemon:
 			return 1
 		signal.signal(signal.SIGTERM, _on_signal)
 		signal.signal(signal.SIGINT, _on_signal)
+		# Converge to a single daemon before publishing anything: the
+		# older daemon's exit cleanup unlinks the shared endpoint file,
+		# so a peer that dies after this bind would strand the freshly
+		# published coordinates (clients see no daemon at all).
+		started = time.time()
+		self.roster.shutdown_others(os.getpid(), started)
 		try:
 			self.server.bind(self.token)
 		except OSError as exc:
@@ -1737,10 +1796,8 @@ class Daemon:
 		log("listening on %s:%d (endpoint %s, registry %s)"
 			% (self.server.host, self.server.port, self.sock_path,
 			   self.registry.path))
-		started = time.time()
 		self.roster.register(os.getpid(), self.server.host,
 							 self.server.port, self.token)
-		self.roster.shutdown_others(os.getpid(), started)
 		self.respawn_from_registry()
 		self.tickets.start()
 		self.idle_watch.start()
@@ -1842,7 +1899,8 @@ class Daemon:
 		self._terminate_sessions(self.table.snapshot())
 		self.roster.remove(os.getpid())
 		self.registry.write({})
-		self.endpoint.remove()
+		self.endpoint.remove_if(self.server.host, self.server.port,
+								self.token)
 		os._exit(0)
 
 	def _terminate_sessions(self, sessions):
