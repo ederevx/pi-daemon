@@ -154,7 +154,7 @@ TICKET_OUTPUT_MAX = 4 << 20  # per-ticket captured output bound
 TICKET_CHUNK = 256 << 10     # max output bytes per ticket-output reply
 TICKET_MAX_RUNNING = 32      # soft cap; further submits get too-busy
 TICKET_MAX_WAIT = 600.0      # cap on a single ticket-wait round trip
-# Extension-reload watch: roots whose changes trigger `/reload` in every
+# Extension-reload watch: roots whose changes trigger a reload in every
 # hosted conversation session (pi re-scans extensions, skills, prompts,
 # themes and context files in place), plus the poll interval and the
 # minimum gap between reloads so bursts of edits coalesce into one. The
@@ -177,6 +177,21 @@ EXT_WATCH_ROOTS = [p for p in os.environ.get(
 ).split(os.pathsep) if p]
 EXT_SNAPSHOT_PATH = os.path.join(REG_DIR, "extensions-snapshot.json")
 EXT_DIFF_PATH = os.path.join(REG_DIR, "extensions-diff.json")
+# Direct reload signaling: instead of typing "/reload" into a hosted
+# session's PTY, the daemon drops a one-shot per-session signal file
+# (carrying a fresh round token) under this directory; the in-session
+# daemon extension watches for it, consumes it and runs pi's own reload
+# flow programmatically (ctx.reload()), so no keystrokes ever enter the
+# TUI. A signal the extension does not consume within this many seconds
+# (an old extension without the watcher) is deleted by the daemon, which
+# then falls back to typing "/reload" into the PTY the old way.
+# Overridable for isolated tests (PI_PTYD_RELOAD_SIGNAL_GRACE=0 skips
+# the wait entirely).
+EXT_RELOAD_SIGNAL_DIR = os.path.join(REG_DIR, "extensions-reload")
+RELOAD_SIGNAL_GRACE = float(
+	os.environ.get("PI_PTYD_RELOAD_SIGNAL_GRACE", "2.0"))
+# How often the consumption wait re-checks the signal files.
+RELOAD_SIGNAL_POLL = 0.05
 
 DEFAULT_COLS = 120
 DEFAULT_ROWS = 40
@@ -324,6 +339,60 @@ def _write_ext_diff(diff):
 	with open(tmp, "w") as f:
 		json.dump(diff, f)
 	os.replace(tmp, EXT_DIFF_PATH)
+
+
+def _new_reload_token():
+	"""A fresh one-shot token for one reload round: signals consumed in
+	earlier rounds (same session, same token) can never fire again."""
+	return "%s-%d" % (os.urandom(8).hex(), time.time_ns())
+
+
+def _reload_signal_path(name):
+	return os.path.join(EXT_RELOAD_SIGNAL_DIR, "%s.json" % name)
+
+
+def _write_reload_signal(name, token):
+	"""Persist one session's reload signal atomically (the extension
+	watches the directory and reads the final file only). Returns False
+	when the name is not a safe single file component or the write
+	fails; the caller then falls back to typing into the PTY."""
+	if not name or name in (".", "..") or os.sep in name \
+			or (os.altsep and os.altsep in name):
+		return False
+	path = _reload_signal_path(name)
+	try:
+		os.makedirs(EXT_RELOAD_SIGNAL_DIR, exist_ok=True)
+		tmp = path + ".tmp"
+		with open(tmp, "w") as f:
+			json.dump({"token": token, "written": time.time()}, f)
+		os.replace(tmp, path)
+	except OSError:
+		return False
+	return True
+
+
+def _clear_reload_signal(name):
+	try:
+		os.unlink(_reload_signal_path(name))
+	except OSError:
+		pass
+
+
+def _clear_stale_reload_signals():
+	"""Daemon startup: signals left behind by a previous daemon run
+	targeted sessions that are gone; a fresh session with the same name
+	would otherwise consume a stale round token on first watch. Drop
+	them: the extension only ever fires on a token the daemon wrote for
+	the live round."""
+	try:
+		for fn in os.listdir(EXT_RELOAD_SIGNAL_DIR):
+			if fn.endswith(".json"):
+				try:
+					os.unlink(os.path.join(EXT_RELOAD_SIGNAL_DIR, fn))
+				except OSError:
+					pass
+	except OSError:
+		pass
 
 
 def _on_signal(_signum, _frame):
@@ -1349,6 +1418,9 @@ class Daemon:
 		self.tickets = TicketRunner(
 			TicketStore(TICKETS_PATH, TICKET_LOG_DIR), self.shutdown_event)
 		self.control = Control(self)
+		# Signals a previous daemon run left behind never fire a fresh
+		# session's watcher; drop them before anything is hosted.
+		_clear_stale_reload_signals()
 
 	# -- control socket ------------------------------------------------------
 
@@ -2321,22 +2393,32 @@ class Control:
 		return {"ok": True, "bytes": len(data)}
 
 	def extensions_reload(self, req):
-		"""Type /reload into hosted conversation sessions so pi re-scans
-		extensions, skills, prompts, themes and context files in place.
+		"""Signal hosted conversation sessions to reload in place so pi
+		re-scans extensions, skills, prompts, themes and context files.
 		When the extension roots actually changed, the file-level diff is
 		persisted for the in-session extension to relay to the agent once
 		it settles. force=1 reloads even without changes.
 
+		The reload is injected directly: the daemon writes a one-shot
+		per-session signal file (fresh round token) under the state dir
+		and the in-session daemon extension consumes it and runs pi's own
+		reload flow programmatically (ctx.reload()) — the same flow as a
+		typed /reload, without ever putting keystrokes into the TUI. A
+		signal the extension does not consume within RELOAD_SIGNAL_GRACE
+		(old extension without the watcher) is deleted again and the
+		daemon falls back to typing "/reload" into the session's PTY, so
+		first-adoption sessions still reload.
+
 		Optional sessions=[names] narrows the round to exactly those
 		sessions; the automatic watch uses it so every live reloadable
-		session is owed exactly one /reload per change while busy
-		sessions retry in later rounds.
+		session is owed exactly one reload per change while busy sessions
+		retry in later rounds.
 
-		Strictly in-place: this function only writes into sessions that
+		Strictly in-place: this function only signals sessions that
 		already exist; it never starts, respawns, or revives anything.
-		A session that dies while processing the injected /reload stays
-		dead (reload_injected clears the revival path) instead of being
-		spawned fresh, so a broken update cannot turn one /reload into a
+		A session that dies while processing the reload stays dead
+		(reload_injected clears the revival path) instead of being
+		spawned fresh, so a broken update cannot turn one reload into a
 		spawn storm.
 
 		The on-disk snapshot advances only when a full round completes;
@@ -2357,28 +2439,25 @@ class Control:
 					"unchanged": True}
 		reloaded, skipped = [], []
 		deferred = False
+		token = _new_reload_token()
+		pending = []
 		for sess in self.daemon.table.snapshot():
 			if only is not None and sess.name not in only:
 				continue
 			if self._session_reloadable(sess):
 				if sess.state != "idle":
-					# Best-effort skip: pi's TUI refuses /reload while a
+					# Best-effort skip: pi refuses a reload while a
 					# response is running, and a session parked on a blocking
 					# daemon wait ('waiting') has its turn still open too;
-					# defer this round instead of typing into a session that
-					# would deny it. Applies even with --force.
+					# defer this round instead of injecting into a session
+					# that would deny it. Applies even with --force.
 					skipped.append({"id": sess.name, "reason": "not-idle"})
 					deferred = True
 					continue
-				try:
-					os.write(sess.master_fd, b"/reload\r")
-				except OSError:
-					skipped.append({"id": sess.name,
-									"reason": "write-failed"})
-				else:
-					reloaded.append(sess.name)
-					# No spawn escape: if this session dies while the
-					# injected /reload is being processed (a broken
+				if _write_reload_signal(sess.name, token):
+					# The in-session extension consumes the signal and runs
+					# pi's own reload flow. No spawn escape: if this session
+					# dies while the reload is being processed (a broken
 					# extension, for example), it stays dead instead of
 					# being revived headless as a fresh spawn. The guard
 					# stays armed (reload_injected_at) until the session
@@ -2386,9 +2465,41 @@ class Control:
 					# different conversation file.
 					sess.reload_injected = True
 					sess.reload_injected_at = time.time()
+					pending.append(sess)
+				elif self._type_reload(sess):
+					reloaded.append(sess.name)
+				else:
+					skipped.append({"id": sess.name,
+									"reason": "write-failed"})
 			else:
 				skipped.append({"id": sess.name,
 								"reason": "not-reloadable"})
+		deadline = time.monotonic() + RELOAD_SIGNAL_GRACE
+		consumed = []
+		while pending and time.monotonic() < deadline:
+			time.sleep(RELOAD_SIGNAL_POLL)
+			# Consumed = the extension deleted the signal file after
+			# queueing pi's reload; absent files are done.
+			remaining = [s for s in pending
+						 if os.path.exists(_reload_signal_path(s.name))]
+			consumed += [s for s in pending if s not in remaining]
+			pending = remaining
+		for sess in consumed:
+			reloaded.append(sess.name)
+		for sess in pending:
+			# Unconsumed: an extension without the watcher never picked
+			# the signal up. Clear the stale file and fall back to typing
+			# /reload into the PTY the old way so the session still
+			# reloads; a failed PTY write disarms the guard again (a
+			# reload that never started must not suppress revival).
+			_clear_reload_signal(sess.name)
+			if self._type_reload(sess):
+				reloaded.append(sess.name)
+			else:
+				sess.reload_injected = False
+				sess.reload_injected_at = 0.0
+				skipped.append({"id": sess.name,
+								"reason": "write-failed"})
 		if only is None and reloaded and not deferred:
 			# Stamp/reload stay atomic: persist the snapshot and diff only
 			# when a whole-table round reloaded every targeted reloadable
@@ -2406,6 +2517,18 @@ class Control:
 						 if self._session_reloadable(s)]}
 
 	@staticmethod
+	def _type_reload(sess):
+		"""Fallback injection for extensions that predate the reload
+		signal file: type "/reload" into the session's PTY the way the
+		attach bridge would. Returns False when the PTY refuses the
+		write (a dead or gone session)."""
+		try:
+			os.write(sess.master_fd, b"/reload\r")
+		except OSError:
+			return False
+		return True
+
+	@staticmethod
 	def _session_reloadable(sess):
 		"""An interactive hosted pi that announced a conversation file: its
 		TUI can accept /reload in place. The live spawn argv carries no
@@ -2416,9 +2539,11 @@ class Control:
 		Injection contract: a reload may re-scan/reload pi's loaded
 		resources in place, but must never terminate sessions, remove them
 		from the registry/table, or touch conversation files; injections
-		happen only via os.write(sess.master_fd, ...). State-based skipping
-		is best-effort: pi denies a reload typed into a truly-busy session
-		with its own warning."""
+		happen via the per-session reload signal file (consumed by the
+		in-session extension) or, as a fallback, via
+		os.write(sess.master_fd, ...). State-based skipping
+		is best-effort: pi denies a reload injected into a truly-busy
+		session with its own warning."""
 		argv = sess.argv or []
 		return bool(sess.file) and "--no-session" not in argv
 
@@ -2447,7 +2572,7 @@ def ext_watch_loop(daemon, stop_event):
 	place. Seeds the baseline from the snapshot file so a daemon restart
 	does not retrigger.
 
-	Every live reloadable session is owed exactly one /reload for a
+	Every live reloadable session is owed exactly one reload for a
 	pending change. A session that is mid-turn or parked on a blocking
 	daemon wait when its turn comes is retried on later polls (the diff
 	is refreshed from the old snapshot each round, so newer edits
@@ -2472,7 +2597,7 @@ def ext_watch_loop(daemon, stop_event):
 			if fp == prev_fp or now - last_reload < EXT_WATCH_DEBOUNCE:
 				continue
 			# A change arrived (the debounce window closed): every live
-			# session is owed one /reload; extensions_reload drops the
+			# session is owed one reload; extensions_reload drops the
 			# ones that are not reloadable from its live list.
 			owed = {s.name for s in daemon.table.snapshot()}
 			if not owed:

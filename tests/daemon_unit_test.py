@@ -37,6 +37,9 @@ with open(os.path.join(EXT_ROOT, "a.ts"), "w") as _f:
 os.environ["PI_PTYD_EXT_WATCH_ROOTS"] = EXT_ROOT
 os.environ["PI_PTYD_EXT_WATCH_INTERVAL"] = "0.05"
 os.environ["PI_PTYD_EXT_WATCH_DEBOUNCE"] = "0.0"
+# Reload injection falls back to typing instantly in tests; the signal
+# path tests below re-enable the wait around their own calls.
+os.environ["PI_PTYD_RELOAD_SIGNAL_GRACE"] = "0"
 os.makedirs(os.environ["XDG_STATE_HOME"], exist_ok=True)
 os.makedirs(os.environ["XDG_RUNTIME_DIR"], exist_ok=True)
 
@@ -452,6 +455,110 @@ def test_reload_guard():
                 "changed conversation file clears the reload guard")
     DAEMON.control.stop({"name": name})
     assert_true(_drain_session(name))
+
+
+def test_reload_signal_consumed_direct():
+    """The daemon signals the in-session extension directly: it writes
+    a one-shot token-stamped signal file and, once the extension
+    consumes it (deletes it), counts the reload as done without ever
+    typing into the PTY."""
+    name = "pi-reloadsig"
+    r = DAEMON.control.start(
+        {"name": name, "dir": SCRATCH, "argv": ["sh", "-c", "sleep 30"]})
+    assert_true(r.get("ok"), r)
+    file = os.path.join(SCRATCH, "conv-reloadsig.jsonl")
+    open(file, "w").close()
+    assert_true(DAEMON.control.announce(
+        {"name": name, "file": file})["ok"])
+    DAEMON.control.state({"name": name, "state": "idle"})
+    sig = os.path.join(daemon.EXT_RELOAD_SIGNAL_DIR, name + ".json")
+    seen = {}
+
+    def consume():
+        for _ in range(400):
+            if os.path.exists(sig):
+                with open(sig) as f:
+                    seen["rec"] = json.load(f)
+                os.unlink(sig)
+                return
+            time.sleep(0.01)
+
+    orig = daemon.RELOAD_SIGNAL_GRACE
+    daemon.RELOAD_SIGNAL_GRACE = 5.0
+    t = threading.Thread(target=consume)
+    t.start()
+    try:
+        res = DAEMON.control.extensions_reload({"force": True})
+    finally:
+        daemon.RELOAD_SIGNAL_GRACE = orig
+        t.join(3)
+    assert_true(name in res["reloaded"], res)
+    assert_true("token" in seen.get("rec", {}),
+                "signal carries a fresh round token")
+    assert_true(not os.path.exists(sig), "signal consumed exactly once")
+    sess = DAEMON.table.get(name)
+    assert_true(sess is not None and sess.reload_injected,
+                "signal path arms the no-spawn guard")
+    DAEMON.control.stop({"name": name})
+    assert_true(_drain_session(name))
+
+
+def test_reload_signal_fallback_types():
+    """An extension without the watcher never consumes the signal: the
+    daemon deletes the stale file and falls back to typing /reload
+    into the PTY, arming the no-spawn guard as before."""
+    name = "pi-reloadfall"
+    r = DAEMON.control.start(
+        {"name": name, "dir": SCRATCH, "argv": ["sh", "-c", "sleep 30"]})
+    assert_true(r.get("ok"), r)
+    file = os.path.join(SCRATCH, "conv-reloadfall.jsonl")
+    open(file, "w").close()
+    assert_true(DAEMON.control.announce(
+        {"name": name, "file": file})["ok"])
+    DAEMON.control.state({"name": name, "state": "idle"})
+    sig = os.path.join(daemon.EXT_RELOAD_SIGNAL_DIR, name + ".json")
+    res = DAEMON.control.extensions_reload({"force": True})
+    assert_true(name in res["reloaded"], res)
+    assert_true(not os.path.exists(sig), "stale signal cleared before typing")
+    sess = DAEMON.table.get(name)
+    assert_true(sess is not None and sess.reload_injected,
+                "fallback keeps the no-spawn guard armed")
+    DAEMON.control.stop({"name": name})
+    assert_true(_drain_session(name))
+
+
+def test_reload_signal_unsafe_name_falls_back():
+    """A session name that cannot be a single file component never
+    becomes a signal path: the daemon falls back to typing, and no
+    signal file ever escapes the signal directory."""
+    name = "pi-../traverse"
+    sess = daemon.Session(name, SCRATCH, ["pi"], pid=1, master_fd=-1)
+    sess.file = os.path.join(SCRATCH, "conv-traverse.jsonl")
+    assert_true(DAEMON.table.put(sess))
+    DAEMON.control.state({"name": name, "state": "idle"})
+    try:
+        res = DAEMON.control.extensions_reload({"sessions": [name],
+                                                "force": True})
+        assert_true(any(e.get("id") == name
+                        and e.get("reason") == "write-failed"
+                        for e in res["skipped"]), res)
+        assert_true(name not in res["reloaded"], res)
+        assert_eq(os.listdir(daemon.EXT_RELOAD_SIGNAL_DIR), [],
+                  "no signal file outside the directory")
+    finally:
+        DAEMON.table.remove_if(sess)
+
+
+def test_reload_signal_startup_cleanup():
+    """Signals left behind by a previous daemon run are dropped at
+    startup so a fresh session with the same name never consumes a
+    stale round token."""
+    sigdir = daemon.EXT_RELOAD_SIGNAL_DIR
+    os.makedirs(sigdir, exist_ok=True)
+    stale = os.path.join(sigdir, "pi-gone.json")
+    open(stale, "w").close()
+    daemon._clear_stale_reload_signals()
+    assert_true(not os.path.exists(stale))
 
 
 def test_reload_death_not_revived():
@@ -1020,6 +1127,14 @@ def _main():
     ok("ticket cancel + reset", test_ticket_cancel_and_reset)
     ok("session control (start/list/state/input/detach/stop)", test_session_control)
     ok("reload guard (in-place only, no spawn)", test_reload_guard)
+    ok("reload signal consumed directly (no PTY typing)",
+       test_reload_signal_consumed_direct)
+    ok("reload signal falls back to PTY typing",
+       test_reload_signal_fallback_types)
+    ok("reload signal refuses unsafe names",
+       test_reload_signal_unsafe_name_falls_back)
+    ok("reload signal startup cleanup",
+       test_reload_signal_startup_cleanup)
     ok("reload death is never revived", test_reload_death_not_revived,
        posix_only=True)
     ok("reload same-file re-announce keeps no-spawn guard",
