@@ -665,8 +665,13 @@ class TicketRunner:
 			rec = self.store.add(rec)
 		except OSError as exc:
 			# The record never persisted, so no reader thread or cancel
-			# path will ever own this child: kill it before reporting the
-			# failure so no orphan keeps running unmanaged.
+			# path will ever own this child: close its output pipe, kill
+			# it, and reap before reporting the failure so no orphan keeps
+			# running unmanaged and no pipe fd is left behind.
+			try:
+				proc.stdout.close()
+			except OSError:
+				pass
 			PROCESS.signal_kill(proc.pid)
 			try:
 				proc.wait(timeout=KILL_GRACE)
