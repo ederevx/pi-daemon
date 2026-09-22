@@ -44,6 +44,7 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,8) else 1)' || {
 dest_extension="$pi_home/extensions/daemon.ts"
 dest_offload="$pi_home/extensions/offload.ts"
 dest_helper="$local_bin/pi-rc"
+dest_helper_cmd="$local_bin/pi-rc.cmd"
 dest_daemon="$local_bin/pi-daemon"
 dest_platform="$local_bin/pi_platform.py"
 dest_conpty="$local_bin/pi_conpty.py"
@@ -86,6 +87,11 @@ if [[ $package_mode -eq 0 ]]; then
 fi
 
 install_to 755 "$repo_root/pi/bin/pi-rc" "$dest_helper"
+# PowerShell/cmd cannot execute shebang scripts, so a bare `pi-rc` would
+# fall through to ShellExecute and open in the text editor; pi.cmd already
+# solves the same problem for the wrapper. The shim delegates to the
+# extensionless client above, so one implementation serves both platforms.
+install_to 755 "$repo_root/pi/bin/pi-rc.cmd" "$dest_helper_cmd"
 install_to 755 "$repo_root/pi/daemon/pi-daemon" "$dest_daemon"
 # The OS-agnostic seam module and its lazy Windows ConPTY backend ship
 # next to the scripts so both find pi_platform.py on sys.path.
@@ -123,9 +129,9 @@ chmod 755 "$dest_wrapper"
 # wrapper, so the guarding logic is not duplicated per platform.
 install_to 755 "$repo_root/pi/bin/pi-wrapper.cmd" "$dest_wrapper_cmd"
 
-owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_wrapper_cmd" "$dest_unit" "$dest_platform" "$dest_conpty")
+owned=("$dest_daemon" "$dest_helper" "$dest_helper_cmd" "$dest_wrapper" "$dest_wrapper_cmd" "$dest_unit" "$dest_platform" "$dest_conpty")
 if [[ $package_mode -eq 0 ]]; then
-  owned=("$dest_daemon" "$dest_helper" "$dest_wrapper" "$dest_wrapper_cmd" "$dest_extension" "$dest_offload" "$dest_unit" "$dest_platform" "$dest_conpty")
+  owned=("$dest_daemon" "$dest_helper" "$dest_helper_cmd" "$dest_wrapper" "$dest_wrapper_cmd" "$dest_extension" "$dest_offload" "$dest_unit" "$dest_platform" "$dest_conpty")
 fi
 {
   printf '{\n'

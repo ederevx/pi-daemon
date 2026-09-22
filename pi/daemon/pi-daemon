@@ -237,9 +237,15 @@ _WIRE_COMMANDS = ("ping", "start", "detach", "resize", "list", "which",
 
 def log(msg):
 	# Daemon output goes to stderr (the journal); stdout is never used.
+	# A broken stderr (a transient probe's dead console pipe) must never
+	# take a request handler down mid-response, so every write failure is
+	# swallowed; main() keeps real daemons on the journal or the log file.
 	with LOG_LOCK:
-		sys.stderr.write("pi-daemon: %s\n" % msg)
-		sys.stderr.flush()
+		try:
+			sys.stderr.write("pi-daemon: %s\n" % msg)
+			sys.stderr.flush()
+		except Exception:
+			pass
 
 
 def kill_socket(client):
@@ -2659,12 +2665,45 @@ def ext_watch_loop(daemon, stop_event):
 				% reloaded_count)
 
 
-def main():
+def main(argv=None):
+	if argv is None:
+		argv = sys.argv[1:]
+	if argv:
+		# pi-daemon is a pure daemon entry point; every control command
+		# lives in pi-rc. Accepting argv silently turned probes such as
+		# `pi-daemon status` into full daemon instances whose stderr is
+		# the probe's console pipe, which then dies under the daemon.
+		try:
+			sys.stderr.write("pi-daemon: takes no arguments (got %r); "
+							 "control commands live in pi-rc\n" % (argv,))
+		except Exception:
+			pass
+		return 2
+	if not _stderr_writable():
+		# A probe-spawned daemon inherits the caller's console pipe, which
+		# can already be dead or may die while the daemon lives on; fall
+		# back to appending to the daemon log so log() keeps a destination.
+		try:
+			sys.stderr = open(LOG_PATH, "a", buffering=1,
+							  encoding="utf-8", errors="replace")
+		except OSError:
+			pass
 	daemon = Daemon(Registry(REG_PATH))
 	threading.Thread(target=ext_watch_loop,
 					 args=(daemon, daemon.shutdown_event),
 					 daemon=True).start()
 	return daemon.serve()
+
+
+def _stderr_writable():
+	# Cheap probe so a daemon whose stderr is already unusable starts on
+	# the daemon log instead of a dead pipe.
+	try:
+		sys.stderr.write("")
+		sys.stderr.flush()
+		return True
+	except Exception:
+		return False
 
 
 if __name__ == "__main__":
