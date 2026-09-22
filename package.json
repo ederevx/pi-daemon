@@ -1,6 +1,6 @@
 {
   "name": "pi-daemon",
-  "version": "2.9.13",
+  "version": "2.9.14",
   "type": "module",
   "scripts": {
     "postinstall": "node scripts/postinstall.mjs"
