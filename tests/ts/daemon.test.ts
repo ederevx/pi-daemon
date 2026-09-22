@@ -6,15 +6,16 @@
  * module-global state and no leaks across instances.
  */
 
-import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { test, assert, assertEq, withEnv, scratchDir } from "./harness.ts";
+import { test, assert, assertEq, withEnv, waitFor, scratchDir } from "./harness.ts";
 import {
   RcBackground,
   ProcessRunner,
   endpointPath,
   stateHome,
+  reloadSignalPath,
   windowlessCandidates,
   default as factory,
 } from "../../pi/extensions/daemon.ts";
@@ -275,7 +276,9 @@ test("daemon: factory wires the command and events", () => {
   const pi = new MockPi();
   factory(pi as never);
   assert(pi.commands.has("bg"), "/bg registered");
-  assertEq(pi.onCalls.get("session_start") ?? 0, 2, "two session_start listeners");
+  assert(pi.commands.has("daemon-reload"), "reload command registered");
+  assertEq(pi.onCalls.get("session_start") ?? 0, 3, "three session_start listeners");
+  assertEq(pi.onCalls.get("session_shutdown") ?? 0, 1);
   assertEq(pi.onCalls.get("before_agent_start") ?? 0, 1);
   assertEq(pi.onCalls.get("agent_end") ?? 0, 1);
   assertEq(pi.onCalls.get("agent_settled") ?? 0, 1);
@@ -286,10 +289,13 @@ class MockPi {
   readonly commands = new Map<string, unknown>();
   readonly onCalls = new Map<string, number>();
   readonly sessionStarters: Array<(event: any) => Promise<void>> = [];
+  readonly shutdownHandlers: Array<(event: any) => Promise<void>> = [];
   readonly messages: string[] = [];
+  readonly messageOptions: Array<Record<string, unknown>> = [];
   on(name: string, handler: any): void {
     this.onCalls.set(name, (this.onCalls.get(name) ?? 0) + 1);
     if (name === "session_start") this.sessionStarters.push(handler);
+    if (name === "session_shutdown") this.shutdownHandlers.push(handler);
   }
   registerCommand(name: string, def: unknown): void {
     this.commands.set(name, def);
@@ -297,8 +303,12 @@ class MockPi {
   async exec(): Promise<ExeResult> {
     return { code: 0, stdout: "", stderr: "", killed: false };
   }
-  async sendUserMessage(text: string): Promise<void> {
+  async sendUserMessage(
+    text: string,
+    options?: Record<string, unknown>,
+  ): Promise<void> {
     this.messages.push(text);
+    this.messageOptions.push(options ?? {});
   }
 }
 
@@ -321,6 +331,122 @@ test("daemon: auto /reload is silent and never messages the agent", async () => 
   await withEnv({ XDG_STATE_HOME: scratchDir() }, async () => {
     await reloadHandler({ reason: "reload" });
     assertEq(pi.messages.length, 0, "no stamp, still no message");
+  });
+});
+
+test("daemon: reload signal queues the command once and reloads", async () => {
+  const state = join(scratchDir(), "signal-state");
+  await hosted("pi-sigtest", async () => {
+    await withEnv({ XDG_STATE_HOME: state }, async () => {
+      const pi = new MockPi();
+      factory(pi as never);
+      // session_start listeners: [watcher start, announce, silent reload]
+      await pi.sessionStarters[0]({ reason: "startup" });
+      const sig = join(state, "pi-pty-host", "extensions-reload",
+        "pi-sigtest.json");
+      // the daemon wrote a fresh round token
+      writeFileSync(sig, JSON.stringify({ token: "round-1" }));
+      await waitFor(() => pi.messages.length === 1, "queued reload command");
+      assertEq(pi.messages[0], "/daemon-reload");
+      // expandPromptTemplates is what dispatches the command: a bare
+      // slash message would be submitted as a plain user prompt
+      assertEq(pi.messageOptions[0].expandPromptTemplates, true);
+      assertEq(pi.messageOptions[0].deliverAs, "followUp");
+      assert(existsSync(sig), "file stays until the command consumes it");
+      // command handler consumes the pending token and reloads
+      let reloaded = 0;
+      const c = ctx() as never as { reload: () => Promise<void> };
+      c.reload = async () => {
+        reloaded++;
+      };
+      const cmd = pi.commands.get("daemon-reload") as {
+        handler: (args: unknown[], ctx: unknown) => Promise<void>;
+      };
+      await cmd.handler([], c);
+      assertEq(reloaded, 1, "ctx.reload ran");
+      assert(!existsSync(sig), "signal consumed (daemon's ack)");
+      // one-shot per round: a manual command run without a fresh
+      // signal is inert
+      await cmd.handler([], c);
+      assertEq(reloaded, 1, "no reload without a pending signal");
+      // a stale repeat of an already consumed token never fires again
+      writeFileSync(sig, JSON.stringify({ token: "round-1" }));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assertEq(pi.messages.length, 1, "stale signal is not even queued");
+      // a genuinely fresh round token queues a new reload
+      writeFileSync(sig, JSON.stringify({ token: "round-2" }));
+      await waitFor(() => pi.messages.length === 2, "fresh token re-queued");
+      await cmd.handler([], c);
+      assertEq(reloaded, 2, "fresh signal fires once");
+      assert(!existsSync(sig), "second signal consumed");
+      // release the watcher so the test run's event loop can exit
+      await pi.shutdownHandlers[0]({ reason: "quit" });
+    });
+  });
+});
+
+test("daemon: unconsumed token (daemon fallback) never double-reloads", async () => {
+  const state = join(scratchDir(), "signal-fallback");
+  await hosted("pi-sigfall", async () => {
+    await withEnv({ XDG_STATE_HOME: state }, async () => {
+      const pi = new MockPi();
+      factory(pi as never);
+      await pi.sessionStarters[0]({ reason: "startup" });
+      const sig = join(state, "pi-pty-host", "extensions-reload",
+        "pi-sigfall.json");
+      writeFileSync(sig, JSON.stringify({ token: "round-2" }));
+      await waitFor(() => pi.messages.length === 1, "queued reload command");
+      // the daemon timed out: it deleted the file and typed /reload
+      rmSync(sig, { force: true });
+      let reloaded = 0;
+      const c = ctx() as never as { reload: () => Promise<void> };
+      c.reload = async () => {
+        reloaded++;
+      };
+      const cmd = pi.commands.get("daemon-reload") as {
+        handler: (args: unknown[], ctx: unknown) => Promise<void>;
+      };
+      await cmd.handler([], c);
+      assertEq(reloaded, 0, "typed fallback wins, no second reload");
+      await pi.shutdownHandlers[0]({ reason: "quit" });
+    });
+  });
+});
+
+test("daemon: session_shutdown stops the watcher (no leaked watchers)", async () => {
+  const state = join(scratchDir(), "signal-shutdown");
+  await hosted("pi-sigstop", async () => {
+    await withEnv({ XDG_STATE_HOME: state }, async () => {
+      const pi = new MockPi();
+      factory(pi as never);
+      await pi.sessionStarters[0]({ reason: "startup" });
+      // the factory's session_shutdown handler tears the watcher down
+      assertEq(pi.shutdownHandlers.length, 1);
+      await pi.shutdownHandlers[0]({ reason: "reload" });
+      const sig = join(state, "pi-pty-host", "extensions-reload",
+        "pi-sigstop.json");
+      writeFileSync(sig, JSON.stringify({ token: "round-3" }));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assertEq(pi.messages.length, 0, "no watcher left after shutdown");
+    });
+  });
+});
+
+test("daemon: reload signal is a no-op outside hosting", async () => {
+  const state = join(scratchDir(), "signal-unhosted");
+  await hosted("", async () => {
+    await withEnv({ XDG_STATE_HOME: state }, async () => {
+      assertEq(reloadSignalPath(), "", "no signal path without hosting");
+      const pi = new MockPi();
+      factory(pi as never);
+      await pi.sessionStarters[0]({ reason: "startup" });
+      const dir = join(state, "pi-pty-host", "extensions-reload");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "pi-other.json"),
+        JSON.stringify({ token: "t" }));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assertEq(pi.messages.length, 0, "unhosted sessions are never signaled");
+    });
   });
 });
 
