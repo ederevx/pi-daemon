@@ -660,6 +660,49 @@ class _Utf8Chunker:
         return 0
 
 
+class _Win32InputModeFilter:
+    """Swallows ConPTY's DECSET 9001 (Win32 Input Mode) requests.
+
+    conhost/ConPTY asks the hosting terminal to switch to Win32 Input
+    Mode by emitting ESC[?9001h (and to leave it with ESC[?9001l). A
+    terminal that honors the enable encodes every key as an
+    ESC[Vk;Sc;Uc;Kd;Cs;Rc_ record, which the hosted pi TUI cannot decode
+    (it understands classic VT and Kitty CSI-u only). Windows Terminal
+    also loses Escape and Alt+[ when the mode is toggled (microsoft/
+    terminal#17737). This attach client reads the console itself and the
+    hosted pi consumes classic VT, so both requests are removed before
+    the real terminal sees them and the terminal's mode is left exactly
+    as its own ConPTY set it. feed() owns the partial-prefix state so a
+    request split across chunks is still swallowed.
+    """
+
+    _SEQUENCES = (b"\x1b[?9001h", b"\x1b[?9001l")
+
+    def __init__(self):
+        self._pending = b""
+
+    def feed(self, data):
+        """Return data with complete requests removed, holding a
+        trailing partial request back for the next call."""
+        buf = self._pending + data
+        self._pending = b""
+        for sequence in self._SEQUENCES:
+            buf = buf.replace(sequence, b"")
+        keep = self._partial_suffix_length(buf)
+        if keep:
+            self._pending = buf[-keep:]
+            buf = buf[:-keep]
+        return buf
+
+    def _partial_suffix_length(self, data):
+        longest = 0
+        for sequence in self._SEQUENCES:
+            for length in range(1, len(sequence)):
+                if data.endswith(sequence[:length]):
+                    longest = max(longest, length)
+        return longest
+
+
 class WindowsConsole:
     """Raw CONIN$/CONOUT$ seam for the Windows pi-rc attach client.
 
@@ -687,6 +730,7 @@ class WindowsConsole:
         self._stop = threading.Event()
         self._last_size = None
         self._chunker = _Utf8Chunker()
+        self._win32_input_filter = _Win32InputModeFilter()
 
     # -- TerminalMode interface -------------------------------------------
 
@@ -847,9 +891,12 @@ class WindowsConsole:
     def write_output(self, data):
         if self._out_handle is None or self._api is None:
             return None
-        # Consume all input; the chunker holds any incomplete trailing
-        # UTF-8 sequence for the next call so a split character is not
-        # decoded across two WriteFile calls.
+        # Consume all input; the filter strips ConPTY's Win32 Input Mode
+        # requests and the chunker holds any incomplete trailing UTF-8
+        # sequence for the next call so a split character is not decoded
+        # across two WriteFile calls.
+        consumed = len(data)
+        data = self._win32_input_filter.feed(data)
         chunk = self._chunker.feed(data)
         if chunk:
             buffer = ctypes.create_string_buffer(chunk, len(chunk))
@@ -859,7 +906,7 @@ class WindowsConsole:
                 ctypes.byref(written), None)
             if not ok:
                 return None
-        return len(data)
+        return consumed
 
     # -- handles ----------------------------------------------------------
 
