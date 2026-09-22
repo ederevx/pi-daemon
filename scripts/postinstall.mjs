@@ -14,9 +14,10 @@
  * succeeds. The manual installer remains available for a retry.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { SettingsReconciler } from "./settings-reconciler.mjs";
 
 /** Runs the manual installer in its package mode and owns the fail-soft
  *  reporting that keeps npm's install step from aborting. */
@@ -55,5 +56,40 @@ class PackageProvisioner {
 	}
 }
 
+/** Fails soft like the provisioner: a reconciliation problem is a
+ *  warning, never an install failure. */
+class SettingsGuard {
+	constructor(version) {
+		this.version = version;
+		this.reconciler = new SettingsReconciler(
+			SettingsReconciler.defaultPath(), version, "pi-daemon");
+	}
+
+	run() {
+		let dropped;
+		try {
+			dropped = this.reconciler.reconcile();
+		} catch (err) {
+			process.stderr.write(
+				`pi-daemon: settings reconciliation skipped (${err?.message ?? err})\n`,
+			);
+			return;
+		}
+		if (dropped.length > 0) {
+			process.stderr.write(
+				`pi-daemon: removed duplicate package entries that would load ` +
+				`its extensions twice: ${dropped.join(", ")}\n`,
+			);
+		}
+	}
+}
+
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+
+const provisioner = new PackageProvisioner(repoRoot);
+const status = provisioner.run();
+new SettingsGuard(
+	JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).version,
+).run();
+process.exit(status);
 process.exit(new PackageProvisioner(repoRoot).run());
