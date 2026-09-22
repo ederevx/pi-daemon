@@ -635,7 +635,7 @@ class DaemonRoster:
 					continue
 				self.remove(int(key))
 				if outcome == "stopped":
-					if not _wait_peer_dead(rec, timeout):
+					if not _wait_peer_gone(int(key), timeout):
 						# The peer acknowledged the shutdown but its exit
 						# teardown is still running (or it lied): the boot
 						# must not proceed beside a live older daemon,
@@ -680,26 +680,37 @@ def _peer_shutdown(rec, timeout):
 		kill_socket(sock)
 
 
-def _wait_peer_dead(rec, timeout):
-	"""Poll a stopped peer's control port until it refuses connections
-	(bounded by timeout): the graceful ack only promises the shutdown is
-	under way, and the boot must not publish its endpoint until the peer
-	- whose exit cleanup removes the shared endpoint file - is gone.
-	Returns True once the port is dead, False if it still accepts."""
+def _pid_alive(pid):
+	"""True while a pid still exists as a live process; a reaped or
+	zombie process counts as gone. Best effort: without os.kill every
+	pid is presumed alive."""
+	if not hasattr(os, "kill"):
+		return True
+	try:
+		os.kill(pid, 0)
+	except ProcessLookupError:
+		return False
+	except OSError:
+		return False
+	try:
+		with open("/proc/%d/stat" % pid) as fh:
+			return not fh.read().rsplit(")", 1)[1].lstrip().startswith("Z")
+	except OSError:
+		return True
+
+
+def _wait_peer_gone(pid, timeout):
+	"""Wait (bounded) until a stopped peer's process is fully gone:
+	its control port can die before its exit teardown runs, and that
+	teardown removes the shared endpoint file - the boot must not
+	publish its own endpoint until the peer has actually exited.
+	Returns True once the process is gone, False if it lingers."""
 	deadline = time.time() + timeout
-	while True:
-		sock = None
-		try:
-			sock = socket.create_connection(
-				(str(rec.get("host")), int(rec.get("port"))), 0.2)
-		except (ConnectionRefusedError, TimeoutError, OSError):
-			return True
-		finally:
-			if sock is not None:
-				kill_socket(sock)
+	while _pid_alive(pid):
 		if time.time() >= deadline:
 			return False
 		time.sleep(0.05)
+	return True
 
 
 def _force_kill_peer(pid, grace=KILL_GRACE):
