@@ -139,6 +139,33 @@ def _main():
     else:
         ok("ticket output captured")
 
+    # Offset mode must be byte-faithful through the base64 wire format:
+    # non-ASCII output must survive the round trip intact, and a read
+    # from the end offset must report no new bytes.
+    r = pi_rc("ticket-submit", "--cwd", SCRATCH, "--",
+              "printf 'caf\\xc3\\xa9-\\xe4\\xb8\\xad' && sleep 0")
+    if r.returncode != 0:
+        fail("utf8 ticket submit", f"rc={r.returncode}")
+        return 1
+    utf8_tid = r.stdout.strip().split()[1]
+    r = pi_rc("ticket-wait", utf8_tid, "10")
+    rec = json.loads(r.stdout.strip().splitlines()[0])
+    if rec["status"] != "done" or rec["exit"] != 0:
+        fail("utf8 ticket wait", r.stdout)
+        return 1
+    r = pi_rc("ticket-output", utf8_tid, "0")
+    payload = base64.b64decode(r.stdout.strip())
+    if payload != "café-中".encode("utf-8"):
+        fail("utf8 ticket output offset", repr(payload))
+        return 1
+    ok("ticket output offset round-trips non-ASCII bytes")
+    r = pi_rc("ticket-output", utf8_tid,
+              str(len("café-中".encode("utf-8"))))
+    if base64.b64decode(r.stdout.strip()) != b"":
+        fail("utf8 ticket output drained", r.stdout)
+        return 1
+    ok("ticket output at end offset reports no new bytes")
+
     r = pi_rc("ticket-list")
     if tid not in r.stdout:
         fail("ticket list", r.stdout)

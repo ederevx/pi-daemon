@@ -47,6 +47,8 @@ class FakePi {
   readonly tools = new Map<string, { name: string; execute?: unknown }>();
   readonly commands = new Map<string, unknown>();
   readonly execCalls: Array<{ file: string; args: string[] }> = [];
+  /** Incremental ticket logs keyed by id, for offset reads. */
+  readonly logs = new Map<string, string>();
   private readonly wait300 = new Map<string, number>();
 
   constructor(private readonly daemonDown = false) {}
@@ -70,6 +72,16 @@ class FakePi {
     if (cmd === "ticket-output") {
       if (args.includes("--json")) {
         return ok(JSON.stringify({ ok: true, id: args[1], status: "done", exit: 0, output: "out-json" }));
+      }
+      // Offset mode mirrors pi-rc's byte-faithful wire format: the
+      // base64 payload from the offset, empty when the log has no
+      // new bytes.
+      const offset = Number(args[2]);
+      if (args[2] !== undefined && !Number.isNaN(offset)) {
+        const log = this.logs.get(args[1]) ?? "";
+        return ok(offset < log.length
+          ? Buffer.from(log.slice(offset), "utf8").toString("base64")
+          : "");
       }
       return ok("");
     }
@@ -101,15 +113,32 @@ function runTool<T= { content?: Array<{ type: string; text: string }>; details?:
   tool: { execute?: unknown } | undefined,
   params: unknown,
 ): Promise<T> {
-  const execute = tool?.execute as ((_id: string, p: unknown, _s: unknown, _o: unknown, _c: unknown) => Promise<T>) | undefined;
+  return runToolIO<T>(tool, params);
+}
+
+/** runTool variant that injects the tool-call IO surface: the abort
+ *  signal, onUpdate capture, and a context with its own flow helpers,
+ *  so the interruptibility and steering paths are exercisable. */
+function runToolIO<T= { content?: Array<{ type: string; text: string }>; details?: unknown }>(
+  tool: { execute?: unknown } | undefined,
+  params: unknown,
+  io: {
+    signal?: AbortSignal;
+    onUpdate?: (update: unknown) => void;
+    ctx?: Record<string, unknown>;
+  } = {},
+): Promise<T> {
+  const execute = tool?.execute as ((_id: string, p: unknown, s: unknown, o: unknown, c: unknown) => Promise<T>) | undefined;
   assert(typeof execute === "function", "tool has execute");
-  return execute!("call1", params, undefined, undefined, {
+  return execute!("call1", params, io.signal, io.onUpdate, {
     sessionManager: {
       getSessionId: () => "test-session",
       getSessionFile: () => "/x/abc.jsonl",
     },
     cwd: scratchDir(),
     mode: "cli",
+    hasPendingMessages: () => false,
+    ...io.ctx,
   });
 }
 
@@ -172,6 +201,84 @@ test("offload: daemon_tasks status/result/list/cancel/remove/reset", async () =>
   );
   // no subagent actions accepted
   await assertReject(() => runTool(tools, { action: "submit", command: "" }), "submit without command rejected");
+});
+
+test("offload: result wait completes by active polling with live status", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  const updates: Array<{ content?: Array<{ text?: string }> }> = [];
+  const result = await runToolIO<{ content: Array<{ text: string }> }>(
+    tools,
+    { action: "result", id: "t-1", wait: 5 },
+    { onUpdate: (u) => updates.push(u as { content: Array<{ text?: string }> }) },
+  );
+  // The poll loop returned the finished ticket instead of the bound.
+  assertMatches(result.content[0].text, /ticket t-1 done/);
+  assertMatches(result.content[0].text, /exit 0/);
+  // Live elapsed status was emitted while the ticket ran.
+  assert(updates.length > 0, "live elapsed status emitted");
+  assertMatches(updates[0].content?.[0]?.text ?? "", /waiting for ticket t-1/);
+});
+
+test("offload: a pre-aborted signal releases the result wait without blocking rounds", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  const controller = new AbortController();
+  controller.abort();
+  const result = await runToolIO<{ content: Array<{ text: string }> }>(
+    tools,
+    { action: "result", id: "t-1", wait: 30 },
+    { signal: controller.signal },
+  );
+  assertMatches(result.content[0].text, /still running/);
+  // The wait must not hold a blocking pi-rc round trip open: only the
+  // immediate status probe (two args) is allowed.
+  assert(!pi.execCalls.some((c) => c.args[0] === "ticket-wait" && c.args.length > 2),
+    "no blocking ticket-wait round trips after abort");
+});
+
+test("offload: a queued user message yields the result wait", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  const result = await runToolIO<{ content: Array<{ text: string }> }>(
+    tools,
+    { action: "result", id: "t-1", wait: 30 },
+    { ctx: { hasPendingMessages: () => true } },
+  );
+  assertMatches(result.content[0].text, /still running/);
+  assert(!pi.execCalls.some((c) => c.args[0] === "ticket-wait" && c.args.length > 2),
+    "no blocking round trips while a message is queued");
+});
+
+test("offload: watch streams incremental output and abort releases the wait", async () => {
+  const pi = mount(new FakePi());
+  pi.logs.set("t-1", "chunk-one-chunk-two");
+  const tools = pi.tools.get("daemon_tasks");
+  const updates: string[] = [];
+  const result = await runToolIO<{ content: Array<{ text: string }> }>(
+    tools,
+    { action: "watch", id: "t-1" },
+    { onUpdate: (u) => updates.push((u as { content: Array<{ text: string }> }).content[0].text) },
+  );
+  assertMatches(result.content[0].text, /ticket t-1 done/);
+  assertMatches(result.content[0].text, /chunk-one-chunk-two/);
+  assert(updates.length > 0, "watch streamed a tail update");
+  assertMatches(updates[updates.length - 1], /chunk-one-chunk-two/);
+});
+
+test("offload: watch abort releases the wait with the ticket still running", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  const controller = new AbortController();
+  controller.abort();
+  const result = await runToolIO<{ content: Array<{ text: string }> }>(
+    tools,
+    { action: "watch", id: "t-1" },
+    { signal: controller.signal },
+  );
+  assertMatches(result.content[0].text, /released early/);
+  assert(!pi.execCalls.some((c) => c.args[0] === "ticket-wait" && c.args.length > 2),
+    "no blocking round trips after abort");
 });
 
 test("offload: bash tool falls back to local execution when the daemon is down", async () => {
