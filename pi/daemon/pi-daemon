@@ -74,6 +74,13 @@
 #   handoff-target {name}                 the live holder a resumed-away
 #                                         duplicate session's viewers
 #                                         should attach to, if any
+#   daemon-restart                        hand the daemon over to a fresh
+#                                         successor of the installed
+#                                         build: keep the registry, spawn
+#                                         a detached successor and exit;
+#                                         the successor respawns every
+#                                         hosted session and publishes a
+#                                         fresh endpoint
 #   ticket-submit {session,cwd,command
 #                  [,env]}                run a command as a daemon-owned
 #                                         ticket: the command outlives
@@ -102,6 +109,18 @@
 #
 # Env: XDG_RUNTIME_DIR (control endpoint), XDG_STATE_HOME (registry and
 # ticket state); on Windows those fall back to %TEMP%/%LOCALAPPDATA%.
+#
+# Idle auto-shutdown: when nothing has been attached, every session's
+# published model state is idle, and no ticket is running for
+# PI_DAEMON_IDLE_TIMEOUT seconds (default 300, 0 disables) continuously,
+# the daemon performs the same graceful shutdown as pi-rc daemon-stop.
+#
+# Single-daemon guarantee: every daemon publishes its control
+# coordinates in a state-dir roster at bind time; at boot the newest
+# daemon gracefully shuts down older roster entries, so a restart
+# (daemon-restart) and strays from endpoint-hijack eras converge to
+# exactly one live daemon. Daemons that predate the roster publish no
+# coordinates and must be stopped once manually (pi-rc daemon-stop
 
 import base64
 import hashlib
@@ -219,6 +238,19 @@ RELOAD_GUARD_GRACE = float(os.environ.get("PI_PTYD_RELOAD_GUARD_GRACE", "60"))
 # SIGTERMing an absorbed holder.
 ABSORB_GUARD = 10.0
 ABSORB_SETTLE = 0.5
+# Whole-daemon idle shutdown: once nothing is attached, every session's
+# published state is idle, and no ticket is running for this long
+# continuously, the daemon shuts itself down like pi-rc daemon-stop.
+# PI_DAEMON_IDLE_TIMEOUT=0 disables the sweep.
+DAEMON_IDLE_TIMEOUT = float(
+	os.environ.get("PI_DAEMON_IDLE_TIMEOUT", "300"))
+# Sweep cadence: bounded so small test timeouts still sweep promptly.
+IDLE_SWEEP_TICK = (max(0.2, min(10.0, DAEMON_IDLE_TIMEOUT / 5.0))
+				   if DAEMON_IDLE_TIMEOUT > 0 else 60.0)
+# Roster of live daemons: every daemon publishes its control coordinates
+# here at bind time and the newest daemon shuts older entries down at
+# boot, so a restart converges to exactly one live daemon.
+ROSTER_PATH = os.path.join(REG_DIR, "daemons.json")
 
 LOG_LOCK = threading.Lock()
 
@@ -228,7 +260,7 @@ CLEAR_SEQ = b"\x1b[H\x1b[2J\x1b[m"
 # the connection loop).
 _WIRE_COMMANDS = ("ping", "start", "detach", "resize", "list", "which",
 				  "whichall", "state", "stop", "handover", "carry", "resume",
-				  "announce", "handoff-target",
+				  "announce", "handoff-target", "daemon-restart",
 				  "input", "extensions-reload",
 				  "ticket-submit", "ticket-wait", "ticket-output",
 				  "ticket-list", "ticket-cancel", "ticket-remove",
@@ -405,6 +437,18 @@ def _on_signal(_signum, _frame):
 	raise SystemExit(0)
 
 
+def argv_session_file(argv):
+	"""The conversation file a registry argv resumes (the element after
+	--session), or None for a blank-start argv. One conversation key per
+	registry entry; duplicates of the same conversation file must never
+	be respawned side by side."""
+	argv = list(argv or [])
+	for i, arg in enumerate(argv):
+		if arg == "--session" and i + 1 < len(argv):
+			return argv[i + 1]
+	return None
+
+
 class LineReader:
 	"""Incremental JSON-line reader over a control socket."""
 
@@ -480,6 +524,153 @@ class Registry:
 			if name in data:
 				data[name]["argv"] = list(argv)
 				self._store(data)
+
+	def dedupe(self, file_of, prefer=None):
+		"""Keep one entry per conversation file: races and earlier daemon
+		eras can leave two registry names resuming the same --session
+		file, and respawning both would run diverging copies of one
+		conversation. Entries whose argv carries no conversation file
+		(blank starts) are never duplicates and stay untouched. Ties are
+		broken by the lexicographically first name; a prefer(name)
+		callback (the live session's viewer count) pulls the attached
+		session's entry forward instead. Returns (keep, drop) name
+		lists; dropped entries are removed from the store."""
+		keep, drop = {}, []
+		with self._lock:
+			data = self.load()
+			for name in sorted(data):
+				key = file_of(data[name].get("argv"))
+				if not key:
+					continue
+				if key not in keep:
+					keep[key] = name
+					continue
+				if prefer is not None and prefer(name) \
+						and not prefer(keep[key]):
+					drop.append(keep[key])
+					keep[key] = name
+				else:
+					drop.append(name)
+			for name in drop:
+				del data[name]
+			if drop:
+				self._store(data)
+		return keep, drop
+
+
+class DaemonRoster:
+	"""Live-daemon roster in the state dir: every daemon publishes its
+	control coordinates here at bind time and drops its entry at exit,
+	and the newest daemon shuts older entries down at boot. This is the
+	single-daemon guarantee: a restart (daemon-restart) and strays left
+	by the endpoint-hijack eras (each start once overwrote the endpoint
+	file while older daemons kept running) converge to exactly one live
+	daemon. A peer is stopped gracefully through its own roster
+	coordinates; a peer whose port refuses connections is dead and its
+	stale entry is pruned. Daemons that predate the roster publish no
+	coordinates and are invisible to it: stop them once manually
+	(pi-rc daemon-stop against their endpoint, or a process kill as the
+	documented fallback)."""
+
+	def __init__(self, path):
+		self.path = path
+		# Reentrant: shutdown_others prunes entries (remove) while it
+		# holds the lock over its whole candidate pass.
+		self._lock = threading.RLock()
+
+	def register(self, pid, host, port, token):
+		with self._lock:
+			data = self._load()
+			data[str(int(pid))] = {"host": str(host), "port": int(port),
+								   "token": str(token),
+								   "started": time.time()}
+			self._store(data)
+
+	def remove(self, pid):
+		with self._lock:
+			data = self._load()
+			if str(int(pid)) in data:
+				del data[str(int(pid))]
+				self._store(data)
+
+	def _load(self):
+		try:
+			with open(self.path) as f:
+				data = json.load(f)
+			return data if isinstance(data, dict) else {}
+		except (OSError, ValueError):
+			return {}
+
+	def _store(self, data):
+		os.makedirs(os.path.dirname(self.path), exist_ok=True)
+		tmp = self.path + ".tmp"
+		with open(tmp, "w") as f:
+			json.dump(data, f)
+			f.write("\n")
+		os.replace(tmp, self.path)
+
+	def shutdown_others(self, pid, started, timeout=2.0):
+		"""Gracefully stop every roster entry strictly older than
+		(started, pid): one candidate order, so two concurrent boots
+		never shut each other down - only the newer wins. Unreachable
+		(but listening) peers are left alone and reported; dead peers'
+		entries are pruned. Returns (stopped, pruned)."""
+		stopped, pruned = 0, 0
+		with self._lock:
+			data = self._load()
+			mine = (float(started), int(pid))
+			for key in sorted(data):
+				rec = data[key]
+				try:
+					peer = (float(rec.get("started", 0)), int(key))
+				except (TypeError, ValueError):
+					continue
+				if peer >= mine:
+					continue
+				outcome = _peer_shutdown(rec, timeout)
+				if outcome == "unreachable":
+					log("roster: live peer at %s:%s did not accept a "
+						"shutdown; left running" % (rec.get("host"),
+													rec.get("port")))
+					continue
+				self.remove(int(key))
+				if outcome == "stopped":
+					stopped += 1
+					log("roster: shut down older daemon pid %s" % key)
+				else:
+					pruned += 1
+					log("roster: pruned dead daemon pid %s" % key)
+		return stopped, pruned
+
+
+def _peer_shutdown(rec, timeout):
+	"""One graceful control shutdown through a roster entry's own
+	{host, port, token}: the exact handshake the endpoint publishes,
+	aimed at the peer's published coordinates instead. Returns
+	"stopped", "dead" (port refused: no process owns it), or
+	"unreachable" (something answered badly or the connection failed
+	mid-handshake)."""
+	try:
+		sock = socket.create_connection(
+			(str(rec.get("host")), int(rec.get("port"))), timeout)
+	except (ConnectionRefusedError, TimeoutError):
+		return "dead"
+	except OSError:
+		return "unreachable"
+	try:
+		sock.settimeout(timeout)
+		reader = LineReader(sock)
+		send_json(sock, {"cmd": "hello", "token": rec.get("token") or ""})
+		ack = json.loads(reader.readline().decode())
+		if not ack.get("ok"):
+			return "unreachable"
+		send_json(sock, {"cmd": "shutdown"})
+		reply = json.loads(reader.readline().decode())
+		return "stopped" if reply.get("ok") else "unreachable"
+	except (OSError, ValueError, AttributeError):
+		return "unreachable"
+	finally:
+		kill_socket(sock)
 
 
 class TicketStore:
@@ -956,6 +1147,104 @@ class TicketRunner:
 							  error="interrupted by daemon shutdown")
 
 
+class RestartPlanner:
+	"""Prepares the handover to a successor daemon: one registry entry
+	per conversation, then a detached successor launch."""
+
+	def __init__(self, registry, table):
+		self.registry = registry
+		self.table = table
+
+	def dedupe_registry(self):
+		"""One registry entry per conversation file before the successor
+		respawns it. The live table breaks ties toward the session a
+		viewer is attached to; absent that, the lexicographically first
+		name survives. Returns (keep, drop) name lists."""
+		with self.table.lock:
+			def prefer(name):
+				sess = self.table.get(name)
+				return sess is not None and sess.count_clients() > 0
+			return self.registry.dedupe(argv_session_file, prefer)
+
+	def spawn_successor(self, script, log_path):
+		"""Start the detached successor daemon from the installed script
+		this process runs, exactly like pi-rc daemon-start launches one
+		(windowless interpreter, daemon log for output). Returns False
+		when the launch fails; the registry is left in place either way,
+		so the next pi-rc daemon-start still respawns everything."""
+		os.makedirs(os.path.dirname(log_path), exist_ok=True)
+		try:
+			logf = open(log_path, "ab")
+		except OSError as exc:
+			log("restart: successor log unavailable: %s" % exc)
+			return False
+		try:
+			PROCESS.launch_detached(
+				[PROCESS.windowless_python(sys.executable), script], logf)
+		except OSError as exc:
+			log("restart: successor launch failed: %s" % exc)
+			return False
+		finally:
+			logf.close()
+		return True
+
+
+class IdleShutdownWatch:
+	"""Whole-daemon idle shutdown: a periodic sweep that performs the
+	normal graceful shutdown (pi-rc daemon-stop semantics) once the
+	daemon has been fully quiet for DAEMON_IDLE_TIMEOUT seconds
+	continuously. Quiet means every signal at once: no session has a
+	bridge viewer, every session's published model state is idle (the
+	in-session extension publishes busy/idle per turn via pi-rc state;
+	"waiting" - parked on a blocking daemon wait - counts as active
+	too), no offload ticket is running, and no handover connection is
+	parked waiting for a handing-over pi to exit. PI_DAEMON_IDLE_TIMEOUT
+	(env, seconds, default 300, 0 disables) configures it; a successor
+	daemon starts its own idle clock at boot, so a restart never
+	inherits quiet time."""
+
+	def __init__(self, daemon, shutdown_event):
+		self.daemon = daemon
+		self.shutdown_event = shutdown_event
+
+	def start(self):
+		if DAEMON_IDLE_TIMEOUT <= 0:
+			return
+		t = threading.Thread(target=self._sweep_loop, daemon=True)
+		t.start()
+
+	def quiescent(self):
+		"""Whether every idle signal is quiet right now: one owner per
+		signal, checked in one place."""
+		if self.daemon.tickets.running_count() > 0:
+			return False
+		with self.daemon.handover_lock:
+			if self.daemon.handover_wait:
+				return False
+		# snapshot() takes the table lock itself.
+		sessions = self.daemon.table.snapshot()
+		for sess in sessions:
+			if sess.count_clients() > 0 or sess.state != "idle":
+				return False
+		return True
+
+	def _sweep_loop(self):
+		idle_since = None
+		while not self.shutdown_event.wait(IDLE_SWEEP_TICK):
+			if self.quiescent():
+				now = time.time()
+				if idle_since is None:
+					idle_since = now
+				elif now - idle_since >= DAEMON_IDLE_TIMEOUT:
+					log("idle shutdown: quiet for %gs" % DAEMON_IDLE_TIMEOUT)
+					t = threading.Thread(target=self.daemon.shutdown,
+						 daemon=True)
+					t.start()
+					return
+			else:
+				idle_since = None
+
+
 class SessionTable:
 	"""Live sessions plus the single lock guarding them."""
 
@@ -1423,6 +1712,9 @@ class Daemon:
 		self.spawner = SessionSpawner(self.table, registry, owner=self)
 		self.tickets = TicketRunner(
 			TicketStore(TICKETS_PATH, TICKET_LOG_DIR), self.shutdown_event)
+		self.roster = DaemonRoster(ROSTER_PATH)
+		self.restart_planner = RestartPlanner(self.registry, self.table)
+		self.idle_watch = IdleShutdownWatch(self, self.shutdown_event)
 		self.control = Control(self)
 		# Signals a previous daemon run left behind never fire a fresh
 		# session's watcher; drop them before anything is hosted.
@@ -1445,8 +1737,13 @@ class Daemon:
 		log("listening on %s:%d (endpoint %s, registry %s)"
 			% (self.server.host, self.server.port, self.sock_path,
 			   self.registry.path))
+		started = time.time()
+		self.roster.register(os.getpid(), self.server.host,
+							 self.server.port, self.token)
+		self.roster.shutdown_others(os.getpid(), started)
 		self.respawn_from_registry()
 		self.tickets.start()
+		self.idle_watch.start()
 		try:
 			self._accept_loop(self.server)
 		except SystemExit:
@@ -1542,7 +1839,16 @@ class Daemon:
 		self.shutdown_event.set()
 		log("shutdown")
 		self.tickets.stop()
-		sessions = self.table.snapshot()
+		self._terminate_sessions(self.table.snapshot())
+		self.roster.remove(os.getpid())
+		self.registry.write({})
+		self.endpoint.remove()
+		os._exit(0)
+
+	def _terminate_sessions(self, sessions):
+		# Shared teardown for shutdown and restart: TERM every child, a
+		# bounded reap wait, KILL the survivors, close every PTY. Nothing
+		# is left behind: each child's process tree goes with it.
 		for sess in sessions:
 			PROCESS.signal_term(sess.pid)
 		deadline = time.time() + KILL_GRACE
@@ -1560,8 +1866,31 @@ class Daemon:
 		for sess in sessions:
 			sess.signal_closed()
 			sess.child.close()
-		self.registry.write({})
-		self.endpoint.remove()
+
+	def restart(self):
+		"""Hand the daemon over to a fresh successor of the installed
+		build: dedupe the registry, kill every hosted child, spawn the
+		detached successor and exit. Unlike shutdown() the registry and
+		endpoint file are left in place - the graceful shutdown path
+		intentionally drops detached idle sessions, but a restart must
+		respawn ALL hosted sessions - and the successor publishes its own
+		endpoint over the old one. The successor launch happens after
+		this daemon's children are dead, so no conversation is ever
+		hosted twice; if the launch fails the registry still stands and
+		the next pi-rc daemon-start respawns everything."""
+		if self.shutdown_event.is_set():
+			return
+		keep, dropped = self.restart_planner.dedupe_registry()
+		if dropped:
+			log("restart: dropped duplicate registry entries: %s"
+				% ", ".join(sorted(dropped)))
+		self.shutdown_event.set()
+		log("restart (registry holds %d session(s))" % len(keep))
+		self.tickets.stop()
+		self._terminate_sessions(self.table.snapshot())
+		self.roster.remove(os.getpid())
+		self.restart_planner.spawn_successor(os.path.abspath(__file__),
+											 LOG_PATH)
 		os._exit(0)
 
 	# -- session lifecycle -----------------------------------------------------
@@ -1678,6 +2007,14 @@ class Daemon:
 			log("revive '%s' skipped: name taken during revive" % sess.name)
 
 	def respawn_from_registry(self):
+		# One entry per conversation file: a registry inherited from an
+		# earlier era can hold duplicates, and respawning both would run
+		# diverging copies of one conversation. No table exists yet, so
+		# the lexicographically first name per file survives.
+		keep, dropped = self.registry.dedupe(argv_session_file)
+		if dropped:
+			log("respawn: dropped duplicate registry entries: %s"
+				% ", ".join(sorted(dropped)))
 		data = self.registry.load()
 		for name, rec in sorted(data.items()):
 			try:
@@ -2557,6 +2894,16 @@ class Control:
 		t = threading.Thread(target=self.daemon.shutdown, daemon=True)
 		t.start()
 		return {"ok": True}
+
+	def daemon_restart(self, _req):
+		"""Restart the daemon itself (see Daemon.restart): the response
+		is sent first, exactly like the shutdown op, because the daemon
+		exits mid-flow and the requesting session - a hosted pi running
+		/daemon-reload - is killed with every other hosted session. The
+		successor respawns it from its registry entry."""
+		t = threading.Thread(target=self.daemon.restart, daemon=True)
+		t.start()
+		return {"ok": True, "restarting": True}
 
 
 def _dir_base(dir_):

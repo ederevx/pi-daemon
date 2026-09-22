@@ -525,6 +525,20 @@ export class RcBackground {
 		await this.supervisor.ensure();
 	}
 
+	/** Hand the daemon over to a fresh successor: the daemon keeps its
+	 *  registry, spawns a detached successor from the newly installed
+	 *  build and exits; every hosted session respawns under the
+	 *  successor. Throws when pi-rc reports failure (including an old
+	 *  daemon that does not know the request). */
+	async restartDaemon(): Promise<void> {
+		const result = await this.runPiRc(["daemon-restart"]);
+		if (result.code !== 0) {
+			throw new Error(
+				(result.stderr || "").trim()
+					|| `pi-rc daemon-restart exit ${result.code}`);
+		}
+	}
+
 	/** Tell the daemon which session file backs this hosted pi so an
 	 *  abnormal death can be revived as `pi --session <file>`. The daemon
 	 *  also rewrites its registry argv with it, so a daemon restart
@@ -836,19 +850,37 @@ export default function (pi: ExtensionAPI) {
 		reloadWatcher.stop();
 	});
 
-	// Reload entrypoint queued by the signal watcher. Terminal per pi's
-	// ctx.reload() contract: consume the signal (so the daemon counts
-	// the round as consumed), then run the same flow as /reload and stop.
-	// Without a fresh pending signal the command is inert: a manual
-	// invocation and a signal the daemon already timed out on (it typed
-	// /reload into the PTY instead) never double-reload.
+	// Reload entrypoint queued by the signal watcher. With a fresh
+	// pending signal this is terminal per pi's ctx.reload() contract:
+	// consume the signal (so the daemon counts the round as consumed),
+	// then run the same flow as /reload and stop. Manual invocation
+	// (no pending signal) restarts the daemon instead: an in-place
+	// reload would be inert, while a restart adopts a newly installed
+	// pi-daemon build.
 	pi.registerCommand("daemon-reload", {
 		description:
-			"Reload resources on the pi-daemon's signal (internal)",
+			"Reload resources on the daemon's signal; without a pending signal, restart the pi-daemon to adopt a newly installed build",
 		handler: async (_args, ctx) => {
 			const token = reloadWatcher.pendingToken;
 			if (token && reloadWatcher.consume(token)) {
 				await ctx.reload();
+				return;
+			}
+			// The daemon orchestrates the restart: registry snapshot
+			// (deduped), detached successor, exit. This session is one
+			// of the hosted sessions the successor respawns; the TUI
+			// goes down with the old daemon and its viewer reattaches.
+			// A failure is reported while the session still lives: an
+			// old daemon answers bad-request instead of restarting.
+			try {
+				await app.restartDaemon();
+			} catch (err) {
+				ctx?.ui?.notify?.(
+					`Daemon restart failed ` +
+						`(${err instanceof Error ? err.message : String(err)}); ` +
+					"this session keeps running.",
+					"warning",
+				);
 			}
 		},
 	});
