@@ -100,11 +100,14 @@
 #                                       (hosted sessions are untouched)
 #   pi-rc input <name> <text...>        type raw text into a hosted
 #                                       session's PTY master (e.g. a slash
-#                                       command); used by extensions-reload
+#                                       command)
 #   pi-rc extensions-reload [--force]   re-scan extensions, skills,
 #                                       prompts, themes and context files
 #                                       in every hosted conversation
-#                                       session (in-place /reload); the
+#                                       session (in-place reload, signaled
+#                                       to the in-session extension
+#                                       directly with a PTY-typing
+#                                       fallback); the
 #                                       file-level diff is relayed to each
 #                                       agent once it settles; --force
 #                                       reloads even without changes

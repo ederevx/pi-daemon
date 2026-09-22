@@ -71,9 +71,17 @@ them, and can uninstall exactly what it installed.
   deaths can be revived from the same conversation.
 - **Extension reload watch**: the daemon polls the extension roots
   (extensions, skills, prompts, themes, context files); on change it
-  types `/reload` into every hosted conversation session so pi re-scans
+  signals a reload to every hosted conversation session so pi re-scans
   its loaded resources in place, and persists the file-level diff for
-  the in-session daemon extension to relay to the agent once it settles.
+  the in-session daemon extension to relay to the agent once it
+  settles. The signal is direct: the daemon writes a one-shot
+  token-stamped per-session signal file under the daemon state dir and
+  the in-session daemon extension (watching for it) consumes the
+  signal and runs pi's own reload flow programmatically (`ctx.reload()`
+  — the same flow as a typed `/reload`, with no keystrokes entering
+  the TUI); a signal an extension without the watcher does not consume
+  within a short grace is deleted again and the daemon falls back to
+  typing `/reload` into the session's PTY the old way.
   Sessions that are not idle are skipped for the round instead (busy
   mid-turn, or parked on a blocking daemon wait `waiting`) since pi
   would deny a reload in either state; each skipped session stays owed,
@@ -81,9 +89,9 @@ them, and can uninstall exactly what it installed.
   only once every owed session was reloaded or is gone (never dropped,
   with newer edits coalescing into the pending diff). A manual
   `pi-rc extensions-reload` follows the same deferral and the watch
-  finishes its busy sessions. The reload is strictly in-place: it only writes into
+  finishes its busy sessions. The reload is strictly in-place: it only signals
   sessions that already exist and never starts or revives one, and a
-  session that dies while processing the injected `/reload` stays dead
+  session that dies while processing the reload stays dead
   instead of being respawned, so a broken update cannot cascade into a
   spawn storm.
 - **Command offloading** (`offload` pi extension): every `bash` call is
