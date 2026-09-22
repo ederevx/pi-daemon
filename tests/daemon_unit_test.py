@@ -895,6 +895,39 @@ def test_platform_seams():
     assert_eq(hs.reject().get("error"), "bad-handshake")
 
 
+def test_shell_path_skips_wsl_stub():
+    plat = daemon.pi_platform
+    root = os.environ.get("SystemRoot", "C:\\WINDOWS")
+    stub = os.path.join(root, "System32", "bash.exe")
+    # Windows ships bash.exe in the system directory as the WSL launcher;
+    # it execs into the default Linux distro, so a session started
+    # through it dies with 127 (the Windows pi chain is not reachable
+    # there). It is the only bash a native-Windows PATH resolves, so the
+    # seam rejects it everywhere, explicit override included, and the
+    # next candidate (Git bash) wins.
+    win = plat.ProcessControl(platform="win32",
+                              environ={"SystemRoot": root,
+                                       "PI_SHELL": stub})
+    resolved = win.shell_path()
+    assert_true(resolved)
+    assert_true(os.path.normcase(os.path.abspath(resolved))
+                != os.path.normcase(os.path.abspath(stub)))
+    assert_eq(win.pi_argv()[0], resolved)
+    assert_eq(win.resume_command()[0], resolved)
+    # The predicate is a pure path judgement.
+    assert_eq(win._is_wsl_stub(stub), True)
+    assert_eq(win._is_wsl_stub(
+        os.path.join(root, "Sysnative", "bash.exe")), True)
+    assert_eq(win._is_wsl_stub(r"C:\Program Files\Git\bin\bash.exe"),
+              False)
+    # Without the system dir there is nothing to reject, so an explicit
+    # path is honored verbatim.
+    bare = plat.ProcessControl(platform="win32",
+                               environ={"PI_SHELL": stub})
+    assert_eq(bare._is_wsl_stub(stub), False)
+    assert_eq(bare.shell_path(), stub)
+
+
 class _RecordingControl:
     """Stand-in ProcessControl: records SIGWINCH deliveries."""
 
