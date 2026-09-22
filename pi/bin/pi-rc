@@ -85,8 +85,10 @@
 #                                       JSON line
 #   pi-rc ticket-output <id> [--json] [offset]
 #                                       print the ticket's final output text
-#                                       (or JSON record with --json; raw bytes
-#                                       from offset when offset is given)
+#                                       (or JSON record with --json; the base64
+#                                       payload from offset when offset is
+#                                       given, so binary output survives the
+#                                       pipe byte-faithful)
 #   pi-rc ticket-list [session]         print one ticket record JSON line
 #                                       per ticket, oldest first
 #   pi-rc ticket-cancel <id>            TERM then KILL a running ticket
@@ -129,7 +131,6 @@
 #                                       exits; every hosted session
 #                                       respawns under the successor
 
-import base64
 import hashlib
 import json
 import os
@@ -1268,7 +1269,10 @@ def cmd_ticket_wait(args, client):
 def cmd_ticket_output(args, client):
 	# Without offset: fetches the ticket's final output text from daemon
 	# control (or full JSON record with --json).
-	# With offset: raw incremental output from byte offset to stdout.
+	# With offset: the incremental base64 payload from byte offset,
+	# printed verbatim: decoding and re-encoding raw bytes through a
+	# text pipe corrupted non-ASCII output and drifted client offsets,
+	# so the base64 form is the byte-faithful wire format.
 	if len(args) < 1 or len(args) > 3:
 		usage_error("ticket-output takes an id and an optional offset (or --json)")
 	tid = args[0]
@@ -1294,8 +1298,8 @@ def cmd_ticket_output(args, client):
 							   "offset": offset})
 		if not resp.get("ok"):
 			die("ticket-output failed: %s" % resp.get("error"))
-		sys.stdout.buffer.write(base64.b64decode(resp["data"]))
-		sys.stdout.buffer.flush()
+		sys.stdout.write(resp["data"])
+		sys.stdout.flush()
 
 
 def cmd_ticket_list(args, client):
