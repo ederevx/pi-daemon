@@ -978,58 +978,10 @@ def test_daemon_roster():
     assert_eq(roster._load(), {})
 
 
-def test_roster_waits_for_peer_death():
-    """A peer that acks the graceful shutdown is awaited until its
-    control port actually refuses: the boot must not publish its
-    endpoint while the dying peer's cleanup can still unlink it."""
-    path = os.path.join(SCRATCH, "roster-wait.json")
-    roster = daemon.DaemonRoster(path)
-    srv = socket.socket()
-    srv.bind(("127.0.0.1", 0))
-    port = srv.getsockname()[1]
-    srv.listen(4)
-    state = {"served": False}
-
-    def fake_peer():
-        conn, _ = srv.accept()
-        try:
-            f = conn.makefile("rwb")
-            json.loads(f.readline())
-            f.write(json.dumps({"ok": True}).encode() + b"\n")
-            f.flush()
-            json.loads(f.readline())
-            f.write(json.dumps({"ok": True}).encode() + b"\n")
-            f.flush()
-            state["served"] = True
-            # Linger a beat past the ack, like a real exit teardown.
-            time.sleep(0.3)
-        finally:
-            conn.close()
-            srv.close()
-
-    t = threading.Thread(target=fake_peer, daemon=True)
-    t.start()
-    roster.register(202, "127.0.0.1", port, "tok")
-    with open(path) as f:
-        data = json.load(f)
-    data["202"]["started"] = 100.0
-    with open(path, "w") as f:
-        json.dump(data, f)
-    t0 = time.time()
-    stopped, pruned = roster.shutdown_others(999, 200.0, 5.0)
-    t.join(timeout=5)
-    assert_eq(stopped, 1)
-    assert_eq(pruned, 0)
-    assert_true(state["served"], "peer answered the shutdown handshake")
-    assert_true(time.time() - t0 >= 0.3,
-                "shutdown_others returned before the peer died")
-    assert_true(roster._load() == {}, "stopped entry is pruned")
-
-
-def test_roster_force_kills_lingering_peer():
-    """A peer that acks the shutdown but never exits is killed by its
-    roster pid, so a new daemon always proceeds to a single-daemon
-    state instead of sharing the host with a zombie."""
+def _spawn_fake_daemon(linger):
+    """Spawn a subprocess that speaks the daemon control handshake
+    (hello, shutdown - both acked) on an ephemeral port, then lingers
+    for `linger` seconds before exiting (unless killed first)."""
     code = (
         "import json, socket, sys, threading, time\n"
         "srv = socket.socket()\n"
@@ -1053,21 +1005,57 @@ def test_roster_force_kills_lingering_peer():
         "        finally:\n"
         "            conn.close()\n"
         "threading.Thread(target=serve, daemon=True).start()\n"
-        "time.sleep(30)\n"
+        "time.sleep(%f)\n" % linger
     )
     proc = subprocess.Popen([sys.executable, "-c", code],
                             stdout=subprocess.PIPE, text=True)
-    port = int(proc.stdout.readline().strip())
-    path = os.path.join(SCRATCH, "roster-kill.json")
+    return proc, int(proc.stdout.readline().strip())
+
+
+def _roster_with_peer(pid, port, tag):
+    path = os.path.join(SCRATCH, "roster-%s.json" % tag)
     roster = daemon.DaemonRoster(path)
-    roster.register(proc.pid, "127.0.0.1", port, "tok")
+    roster.register(pid, "127.0.0.1", port, "tok")
     with open(path) as f:
         data = json.load(f)
-    data[str(proc.pid)]["started"] = 100.0
+    data[str(pid)]["started"] = 100.0
     with open(path, "w") as f:
         json.dump(data, f)
+    return roster
+
+
+def test_roster_waits_for_peer_death():
+    """A peer that acks the graceful shutdown is awaited until its
+    process is actually gone: its control port can die before its exit
+    teardown runs, and that teardown removes the shared endpoint file
+    the boot is about to republish."""
+    proc, port = _spawn_fake_daemon(linger=0.4)
+    roster = _roster_with_peer(proc.pid, port, "wait")
     try:
-        # A short wait budget guarantees the force-kill branch runs.
+        t0 = time.time()
+        stopped, pruned = roster.shutdown_others(999, 200.0, 5.0)
+        elapsed = time.time() - t0
+        assert_eq(stopped, 1)
+        assert_eq(pruned, 0)
+        assert_true(elapsed >= 0.4,
+                    "shutdown_others returned before the peer died "
+                    "(%.2fs)" % elapsed)
+        assert_true(roster._load() == {}, "stopped entry is pruned")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_roster_force_kills_lingering_peer():
+    """A peer that acks the shutdown but never exits is killed by its
+    roster pid, so a new daemon always proceeds to a single-daemon
+    state instead of sharing the host with a zombie."""
+    proc, port = _spawn_fake_daemon(linger=30.0)
+    roster = _roster_with_peer(proc.pid, port, "kill")
+    try:
+        # A wait budget shorter than the linger guarantees the
+        # force-kill branch runs.
         stopped, pruned = roster.shutdown_others(999, 200.0, 0.2)
         assert_eq(stopped, 1)
         assert_eq(pruned, 0)
@@ -1076,8 +1064,6 @@ def test_roster_force_kills_lingering_peer():
         except subprocess.TimeoutExpired:
             proc.kill()
             raise AssertionError("lingering peer survived the force kill")
-        assert_true(proc.returncode != 0 or True,
-                    "peer process exited after the kill")
         assert_true(roster._load() == {}, "killed entry is pruned")
     finally:
         if proc.poll() is None:
