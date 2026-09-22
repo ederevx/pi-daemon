@@ -122,6 +122,12 @@
 #   pi-rc daemon-start                  ensure the host daemon is running
 #   pi-rc daemon-stop                   stop the daemon and every hosted
 #                                       session
+#   pi-rc daemon-restart                hand the daemon over to a fresh
+#                                       successor of the installed build:
+#                                       the daemon keeps its registry,
+#                                       spawns a detached successor and
+#                                       exits; every hosted session
+#                                       respawns under the successor
 
 import base64
 import hashlib
@@ -165,6 +171,7 @@ DEFAULT_COLS = 120
 DEFAULT_ROWS = 40
 CONTROL_TIMEOUT = 5.0    # seconds per control round-trip; never hang
 DAEMON_START_WAIT = 2.0  # seconds to wait for the socket after spawning
+DAEMON_RESTART_WAIT = 30.0  # seconds for the successor to publish
 MAX_BUF = 1 << 20        # per-direction bridge buffer bound (backpressure)
 RELAY_TICK = 0.1         # select bound: lets Windows poll for resize
 
@@ -184,7 +191,7 @@ DETACH_KEY = b"\x1c"  # Ctrl-\: pop out of an attached session without exiting p
 # Commands served by main(); ls has a list alias.
 _COMMANDS = ("which", "whichall", "owned", "state", "carry", "resume", "start",
 			 "attach", "announce", "detach", "stop", "handover",
-			 "daemon-start", "daemon-stop",
+			 "daemon-start", "daemon-stop", "daemon-restart",
 			 "input", "extensions-reload",
 			 "ticket-submit", "ticket-wait", "ticket-output",
 			 "ticket-list", "ticket-cancel", "ticket-remove", "tickets-reset")
@@ -751,6 +758,34 @@ def cmd_daemon_stop(_args, client):
 		sock.close()
 	except (OSError, SystemExit):
 		pass
+
+
+def cmd_daemon_restart(_args, client):
+	# Hand the daemon over to a fresh successor of the installed build:
+	# the daemon keeps its registry, spawns a detached successor and
+	# exits; the successor publishes new endpoint coordinates and
+	# respawns every hosted session. Old daemons that predate the
+	# request answer bad-request, which is reported, not ambiguous.
+	before = ENDPOINT.read()
+	if not client.alive():
+		die("background service is not running "
+			"(systemctl --user start pi-daemon)", EXIT_NO_DAEMON)
+	resp = client.control({"cmd": "daemon-restart"})
+	if not resp.get("ok"):
+		die("daemon restart refused: %s (update pi-daemon)"
+			% resp.get("error"))
+	# The endpoint rotates to the successor; wait until the new
+	# coordinates answer before declaring success.
+	deadline = time.time() + DAEMON_RESTART_WAIT
+	while time.time() < deadline:
+		data = ENDPOINT.read()
+		if data != before and data.get("host") and client.alive():
+			print("pi-daemon restarted (endpoint %s:%s)"
+				  % (data.get("host"), data.get("port")))
+			return
+		time.sleep(0.1)
+	die("daemon restart did not complete (see %s)" % LOG_PATH,
+		EXIT_AMBIGUOUS)
 
 
 # ---------------------------------------------------------------- commands
@@ -1342,6 +1377,7 @@ def main():
 		 "attach": cmd_attach, "announce": cmd_announce,
 		 "detach": cmd_detach, "stop": cmd_stop, "handover": cmd_handover,
 		 "daemon-start": cmd_daemon_start, "daemon-stop": cmd_daemon_stop,
+		 "daemon-restart": cmd_daemon_restart,
 		 "input": cmd_input, "extensions-reload": cmd_extensions_reload,
 		 "ticket-submit": cmd_ticket_submit, "ticket-wait": cmd_ticket_wait,
 		 "ticket-output": cmd_ticket_output, "ticket-list": cmd_ticket_list,
