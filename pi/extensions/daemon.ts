@@ -492,6 +492,7 @@ export class RcBackground {
 	private readonly piRc: string;
 	private readonly hold: HandoverHold;
 	private readonly supervisor: DaemonSupervisor;
+	private readonly platform: string;
 
 	/** Owns the OS launcher for pi-rc, built from the injected exec. */
 	private readonly runner: ProcessRunner;
@@ -500,10 +501,12 @@ export class RcBackground {
 		exec: (file: string, args: string[]) => Promise<any>,
 		hold: HandoverHold = new HandoverHold(),
 		supervisor: DaemonSupervisor = new DaemonSupervisor(),
+		platform: string = process.platform,
 	) {
 		this.runner = new ProcessRunner(exec);
 		this.hold = hold;
 		this.supervisor = supervisor;
+		this.platform = platform;
 		this.piRc = resolvePiRc();
 	}
 
@@ -536,6 +539,42 @@ export class RcBackground {
 			throw new Error(
 				(result.stderr || "").trim()
 					|| `pi-rc daemon-restart exit ${result.code}`);
+		}
+	}
+
+	/** Restart the background service directly when the running daemon
+	 *  cannot restart itself: an old build answers bad-request to
+	 *  pi-rc daemon-restart, and an unreachable daemon makes pi-rc fail
+	 *  before any request lands. The daemon's persisted registry makes
+	 *  both paths session-preserving — a restart respawns every recorded
+	 *  session. POSIX restarts the user systemd unit the install
+	 *  manages; Windows has no service manager, so the daemon is stopped
+	 *  and the supervisor respawns it windowless. Throws on failure so
+	 *  the caller can report and keep the session alive. */
+	async restartService(): Promise<void> {
+		if (this.platform === "win32") {
+			const stop = await this.runPiRc(["daemon-stop"]);
+			if (stop.code !== 0 && !stop.killed) {
+				throw new Error((stop.stderr || "").trim()
+					|| `pi-rc daemon-stop exit ${stop.code}`);
+			}
+			await this.supervisor.ensure();
+			// The windowless spawn publishes the endpoint asynchronously;
+			// give it a bounded window to come up.
+			const deadline = Date.now() + 5000;
+			while (!existsSync(endpointPath()) && Date.now() < deadline) {
+				await new Promise((r) => setTimeout(r, 100));
+			}
+			if (!existsSync(endpointPath())) {
+				throw new Error("daemon did not come back up");
+			}
+			return;
+		}
+		const result = await this.runner.run("systemctl",
+			["--user", "restart", "pi-daemon.service"]);
+		if (result.code !== 0) {
+			throw new Error((result.stderr || result.stdout || "").trim()
+				|| `systemctl exit ${result.code}`);
 		}
 	}
 
@@ -859,7 +898,7 @@ export default function (pi: ExtensionAPI) {
 	// pi-daemon build.
 	pi.registerCommand("daemon-reload", {
 		description:
-			"Reload resources on the daemon's signal; without a pending signal, restart the pi-daemon to adopt a newly installed build",
+			"Reload resources on the daemon's signal; without a pending signal, restart the pi-daemon to adopt a newly installed build (falls back to restarting the background service when the daemon cannot)",
 		handler: async (_args, ctx) => {
 			const token = reloadWatcher.pendingToken;
 			if (token && reloadWatcher.consume(token)) {
@@ -875,11 +914,29 @@ export default function (pi: ExtensionAPI) {
 			try {
 				await app.restartDaemon();
 			} catch (err) {
+				// The running daemon may be unable to restart itself: an
+				// old build answers bad-request to pi-rc daemon-restart,
+				// and an unreachable daemon fails before any request
+				// lands. Restart the background service directly; the
+				// persisted registry respawns every recorded session.
+				try {
+					await app.restartService();
+				} catch (serviceErr) {
+					ctx?.ui?.notify?.(
+						`Daemon restart failed ` +
+							`(${err instanceof Error ? err.message : String(err)}); ` +
+							`the service restart also failed ` +
+							`(${serviceErr instanceof Error ? serviceErr.message : String(serviceErr)}); ` +
+						"this session keeps running.",
+						"warning",
+					);
+					return;
+				}
 				ctx?.ui?.notify?.(
-					`Daemon restart failed ` +
-						`(${err instanceof Error ? err.message : String(err)}); ` +
-					"this session keeps running.",
-					"warning",
+					"The daemon could not restart itself, so the background " +
+						"service was restarted directly; every hosted session " +
+						"respawns from the registry.",
+					"info",
 				);
 			}
 		},

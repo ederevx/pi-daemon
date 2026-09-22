@@ -8,11 +8,12 @@
 
 import { mkdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test, assert, assertEq, withEnv, waitFor, scratchDir } from "./harness.ts";
 import {
   RcBackground,
   ProcessRunner,
+  DaemonSupervisor,
   endpointPath,
   stateHome,
   reloadSignalPath,
@@ -464,3 +465,57 @@ test("daemon: windowless python prefers the GUI-subsystem twin", async () => {
   assert(windowlessCandidates("python").includes("pythonw"),
     "bare python offers pythonw");
 });
+
+/** Expects rejection; the caller names the invariant in message. */
+async function assertReject(fn: () => Promise<unknown>, message: string): Promise<void> {
+  let threw = false;
+  try {
+    await fn();
+  } catch {
+    threw = true;
+  }
+  assert(threw, message);
+}
+
+/** A supervisor whose ensure() publishes the endpoint, so the win32
+ *  restart path is exercisable without a real windowless spawn. */
+class EnsureWritesEndpoint extends DaemonSupervisor {
+  async ensure(): Promise<void> {
+    mkdirSync(dirname(endpointPath()), { recursive: true });
+    writeFileSync(endpointPath(), "{}");
+  }
+}
+
+test("daemon: restartService restarts the systemd unit on POSIX", async () => {
+  const exe = new ExecScript([{ code: 0 }]);
+  const app = new RcBackground(exe.run.bind(exe), undefined, undefined, "linux");
+  await app.restartService();
+  assertEq(exe.calls[0].join(" "), "--user restart pi-daemon.service");
+});
+
+test("daemon: restartService throws with systemctl's failure detail", async () => {
+  const exe = new ExecScript([{ code: 1, stderr: "Unit pi-daemon.service not found." }]);
+  const app = new RcBackground(exe.run.bind(exe), undefined, undefined, "linux");
+  await assertReject(
+    () => app.restartService(),
+    "a failed unit restart must surface its detail",
+  );
+});
+
+test("daemon: restartService stops and respawns the daemon on win32", async () => {
+  const exe = new ExecScript([{ code: 0 }]);
+  const app = new RcBackground(
+    exe.run.bind(exe),
+    undefined,
+    new EnsureWritesEndpoint(),
+    "win32",
+  );
+  // endpointPath() resolves under XDG_RUNTIME_DIR inside the hosted()
+  // scratch runtime, so EnsureWritesEndpoint's file satisfies the
+  // respawn probe without touching a real daemon.
+  await app.restartService();
+  assertEq(exe.calls[0][0], "daemon-stop");
+  assert(existsSync(endpointPath()), "endpoint republished by ensure()");
+});
+
+/** Runs fn with a hosted-session env and awaits the body. */

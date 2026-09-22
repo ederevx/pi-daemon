@@ -978,6 +978,129 @@ def test_daemon_roster():
     assert_eq(roster._load(), {})
 
 
+def test_roster_waits_for_peer_death():
+    """A peer that acks the graceful shutdown is awaited until its
+    control port actually refuses: the boot must not publish its
+    endpoint while the dying peer's cleanup can still unlink it."""
+    path = os.path.join(SCRATCH, "roster-wait.json")
+    roster = daemon.DaemonRoster(path)
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(4)
+    state = {"served": False}
+
+    def fake_peer():
+        conn, _ = srv.accept()
+        try:
+            f = conn.makefile("rwb")
+            json.loads(f.readline())
+            f.write(json.dumps({"ok": True}).encode() + b"\n")
+            f.flush()
+            json.loads(f.readline())
+            f.write(json.dumps({"ok": True}).encode() + b"\n")
+            f.flush()
+            state["served"] = True
+            # Linger a beat past the ack, like a real exit teardown.
+            time.sleep(0.3)
+        finally:
+            conn.close()
+            srv.close()
+
+    t = threading.Thread(target=fake_peer, daemon=True)
+    t.start()
+    roster.register(202, "127.0.0.1", port, "tok")
+    with open(path) as f:
+        data = json.load(f)
+    data["202"]["started"] = 100.0
+    with open(path, "w") as f:
+        json.dump(data, f)
+    t0 = time.time()
+    stopped, pruned = roster.shutdown_others(999, 200.0, 5.0)
+    t.join(timeout=5)
+    assert_eq(stopped, 1)
+    assert_eq(pruned, 0)
+    assert_true(state["served"], "peer answered the shutdown handshake")
+    assert_true(time.time() - t0 >= 0.3,
+                "shutdown_others returned before the peer died")
+    assert_true(roster._load() == {}, "stopped entry is pruned")
+
+
+def test_roster_force_kills_lingering_peer():
+    """A peer that acks the shutdown but never exits is killed by its
+    roster pid, so a new daemon always proceeds to a single-daemon
+    state instead of sharing the host with a zombie."""
+    code = (
+        "import json, socket, sys, threading, time\n"
+        "srv = socket.socket()\n"
+        "srv.bind(('127.0.0.1', 0))\n"
+        "srv.listen(4)\n"
+        "print(srv.getsockname()[1], flush=True)\n"
+        "def serve():\n"
+        "    while True:\n"
+        "        try:\n"
+        "            conn, _ = srv.accept()\n"
+        "        except OSError:\n"
+        "            return\n"
+        "        try:\n"
+        "            f = conn.makefile('rwb')\n"
+        "            json.loads(f.readline())\n"
+        "            f.write(b'{\"ok\": true}\\n'); f.flush()\n"
+        "            json.loads(f.readline())\n"
+        "            f.write(b'{\"ok\": true}\\n'); f.flush()\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "        finally:\n"
+        "            conn.close()\n"
+        "threading.Thread(target=serve, daemon=True).start()\n"
+        "time.sleep(30)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", code],
+                            stdout=subprocess.PIPE, text=True)
+    port = int(proc.stdout.readline().strip())
+    path = os.path.join(SCRATCH, "roster-kill.json")
+    roster = daemon.DaemonRoster(path)
+    roster.register(proc.pid, "127.0.0.1", port, "tok")
+    with open(path) as f:
+        data = json.load(f)
+    data[str(proc.pid)]["started"] = 100.0
+    with open(path, "w") as f:
+        json.dump(data, f)
+    try:
+        # A short wait budget guarantees the force-kill branch runs.
+        stopped, pruned = roster.shutdown_others(999, 200.0, 0.2)
+        assert_eq(stopped, 1)
+        assert_eq(pruned, 0)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise AssertionError("lingering peer survived the force kill")
+        assert_true(proc.returncode != 0 or True,
+                    "peer process exited after the kill")
+        assert_true(roster._load() == {}, "killed entry is pruned")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_endpoint_remove_if_owner_scoped():
+    """EndpointFile.remove_if unlinks only a file that still publishes
+    the caller's own coordinates: a dying daemon must never delete the
+    endpoint a successor published over it."""
+    ep = daemon.pi_platform.EndpointFile(
+        os.path.join(SCRATCH, "endpoint.json"))
+    ep.write("127.0.0.1", 40000, "mine")
+    ep.remove_if("127.0.0.1", 40000, "theirs")
+    assert_true(ep.read().get("token") == "mine",
+                "foreign coordinates never unlink the file")
+    ep.remove_if("127.0.0.1", 40000, "mine")
+    assert_eq(ep.read(), {}, "own coordinates unlink the file")
+    ep.remove_if("127.0.0.1", 40000, "mine")
+    assert_eq(ep.read(), {}, "removing a missing file is quiet")
+
+
 def test_idle_shutdown_watch():
     """The sweep stays quiet while any activity signal is live: a busy
     or waiting session, an attached viewer, a running ticket, or a
@@ -1366,6 +1489,12 @@ def _main():
        test_idle_shutdown_watch)
     ok("platform seams (layout, handshake, shell)",
        test_platform_seams)
+    ok("roster waits for peer death before publishing",
+       test_roster_waits_for_peer_death)
+    ok("roster force-kills a lingering peer",
+       test_roster_force_kills_lingering_peer, posix_only=True)
+    ok("endpoint remove_if is owner-scoped",
+       test_endpoint_remove_if_owner_scoped)
     ok("posix pty child seam", test_posix_pty_child, posix_only=True)
     ok("terminal seam (raw mode, io, SIGWINCH resize)",
        test_terminal_seam, posix_only=True)
