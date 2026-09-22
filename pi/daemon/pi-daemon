@@ -369,33 +369,42 @@ class Registry:
 	def write(self, data):
 		# Atomic replacement so readers never see a partial file.
 		with self._lock:
-			os.makedirs(os.path.dirname(self.path), exist_ok=True)
-			tmp = self.path + ".tmp"
-			with open(tmp, "w") as f:
-				json.dump(data, f)
-				f.write("\n")
-				f.flush()
-				os.fsync(f.fileno())
-			os.replace(tmp, self.path)
+			self._store(data)
+
+	def _store(self, data):
+		# Caller holds _lock: every mutation is one load-modify-write
+		# under the lock, so a concurrent set_argv can no longer resurrect
+		# a name drop() just removed (a stale respawn on daemon restart).
+		os.makedirs(os.path.dirname(self.path), exist_ok=True)
+		tmp = self.path + ".tmp"
+		with open(tmp, "w") as f:
+			json.dump(data, f)
+			f.write("\n")
+			f.flush()
+			os.fsync(f.fileno())
+		os.replace(tmp, self.path)
 
 	def add(self, name, dir_, argv):
-		data = self.load()
-		data[name] = {"dir": dir_, "argv": list(argv)}
-		self.write(data)
+		with self._lock:
+			data = self.load()
+			data[name] = {"dir": dir_, "argv": list(argv)}
+			self._store(data)
 
 	def drop(self, name):
-		data = self.load()
-		if name in data:
-			del data[name]
-			self.write(data)
+		with self._lock:
+			data = self.load()
+			if name in data:
+				del data[name]
+				self._store(data)
 
 	def set_argv(self, name, argv):
 		# An announced session file rewrites the resume argv so a daemon
 		# restart respawns the same conversation instead of a blank one.
-		data = self.load()
-		if name in data:
-			data[name]["argv"] = list(argv)
-			self.write(data)
+		with self._lock:
+			data = self.load()
+			if name in data:
+				data[name]["argv"] = list(argv)
+				self._store(data)
 
 
 class TicketStore:
@@ -652,7 +661,19 @@ class TicketRunner:
 			stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
 			stderr=subprocess.STDOUT, bufsize=0, **extra)
 		rec["pid"] = proc.pid
-		rec = self.store.add(rec)
+		try:
+			rec = self.store.add(rec)
+		except OSError as exc:
+			# The record never persisted, so no reader thread or cancel
+			# path will ever own this child: kill it before reporting the
+			# failure so no orphan keeps running unmanaged.
+			PROCESS.signal_kill(proc.pid)
+			try:
+				proc.wait(timeout=KILL_GRACE)
+			except Exception:
+				pass
+			log("ticket-submit '%s' aborted: %s" % (tid, exc))
+			raise
 		with self._lock:
 			self._procs[tid] = proc
 		t = threading.Thread(target=self._run, args=(tid, proc), daemon=True)
@@ -1724,35 +1745,44 @@ class Daemon:
 		# just started (state publish still in flight) must not be killed
 		# mid-turn.
 		time.sleep(ABSORB_SETTLE)
+		kill = False
 		with self.table.lock:
 			if holder.state == "idle":
-				holder.terminate()
-				return
-			# The holder started working during the settle: it wins
-			# instead. Never kill a working agent — and never kill the
-			# announcer while it is working either; if both sides started
-			# within the window, sparing both leaves a divergence, but
-			# aborting a working agent is worse. One yield wins; later
-			# busy holders are only spared.
-			holder.stopping = False
-			self.ledger.pop(holder.name)
-			sess = self.table.get(announcer)
-			if sess is None:
-				return
-			sess.absorbing_until = 0
-			if sess.yielded_to is not None:
-				log("absorb spare '%s': announcer '%s' already yielded"
-					% (holder.name, announcer))
-				return
-			if sess.state != "idle":
-				log("absorb aborted '%s' vs working '%s': both working, left alone"
-					% (announcer, holder.name))
-				return
-			sess.yielded_to = holder.name
-			self.ledger.record(announcer, holder.name)
-			sess.signal_closed()
-			log("absorb yield '%s' -> working '%s'" % (announcer, holder.name))
-			threading.Thread(target=sess.terminate, daemon=True).start()
+				# terminate() blocks for the kill grace, so it must run
+				# outside the table lock: held under it, every control
+				# request (start/attach/list) stalls behind a dying
+				# session. The kill decision was made under the lock; a
+				# state flip after it is the same best-effort race the
+				# settle window already accepts.
+				kill = True
+			else:
+				# The holder started working during the settle: it wins
+				# instead. Never kill a working agent — and never kill the
+				# announcer while it is working either; if both sides started
+				# within the window, sparing both leaves a divergence, but
+				# aborting a working agent is worse. One yield wins; later
+				# busy holders are only spared.
+				holder.stopping = False
+				self.ledger.pop(holder.name)
+				sess = self.table.get(announcer)
+				if sess is None:
+					return
+				sess.absorbing_until = 0
+				if sess.yielded_to is not None:
+					log("absorb spare '%s': announcer '%s' already yielded"
+						% (holder.name, announcer))
+					return
+				if sess.state != "idle":
+					log("absorb aborted '%s' vs working '%s': both working, left alone"
+						% (announcer, holder.name))
+					return
+				sess.yielded_to = holder.name
+				self.ledger.record(announcer, holder.name)
+				sess.signal_closed()
+				log("absorb yield '%s' -> working '%s'" % (announcer, holder.name))
+				threading.Thread(target=sess.terminate, daemon=True).start()
+		if kill:
+			holder.terminate()
 
 
 class Control:

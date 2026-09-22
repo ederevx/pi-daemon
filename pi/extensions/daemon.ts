@@ -378,6 +378,12 @@ export class RcBackground {
 		return (process.env.PI_HOSTED_SESSION || "").replace(/^pi-/, "");
 	}
 
+	/** Ensure the daemon is reachable. No-op on POSIX (systemd owns it);
+	 *  on Windows it starts the windowless detached daemon. */
+	async ensureDaemon(): Promise<void> {
+		await this.supervisor.ensure();
+	}
+
 	/** Tell the daemon which session file backs this hosted pi so an
 	 *  abnormal death can be revived as `pi --session <file>`. The daemon
 	 *  also rewrites its registry argv with it, so a daemon restart
@@ -386,12 +392,6 @@ export class RcBackground {
 	 *  takeover, its resolution of the duplicate. No-op outside hosting
 	 *  and for ephemeral sessions; failures are retried on the next
 	 *  prompt (the announced marker is only set on success). */
-	/** Ensure the daemon is reachable. No-op on POSIX (systemd owns it);
-	 *  on Windows it starts the windowless detached daemon. */
-	async ensureDaemon(): Promise<void> {
-		await this.supervisor.ensure();
-	}
-
 	async announce(ctx: any): Promise<void> {
 		const session = this.hostedSession();
 		if (!session) return;
