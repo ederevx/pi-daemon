@@ -27,7 +27,9 @@
  * and a session that crashes or restarts re-arms watchers on
  * session_start so pending results still get delivered. The `daemon_tasks`
  * tool exposes the same machinery explicitly: background submission,
- * status, one-go result fetch, live watch (streamed via partial updates),
+ * status, one-go result fetch, an active result wait that returns as
+ * soon as the ticket finishes (interruptible, steerable, live elapsed
+ * status), live watch (incremental output via partial updates),
  * cancel, and per-session listing.
  */
 
@@ -69,6 +71,31 @@ const DEFAULT_WAIT_SECONDS = 120;
 
 /** Longest single ticket-wait round trip, in seconds. */
 const WAIT_CHUNK_SECONDS = 300;
+
+/** Poll tick for active waits: each tick is one bounded pi-rc round
+ *  trip, so a wait notices completion, an abort, or a queued message
+ *  within one tick, and costs one exec per second while it waits. */
+const WAIT_POLL_SECONDS = 1;
+
+/** Stop conditions and per-tick hooks for an active ticket wait. The
+ *  wait owns the poll loop; its caller owns presentation and
+ *  consumption of the result. */
+export interface ActiveWaitHooks {
+	/** Total seconds to wait before releasing (0 = probe only). */
+	bound: number;
+	/** The run's abort signal (Escape): releases the wait without
+	 *  cancelling the deliberately backgrounded ticket. */
+	signal?: AbortSignal;
+	/** True while a user message is queued: the wait yields early so
+	 *  the agent stays steerable mid-turn. */
+	shouldYield?: () => boolean;
+	/** Per-tick hook, awaited between polls, with the latest record and
+	 *  the elapsed seconds. */
+	onPoll?: (
+		ticket: Ticket,
+		elapsedSeconds: number,
+	) => void | Promise<void>;
+}
 
 export interface TicketCost {
 	input?: number;
@@ -261,16 +288,31 @@ export class TicketClient {
 		}
 	}
 
+	/** Reads one bounded chunk of the output log from `offset`; returns
+	 *  the raw bytes and the offset to resume from. The offset reply is
+	 *  base64 on the wire (pi-rc prints it verbatim), so binary output
+	 *  survives the UTF-8 exec channel byte-faithfully and client
+	 *  offsets stay true byte offsets. An empty chunk means the log
+	 *  grew by nothing, so an incremental reader can poll for new bytes
+	 *  without ever re-reading what it already has. */
+	async outputFrom(
+		id: string,
+		offset: number,
+	): Promise<{ data: Buffer; next: number }> {
+		const out = await this.run(["ticket-output", id, String(offset)]);
+		const data = Buffer.from(out.trim(), "base64");
+		return { data, next: offset + data.length };
+	}
+
 	/** Reads the whole output log in bounded chunks. */
 	async outputAll(id: string): Promise<string> {
 		const parts: Buffer[] = [];
 		let offset = 0;
 		for (let i = 0; i < 256; i++) {
-			const out = await this.run(["ticket-output", id, String(offset)]);
-			const chunk = Buffer.from(out, "binary");
-			if (chunk.length === 0) break;
-			parts.push(chunk);
-			offset += chunk.length;
+			const { data, next } = await this.outputFrom(id, offset);
+			if (data.length === 0) break;
+			parts.push(data);
+			offset = next;
 		}
 		return Buffer.concat(parts).toString("utf8");
 	}
@@ -379,30 +421,79 @@ class DaemonTasks {
 		return this.client.wait(id, 0);
 	}
 
-	/** One-go result fetch; marks the ticket fetched so the watcher
-	 *  will not also deliver it. */
-	async result(id: string, waitSeconds: number): Promise<{ ticket: Ticket; output: string }> {
-		const ticket = await this.client.wait(id, waitSeconds);
-		if (ticket.status !== "running") {
-			this.fetched.add(id);
-			return { ticket, output: await this.client.outputAll(id) };
+	/** Actively waits for a ticket under the call's stop conditions: the
+	 *  ticket finishes, the bound elapses, the run aborts, or a user
+	 *  message is queued. A status probe returns at once, so an
+	 *  already-finished ticket never opens the loop, and each tick is
+	 *  one bounded pi-rc round trip, so completion is noticed within
+	 *  one poll instead of at the end of a long block. Consumption
+	 *  invariant: a completed ticket is marked fetched synchronously
+	 *  here, before any caller fetches output, so the submit-armed
+	 *  delivery watcher's double-check never steers a duplicate. An
+	 *  early release leaves the ticket running with its delivery still
+	 *  armed. The loop's longest uninterruptible stretch is one poll
+	 *  tick (WAIT_POLL_SECONDS), so no signal listener is needed. */
+	async activeWait(
+		id: string,
+		hooks: ActiveWaitHooks,
+	): Promise<{ ticket: Ticket; completed: boolean }> {
+		const started = Date.now();
+		const elapsed = (): number => (Date.now() - started) / 1000;
+		let ticket = await this.client.wait(id, 0);
+		while (ticket.status === "running"
+			&& elapsed() < hooks.bound
+			&& !hooks.signal?.aborted
+			&& !(hooks.shouldYield?.() ?? false)) {
+			const remaining = Math.max(0.1, hooks.bound - elapsed());
+			ticket = await this.client.wait(
+				id, Math.min(WAIT_POLL_SECONDS, remaining));
+			await hooks.onPoll?.(ticket, elapsed());
 		}
-		return { ticket, output: "" };
+		const completed = ticket.status !== "running";
+		if (completed) this.fetched.add(id);
+		return { ticket, completed };
 	}
 
 	/** Streams a running ticket's output via onUpdate until it finishes;
-	 *  blocking waits mean one pi-rc round trip per 300s, not a spin. */
-	async watch(id: string, onUpdate?: (text: string) => void): Promise<{ ticket: Ticket; output: string }> {
-		let ticket = await this.client.wait(id, 0);
-		while (ticket.status === "running") {
-			ticket = await this.client.wait(id, WAIT_CHUNK_SECONDS);
-			if (ticket.status === "running" && onUpdate) {
-				const output = await this.client.outputAll(id);
-				onUpdate(output);
-			}
-		}
-		this.fetched.add(id);
-		return { ticket, output: await this.client.outputAll(id) };
+	 *  the wait is interruptible (hooks.signal) and steerable
+	 *  (hooks.shouldYield), and each poll reads only the bytes the log
+	 *  gained since the last tick, so following a chatty ticket costs
+	 *  one pi-rc exec per second plus its new output, never a full log
+	 *  reread. An early release returns the accumulated tail; the armed
+	 *  delivery watcher still delivers the final result. */
+	async watch(
+		id: string,
+		onTail?: (text: string, elapsedSeconds: number, ticket: Ticket) => void,
+		hooks: Pick<ActiveWaitHooks, "signal" | "shouldYield"> = {},
+	): Promise<{ ticket: Ticket; output: string }> {
+		const parts: Buffer[] = [];
+		let offset = 0;
+		const { ticket } = await this.activeWait(id, {
+			...hooks,
+			bound: Infinity,
+			onPoll: async (polled, elapsed) => {
+				const before = offset;
+				let cursor = offset;
+				// Bounded like outputAll (256 chunks): the drain keeps a
+				// tick's work bounded even against a pathological log.
+				for (let i = 0; i < 256; i++) {
+					const { data, next } =
+						await this.client.outputFrom(id, cursor);
+					if (data.length === 0) break;
+					parts.push(data);
+					cursor = next;
+				}
+				offset = cursor;
+				if (onTail && cursor > before) {
+					onTail(Buffer.concat(parts).toString("utf8"),
+						elapsed, polled);
+				}
+			},
+		});
+		const output = ticket.status === "running"
+			? Buffer.concat(parts).toString("utf8")
+			: await this.client.outputAll(id);
+		return { ticket, output };
 	}
 
 	async cancel(id: string): Promise<Ticket> {
@@ -1012,22 +1103,29 @@ export default function (pi: ExtensionAPI) {
 			"Manage commands offloaded to the pi-daemon as tickets. " +
 			"submit runs a command in the background and returns a ticket id " +
 			"immediately (the result is delivered automatically when done); " +
-			"result fetches a finished ticket's full output in one go; watch " +
-			"streams a running ticket's output; status, list and cancel do " +
-			"what they say. Requires the pi-daemon service.",
+			"result fetches a finished ticket's full output in one go, and " +
+			"with wait blocks actively: it returns as soon as the ticket " +
+			"finishes, stays interruptible, yields early if you queue a " +
+			"message, and shows a live elapsed status; watch streams a " +
+			"running ticket's output; status, list and cancel do what they " +
+			"say. Requires the pi-daemon service.",
 		promptSnippet: "Run long shell commands as background daemon tickets",
 		promptGuidelines: [
 			"Prefer daemon_tasks submit for builds, test suites, downloads and " +
 				"other long-running commands: you keep working immediately and " +
 				"the full result is delivered to you when the task finishes. " +
-				"Use result to fetch a ticket's output, watch to follow it live.",
+				"Use result to fetch a ticket's output, watch to follow it live. " +
+				"A blocking result wait is interruptible and steerable: Escape " +
+				"or a queued message releases it, the ticket keeps running, and " +
+				"the result is still delivered on completion; re-call result " +
+				"with wait to block again.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(["submit", "status", "result", "watch", "cancel", "remove", "reset", "list"] as const),
 			command: Type.Optional(Type.String({ description: "Shell command (submit)" })),
 			cwd: Type.Optional(Type.String({ description: "Working directory (submit; default session cwd)" })),
 			id: Type.Optional(Type.String({ description: "Ticket id (status/result/watch/cancel)" })),
-			wait: Type.Optional(Type.Number({ description: "Seconds to wait for result (result; default 0)" })),
+			wait: Type.Optional(Type.Number({ description: "Seconds to actively wait for result (result; default 0)" })),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			if (disabled()) {
@@ -1066,49 +1164,94 @@ export default function (pi: ExtensionAPI) {
 					if (!params.id) throw new Error("result needs a ticket id");
 					const blocking = (params.wait ?? 0) > 0;
 					if (blocking) tasks.setSessionState("waiting");
-					const { ticket, output } = await tasks.result(
-						params.id, params.wait ?? 0);
-					if (blocking) tasks.setSessionState("busy");
-					if (ticket.status === "running") {
+					try {
+						const { ticket } = await tasks.activeWait(params.id, {
+							bound: params.wait ?? 0,
+							signal,
+							shouldYield: () =>
+								Boolean(ctx?.hasPendingMessages?.()),
+							onPoll: (polled, elapsed) => {
+								if (!blocking || polled.status !== "running") {
+									return;
+								}
+								// Live wait status: a partial tool result
+								// the TUI re-renders each poll tick.
+								onUpdate?.({
+									content: [{
+										type: "text",
+										text: `waiting for ticket ${params.id}` +
+											` (${Math.round(elapsed)}s elapsed)`,
+									}],
+									details: undefined,
+								});
+							},
+						});
+						if (ticket.status === "running") {
+							// Bound elapsed, aborted, or a queued message
+							// yielded the wait: the ticket keeps running
+							// with its delivery armed, so the agent can
+							// re-block later or just continue.
+							return {
+								content: [{
+									type: "text",
+									text: `ticket ${ticket.id} still running: ${ticket.command}\n` +
+										`The result will still be delivered automatically when ` +
+										`it finishes, or re-call daemon_tasks result ${ticket.id}` +
+										` with wait to block again (the wait is interruptible ` +
+										`and yields early when a message is queued).`,
+								}],
+								details: { ticket },
+							};
+						}
+						const output = await tasks.client.outputAll(params.id);
 						return {
-							content: [{
-								type: "text",
-								text: `ticket ${ticket.id} still running: ${ticket.command}\n` +
-									`Use wait to block for it, watch to follow its output, ` +
-									`or continue and the result will be delivered when done.`,
-							}],
+							content: [{ type: "text", text: formatResult(ticket, output) }],
 							details: { ticket },
 						};
+					} finally {
+						if (blocking) tasks.setSessionState("busy");
 					}
-					return {
-						content: [{ type: "text", text: formatResult(ticket, output) }],
-						details: { ticket },
-					};
 				}
 				case "watch": {
 					if (!params.id) throw new Error("watch needs a ticket id");
 					let lastText = "";
 					tasks.setSessionState("waiting");
-					let watched: { ticket: Ticket; output: string };
 					try {
-						watched = await tasks.watch(params.id, (tail) => {
-							const text = formatResult({ ...ticket, status: "running" }, tail);
-							if (text !== lastText) {
-								lastText = text;
-								onUpdate?.({
-									content: [{ type: "text", text }],
-									details: { ticketId: params.id, running: true },
-								});
-							}
-						});
+						const { ticket, output } = await tasks.watch(
+							params.id,
+							(tail, elapsed, running) => {
+								const text = formatResult(
+									{ ...running, status: "running" },
+									tail,
+								) + ` (${Math.round(elapsed)}s elapsed)`;
+								if (text !== lastText) {
+									lastText = text;
+									onUpdate?.({
+										content: [{ type: "text", text }],
+										details: { ticketId: params.id, running: true },
+									});
+								}
+							},
+							{
+								signal,
+								shouldYield: () =>
+									Boolean(ctx?.hasPendingMessages?.()),
+							},
+						);
+						const note = ticket.status === "running"
+							? "\n[watch released early; the ticket keeps running and " +
+								"its result will still be delivered when it finishes]"
+							: "";
+						return {
+							content: [{
+								type: "text",
+								text: formatResult(ticket, output) + note,
+							}],
+							details: { ticket },
+						};
 					} finally {
 						tasks.setSessionState("busy");
 					}
-					const { ticket, output } = watched;
-					return {
-						content: [{ type: "text", text: formatResult(ticket, output) }],
-						details: { ticket },
-					};
 				}
 				case "cancel": {
 					if (!params.id) throw new Error("cancel needs a ticket id");

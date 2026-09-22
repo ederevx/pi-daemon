@@ -111,7 +111,9 @@ them, and can uninstall exactly what it installed.
   (`t-<seg>-<n>`), so a task names the session it belongs to at a
   glance without a separate lookup. The `daemon_tasks` tool exposes the machinery
   explicitly: `submit` (fire-and-forget background command), `result`
-  (one-go fetch), `watch` (live output via partial updates), and
+  (one-go fetch, or an active interruptible wait with `wait` that
+  returns as soon as the ticket finishes and yields early when a user
+  message is queued), `watch` (live output via partial updates), and
   `status`, `list`, `cancel`, `remove`, and `reset`. When the daemon is
   bash tool falls back to pi's local execution transparently, and
   `PI_OFFLOAD=off` disables offloading entirely. Tickets are garbage
