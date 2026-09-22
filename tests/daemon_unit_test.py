@@ -845,6 +845,181 @@ def test_idle_reap_spares_busy_and_attached():
     assert_true(_drain_session(name))
 
 
+# --- restart handover (registry dedupe, roster, idle watch) -----------------
+
+def test_registry_dedupe():
+    """One registry entry per conversation file: duplicates of the same
+    --session conversation are dropped (never respawned side by side),
+    the attached duplicate wins when a prefer callback says so, and
+    blank-start argv entries are never treated as duplicates."""
+    assert_eq(daemon.argv_session_file(["pi", "--session", "x"]), "x")
+    assert_eq(daemon.argv_session_file(["pi"]), None)
+
+    def write(path, a_extra=None):
+        entries = {
+            "pi-a": {"dir": SCRATCH,
+                     "argv": ["pi", "--session", "conv-a.jsonl"]},
+            "pi-b": {"dir": SCRATCH,
+                     "argv": ["pi", "--session", "conv-a.jsonl"]},
+            "pi-c": {"dir": SCRATCH,
+                     "argv": ["pi", "--session", "conv-c.jsonl"]},
+            "pi-d": {"dir": SCRATCH, "argv": ["pi"]},
+        }
+        reg = daemon.Registry(path)
+        reg.write(entries)
+        return reg
+
+    reg = write(os.path.join(SCRATCH, "dedupe1.json"))
+    keep, drop = reg.dedupe(daemon.argv_session_file)
+    assert_eq(drop, ["pi-b"], drop)
+    assert_eq(keep, {"conv-a.jsonl": "pi-a", "conv-c.jsonl": "pi-c"})
+    data = reg.load()
+    assert_true("pi-b" not in data and "pi-a" in data)
+    assert_true("pi-d" in data, "blank-start entries stay untouched")
+
+    reg = write(os.path.join(SCRATCH, "dedupe2.json"))
+    keep, drop = reg.dedupe(daemon.argv_session_file,
+                            prefer=lambda n: n == "pi-b")
+    assert_eq(drop, ["pi-a"], drop)
+    assert_eq(keep["conv-a.jsonl"], "pi-b")
+
+
+def test_restart_planner_prefers_attached():
+    """RestartPlanner.dedupe_registry keeps the duplicate whose live
+    session has a bridge viewer (the one a user is attached to)."""
+    path = os.path.join(SCRATCH, "dedupe3.json")
+    reg = daemon.Registry(path)
+    reg.write({
+        "pi-attach": {"dir": SCRATCH,
+                      "argv": ["pi", "--session", "conv-att.jsonl"]},
+        "pi-detach": {"dir": SCRATCH,
+                      "argv": ["pi", "--session", "conv-att.jsonl"]},
+    })
+    a = daemon.Session("pi-attach", SCRATCH, ["pi"],
+                       pid=os.getpid(), master_fd=0)
+    d = daemon.Session("pi-detach", SCRATCH, ["pi"],
+                       pid=os.getpid(), master_fd=0)
+    assert_true(DAEMON.table.put(a, refuse_if_exists=True))
+    assert_true(DAEMON.table.put(d, refuse_if_exists=True))
+    pair = socket.socketpair()
+    a.install_client(pair[0])
+    try:
+        planner = daemon.RestartPlanner(reg, DAEMON.table)
+        keep, drop = planner.dedupe_registry()
+        assert_eq(drop, ["pi-detach"], drop)
+        assert_eq(keep["conv-att.jsonl"], "pi-attach")
+    finally:
+        pair[0].close()
+        pair[1].close()
+        DAEMON.table.remove_if(a)
+        DAEMON.table.remove_if(d)
+
+
+def test_daemon_roster():
+    """The roster drives the single-daemon guarantee: older entries are
+    shut down gracefully through their own coordinates, dead entries
+    are pruned, and younger entries are never touched."""
+    path = os.path.join(SCRATCH, "roster.json")
+    roster = daemon.DaemonRoster(path)
+    roster.register(202, "127.0.0.1", 1, "tok")
+    roster.register(303, "127.0.0.1", 1, "tok")
+    roster.register(404, "127.0.0.1", 1, "tok")
+    # rewrite stamps so ordering is deterministic: 202 (fake live peer)
+    # and 303 (dead port) are older than the caller, 404 is younger.
+    with open(path) as f:
+        data = json.load(f)
+    data["202"]["started"] = 100.0
+    data["303"]["started"] = 150.0
+    data["404"]["started"] = 600.0
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+    got = []
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(4)
+
+    def fake_peer():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                f = conn.makefile("rwb")
+                got.append(json.loads(f.readline()).get("cmd"))
+                f.write(json.dumps({"ok": True}).encode() + b"\n")
+                f.flush()
+                got.append(json.loads(f.readline()).get("cmd"))
+                f.write(json.dumps({"ok": True}).encode() + b"\n")
+                f.flush()
+            except Exception:
+                return
+            finally:
+                conn.close()
+
+    t = threading.Thread(target=fake_peer, daemon=True)
+    t.start()
+    data["202"]["port"] = port
+    with open(path, "w") as f:
+        json.dump(data, f)
+    try:
+        stopped, pruned = roster.shutdown_others(999, 200.0)
+        assert_eq(stopped, 1, got)
+        assert_eq(pruned, 1, "refused port is a dead entry")
+        assert_true(got[:2] == ["hello", "shutdown"], got)
+        data = roster._load()
+        assert_true("404" in data, "younger entry is never touched")
+        assert_true("202" not in data and "303" not in data)
+    finally:
+        srv.close()
+    roster.remove(404)
+    assert_eq(roster._load(), {})
+
+
+def test_idle_shutdown_watch():
+    """The sweep stays quiet while any activity signal is live: a busy
+    or waiting session, an attached viewer, a running ticket, or a
+    parked handover connection; a fully detached idle daemon is
+    quiescent."""
+    assert_eq(daemon.DAEMON_IDLE_TIMEOUT, 300.0)
+    watch = daemon.IdleShutdownWatch(DAEMON, DAEMON.shutdown_event)
+    assert_true(watch.quiescent())
+    sess = daemon.Session("pi-idlewatch", SCRATCH, ["pi"],
+                          pid=os.getpid(), master_fd=0)
+    assert_true(DAEMON.table.put(sess, refuse_if_exists=True))
+    pair = socket.socketpair()
+    try:
+        assert_true(watch.quiescent())
+        sess.state = "busy"
+        assert_true(not watch.quiescent())
+        sess.state = "waiting"
+        assert_true(not watch.quiescent(),
+                    "parked on a daemon wait counts as active")
+        sess.state = "idle"
+        sess.install_client(pair[0])
+        assert_true(not watch.quiescent(), "attached viewer is activity")
+        sess.take_clients()
+        assert_true(watch.quiescent())
+        with DAEMON.handover_lock:
+            DAEMON.handover_wait[object()] = ("t", "d", "f", None)
+        assert_true(not watch.quiescent(), "parked handover is activity")
+        with DAEMON.handover_lock:
+            DAEMON.handover_wait.clear()
+        r = DAEMON.control.ticket_submit(
+            {"session": "s1", "cwd": SCRATCH, "command": "sleep 30"})
+        assert_true(not watch.quiescent(), "running ticket is activity")
+        DAEMON.control.ticket_cancel({"id": r["id"]})
+        assert_true(watch.quiescent())
+    finally:
+        pair[0].close()
+        pair[1].close()
+        DAEMON.table.remove_if(sess)
+        with DAEMON.handover_lock:
+            DAEMON.handover_wait.clear()
+
+
 # --- platform seams -------------------------------------------------------
 
 def test_platform_seams():
@@ -1182,6 +1357,13 @@ def _main():
        test_idle_reap_detects_and_ends_detached_sessions)
     ok("idle reap spares busy and attached sessions",
        test_idle_reap_spares_busy_and_attached)
+    ok("registry dedupe (one entry per conversation)", test_registry_dedupe)
+    ok("restart planner prefers the attached duplicate",
+       test_restart_planner_prefers_attached)
+    ok("daemon roster (graceful shutdown, prune, younger spared)",
+       test_daemon_roster)
+    ok("idle shutdown watch (quiescence signals)",
+       test_idle_shutdown_watch)
     ok("platform seams (layout, handshake, shell)",
        test_platform_seams)
     ok("posix pty child seam", test_posix_pty_child, posix_only=True)
