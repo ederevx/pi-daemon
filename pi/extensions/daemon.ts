@@ -318,38 +318,129 @@ export class HandoverHold {
 	}
 }
 
-/** Keeps the daemon reachable on platforms without a service manager.
- *  On POSIX the systemd unit owns it, so this is a no-op there. */
+/** Keeps the background service reachable, choosing the mechanism the
+ *  host provides. POSIX with the pi-daemon.service user unit
+ *  installed: systemd owns the daemon, so an inactive or failed unit
+ *  is started at session start (the fresh daemon's roster newest-wins
+ *  converge shuts any stray detached successor down). Where no service
+ *  manager owns the daemon — Windows, POSIX without systemd or
+ *  without the unit — the detached windowless daemon is spawned when
+ *  its endpoint is missing. Best-effort: a failure only costs /bg +
+ *  revive, so ensure() never throws; it returns whether it started
+ *  something. */
 export class DaemonSupervisor {
 	private readonly daemonPath: string;
+	private readonly platform: string;
+	private readonly runner: ProcessRunner;
 	private starting = false;
 
-	constructor(daemonPath: string = resolveDaemon()) {
+	constructor(
+		daemonPath: string = resolveDaemon(),
+		platform: string = process.platform,
+		runner: ProcessRunner = new ProcessRunner(async () => ({
+			code: 1, stdout: "", stderr: "", killed: false,
+		})),
+	) {
 		this.daemonPath = daemonPath;
+		this.platform = platform;
+		this.runner = runner;
 	}
 
-	async ensure(): Promise<void> {
-		if (process.platform !== "win32") return;
-		if (existsSync(endpointPath())) return;
-		if (this.starting) return;
+	/** Whether a service manager owns the daemon: the OS-agnostic
+	 *  probe behind both the auto-start check and /daemon-reload's path
+	 *  choice. POSIX with the pi-daemon.service user unit installed
+	 *  returns true; Windows has no service manager and a POSIX host
+	 *  without systemd or without the unit answers no, so the detached
+	 *  spawn stays the mechanism there. A failed probe (no systemctl,
+	 *  no user bus) is treated as "not managed" so an unusual host can
+	 *  never break the start. */
+	async hasServiceUnit(): Promise<boolean> {
+		if (this.platform === "win32") return false;
+		try {
+			const result = await this.runner.run("systemctl", [
+				"--user", "list-unit-files", "--no-legend",
+				"pi-daemon.service",
+			]);
+			return result.code === 0
+				&& (result.stdout || "").trim() !== "";
+		} catch {
+			return false;
+		}
+	}
+
+	/** Whether the unit is active right now. A failed probe counts as
+	 *  not active so the caller falls back to the mechanism the host
+	 *  actually provides. */
+	private async isServiceActive(): Promise<boolean> {
+		try {
+			const result = await this.runner.run("systemctl", [
+				"--user", "is-active", "pi-daemon.service",
+			]);
+			return result.code === 0
+				&& (result.stdout || "").trim() === "active";
+		} catch {
+			return false;
+		}
+	}
+
+	/** Start the user unit through systemd. Throws on failure; ensure()
+	 *  swallows it (best-effort), /daemon-reload surfaces it. */
+	async startService(): Promise<void> {
+		const result = await this.runner.run("systemctl",
+			["--user", "start", "pi-daemon.service"]);
+		if (result.code !== 0) {
+			throw new Error((result.stderr || result.stdout || "").trim()
+				|| `systemctl exit ${result.code}`);
+		}
+	}
+
+	/** Ensure the daemon is reachable, returning whether this call
+	 *  started it: the user unit where a service manager owns the
+	 *  daemon, the detached spawn where none does. Never throws. */
+	async ensure(): Promise<boolean> {
+		if (this.platform !== "win32") {
+			if (await this.isServiceActive()) return false;
+			if (await this.hasServiceUnit()) {
+				try {
+					await this.startService();
+					return true;
+				} catch {
+					return false;
+				}
+			}
+		}
+		return this.ensureDetached();
+	}
+
+	/** Spawn the detached windowless daemon (test seam). */
+	protected spawnDetached(log: number): any {
+		const child = spawn(resolveWindowlessPython(),
+			[this.daemonPath], {
+				detached: true,
+				windowsHide: true,
+				stdio: ["ignore", log, log],
+			});
+		child.unref();
+		return child;
+	}
+
+	private async ensureDetached(): Promise<boolean> {
+		if (existsSync(endpointPath())) return false;
+		if (this.starting) return false;
 		this.starting = true;
 		try {
 			const logDir = join(stateHome(), "pi-pty-host");
 			mkdirSync(logDir, { recursive: true });
 			const log = openSync(join(logDir, "daemon.log"), "a");
 			try {
-				const child = spawn(resolveWindowlessPython(),
-					[this.daemonPath], {
-						detached: true,
-						windowsHide: true,
-						stdio: ["ignore", log, log],
-					});
-				child.unref();
+				this.spawnDetached(log);
 			} finally {
 				closeSync(log);
 			}
+			return true;
 		} catch {
 			// Best-effort: an unreachable daemon only costs /bg + revive.
+			return false;
 		} finally {
 			this.starting = false;
 		}
@@ -500,12 +591,16 @@ export class RcBackground {
 	constructor(
 		exec: (file: string, args: string[]) => Promise<any>,
 		hold: HandoverHold = new HandoverHold(),
-		supervisor: DaemonSupervisor = new DaemonSupervisor(),
+		supervisor: DaemonSupervisor | null = null,
 		platform: string = process.platform,
 	) {
 		this.runner = new ProcessRunner(exec);
 		this.hold = hold;
-		this.supervisor = supervisor;
+		// Default supervisor shares this app's exec and platform so its
+		// systemd probes and detached spawn follow the injected reality.
+		this.supervisor = supervisor
+			?? new DaemonSupervisor(resolveDaemon(), platform,
+				new ProcessRunner(exec));
 		this.platform = platform;
 		this.piRc = resolvePiRc();
 	}
@@ -522,10 +617,14 @@ export class RcBackground {
 		return (process.env.PI_HOSTED_SESSION || "").replace(/^pi-/, "");
 	}
 
-	/** Ensure the daemon is reachable. No-op on POSIX (systemd owns it);
-	 *  on Windows it starts the windowless detached daemon. */
-	async ensureDaemon(): Promise<void> {
-		await this.supervisor.ensure();
+	/** Ensure the daemon is reachable, starting the background service
+	 *  when it is not present: the user unit where a service manager
+	 *  owns the daemon (the fresh daemon's roster converge shuts any
+	 *  stray detached successor down), the detached windowless daemon
+	 *  where none does. Best-effort; returns whether it started
+	 *  something so the caller can tell the user. */
+	async ensureDaemon(): Promise<boolean> {
+		return this.supervisor.ensure();
 	}
 
 	/** Hand the daemon over to a fresh successor: the daemon keeps its
@@ -542,21 +641,10 @@ export class RcBackground {
 		}
 	}
 
-	/** Whether a service manager owns the daemon: the OS-agnostic
-	 *  probe behind /daemon-reload's path choice. POSIX with the
-	 *  pi-daemon.service user unit installed returns true; Windows has
-	 *  no service manager and a POSIX host without systemd or without
-	 *  the unit answers no, so the detached-successor path stays the
-	 *  mechanism there. A failed probe is treated as "not managed" so
-	 *  an unusual host can never break the restart. */
+	/** Whether a service manager owns the daemon (see
+	 *  DaemonSupervisor.hasServiceUnit — the probe's single owner). */
 	async hasServiceUnit(): Promise<boolean> {
-		if (this.platform === "win32") return false;
-		const result = await this.runner.run("systemctl", [
-			"--user", "list-unit-files", "--no-legend",
-			"pi-daemon.service",
-		]);
-		return result.code === 0
-			&& (result.stdout || "").trim() !== "";
+		return this.supervisor.hasServiceUnit();
 	}
 
 	/** Restart the background service directly. Primary path wherever
@@ -988,7 +1076,17 @@ export default function (pi: ExtensionAPI) {
 	// their own session_start). The announced-file guard keeps repeats
 	// free. The first prompt is also where a turn begins: report busy.
 	pi.on("session_start", async (_event, ctx) => {
-		await app.ensureDaemon();
+		// Auto-start: wherever the background service is not present at
+		// session start — a dead user unit on systemd hosts, a missing
+		// endpoint elsewhere — the supervisor brings it up through the
+		// mechanism the host provides, and the user is told once.
+		if (await app.ensureDaemon()) {
+			ctx?.ui?.notify?.(
+				"The background pi-daemon was not running; it has been " +
+					"started.",
+				"info",
+			);
+		}
 		await app.announce(ctx);
 		await app.setState("idle", ctx);
 	});
