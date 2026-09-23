@@ -61,6 +61,15 @@ class ScratchHome:
     def cleanup(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
+def winform(path):
+    """Normalize an MSYS-style /c/... path from the bash installer to the
+    Windows form pathlib reports, so manifest membership checks hold on
+    both platforms."""
+    text = str(path)
+    if len(text) > 2 and text[0] == "/" and text[2] == "/":
+        text = text[1].upper() + ":" + text[2:]
+    return os.path.normpath(text)
+
 
 @unittest.skipUnless(BASH, "no bash interpreter available")
 class InstallScriptTests(unittest.TestCase):
@@ -76,8 +85,7 @@ class InstallScriptTests(unittest.TestCase):
         self.assertTrue(
             self.scratch.path(".pi/agent/extensions/offload.ts").is_file())
         owned = self.scratch.manifest()["owned"]
-        self.assertIn(
-            str(self.scratch.path(".pi/agent/extensions/daemon.ts")), owned)
+        self.assertIn(winform(self.scratch.path(".pi/agent/extensions/daemon.ts")), [winform(o) for o in owned])
 
     def test_package_install_skips_extensions_and_writes_service_files(self):
         result = self.scratch.run("--package")
@@ -91,8 +99,7 @@ class InstallScriptTests(unittest.TestCase):
                     ".config/systemd/user/pi-daemon.service"):
             self.assertTrue(self.scratch.path(rel).is_file(), rel)
         owned = self.scratch.manifest()["owned"]
-        self.assertNotIn(
-            str(self.scratch.path(".pi/agent/extensions/daemon.ts")), owned)
+        self.assertNotIn(winform(self.scratch.path(".pi/agent/extensions/daemon.ts")), [winform(o) for o in owned])
 
     def test_package_install_removes_prior_manual_extensions(self):
         self.assertEqual(self.scratch.run().returncode, 0)
@@ -128,6 +135,37 @@ class InstallScriptTests(unittest.TestCase):
     def test_unknown_argument_is_an_error(self):
         self.assertEqual(self.scratch.run("--bogus").returncode, 2)
         self.assertIn("unexpected argument", self.scratch.run("--bogus").stderr)
+
+    def test_manual_install_refuses_when_pinned(self):
+        settings = self.scratch.path(".pi/agent/settings.json")
+        settings.write_text(json.dumps({"packages": [
+            "git:github.com/ederevx/pi-daemon@v2.9.24"]}))
+        result = self.scratch.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installed as a pi package", result.stderr)
+        self.assertFalse(
+            self.scratch.path(".pi/agent/extensions/daemon.ts").exists())
+        self.assertFalse(
+            self.scratch.path(".pi/agent/.pi-daemon/manifest.json").exists())
+
+    def test_manual_install_refuses_local_path_entry(self):
+        settings = self.scratch.path(".pi/agent/settings.json")
+        settings.write_text(json.dumps({"packages": [
+            str(ROOT)]}))
+        result = self.scratch.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installed as a pi package", result.stderr)
+        self.assertFalse(
+            self.scratch.path(".pi/agent/extensions/daemon.ts").exists())
+
+    def test_manual_install_allowed_without_pin(self):
+        settings = self.scratch.path(".pi/agent/settings.json")
+        settings.write_text(json.dumps({"packages": [
+            "git:github.com/ederevx/pi-teams@v0.4.18"]}))
+        result = self.scratch.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(
+            self.scratch.path(".pi/agent/extensions/daemon.ts").is_file())
 
 
 if __name__ == "__main__":

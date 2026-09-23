@@ -594,13 +594,16 @@ export class RcBackground {
 		supervisor: DaemonSupervisor | null = null,
 		platform: string = process.platform,
 	) {
-		this.runner = new ProcessRunner(exec);
+		// One launcher for the whole app: the injected platform picks the
+		// OS launch shape (the Python interpreter prefix on Windows, a
+		// direct exec elsewhere), so the app's own pi-rc calls and the
+		// supervisor's systemd probes follow the same injected reality.
+		this.runner = new ProcessRunner(exec, platform);
 		this.hold = hold;
 		// Default supervisor shares this app's exec and platform so its
 		// systemd probes and detached spawn follow the injected reality.
 		this.supervisor = supervisor
-			?? new DaemonSupervisor(resolveDaemon(), platform,
-				new ProcessRunner(exec));
+			?? new DaemonSupervisor(resolveDaemon(), platform, this.runner);
 		this.platform = platform;
 		this.piRc = resolvePiRc();
 	}
