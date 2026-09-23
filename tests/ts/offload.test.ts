@@ -54,13 +54,19 @@ class FakePi {
   constructor(private readonly daemonDown = false) {}
 
   async exec(file: string, args: string[]): Promise<ExeResult> {
-    this.execCalls.push({ file, args });
+    // The Windows launch shape runs pi-rc through the Python
+    // interpreter (the script path leads the args); normalize to the
+    // POSIX shape - the script is the file, the args follow - so the
+    // dispatch and recorded calls match on every platform.
+    const python = /python/i.test(file);
+    const cmd = (python ? args[1] : args[0]) ?? "";
+    const rest = python ? args.slice(2) : args.slice(1);
+    this.execCalls.push({ file: python ? args[0] : file, args: rest });
     if (this.daemonDown) return { code: 4, stdout: "", stderr: "down", killed: false };
-    const cmd = args[0];
     if (cmd === "ticket-submit") return ok("ticket t-1\n");
     if (cmd === "ticket-wait") {
-      const id = args[1];
-      const timeout = Number(args[2] ?? 0);
+      const id = rest[0];
+      const timeout = Number(rest[1] ?? 0);
       if (timeout > 0) {
         const n = (this.wait300.get(id) ?? 0) + 1;
         this.wait300.set(id, n);
@@ -71,14 +77,14 @@ class FakePi {
     }
     if (cmd === "ticket-output") {
       if (args.includes("--json")) {
-        return ok(JSON.stringify({ ok: true, id: args[1], status: "done", exit: 0, output: "out-json" }));
+        return ok(JSON.stringify({ ok: true, id: rest[0], status: "done", exit: 0, output: "out-json" }));
       }
       // Offset mode mirrors pi-rc's byte-faithful wire format: the
       // base64 payload from the offset, empty when the log has no
       // new bytes.
-      const offset = Number(args[2]);
-      if (args[2] !== undefined && !Number.isNaN(offset)) {
-        const log = this.logs.get(args[1]) ?? "";
+      const offset = Number(rest[1]);
+      if (rest[1] !== undefined && !Number.isNaN(offset)) {
+        const log = this.logs.get(rest[0]) ?? "";
         return ok(offset < log.length
           ? Buffer.from(log.slice(offset), "utf8").toString("base64")
           : "");
