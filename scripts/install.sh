@@ -54,6 +54,43 @@ dest_wrapper_cmd="$local_bin/pi.cmd"
 
 mkdir -p "$pi_home/extensions" "$local_bin" "$systemd_dir" "$state_dir"
 
+# The one-loader guard: a pinned pi package already loads this repo's
+# extensions from its own clone, and a manual extension copy beside it
+# aborts every new pi session with tool-conflict errors ("Tool "bash"
+# conflicts ... offload.ts"). The bare manual invocation therefore
+# refuses outright whenever a packages entry installs pi-daemon — a git
+# pin or a local path whose final component is this package. --package
+# mode is exempt: it is the package's own postinstall and exists to
+# remove such copies. Uninstall the manual copy or drop the pin first;
+# nothing on disk has been touched by the refusal.
+if [[ $package_mode -eq 0 ]]; then
+  pinned="$(python3 - "$pi_home/settings.json" <<'PYGUARD'
+import json, sys
+try:
+    packages = json.load(open(sys.argv[1], encoding="utf-8")).get("packages", [])
+except Exception:
+    packages = []
+for entry in packages:
+    if not isinstance(entry, str):
+        continue
+    normalized = entry.replace("\\", "/").rstrip("/")
+    if (normalized.startswith("git:") and "pi-daemon" in normalized) \
+            or normalized.rsplit("/", 1)[-1] == "pi-daemon":
+        print(entry)
+        break
+PYGUARD
+)"
+  if [[ -n "$pinned" ]]; then
+    echo "install: pi-daemon is installed as a pi package ($pinned)." >&2
+    echo "  A manual install would load its extensions twice and abort every" >&2
+    echo "  new session with tool-conflict errors. Update the package instead" >&2
+    echo "  (pi update git:github.com/ederevx/pi-daemon), drop the pin before" >&2
+    echo "  a manual install, or use scripts/install.sh --package to refresh" >&2
+    echo "  only the bin helpers and unit." >&2
+    exit 1
+  fi
+fi
+
 install_to() {
 	# Atomic replacement, per shared convention: never truncate a file
 	# that running software may read or execute — land the complete new

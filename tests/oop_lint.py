@@ -136,7 +136,10 @@ def check_no_subagent_residue(root: str) -> None:
         # separator is "\\", so a "/.git" substring check would scan
         # tests/ (which intentionally contains the removed identifiers)
         # and fail the lint on every Windows run.
-        dirs[:] = [d for d in dirs if d not in (".git", "tests")]
+        # node_modules: a local npm install (needed by the TS suite)
+        # carries third-party sources and vendored pi copies that hold
+        # the removed identifiers; they are not this repo's code.
+        dirs[:] = [d for d in dirs if d not in (".git", "tests", "node_modules")]
         for name in files:
             path = os.path.join(dirpath, name)
             if path.endswith((".pyc", ".map")):

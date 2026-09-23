@@ -9,7 +9,7 @@
 import { mkdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { test, assert, assertEq, withEnv, waitFor, scratchDir } from "./harness.ts";
+import { test, assert, assertEq, withEnv, withPlatform, waitFor, scratchDir } from "./harness.ts";
 import {
   RcBackground,
   ProcessRunner,
@@ -40,13 +40,11 @@ class ExecScript {
   ) {}
 
   async run(_file: string, args: string[]): Promise<ExeResult> {
-    // Windows runs pi-rc through the Python interpreter, so the script
-    // path leads the args there; drop it so tests assert commands
-    // uniformly on every platform.
-    const logical =
-      args.length > 0 && /(^|[\\/])pi-rc$/.test(args[0])
-        ? args.slice(1)
-        : args;
+    // The Windows launch shape runs the script through the Python
+    // interpreter, so the script path leads the args there; normalize
+    // to the POSIX shape (the script is the file, the args follow) so
+    // tests assert commands uniformly on every platform.
+    const logical = /python/i.test(_file) ? args.slice(1) : args;
     this.calls.push(logical);
     const spec = this.responses[Math.min(this.index, this.responses.length - 1)];
     this.index++;
@@ -414,7 +412,7 @@ test("daemon: unconsumed token (daemon fallback) never double-reloads", async ()
   });
 });
 
-test("daemon: session start auto-starts the service and says so", async () => {
+test("daemon: session start auto-starts the service and says so", async () => withPlatform("linux", async () => {
   const state = join(scratchDir(), "autostart");
   await hosted("pi-autostart", async () => {
     await withEnv({ XDG_STATE_HOME: state }, async () => {
@@ -452,7 +450,7 @@ test("daemon: session start auto-starts the service and says so", async () => {
       await pi.shutdownHandlers[0]({ reason: "quit" });
     });
   });
-});
+}));
 
 test("daemon: session_shutdown stops the watcher (no leaked watchers)", async () => {
   const state = join(scratchDir(), "signal-shutdown");
@@ -515,7 +513,7 @@ test("daemon: hasServiceUnit probes the unit only on POSIX", async () => {
   assertEq(win.calls.length, 0, "win32 never probes systemctl");
 });
 
-test("daemon: manual /daemon-reload prefers the unit where managed", async () => {
+test("daemon: manual /daemon-reload prefers the unit where managed", async () => withPlatform("linux", async () => {
   const state = join(scratchDir(), "reload-unit");
   await hosted("pi-unit", async () => {
     await withEnv({ XDG_STATE_HOME: state }, async () => {
@@ -549,7 +547,7 @@ test("daemon: manual /daemon-reload prefers the unit where managed", async () =>
       await pi.shutdownHandlers[0]({ reason: "quit" });
     });
   });
-});
+}));
 
 test("daemon: manual /daemon-reload uses the successor without a unit", async () => {
   const state = join(scratchDir(), "reload-successor");
@@ -643,7 +641,7 @@ test("daemon: supervisor starts the unit where the service manager owns it", asy
     },
   ]);
   const sup = new DaemonSupervisor("/x/pi-daemon", "linux",
-    new ProcessRunner(exe.run.bind(exe)));
+    new ProcessRunner(exe.run.bind(exe), "linux"));
   assert(await sup.ensure(), "a dead unit is started");
   const verbs = exe.calls.map((a) => a[1]);
   assert(verbs.includes("is-active"), "the active probe leads");
@@ -656,7 +654,7 @@ test("daemon: supervisor is a no-op while the unit is active", async () => {
       ? { code: 0, stdout: "active\n" } : { code: 0 },
   ]);
   const sup = new DaemonSupervisor("/x/pi-daemon", "linux",
-    new ProcessRunner(exe.run.bind(exe)));
+    new ProcessRunner(exe.run.bind(exe), "linux"));
   assert(!await sup.ensure(), "an active unit needs no start");
   assertEq(exe.calls.length, 1, "only the active probe ran");
 });
@@ -708,7 +706,7 @@ test("daemon: supervisor swallows a failed unit start", async () => {
     },
   ]);
   const sup = new DaemonSupervisor("/x/pi-daemon", "linux",
-    new ProcessRunner(exe.run.bind(exe)));
+    new ProcessRunner(exe.run.bind(exe), "linux"));
   assert(!await sup.ensure(),
     "ensure is best-effort and never throws on a failed start");
 });

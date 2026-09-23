@@ -105,6 +105,27 @@ export function cleanupScratch(): void {
 }
 
 /** Save/restore env around a test body (async-aware). */
+/** Forces `process.platform` for the body — the extension's launch
+ *  shape (interpreter prefix, probe paths) follows the host platform,
+ *  so POSIX-path tests must pin it explicitly to be portable to a
+ *  Windows test host. Restores the real platform afterwards. */
+export async function withPlatform(
+  platform: string,
+  fn: () => void | Promise<void>,
+): Promise<void> {
+  const real = process.platform;
+  Object.defineProperty(process, "platform", {
+    value: platform, configurable: true,
+  });
+  try {
+    await fn();
+  } finally {
+    Object.defineProperty(process, "platform", {
+      value: real, configurable: true,
+    });
+  }
+}
+
 export async function withEnv(
   overrides: Record<string, string | undefined>,
   fn: () => void | Promise<void>,
