@@ -505,17 +505,13 @@ class WindowsPtyChild:
         self._api.lib.TerminateProcess(self._process, 1)
 
     def _taskkill_tree(self, grace):
+        # Same tree kill the platform seam owns for the daemon; the
+        # lazy pi_platform import is safe here (it loads this module
+        # only behind a runtime platform check, never at import time).
         if not _IS_WINDOWS:
             return
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(self.pid), "/T", "/F"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                timeout=max(0.0, grace))
-        except (OSError, subprocess.SubprocessError):
-            pass
+        import pi_platform
+        pi_platform.ProcessControl().taskkill_tree(self.pid, max(0.0, grace))
 
     def _wait_reaped(self, grace):
         deadline = time.time() + max(0.0, grace)

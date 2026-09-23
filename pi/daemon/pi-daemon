@@ -130,6 +130,7 @@ import re
 import select
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -254,6 +255,11 @@ ROSTER_PATH = os.path.join(REG_DIR, "daemons.json")
 
 LOG_LOCK = threading.Lock()
 
+# The detached daemon's log file is rotated once past this size; the
+# previous generation is kept as <LOG_PATH>.1 and replaced on the next
+# rotation, so the log's disk footprint is bounded at twice the cap.
+LOG_MAX_BYTES = 8 << 20
+
 CLEAR_SEQ = b"\x1b[H\x1b[2J\x1b[m"
 
 # Wire commands served by Control (attach + shutdown are special-cased in
@@ -273,11 +279,45 @@ def log(msg):
 	# take a request handler down mid-response, so every write failure is
 	# swallowed; main() keeps real daemons on the journal or the log file.
 	with LOG_LOCK:
+		_rotate_log()
 		try:
 			sys.stderr.write("pi-daemon: %s\n" % msg)
 			sys.stderr.flush()
 		except Exception:
 			pass
+
+
+def _rotate_log():
+	# The detached daemon appends to one log file forever; cap it by
+	# rotating once past LOG_MAX_BYTES (single .1 generation, so the
+	# footprint stays bounded). Only the daemon's own log is touched:
+	# stderr must be the regular file at LOG_PATH (journald's stderr is
+	# not). rename + fresh-open + dup2 under LOG_LOCK: sys.stderr keeps
+	# writing through fd 2 into the fresh file. Windows rejects a rename
+	# onto an existing target, so the stale rotation is removed first.
+	try:
+		st = os.fstat(2)
+		logst = os.stat(LOG_PATH)
+	except OSError:
+		return
+	if (not stat.S_ISREG(st.st_mode)
+			or (st.st_dev, st.st_ino) != (logst.st_dev, logst.st_ino)
+			or st.st_size <= LOG_MAX_BYTES):
+		return
+	try:
+		try:
+			os.replace(LOG_PATH, LOG_PATH + ".1")
+		except OSError:
+			os.remove(LOG_PATH + ".1")
+			os.replace(LOG_PATH, LOG_PATH + ".1")
+		fresh = os.open(LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+						0o600)
+		try:
+			os.dup2(fresh, 2)
+		finally:
+			os.close(fresh)
+	except OSError:
+		pass
 
 
 def kill_socket(client):
@@ -470,8 +510,7 @@ class Registry:
 		self._lock = threading.Lock()
 
 	def load(self):
-		data = self._file.read()
-		return data if isinstance(data, dict) else {}
+		return self._file.read_dict()
 
 	def write(self, data):
 		# Atomic replacement so readers never see a partial file.
@@ -548,7 +587,10 @@ class DaemonRoster:
 	file while older daemons kept running) converge to exactly one live
 	daemon. A peer is stopped gracefully through its own roster
 	coordinates; a peer whose port refuses connections is dead and its
-	stale entry is pruned. Daemons that predate the roster publish no
+	stale entry is pruned. Each entry also records the publisher's
+	process start token, so a lingering pid is only ever signalled
+	while it is still the daemon that published it - a recycled pid is
+	never killed. Daemons that predate the roster publish no
 	coordinates and are invisible to it: stop them once manually
 	(pi-rc daemon-stop against their endpoint, or a process kill as the
 	documented fallback)."""
@@ -565,8 +607,26 @@ class DaemonRoster:
 			data = self._load()
 			data[str(int(pid))] = {"host": str(host), "port": int(port),
 								   "token": str(token),
-								   "started": time.time()}
+								   "started": time.time(),
+								   "start_token": PROCESS.process_start_token(pid)}
 			self._store(data)
+
+	@staticmethod
+	def _wait_peer_gone(pid, token, timeout):
+		"""Wait (bounded) until a stopped peer's process is fully gone:
+		its control port can die before its exit teardown runs, and that
+		teardown removes the shared endpoint file - the boot must not
+		publish its own endpoint until the peer has actually exited.
+		A live pid whose start token no longer matches the peer's
+		published one is a recycled pid: the original is gone. Returns
+		True once the peer is gone, False if it lingers."""
+		deadline = time.time() + timeout
+		while PROCESS.pid_alive(pid) \
+				and PROCESS.pid_matches_token(pid, token):
+			if time.time() >= deadline:
+				return False
+			time.sleep(0.05)
+		return True
 
 	def remove(self, pid):
 		with self._lock:
@@ -576,8 +636,7 @@ class DaemonRoster:
 				self._store(data)
 
 	def _load(self):
-		data = self._file.read()
-		return data if isinstance(data, dict) else {}
+		return self._file.read_dict()
 
 	def _store(self, data):
 		self._file.write(data)
@@ -600,7 +659,7 @@ class DaemonRoster:
 					continue
 				if peer >= mine:
 					continue
-				outcome = _peer_shutdown(rec, timeout)
+				outcome = self._peer_shutdown(rec, timeout)
 				if outcome == "unreachable":
 					log("roster: live peer at %s:%s did not accept a "
 						"shutdown; left running" % (rec.get("host"),
@@ -608,13 +667,16 @@ class DaemonRoster:
 					continue
 				self.remove(int(key))
 				if outcome == "stopped":
-					if not _wait_peer_gone(int(key), timeout):
+					if not self._wait_peer_gone(int(key),
+												rec.get("start_token"),
+												timeout):
 						# The peer acknowledged the shutdown but its exit
 						# teardown is still running (or it lied): the boot
 						# must not proceed beside a live older daemon,
 						# whose exit cleanup would race the newcomer's
 						# endpoint publish. Kill it by its roster pid.
-						_force_kill_peer(int(key))
+						self._force_kill_peer(int(key),
+											  rec.get("start_token"))
 					stopped += 1
 					log("roster: shut down older daemon pid %s" % key)
 				else:
@@ -622,92 +684,60 @@ class DaemonRoster:
 					log("roster: pruned dead daemon pid %s" % key)
 		return stopped, pruned
 
-
-def _peer_shutdown(rec, timeout):
-	"""One graceful control shutdown through a roster entry's own
-	{host, port, token}: the exact handshake the endpoint publishes,
-	aimed at the peer's published coordinates instead. Returns
-	"stopped", "dead" (port refused: no process owns it), or
-	"unreachable" (something answered badly or the connection failed
-	mid-handshake)."""
-	try:
-		sock = socket.create_connection(
-			(str(rec.get("host")), int(rec.get("port"))), timeout)
-	except (ConnectionRefusedError, TimeoutError):
-		return "dead"
-	except OSError:
-		return "unreachable"
-	try:
-		sock.settimeout(timeout)
-		reader = LineReader(sock)
-		send_json(sock, {"cmd": "hello", "token": rec.get("token") or ""})
-		ack = json.loads(reader.readline().decode())
-		if not ack.get("ok"):
-			return "unreachable"
-		send_json(sock, {"cmd": "shutdown"})
-		reply = json.loads(reader.readline().decode())
-		return "stopped" if reply.get("ok") else "unreachable"
-	except (OSError, ValueError, AttributeError):
-		return "unreachable"
-	finally:
-		kill_socket(sock)
-
-
-def _pid_alive(pid):
-	"""True while a pid still exists as a live process; a reaped or
-	zombie process counts as gone. Best effort: without os.kill every
-	pid is presumed alive."""
-	if not hasattr(os, "kill"):
-		return True
-	try:
-		os.kill(pid, 0)
-	except ProcessLookupError:
-		return False
-	except OSError:
-		return False
-	try:
-		with open("/proc/%d/stat" % pid) as fh:
-			return not fh.read().rsplit(")", 1)[1].lstrip().startswith("Z")
-	except OSError:
-		return True
-
-
-def _wait_peer_gone(pid, timeout):
-	"""Wait (bounded) until a stopped peer's process is fully gone:
-	its control port can die before its exit teardown runs, and that
-	teardown removes the shared endpoint file - the boot must not
-	publish its own endpoint until the peer has actually exited.
-	Returns True once the process is gone, False if it lingers."""
-	deadline = time.time() + timeout
-	while _pid_alive(pid):
-		if time.time() >= deadline:
-			return False
-		time.sleep(0.05)
-	return True
-
-
-def _force_kill_peer(pid, grace=KILL_GRACE):
-	"""Kill a lingering peer by the pid it published in the roster:
-	TERM, a bounded reap wait, then KILL. Best effort - a peer that
-	vanishes mid-kill or cannot be signalled just logs."""
-	if not pid or not hasattr(os, "kill"):
-		return
-	log("roster: peer pid %d lingers after shutdown; killing" % pid)
-	try:
-		os.kill(pid, signal.SIGTERM)
-	except OSError:
-		return
-	deadline = time.time() + grace
-	while time.time() < deadline:
+	@staticmethod
+	def _peer_shutdown(rec, timeout):
+		"""One graceful control shutdown through a roster entry's own
+		{host, port, token}: the exact handshake the endpoint publishes,
+		aimed at the peer's published coordinates instead. Returns
+		"stopped", "dead" (port refused: no process owns it), or
+		"unreachable" (something answered badly or the connection failed
+		mid-handshake)."""
 		try:
-			os.kill(pid, 0)
+			sock = socket.create_connection(
+				(str(rec.get("host")), int(rec.get("port"))), timeout)
+		except (ConnectionRefusedError, TimeoutError):
+			return "dead"
+		except OSError:
+			return "unreachable"
+		try:
+			sock.settimeout(timeout)
+			reader = LineReader(sock)
+			send_json(sock, {"cmd": "hello", "token": rec.get("token") or ""})
+			ack = json.loads(reader.readline().decode())
+			if not ack.get("ok"):
+				return "unreachable"
+			send_json(sock, {"cmd": "shutdown"})
+			reply = json.loads(reader.readline().decode())
+			return "stopped" if reply.get("ok") else "unreachable"
+		except (OSError, ValueError, AttributeError):
+			return "unreachable"
+		finally:
+			kill_socket(sock)
+
+	@staticmethod
+	def _force_kill_peer(pid, token, grace=KILL_GRACE):
+		"""Kill a lingering peer by the pid it published in the roster:
+		TERM, a bounded reap wait, then KILL. Best effort - a peer that
+		vanishes mid-kill or cannot be signalled just logs. The pid is only
+		signalled while it still matches the peer's published start token:
+		a recycled pid must never receive the kill."""
+		if not pid or not hasattr(os, "kill"):
+			return
+		if not PROCESS.pid_matches_token(pid, token):
+			log("roster: pid %d is not the published daemon anymore; "
+				"left alone" % pid)
+			return
+		log("roster: peer pid %d lingers after shutdown; killing" % pid)
+		try:
+			os.kill(pid, signal.SIGTERM)
 		except OSError:
 			return
-		time.sleep(0.05)
-	try:
-		os.kill(pid, signal.SIGKILL)
-	except OSError:
-		pass
+		if DaemonRoster._wait_peer_gone(pid, token, grace):
+			return
+		try:
+			os.kill(pid, signal.SIGKILL)
+		except OSError:
+			pass
 
 
 class TicketStore:
@@ -727,9 +757,7 @@ class TicketStore:
 		self._next = 1
 
 	def load(self):
-		data = self._file.read()
-		if not isinstance(data, dict):
-			data = {}
+		data = self._file.read_dict()
 		tickets = data.get("tickets")
 		self._tickets = tickets if isinstance(tickets, dict) else {}
 		try:
