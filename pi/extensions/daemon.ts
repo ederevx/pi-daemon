@@ -542,14 +542,34 @@ export class RcBackground {
 		}
 	}
 
-	/** Restart the background service directly when the running daemon
-	 *  cannot restart itself: an old build answers bad-request to
-	 *  pi-rc daemon-restart, and an unreachable daemon makes pi-rc fail
-	 *  before any request lands. The daemon's persisted registry makes
-	 *  both paths session-preserving — a restart respawns every recorded
-	 *  session. POSIX restarts the user systemd unit the install
-	 *  manages; Windows has no service manager, so the daemon is stopped
-	 *  and the supervisor respawns it windowless. Throws on failure so
+	/** Whether a service manager owns the daemon: the OS-agnostic
+	 *  probe behind /daemon-reload's path choice. POSIX with the
+	 *  pi-daemon.service user unit installed returns true; Windows has
+	 *  no service manager and a POSIX host without systemd or without
+	 *  the unit answers no, so the detached-successor path stays the
+	 *  mechanism there. A failed probe is treated as "not managed" so
+	 *  an unusual host can never break the restart. */
+	async hasServiceUnit(): Promise<boolean> {
+		if (this.platform === "win32") return false;
+		const result = await this.runner.run("systemctl", [
+			"--user", "list-unit-files", "--no-legend",
+			"pi-daemon.service",
+		]);
+		return result.code === 0
+			&& (result.stdout || "").trim() !== "";
+	}
+
+	/** Restart the background service directly. Primary path wherever
+	 *  a service manager owns the daemon (POSIX with the unit
+	 *  installed): the fresh daemon is born supervised, while the
+	 *  in-daemon successor path would leave the unit inactive. Also
+	 *  the fallback when the running daemon cannot restart itself: an
+	 *  old build answers bad-request to pi-rc daemon-restart, and an
+	 *  unreachable daemon makes pi-rc fail before any request lands.
+	 *  The daemon's persisted registry makes both paths
+	 *  session-preserving — a restart respawns every recorded session.
+	 *  Windows has no service manager, so the daemon is stopped and
+	 *  the supervisor respawns it windowless. Throws on failure so
 	 *  the caller can report and keep the session alive. */
 	async restartService(): Promise<void> {
 		if (this.platform === "win32") {
@@ -898,47 +918,60 @@ export default function (pi: ExtensionAPI) {
 	// pi-daemon build.
 	pi.registerCommand("daemon-reload", {
 		description:
-			"Reload resources on the daemon's signal; without a pending signal, restart the pi-daemon to adopt a newly installed build (falls back to restarting the background service when the daemon cannot)",
+			"Reload resources on the daemon's signal; without a pending signal, restart the pi-daemon to adopt a newly installed build (through the systemd unit where the service manager owns it, otherwise the in-daemon successor path)",
 		handler: async (_args, ctx) => {
 			const token = reloadWatcher.pendingToken;
 			if (token && reloadWatcher.consume(token)) {
 				await ctx.reload();
 				return;
 			}
-			// The daemon orchestrates the restart: registry snapshot
-			// (deduped), detached successor, exit. This session is one
-			// of the hosted sessions the successor respawns; the TUI
-			// goes down with the old daemon and its viewer reattaches.
-			// A failure is reported while the session still lives: an
-			// old daemon answers bad-request instead of restarting.
-			try {
-				await app.restartDaemon();
-			} catch (err) {
-				// The running daemon may be unable to restart itself: an
-				// old build answers bad-request to pi-rc daemon-restart,
-				// and an unreachable daemon fails before any request
-				// lands. Restart the background service directly; the
-				// persisted registry respawns every recorded session.
+			// Manual invocation: restart the daemon along the path the
+			// host actually manages, so a newly installed build is adopted.
+			// Where a service manager owns the daemon (POSIX with
+			// pi-daemon.service installed), restart the unit: the fresh
+			// daemon is born supervised, while the in-daemon successor
+			// path would leave the unit inactive with the running daemon
+			// unsupervised (the measured dysfunction: the successor
+			// spawn is detached outside systemd and nothing re-adopts
+			// the unit). Where no service manager exists — Windows, or
+			// POSIX without the unit — the detached successor remains
+			// the mechanism: the daemon snapshots its registry (deduped),
+			// spawns the successor and exits; every hosted session
+			// respawns and the TUI's viewer reattaches. The other path
+			// is the fallback when the first fails, so a broken unit or
+			// an old daemon never blocks the restart; the persisted
+			// registry makes both session-preserving.
+			const serviceFirst = await app.hasServiceUnit()
+				.catch(() => false);
+			const paths = serviceFirst
+				? ["service", "daemon"] as const
+				: ["daemon", "service"];
+			const failures: string[] = [];
+			for (const path of paths) {
 				try {
-					await app.restartService();
-				} catch (serviceErr) {
-					ctx?.ui?.notify?.(
-						`Daemon restart failed ` +
-							`(${err instanceof Error ? err.message : String(err)}); ` +
-							`the service restart also failed ` +
-							`(${serviceErr instanceof Error ? serviceErr.message : String(serviceErr)}); ` +
-						"this session keeps running.",
-						"warning",
-					);
-					return;
+					if (path === "service") await app.restartService();
+					else await app.restartDaemon();
+				} catch (err) {
+					failures.push(
+						`${path === "service" ? "service" : "daemon"} restart: ` +
+							(err instanceof Error ? err.message : String(err)));
+					continue;
 				}
-				ctx?.ui?.notify?.(
-					"The daemon could not restart itself, so the background " +
-						"service was restarted directly; every hosted session " +
-						"respawns from the registry.",
-					"info",
-				);
+				if (path === "service" && !serviceFirst) {
+					ctx?.ui?.notify?.(
+						"The daemon could not restart itself, so the " +
+							"background service was restarted directly; every " +
+							"hosted session respawns from the registry.",
+						"info",
+					);
+				}
+				return;
 			}
+			ctx?.ui?.notify?.(
+				`Daemon restart failed (${failures.join("; ")}); ` +
+					"this session keeps running.",
+				"warning",
+			);
 		},
 	});
 

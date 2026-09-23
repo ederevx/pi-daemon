@@ -451,6 +451,100 @@ test("daemon: reload signal is a no-op outside hosting", async () => {
   });
 });
 
+test("daemon: hasServiceUnit probes the unit only on POSIX", async () => {
+  const installed = new ExecScript([{ code: 0, stdout: "pi-daemon.service enabled enabled\n" }]);
+  const linux = new RcBackground(
+    installed.run.bind(installed), undefined, undefined, "linux");
+  assert(await linux.hasServiceUnit(), "an installed unit is service-managed");
+  assertEq(installed.calls[0].join(" "),
+    "--user list-unit-files --no-legend pi-daemon.service");
+  // A POSIX host without the unit (or without systemd at all) is not
+  // service-managed; the successor path stays the mechanism there.
+  const missing = new ExecScript([{ code: 0, stdout: "" }]);
+  assert(!await new RcBackground(
+    missing.run.bind(missing), undefined, undefined, "linux",
+  ).hasServiceUnit(), "an empty unit list is not managed");
+  const nosystemd = new ExecScript([{ code: 1, stderr: "Failed to connect to bus" }]);
+  assert(!await new RcBackground(
+    nosystemd.run.bind(nosystemd), undefined, undefined, "linux",
+  ).hasServiceUnit(), "a failed systemctl probe is not service-managed");
+  const win = new ExecScript([]);
+  assert(!await new RcBackground(
+    win.run.bind(win), undefined, undefined, "win32",
+  ).hasServiceUnit(), "Windows has no service manager");
+  assertEq(win.calls.length, 0, "win32 never probes systemctl");
+});
+
+test("daemon: manual /daemon-reload prefers the unit where managed", async () => {
+  const state = join(scratchDir(), "reload-unit");
+  await hosted("pi-unit", async () => {
+    await withEnv({ XDG_STATE_HOME: state }, async () => {
+      const exe = new ExecScript([
+        (args: string[]) =>
+          args[0] === "--user" && args[1] === "list-unit-files"
+          ? { code: 0, stdout: "pi-daemon.service enabled enabled\n" }
+          : { code: 0 },
+      ]);
+      class UnitPi extends MockPi {
+        override async exec(file: string, args: string[]): Promise<ExeResult> {
+          return exe.run(file, args);
+        }
+      }
+      const pi = new UnitPi();
+      factory(pi as never);
+      await pi.sessionStarters[0]({ reason: "startup" });
+      const c = ctx() as never as { reload: () => Promise<void> };
+      c.reload = async () => {};
+      const cmd = pi.commands.get("daemon-reload") as {
+        handler: (args: unknown[], ctx: unknown) => Promise<void>;
+      };
+      exe.calls.length = 0;
+      await cmd.handler([], c);
+      const probe = exe.calls.find((a) => a[1] === "list-unit-files");
+      assert(probe, "the unit probe leads the path choice");
+      assert(exe.calls.some((a) => a.join(" ") === "--user restart pi-daemon.service"),
+        "a managed daemon restarts through the unit, staying supervised");
+      assert(!exe.calls.some((a) => a[0] === "daemon-restart"),
+        "no successor spawn beside the unit");
+      await pi.shutdownHandlers[0]({ reason: "quit" });
+    });
+  });
+});
+
+test("daemon: manual /daemon-reload uses the successor without a unit", async () => {
+  const state = join(scratchDir(), "reload-successor");
+  await hosted("pi-succ", async () => {
+    await withEnv({ XDG_STATE_HOME: state }, async () => {
+      const exe = new ExecScript([
+        (args: string[]) =>
+          args[0] === "--user" && args[1] === "list-unit-files"
+          ? { code: 0, stdout: "" }
+          : { code: 0 },
+      ]);
+      class NoUnitPi extends MockPi {
+        override async exec(file: string, args: string[]): Promise<ExeResult> {
+          return exe.run(file, args);
+        }
+      }
+      const pi = new NoUnitPi();
+      factory(pi as never);
+      await pi.sessionStarters[0]({ reason: "startup" });
+      const c = ctx() as never as { reload: () => Promise<void> };
+      c.reload = async () => {};
+      const cmd = pi.commands.get("daemon-reload") as {
+        handler: (args: unknown[], ctx: unknown) => Promise<void>;
+      };
+      exe.calls.length = 0;
+      await cmd.handler([], c);
+      assert(exe.calls.some((a) => a[0] === "daemon-restart"),
+        "an unmanaged daemon takes the successor path");
+      assert(!exe.calls.some((a) => a.join(" ").includes("restart pi-daemon.service")),
+        "the unit restart is never attempted");
+      await pi.shutdownHandlers[0]({ reason: "quit" });
+    });
+  });
+});
+
 test("daemon: windowless python prefers the GUI-subsystem twin", async () => {
   // A console interpreter would flash a window when the detached daemon
   // starts; the GUI-subsystem twin must lead the candidate list.
