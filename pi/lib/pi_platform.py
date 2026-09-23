@@ -171,6 +171,12 @@ class AtomicStateFile:
         except (OSError, ValueError):
             return None
 
+    def read_dict(self):
+        """The parsed file when it holds an object, else {}: the guarded
+        read every dict-shaped state store uses on load."""
+        data = self.read()
+        return data if isinstance(data, dict) else {}
+
     def _restrict(self, path):
         # On POSIX this keeps the state out of other users' reach; on
         # Windows chmod only toggles the read-only bit, which is fine
@@ -189,14 +195,11 @@ class EndpointFile:
         self._file = AtomicStateFile(path, restrict=True)
 
     def write(self, host, port, token):
-        directory = os.path.dirname(self.path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
+        # AtomicStateFile.write creates the target directory itself.
         self._file.write({"host": host, "port": port, "token": token})
 
     def read(self):
-        data = self._file.read()
-        return data if isinstance(data, dict) else {}
+        return self._file.read_dict()
 
     def remove(self):
         try:
@@ -305,11 +308,54 @@ class ControlClient:
 
 
 class ProcessControl:
-    """One portable terminate/kill-tree path and terminal signalling."""
+    """One portable terminate/kill-tree path, terminal signalling, and
+    pid liveness."""
 
     def __init__(self, platform=None, environ=None):
         self.platform = sys.platform if platform is None else platform
         self.environ = os.environ if environ is None else environ
+
+    def pid_alive(self, pid):
+        """True while a pid still exists as a live process; a reaped or
+        zombie process counts as gone. Best effort: without os.kill
+        every pid is presumed alive."""
+        if self.platform.startswith("win") or not hasattr(os, "kill"):
+            return True
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        try:
+            with open("/proc/%d/stat" % pid) as fh:
+                return not fh.read().rsplit(")", 1)[1].lstrip().startswith("Z")
+        except OSError:
+            return True
+
+    def process_start_token(self, pid):
+        """A token identifying this exact process incarnation: the
+        starttime field (ticks since boot) of /proc/<pid>/stat. A bare
+        signal probe cannot tell a recycled pid from the original one;
+        comparing recorded tokens can. Returns None where the start
+        time is unavailable (Windows has no /proc)."""
+        if self.platform.startswith("win"):
+            return None
+        try:
+            with open("/proc/%d/stat" % pid) as fh:
+                # Drop "pid (comm) "; the remaining fields start at 3,
+                # so overall field 22 (starttime) is index 19.
+                return fh.read().rsplit(")", 1)[1].split()[19]
+        except (OSError, IndexError):
+            return None
+
+    def pid_matches_token(self, pid, token):
+        """True while pid is still the process incarnation the token was
+        recorded for. A token that was never recorded (a pre-token
+        roster entry, or no /proc on Windows) cannot be disproved, so
+        it always matches."""
+        current = self.process_start_token(pid)
+        if current is None or token is None:
+            return True
+        return str(current) == str(token)
 
     def terminate_tree(self, pid, grace):
         if self.platform.startswith("win"):
@@ -537,6 +583,11 @@ class ProcessControl:
             kernel32.CloseHandle(handle)
 
     def _windows_terminate(self, pid):
+        self.taskkill_tree(pid)
+
+    def taskkill_tree(self, pid, timeout=5):
+        """Windows tree kill: one taskkill /T /F owner for the daemon's
+        signal paths and the ConPTY backend's child teardown."""
         import subprocess
         try:
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
@@ -545,7 +596,7 @@ class ProcessControl:
                            stderr=subprocess.DEVNULL,
                            creationflags=getattr(subprocess,
                                                   "CREATE_NO_WINDOW", 0),
-                           timeout=5)
+                           timeout=timeout)
         except (OSError, subprocess.SubprocessError):
             pass
 
