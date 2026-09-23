@@ -128,40 +128,74 @@ class RuntimeLayout:
         return self._join(self.registry_dir(), "extensions-diff.json")
 
 
-class EndpointFile:
-    """Atomic read/write of the published {host, port, token} endpoint."""
+class AtomicStateFile:
+    """Atomic JSON state persistence: one owner for the write-temp-fsync-
+    replace pattern every durable state file uses. The temp name carries
+    the pid so two concurrent processes converging on one state dir
+    (roster boot converge, detached successor races) can never corrupt
+    each other's in-flight temp; os.replace publishes readers a complete
+    file or nothing, on every platform. "restrict" keeps a written file
+    out of other users' reach on POSIX. read() returns the parsed JSON
+    or None for a missing/corrupt file, so every state store reads
+    through the same guarded path."""
 
-    def __init__(self, path):
+    def __init__(self, path, restrict=False):
         self.path = path
+        self.restrict = restrict
 
-    def write(self, host, port, token):
+    def write(self, obj):
+        """Serialize obj as one JSON line and publish it atomically:
+        write to a pid-unique temp in the target directory, flush, fsync
+        (the file survives a crash, not just a clean exit), then
+        os.replace. Raises OSError on failure; callers keep their own
+        failure semantics."""
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        data = json.dumps({"host": host, "port": port,
-                           "token": token}) + "\n"
         tmp = "%s.tmp.%d" % (self.path, os.getpid())
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(data)
-        self._restrict(tmp)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(obj) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if self.restrict:
+            self._restrict(tmp)
         os.replace(tmp, self.path)
-        self._restrict(self.path)
+        if self.restrict:
+            self._restrict(self.path)
+
+    def read(self):
+        """The parsed file, or None when it is missing or corrupt."""
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
 
     def _restrict(self, path):
-        # On POSIX this keeps the token out of other users' reach; on
+        # On POSIX this keeps the state out of other users' reach; on
         # Windows chmod only toggles the read-only bit, which is fine
-        # because the endpoint lives under %LOCALAPPDATA%.
+        # because the state lives under %LOCALAPPDATA%.
         try:
             os.chmod(path, 0o600)
         except OSError:
             pass
 
+
+class EndpointFile:
+    """Atomic read/write of the published {host, port, token} endpoint."""
+
+    def __init__(self, path):
+        self.path = path
+        self._file = AtomicStateFile(path, restrict=True)
+
+    def write(self, host, port, token):
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self._file.write({"host": host, "port": port, "token": token})
+
     def read(self):
-        try:
-            with open(self.path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            return {}
+        data = self._file.read()
         return data if isinstance(data, dict) else {}
 
     def remove(self):
