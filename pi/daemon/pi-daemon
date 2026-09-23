@@ -354,29 +354,22 @@ def _read_ext_snapshot():
 	"""Last-known extension fingerprint, or None before any baseline.
 	JSON turns the stored mtime/size tuples into arrays; fold them back
 	into tuples so the comparison on read is exact."""
-	try:
-		with open(EXT_SNAPSHOT_PATH) as f:
-			rec = json.load(f)
-		fp = rec.get("fingerprint")
-		if not isinstance(fp, dict):
-			return None
-		return {k: tuple(v) for k, v in fp.items()}
-	except (OSError, ValueError):
+	rec = pi_platform.AtomicStateFile(EXT_SNAPSHOT_PATH).read()
+	if not isinstance(rec, dict):
 		return None
+	fp = rec.get("fingerprint")
+	if not isinstance(fp, dict):
+		return None
+	return {k: tuple(v) for k, v in fp.items()}
 
 
 def _write_ext_snapshot(fp, diff):
-	tmp = EXT_SNAPSHOT_PATH + ".tmp"
-	with open(tmp, "w") as f:
-		json.dump({"fingerprint": fp, "diff": diff}, f)
-	os.replace(tmp, EXT_SNAPSHOT_PATH)
+	pi_platform.AtomicStateFile(EXT_SNAPSHOT_PATH).write(
+		{"fingerprint": fp, "diff": diff})
 
 
 def _write_ext_diff(diff):
-	tmp = EXT_DIFF_PATH + ".tmp"
-	with open(tmp, "w") as f:
-		json.dump(diff, f)
-	os.replace(tmp, EXT_DIFF_PATH)
+	pi_platform.AtomicStateFile(EXT_DIFF_PATH).write(diff)
 
 
 def _new_reload_token():
@@ -399,11 +392,8 @@ def _write_reload_signal(name, token):
 		return False
 	path = _reload_signal_path(name)
 	try:
-		os.makedirs(EXT_RELOAD_SIGNAL_DIR, exist_ok=True)
-		tmp = path + ".tmp"
-		with open(tmp, "w") as f:
-			json.dump({"token": token, "written": time.time()}, f)
-		os.replace(tmp, path)
+		pi_platform.AtomicStateFile(path).write(
+			{"token": token, "written": time.time()})
 	except OSError:
 		return False
 	return True
@@ -471,19 +461,17 @@ class LineReader:
 
 
 class Registry:
-	"""The on-disk session registry: daemon-restart respawn state."""
+	"""The on-disk session registry: daemon-restart respawn state. Every
+	persistent byte flows through AtomicStateFile (its single owner)."""
 
 	def __init__(self, path):
 		self.path = path
+		self._file = pi_platform.AtomicStateFile(path)
 		self._lock = threading.Lock()
 
 	def load(self):
-		try:
-			with open(self.path) as f:
-				data = json.load(f)
-			return data if isinstance(data, dict) else {}
-		except (OSError, ValueError):
-			return {}
+		data = self._file.read()
+		return data if isinstance(data, dict) else {}
 
 	def write(self, data):
 		# Atomic replacement so readers never see a partial file.
@@ -494,14 +482,7 @@ class Registry:
 		# Caller holds _lock: every mutation is one load-modify-write
 		# under the lock, so a concurrent set_argv can no longer resurrect
 		# a name drop() just removed (a stale respawn on daemon restart).
-		os.makedirs(os.path.dirname(self.path), exist_ok=True)
-		tmp = self.path + ".tmp"
-		with open(tmp, "w") as f:
-			json.dump(data, f)
-			f.write("\n")
-			f.flush()
-			os.fsync(f.fileno())
-		os.replace(tmp, self.path)
+		self._file.write(data)
 
 	def add(self, name, dir_, argv):
 		with self._lock:
@@ -574,6 +555,7 @@ class DaemonRoster:
 
 	def __init__(self, path):
 		self.path = path
+		self._file = pi_platform.AtomicStateFile(path)
 		# Reentrant: shutdown_others prunes entries (remove) while it
 		# holds the lock over its whole candidate pass.
 		self._lock = threading.RLock()
@@ -594,20 +576,11 @@ class DaemonRoster:
 				self._store(data)
 
 	def _load(self):
-		try:
-			with open(self.path) as f:
-				data = json.load(f)
-			return data if isinstance(data, dict) else {}
-		except (OSError, ValueError):
-			return {}
+		data = self._file.read()
+		return data if isinstance(data, dict) else {}
 
 	def _store(self, data):
-		os.makedirs(os.path.dirname(self.path), exist_ok=True)
-		tmp = self.path + ".tmp"
-		with open(tmp, "w") as f:
-			json.dump(data, f)
-			f.write("\n")
-		os.replace(tmp, self.path)
+		self._file.write(data)
 
 	def shutdown_others(self, pid, started, timeout=2.0):
 		"""Gracefully stop every roster entry strictly older than
@@ -747,17 +720,14 @@ class TicketStore:
 	def __init__(self, path, log_dir):
 		self.path = path
 		self.log_dir = log_dir
+		self._file = pi_platform.AtomicStateFile(path)
 		self.lock = threading.Lock()
 		self.cond = threading.Condition(self.lock)
 		self._tickets = {}
 		self._next = 1
 
 	def load(self):
-		try:
-			with open(self.path) as f:
-				data = json.load(f)
-		except (OSError, ValueError):
-			data = {}
+		data = self._file.read()
 		if not isinstance(data, dict):
 			data = {}
 		tickets = data.get("tickets")
@@ -770,14 +740,9 @@ class TicketStore:
 			self._next = 1
 
 	def _write_locked(self):
-		os.makedirs(os.path.dirname(self.path), exist_ok=True)
-		tmp = self.path + ".tmp"
-		with open(tmp, "w") as f:
-			json.dump({"next": self._next, "tickets": self._tickets}, f)
-			f.write("\n")
-			f.flush()
-			os.fsync(f.fileno())
-		os.replace(tmp, self.path)
+		# Caller holds the lock: one atomic write-through (the AtomicStateFile
+		# owns the temp-fsync-replace mechanics).
+		self._file.write({"next": self._next, "tickets": self._tickets})
 
 	def alloc_id_locked(self, session=None):
 		# Caller holds the lock: ids must strictly increase across the
