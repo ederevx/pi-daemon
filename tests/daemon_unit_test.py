@@ -1071,6 +1071,38 @@ def test_roster_force_kills_lingering_peer():
             proc.wait()
 
 
+def test_roster_recycled_pid_never_killed():
+    """A peer whose recorded start token no longer matches its pid is
+    a recycled pid: the wait ends immediately and the kill is never
+    sent, instead of killing whatever process inherited the number."""
+    proc, port = _spawn_fake_daemon(linger=30.0)
+    roster = _roster_with_peer(proc.pid, port, "recycled")
+    # Rewrite the recorded token so the live pid "no longer is" the
+    # daemon that published the entry.
+    path = os.path.join(SCRATCH, "roster-recycled.json")
+    with open(path) as f:
+        data = json.load(f)
+    data[str(proc.pid)]["start_token"] = "999999"
+    with open(path, "w") as f:
+        json.dump(data, f)
+    try:
+        t0 = time.time()
+        stopped, pruned = roster.shutdown_others(999, 200.0, 0.2)
+        elapsed = time.time() - t0
+        assert_eq(stopped, 1)
+        assert_eq(pruned, 0)
+        assert_true(elapsed < 0.2,
+                    "a token-mismatched pid is gone without waiting "
+                    "(%.2fs)" % elapsed)
+        assert_true(proc.poll() is None,
+                    "a foreign process never receives the kill")
+        assert_true(roster._load() == {}, "entry is pruned")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
 def test_endpoint_remove_if_owner_scoped():
     """EndpointFile.remove_if unlinks only a file that still publishes
     the caller's own coordinates: a dying daemon must never delete the
@@ -1479,6 +1511,8 @@ def _main():
        test_roster_waits_for_peer_death)
     ok("roster force-kills a lingering peer",
        test_roster_force_kills_lingering_peer, posix_only=True)
+    ok("roster never kills a recycled pid",
+       test_roster_recycled_pid_never_killed, posix_only=True)
     ok("endpoint remove_if is owner-scoped",
        test_endpoint_remove_if_owner_scoped)
     ok("posix pty child seam", test_posix_pty_child, posix_only=True)
