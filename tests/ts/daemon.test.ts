@@ -414,6 +414,46 @@ test("daemon: unconsumed token (daemon fallback) never double-reloads", async ()
   });
 });
 
+test("daemon: session start auto-starts the service and says so", async () => {
+  const state = join(scratchDir(), "autostart");
+  await hosted("pi-autostart", async () => {
+    await withEnv({ XDG_STATE_HOME: state }, async () => {
+      const exe = new ExecScript([
+        (args: string[]) => {
+          if (args[0] === "--user" && args[1] === "is-active") {
+            return { code: 3, stdout: "inactive\n" };
+          }
+          if (args[0] === "--user" && args[1] === "list-unit-files") {
+            return { code: 0, stdout: "pi-daemon.service enabled enabled\n" };
+          }
+          return { code: 0 };
+        },
+      ]);
+      class AutoPi extends MockPi {
+        override async exec(file: string, args: string[]): Promise<ExeResult> {
+          return exe.run(file, args);
+        }
+      }
+      const pi = new AutoPi();
+      factory(pi as never);
+      const notes: Array<[string, string?]> = [];
+      const c = ctx() as never as {
+        reload: () => Promise<void>;
+        ui: { notify: (t: string, k?: string) => void };
+      };
+      c.ui = { notify: (t: string, k?: string) => { notes.push([t, k ?? ""]); } };
+      // The ensureDaemon handler is the second session_start listener
+      // (the reload watcher arms first).
+      await pi.sessionStarters[1]({ reason: "startup" }, c);
+      assert(exe.calls.some((a) => a[1] === "start"),
+        "a dead unit is started at session start");
+      assertEq(notes.length, 1, "the user is told once");
+      assertEq(notes[0][1], "info");
+      await pi.shutdownHandlers[0]({ reason: "quit" });
+    });
+  });
+});
+
 test("daemon: session_shutdown stops the watcher (no leaked watchers)", async () => {
   const state = join(scratchDir(), "signal-shutdown");
   await hosted("pi-sigstop", async () => {
@@ -574,11 +614,104 @@ async function assertReject(fn: () => Promise<unknown>, message: string): Promis
 /** A supervisor whose ensure() publishes the endpoint, so the win32
  *  restart path is exercisable without a real windowless spawn. */
 class EnsureWritesEndpoint extends DaemonSupervisor {
-  async ensure(): Promise<void> {
+  override async ensure(): Promise<boolean> {
     mkdirSync(dirname(endpointPath()), { recursive: true });
     writeFileSync(endpointPath(), "{}");
+    return false;
   }
 }
+
+/** A supervisor that records detached spawns instead of forking one. */
+class RecordingSpawn extends DaemonSupervisor {
+  spawns = 0;
+  protected override spawnDetached(_log: number): any {
+    this.spawns++;
+    return {};
+  }
+}
+
+test("daemon: supervisor starts the unit where the service manager owns it", async () => {
+  const exe = new ExecScript([
+    (args: string[]) => {
+      if (args[0] === "--user" && args[1] === "is-active") {
+        return { code: 3, stdout: "inactive\n" };
+      }
+      if (args[0] === "--user" && args[1] === "list-unit-files") {
+        return { code: 0, stdout: "pi-daemon.service enabled enabled\n" };
+      }
+      return { code: 0 };
+    },
+  ]);
+  const sup = new DaemonSupervisor("/x/pi-daemon", "linux",
+    new ProcessRunner(exe.run.bind(exe)));
+  assert(await sup.ensure(), "a dead unit is started");
+  const verbs = exe.calls.map((a) => a[1]);
+  assert(verbs.includes("is-active"), "the active probe leads");
+  assert(verbs.includes("start"), "the dead unit is started");
+});
+
+test("daemon: supervisor is a no-op while the unit is active", async () => {
+  const exe = new ExecScript([
+    (args: string[]) => args[1] === "is-active"
+      ? { code: 0, stdout: "active\n" } : { code: 0 },
+  ]);
+  const sup = new DaemonSupervisor("/x/pi-daemon", "linux",
+    new ProcessRunner(exe.run.bind(exe)));
+  assert(!await sup.ensure(), "an active unit needs no start");
+  assertEq(exe.calls.length, 1, "only the active probe ran");
+});
+
+test("daemon: supervisor spawns detached where no service manager exists", async () => {
+  await hosted("pi-spawn", async () => {
+    await withEnv({ XDG_STATE_HOME: join(scratchDir(), "state-spawn") },
+      async () => {
+    rmSync(endpointPath(), { force: true });
+    const exe = new ExecScript([
+      (args: string[]) => args[0] === "--user" && args[1] === "list-unit-files"
+        ? { code: 0, stdout: "" } : { code: 0 },
+    ]);
+    const sup = new RecordingSpawn("/x/pi-daemon", "linux",
+      new ProcessRunner(exe.run.bind(exe)));
+    assert(await sup.ensure(), "a missing endpoint triggers the detached spawn");
+    assertEq(sup.spawns, 1);
+    assert(!exe.calls.some((a) => a[1] === "start"),
+      "systemd is never asked to start what it does not own");
+    });
+  });
+});
+
+test("daemon: supervisor falls back when systemctl is absent", async () => {
+  await hosted("pi-fallback", async () => {
+    await withEnv({ XDG_STATE_HOME: join(scratchDir(), "state-fallback") },
+      async () => {
+    rmSync(endpointPath(), { force: true });
+    const sup = new RecordingSpawn("/x/pi-daemon", "linux",
+      new ProcessRunner(async () => {
+        throw new Error("spawn systemctl ENOENT");
+      }));
+    assert(await sup.ensure(), "a failed probe falls back to the spawn");
+    assertEq(sup.spawns, 1);
+    });
+  });
+});
+
+test("daemon: supervisor swallows a failed unit start", async () => {
+  const exe = new ExecScript([
+    (args: string[]) => {
+      if (args[0] === "--user" && args[1] === "is-active") {
+        return { code: 3, stdout: "failed\n" };
+      }
+      if (args[0] === "--user" && args[1] === "list-unit-files") {
+        return { code: 0, stdout: "pi-daemon.service enabled enabled\n" };
+      }
+      return { code: 1, stderr: "Failed to start pi-daemon.service." };
+    },
+  ]);
+  const sup = new DaemonSupervisor("/x/pi-daemon", "linux",
+    new ProcessRunner(exe.run.bind(exe)));
+  assert(!await sup.ensure(),
+    "ensure is best-effort and never throws on a failed start");
+});
 
 test("daemon: restartService restarts the systemd unit on POSIX", async () => {
   const exe = new ExecScript([{ code: 0 }]);
