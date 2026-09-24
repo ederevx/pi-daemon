@@ -24,14 +24,19 @@ SCRATCH = tempfile.mkdtemp(
     prefix="pi-daemon-unit-", dir=os.path.expanduser("~/tmp"))
 os.environ["XDG_STATE_HOME"] = os.path.join(SCRATCH, "state")
 os.environ["XDG_RUNTIME_DIR"] = os.path.join(SCRATCH, "runtime")
+# Keep settings isolated: the daemon reads the pi settings file's
+# "piDaemon" namespace, so point the agent dir at scratch (a real
+# settings.json must never influence a test).
+os.environ["PI_CODING_AGENT_DIR"] = os.path.join(SCRATCH, "agent")
+os.makedirs(os.environ["PI_CODING_AGENT_DIR"], exist_ok=True)
 os.environ["PI_PTYD_MIN_REVIVE_LIFE"] = "0"
 # Reap detached idle sessions fast in tests so the guard is exercised
 # without waiting the six-hour production default.
 os.environ["PI_PTYD_IDLE_REAP"] = "5.0"
-# The idle reap's finish query is off for the shared suite (the legacy
-# immediate-reap behavior the reap tests below rely on); the finish
-# query tests re-enable the window around their own calls.
-os.environ["PI_PTYD_FINISH_GRACE"] = "0"
+# The idle reap's warning window is off for the shared suite (the legacy
+# immediate-reap behavior the reap tests below rely on); the idle
+# warning tests re-enable the window around their own calls.
+os.environ["PI_PTYD_IDLE_WARN_GRACE"] = "0"
 # The extension-reload watch must never touch the real agent home in
 # tests: point its roots at a scratch dir and run it fast.
 EXT_ROOT = os.path.join(SCRATCH, "ext-root")
@@ -860,76 +865,131 @@ class _FinishChild(daemon.pi_platform.PtyChild):
         self.kills += 1
 
 
-def test_finish_queries_windows():
-    """FinishQueries owns the answer windows: an open window spares the
-    session, a past-grace window expires (closing itself), and an
-    answered or gone session's window can be dropped."""
-    q = daemon.FinishQueries(2.0)
+def test_package_settings_resolution():
+    """PackageSettings reads its namespace from the settings file and
+    resolves env > settings > default for every value shape, tolerating
+    a missing or malformed file."""
+    path = os.path.join(SCRATCH, "settings-probe.json")
+    with open(path, "w") as f:
+        json.dump({"piDaemon": {"idleReapSeconds": 42,
+                                "extWatch": False,
+                                "stateName": "from-file",
+                                "extWatchRoots": ["/a", "/b"]}}, f)
+    s = daemon.pi_settings.PackageSettings.from_file(
+        path, "piDaemon", environ={})
+    assert_eq(s.resolve("PI_PROBE_N", "idleReapSeconds", 1.0), 42.0)
+    assert_eq(s.resolve("PI_PROBE_F", "extWatch", True, kind="flag"), False)
+    assert_eq(s.resolve("PI_PROBE_T", "stateName", "d", kind="text"),
+              "from-file")
+    assert_eq(s.resolve("PI_PROBE_P", "extWatchRoots", [], kind="paths"),
+              ["/a", "/b"])
+    # env overrides settings
+    env = {"PI_PROBE_N": "7", "PI_PROBE_F": "1", "PI_PROBE_T": "env",
+           "PI_PROBE_P": "/x" + os.pathsep + "/y"}
+    s2 = daemon.pi_settings.PackageSettings.from_file(
+        path, "piDaemon", environ=env)
+    assert_eq(s2.resolve("PI_PROBE_N", "idleReapSeconds", 1.0), 7.0)
+    assert_eq(s2.resolve("PI_PROBE_F", "extWatch", True, kind="flag"), True)
+    assert_eq(s2.resolve("PI_PROBE_T", "stateName", "d", kind="text"),
+              "env")
+    assert_eq(s2.resolve("PI_PROBE_P", "extWatchRoots", [], kind="paths"),
+              ["/x", "/y"])
+    # a missing file falls through to the default
+    missing = daemon.pi_settings.PackageSettings.from_file(
+        os.path.join(SCRATCH, "nope.json"), "piDaemon", environ={})
+    assert_eq(missing.resolve("PI_PROBE_N", "idleReapSeconds", 9.0), 9.0)
+    # a malformed env value does not mask a valid setting
+    bad_env = daemon.pi_settings.PackageSettings.from_file(
+        path, "piDaemon", environ={"PI_PROBE_N": "not-a-number"})
+    assert_eq(bad_env.resolve("PI_PROBE_N", "idleReapSeconds", 1.0), 42.0)
+    # a non-dict namespace is ignored
+    with open(path, "w") as f:
+        json.dump({"piDaemon": "nope"}, f)
+    wrong = daemon.pi_settings.PackageSettings.from_file(
+        path, "piDaemon", environ={})
+    assert_eq(wrong.resolve("PI_PROBE_N", "idleReapSeconds", 3.0), 3.0)
+    os.unlink(path)
+
+
+def test_idle_warnings_windows():
+    """IdleWarnings owns the warning windows: an open window spares the
+    session until it expires, and the written flag records whether a
+    deletable file exists."""
+    w = daemon.IdleWarnings(2.0)
     now = 1000.0
-    assert_true(not q.is_open("a", now), "no window before the first ask")
-    q.open("a", now)
-    assert_true(q.is_open("a", now), "the ask opens the window")
-    assert_true(q.is_open("a", now + 1.5), "inside the grace")
-    assert_true(not q.is_open("a", now + 2.0), "past the grace")
-    assert_eq(q.ids(), {"a"})
-    assert_eq(q.expired(now + 2.0), ["a"])
-    assert_eq(q.ids(), set(), "expiry closes the window")
-    q.open("b", now)
-    q.open("c", now + 1.0)
-    assert_eq(sorted(q.expired(now + 3.0)), ["b", "c"])
-    q.open("d", now)
-    q.close("d")
-    assert_true(not q.is_open("d", now + 1.0), "close drops the window")
-    assert_eq(q.expired(now + 99.0), [])
-    q.open("e", now)
-    q.clear()
-    assert_eq(q.ids(), set(), "clear leaves no query state behind")
+    assert_true(w.get("a") is None, "no window before the first warning")
+    w.open("a", True, now)
+    assert_eq(w.get("a"), {"sent": now, "written": True},
+              "the warning records its window and file")
+    assert_true(not w.expired("a", now + 1.5), "inside the grace")
+    assert_true(w.expired("a", now + 2.0), "past the grace")
+    assert_eq(w.ids(), {"a"})
+    w.open("b", False, now)
+    assert_eq(w.get("b"), {"sent": now, "written": False},
+              "an unwritten warning still opens the window")
+    w.close("b")
+    assert_true(w.get("b") is None, "close drops the window")
+    w.clear()
+    assert_eq(w.ids(), set(), "clear leaves no window state behind")
 
 
-def test_finish_query_signal_spares_and_expiry():
-    """With FINISH_GRACE > 0 a due reap asks before ending: the signal
-    file lands, the session is spared while the window is open, and an
-    expired window (silence) proceeds to terminate."""
-    name = "pi-finishsig"
+def test_idle_warning_spares_and_expiry():
+    """With IDLE_WARN_GRACE > 0 a due reap warns before ending: the file
+    lands, the session is spared while the window stands, deleting it
+    re-arms the clock, and a file left past the grace proceeds to
+    terminate."""
+    name = "pi-warnspares"
     sess = daemon.Session(name, SCRATCH, ["pi"], pid=1, master_fd=-1,
                           child=_FinishChild())
     DAEMON.table.put(sess)
-    sig = os.path.join(daemon.FINISH_QUERY_DIR, name + ".json")
-    orig = daemon.FINISH_GRACE
-    daemon.FINISH_GRACE = 2.0
-    DAEMON.finish_queries.grace = 2.0
+    sig = os.path.join(daemon.IDLE_WARNING_DIR, name + ".json")
+    orig = daemon.IDLE_WARN_GRACE
+    daemon.IDLE_WARN_GRACE = 2.0
+    DAEMON.idle_warnings.grace = 2.0
     try:
         sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
         DAEMON.reap_idle_if_due(sess)
-        assert_true(os.path.exists(sig), "finish query signal written")
+        assert_true(os.path.exists(sig), "idle warning file written")
         rec = json.load(open(sig))
-        assert_eq(rec.get("id"), name, "signal names the session")
-        assert_true(isinstance(rec.get("ts"), float), "signal is stamped")
-        assert_true(DAEMON.finish_queries.is_open(name),
-                    "the reap opened the answer window")
+        assert_eq(rec.get("id"), name, "warning names the session")
+        assert_true(isinstance(rec.get("ts"), float), "warning is stamped")
+        assert_true(DAEMON.idle_warnings.get(name) is not None,
+                    "the reap opened the warning window")
         assert_true(DAEMON.table.get(name) is sess,
-                    "session spared while the query is open")
+                    "session spared while the warning stands")
         assert_eq(sess.child.kills, 0, "spared session not terminated")
-        # The window passed with no answer: silence is consent.
-        DAEMON.finish_queries.open(
-            name, now=time.time() - daemon.FINISH_GRACE - 1.0)
+        # Deletion is the working answer: the file goes, the clock re-arms.
+        os.unlink(sig)
+        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
         DAEMON.reap_idle_if_due(sess)
-        assert_eq(sess.child.kills, 1, "expired window terminates")
-        assert_true(not os.path.exists(sig), "expired signal unlinked")
-        assert_true(not DAEMON.finish_queries.is_open(name),
+        assert_eq(sess.child.kills, 0, "deleted warning spares the session")
+        assert_true(DAEMON.idle_warnings.get(name) is None,
+                    "deleted warning closes the window")
+        assert_true(time.time() - sess.last_activity < 5.0,
+                    "deleted warning re-arms the idle clock")
+        # File left past the grace: silence is consent.
+        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
+        DAEMON.reap_idle_if_due(sess)
+        assert_true(os.path.exists(sig), "a new warning is left")
+        DAEMON.idle_warnings.open(
+            name, True, now=time.time() - daemon.IDLE_WARN_GRACE - 1.0)
+        DAEMON.reap_idle_if_due(sess)
+        assert_eq(sess.child.kills, 1, "expired warning terminates")
+        assert_true(not os.path.exists(sig), "expired warning unlinked")
+        assert_true(DAEMON.idle_warnings.get(name) is None,
                     "expired window closed")
     finally:
-        daemon.FINISH_GRACE = orig
-        DAEMON.finish_queries.grace = orig
-        DAEMON.finish_queries.close(name)
+        daemon.IDLE_WARN_GRACE = orig
+        DAEMON.idle_warnings.grace = orig
+        DAEMON.idle_warnings.close(name)
         DAEMON.table.remove_if(sess)
 
 
-def test_control_finish_working_and_done():
-    """The finish control op answers the query: --working spares the
-    session and re-arms the idle clock, --done terminates and drops it
-    (consented stop: never respawned from the registry)."""
-    name = "pi-finishctl"
+def test_idle_warning_deletion_rearms():
+    """Deleting an idle warning file is the working answer: the session
+    is spared and its idle clock re-armed; a later due reap warns again,
+    and leaving that warning is consent to end the session."""
+    name = "pi-warnctl"
     DAEMON.control.stop({"name": name})  # idempotent re-run guard
     r = DAEMON.control.start(
         {"name": name, "dir": SCRATCH,
@@ -937,43 +997,43 @@ def test_control_finish_working_and_done():
     assert_true(r.get("ok"), r)
     sess = DAEMON.table.get(name)
     assert_true(sess is not None, "session did not appear")
-    sig = os.path.join(daemon.FINISH_QUERY_DIR, name + ".json")
-    orig = daemon.FINISH_GRACE
-    daemon.FINISH_GRACE = 2.0
-    DAEMON.finish_queries.grace = 2.0
+    sig = os.path.join(daemon.IDLE_WARNING_DIR, name + ".json")
+    orig = daemon.IDLE_WARN_GRACE
+    daemon.IDLE_WARN_GRACE = 2.0
+    DAEMON.idle_warnings.grace = 2.0
     try:
         sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
         DAEMON.reap_idle_if_due(sess)
-        assert_true(os.path.exists(sig), "due reap asks first")
-        # --working: query cleared, idle clock re-armed, session alive.
-        assert_true(DAEMON.control.finish(
-            {"name": name, "done": False}).get("ok"))
-        assert_true(not os.path.exists(sig),
-                    "working answer clears the signal")
-        assert_true(not DAEMON.finish_queries.is_open(name))
-        assert_true(time.time() - sess.last_activity < 5.0,
-                    "working answer re-arms the idle clock")
-        assert_true(DAEMON.table.get(name) is sess,
-                    "working answer spares the session")
-        # A new due reap asks again; --done ends the session.
+        assert_true(os.path.exists(sig), "due reap warns first")
+        # Deleting the file reports the session working.
+        os.unlink(sig)
         sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
         DAEMON.reap_idle_if_due(sess)
-        assert_true(os.path.exists(sig), "re-armed reap asks again")
-        assert_true(DAEMON.control.finish(
-            {"name": name, "done": True}).get("ok"))
+        assert_true(not os.path.exists(sig),
+                    "deleted warning is not rewritten")
+        assert_true(DAEMON.idle_warnings.get(name) is None)
+        assert_true(time.time() - sess.last_activity < 5.0,
+                    "deletion re-arms the idle clock")
+        assert_true(DAEMON.table.get(name) is sess,
+                    "deletion spares the session")
+        # A new due reap warns again; leaving it past the grace ends it.
+        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
+        DAEMON.reap_idle_if_due(sess)
+        assert_true(os.path.exists(sig), "re-armed reap warns again")
+        DAEMON.idle_warnings.open(
+            name, True, now=time.time() - daemon.IDLE_WARN_GRACE - 1.0)
+        DAEMON.reap_idle_if_due(sess)
     finally:
-        daemon.FINISH_GRACE = orig
-        DAEMON.finish_queries.grace = orig
+        daemon.IDLE_WARN_GRACE = orig
+        DAEMON.idle_warnings.grace = orig
     for _ in range(50):
         if DAEMON.table.get(name) is None:
             break
         time.sleep(0.05)
-    assert_true(DAEMON.table.get(name) is None, "done ended the session")
-    assert_true(not os.path.exists(sig), "done cleared the signal")
+    assert_true(DAEMON.table.get(name) is None, "consent ended the session")
+    assert_true(not os.path.exists(sig), "ended session cleared the warning")
     assert_true(name not in DAEMON.registry.load(),
                 "consented stop is never respawnable")
-    unknown = DAEMON.control.finish({"name": "pi-no-such", "done": True})
-    assert_true(not unknown.get("ok"), "finish of a missing session errors")
 
 
 # --- restart handover (registry dedupe, roster, idle watch) -----------------
@@ -1629,12 +1689,14 @@ def _main():
        test_idle_reap_detects_and_ends_detached_sessions)
     ok("idle reap spares busy and attached sessions",
        test_idle_reap_spares_busy_and_attached)
-    ok("finish queries (open/is_open/expired/close)",
-       test_finish_queries_windows)
-    ok("due reap asks first, expiry proceeds",
-       test_finish_query_signal_spares_and_expiry)
-    ok("control finish --working spares, --done ends",
-       test_control_finish_working_and_done)
+    ok("package settings (env > file > default)",
+       test_package_settings_resolution)
+    ok("idle warnings (open/expired/get/close)",
+       test_idle_warnings_windows)
+    ok("due reap warns first, deletion spares, expiry ends",
+       test_idle_warning_spares_and_expiry)
+    ok("deleting the warning re-arms, silence ends",
+       test_idle_warning_deletion_rearms)
     ok("registry dedupe (one entry per conversation)", test_registry_dedupe)
     ok("restart planner prefers the attached duplicate",
        test_restart_planner_prefers_attached)

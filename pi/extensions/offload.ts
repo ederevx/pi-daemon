@@ -58,6 +58,9 @@ import {
 	type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
 import { ProcessRunner, resolvePiRc } from "./daemon.ts";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 /** pi-rc exit codes: 4 = unreachable before any request landed (safe to
  *  run the task locally); 7 = the request was sent but the outcome is
@@ -68,6 +71,56 @@ const EXIT_AMBIGUOUS = 7;
 
 /** Default hand-off bound for bash offloading, in seconds. */
 const DEFAULT_WAIT_SECONDS = 120;
+
+/** The pi settings file's "piDaemon.offload" section, read once at first
+ *  use. Environment variables still take precedence per call, so tests
+ *  and one-off runs can override without editing the settings file. */
+class OffloadSettings {
+	private section: Record<string, unknown> | null = null;
+
+	/** Whether offloading is enabled: PI_OFFLOAD=off wins, then the
+	 *  offload.enabled setting, then enabled. */
+	enabled(): boolean {
+		const env = process.env.PI_OFFLOAD;
+		if (env !== undefined && env !== "") return env !== "off";
+		const value = this.offload().enabled;
+		return typeof value === "boolean" ? value : true;
+	}
+
+	/** The hand-off bound: PI_OFFLOAD_WAIT wins, then
+	 *  offload.waitSeconds, then the built-in default. */
+	waitSeconds(): number {
+		const raw = Number(process.env.PI_OFFLOAD_WAIT);
+		if (Number.isFinite(raw) && raw > 0) return raw;
+		const value = Number(this.offload().waitSeconds);
+		if (Number.isFinite(value) && value > 0) return value;
+		return DEFAULT_WAIT_SECONDS;
+	}
+
+	private offload(): Record<string, unknown> {
+		const section = this.load().offload;
+		return section && typeof section === "object"
+			? section as Record<string, unknown> : {};
+	}
+
+	private load(): Record<string, unknown> {
+		if (this.section !== null) return this.section;
+		const dir = process.env.PI_CODING_AGENT_DIR
+			|| join(homedir(), ".pi", "agent");
+		try {
+			const raw = JSON.parse(
+				readFileSync(join(dir, "settings.json"), "utf8"));
+			const section = raw?.piDaemon;
+			this.section = section && typeof section === "object"
+				? section as Record<string, unknown> : {};
+		} catch {
+			this.section = {};
+		}
+		return this.section;
+	}
+}
+
+const OFFLOAD_SETTINGS = new OffloadSettings();
 
 /** Longest single ticket-wait round trip, in seconds. */
 const WAIT_CHUNK_SECONDS = 300;
@@ -933,12 +986,11 @@ class OffloadedBash implements BashOperations {
 	) {}
 
 	private offloadDisabled(): boolean {
-		return process.env.PI_OFFLOAD === "off";
+		return !OFFLOAD_SETTINGS.enabled();
 	}
 
 	private waitBoundSeconds(): number {
-		const raw = Number(process.env.PI_OFFLOAD_WAIT);
-		return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_WAIT_SECONDS;
+		return OFFLOAD_SETTINGS.waitSeconds();
 	}
 
 	exec: BashOperations["exec"] = async (command, cwd, { onData, signal, timeout, env }) => {
@@ -1071,7 +1123,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	const localBash: BashOperations = createLocalBashOperations();
 
-	const disabled = () => process.env.PI_OFFLOAD === "off";
+	const disabled = () => !OFFLOAD_SETTINGS.enabled();
 
 	// -- transparent bash offloading -------------------------------------
 	// The offload backend lives in the OffloadedBash class (module level);
@@ -1129,7 +1181,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			if (disabled()) {
-				throw new Error("Command offloading is disabled (PI_OFFLOAD=off)");
+				throw new Error("Command offloading is disabled (PI_OFFLOAD=off or piDaemon.offload.enabled=false)");
 			}
 			const sessionFile = ctx?.sessionManager?.getSessionFile?.() ?? null;
 			switch (params.action) {
