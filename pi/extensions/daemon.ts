@@ -151,6 +151,18 @@ export function reloadSignalPath(
 		`${session}.json`);
 }
 
+/** The daemon's per-session finish-query file, mirroring the daemon's
+ *  FINISH_QUERY_DIR (REG_DIR/finish-query/<name>.json). Empty outside
+ *  hosting: only hosted sessions are ever queried. */
+export function finishSignalPath(
+	session: string = process.env.PI_HOSTED_SESSION || "",
+	platform: string = process.platform,
+): string {
+	if (!session) return "";
+	return join(stateHome(platform), "pi-pty-host", "finish-query",
+		`${session}.json`);
+}
+
 /** Resolve a Python interpreter without a platform branch. */
 function resolvePython(): string {
 	if (process.env.PYTHON) return process.env.PYTHON;
@@ -572,6 +584,95 @@ export class HostedReloadWatcher {
 		} catch {
 			return null;
 		}
+	}
+}
+
+/** A finish query the daemon left for this session. */
+interface FinishSignal {
+	id?: unknown;
+	ts?: unknown;
+}
+
+/** Watches the daemon's per-session finish-query file and surfaces the
+ *  daemon's ask-before-reap question to the agent.
+ *
+ *  When a hosted session has been detached and model-idle past the reap
+ *  grace, the daemon (reap_idle_if_due) writes
+ *  <state>/pi-pty-host/finish-query/<session>.json and spares the
+ *  session while the answer window is open; an answer of done — or
+ *  silence past the grace — ends it. This class watches the directory:
+ *  on a fresh signal it steers one message to the agent telling it how
+ *  to answer (`pi-rc finish <name> --done|--working`). Each query fires
+ *  once (per ts): a watcher restart never re-asks a surfaced query,
+ *  while a later window (a new ts after a --working answer) fires
+ *  again. The watcher is session-scoped: it is stopped on
+ *  session_shutdown and session switches and re-armed by the next
+ *  session_start. */
+export class FinishQueryWatcher {
+	private watcher: ReturnType<typeof watch> | null = null;
+	/** ts of the signal already surfaced to the agent. */
+	private surfacedTs: number | null = null;
+
+	constructor(
+		private readonly signalFile: string,
+		private readonly ask: (name: string) => void,
+	) {}
+
+	/** Watch the signal directory; a signal written before this point
+	 *  (between daemon write and watcher registration) is picked up by
+	 *  the initial peek. No-op outside hosting (empty signal path). */
+	start(): void {
+		if (!this.signalFile) return;
+		this.stop();
+		try {
+			mkdirSync(dirname(this.signalFile), { recursive: true });
+			this.peek();
+			this.watcher = watch(dirname(this.signalFile),
+				(_event, filename) => {
+					// filename can be null on some platforms: peek is
+					// cheap and harmless, it reads only our own file.
+					if (!filename || filename === basename(this.signalFile)) {
+						this.peek();
+					}
+				});
+		} catch {
+			// Missing or unwatchable directory: the query still expires
+			// on its own (silence ends the session); we just never ask.
+			this.watcher = null;
+		}
+	}
+
+	/** Stop watching (session_shutdown / session switch): never leaves
+	 *  a leaked watcher behind when the runtime is torn down. */
+	stop(): void {
+		if (this.watcher === null) return;
+		try {
+			this.watcher.close();
+		} catch {
+			// Already gone.
+		}
+		this.watcher = null;
+	}
+
+	get watching(): boolean {
+		return this.watcher !== null;
+	}
+
+	/** Read the signal file and surface a fresh query exactly once. */
+	private peek(): void {
+		let id: string | null = null;
+		let ts: number | null = null;
+		try {
+			const rec = JSON.parse(
+				readFileSync(this.signalFile, "utf8")) as FinishSignal;
+			if (typeof rec.id === "string") id = rec.id;
+			if (typeof rec.ts === "number") ts = rec.ts;
+		} catch {
+			return; // gone or unreadable: nothing pending
+		}
+		if (!id || ts === null || ts === this.surfacedTs) return;
+		this.surfacedTs = ts;
+		this.ask(id);
 	}
 }
 
@@ -998,6 +1099,31 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", async () => {
 		reloadWatcher.stop();
+	});
+
+	// The daemon asks a detached model-idle session whether it is done
+	// before ending it (finish-query signal); the watcher surfaces the
+	// question once per window and the agent answers through pi-rc.
+	const finishWatcher = new FinishQueryWatcher(finishSignalPath(), (name) => {
+		// The signal carries the daemon's full session name; pi-rc takes
+		// the short form (it prepends the "pi-" prefix itself).
+		const short = name.startsWith("pi-") ? name.slice(3) : name;
+		void pi.sendMessage(
+			"pi-daemon: this session has been detached and model-idle past " +
+			"the reap grace. Reply by running " +
+			`\`pi-rc finish ${short} --done\` to end it cleanly, or ` +
+			`\`pi-rc finish ${short} --working\` to keep it alive; ` +
+			"silence also ends it.",
+			{ triggerTurn: true, deliverAs: "steer" });
+	});
+	pi.on("session_start", async () => {
+		finishWatcher.start();
+	});
+	pi.on("session_shutdown", async () => {
+		finishWatcher.stop();
+	});
+	pi.on("session_before_switch", async () => {
+		finishWatcher.stop();
 	});
 
 	// Reload entrypoint queued by the signal watcher. With a fresh
