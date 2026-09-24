@@ -28,6 +28,10 @@ os.environ["PI_PTYD_MIN_REVIVE_LIFE"] = "0"
 # Reap detached idle sessions fast in tests so the guard is exercised
 # without waiting the six-hour production default.
 os.environ["PI_PTYD_IDLE_REAP"] = "5.0"
+# The idle reap's finish query is off for the shared suite (the legacy
+# immediate-reap behavior the reap tests below rely on); the finish
+# query tests re-enable the window around their own calls.
+os.environ["PI_PTYD_FINISH_GRACE"] = "0"
 # The extension-reload watch must never touch the real agent home in
 # tests: point its roots at a scratch dir and run it fast.
 EXT_ROOT = os.path.join(SCRATCH, "ext-root")
@@ -845,6 +849,133 @@ def test_idle_reap_spares_busy_and_attached():
     assert_true(_drain_session(name))
 
 
+class _FinishChild(daemon.pi_platform.PtyChild):
+    """Stand-in PTY child: terminate() only records the kill, so a fake
+    session can exercise the reap path without a real process."""
+
+    def __init__(self):
+        self.kills = 0
+
+    def kill_tree(self, grace):
+        self.kills += 1
+
+
+def test_finish_queries_windows():
+    """FinishQueries owns the answer windows: an open window spares the
+    session, a past-grace window expires (closing itself), and an
+    answered or gone session's window can be dropped."""
+    q = daemon.FinishQueries(2.0)
+    now = 1000.0
+    assert_true(not q.is_open("a", now), "no window before the first ask")
+    q.open("a", now)
+    assert_true(q.is_open("a", now), "the ask opens the window")
+    assert_true(q.is_open("a", now + 1.5), "inside the grace")
+    assert_true(not q.is_open("a", now + 2.0), "past the grace")
+    assert_eq(q.ids(), {"a"})
+    assert_eq(q.expired(now + 2.0), ["a"])
+    assert_eq(q.ids(), set(), "expiry closes the window")
+    q.open("b", now)
+    q.open("c", now + 1.0)
+    assert_eq(sorted(q.expired(now + 3.0)), ["b", "c"])
+    q.open("d", now)
+    q.close("d")
+    assert_true(not q.is_open("d", now + 1.0), "close drops the window")
+    assert_eq(q.expired(now + 99.0), [])
+    q.open("e", now)
+    q.clear()
+    assert_eq(q.ids(), set(), "clear leaves no query state behind")
+
+
+def test_finish_query_signal_spares_and_expiry():
+    """With FINISH_GRACE > 0 a due reap asks before ending: the signal
+    file lands, the session is spared while the window is open, and an
+    expired window (silence) proceeds to terminate."""
+    name = "pi-finishsig"
+    sess = daemon.Session(name, SCRATCH, ["pi"], pid=1, master_fd=-1,
+                          child=_FinishChild())
+    DAEMON.table.put(sess)
+    sig = os.path.join(daemon.FINISH_QUERY_DIR, name + ".json")
+    orig = daemon.FINISH_GRACE
+    daemon.FINISH_GRACE = 2.0
+    DAEMON.finish_queries.grace = 2.0
+    try:
+        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
+        DAEMON.reap_idle_if_due(sess)
+        assert_true(os.path.exists(sig), "finish query signal written")
+        rec = json.load(open(sig))
+        assert_eq(rec.get("id"), name, "signal names the session")
+        assert_true(isinstance(rec.get("ts"), float), "signal is stamped")
+        assert_true(DAEMON.finish_queries.is_open(name),
+                    "the reap opened the answer window")
+        assert_true(DAEMON.table.get(name) is sess,
+                    "session spared while the query is open")
+        assert_eq(sess.child.kills, 0, "spared session not terminated")
+        # The window passed with no answer: silence is consent.
+        DAEMON.finish_queries.open(
+            name, now=time.time() - daemon.FINISH_GRACE - 1.0)
+        DAEMON.reap_idle_if_due(sess)
+        assert_eq(sess.child.kills, 1, "expired window terminates")
+        assert_true(not os.path.exists(sig), "expired signal unlinked")
+        assert_true(not DAEMON.finish_queries.is_open(name),
+                    "expired window closed")
+    finally:
+        daemon.FINISH_GRACE = orig
+        DAEMON.finish_queries.grace = orig
+        DAEMON.finish_queries.close(name)
+        DAEMON.table.remove_if(sess)
+
+
+def test_control_finish_working_and_done():
+    """The finish control op answers the query: --working spares the
+    session and re-arms the idle clock, --done terminates and drops it
+    (consented stop: never respawned from the registry)."""
+    name = "pi-finishctl"
+    DAEMON.control.stop({"name": name})  # idempotent re-run guard
+    r = DAEMON.control.start(
+        {"name": name, "dir": SCRATCH,
+         "argv": ["sh", "-c", "echo hosted-ready; sleep 60"]})
+    assert_true(r.get("ok"), r)
+    sess = DAEMON.table.get(name)
+    assert_true(sess is not None, "session did not appear")
+    sig = os.path.join(daemon.FINISH_QUERY_DIR, name + ".json")
+    orig = daemon.FINISH_GRACE
+    daemon.FINISH_GRACE = 2.0
+    DAEMON.finish_queries.grace = 2.0
+    try:
+        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
+        DAEMON.reap_idle_if_due(sess)
+        assert_true(os.path.exists(sig), "due reap asks first")
+        # --working: query cleared, idle clock re-armed, session alive.
+        assert_true(DAEMON.control.finish(
+            {"name": name, "done": False}).get("ok"))
+        assert_true(not os.path.exists(sig),
+                    "working answer clears the signal")
+        assert_true(not DAEMON.finish_queries.is_open(name))
+        assert_true(time.time() - sess.last_activity < 5.0,
+                    "working answer re-arms the idle clock")
+        assert_true(DAEMON.table.get(name) is sess,
+                    "working answer spares the session")
+        # A new due reap asks again; --done ends the session.
+        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
+        DAEMON.reap_idle_if_due(sess)
+        assert_true(os.path.exists(sig), "re-armed reap asks again")
+        assert_true(DAEMON.control.finish(
+            {"name": name, "done": True}).get("ok"))
+    finally:
+        daemon.FINISH_GRACE = orig
+        DAEMON.finish_queries.grace = orig
+    for _ in range(50):
+        if DAEMON.table.get(name) is None:
+            break
+        time.sleep(0.05)
+    assert_true(DAEMON.table.get(name) is None, "done ended the session")
+    assert_true(not os.path.exists(sig), "done cleared the signal")
+    assert_true(name not in DAEMON.registry.load(),
+                "consented stop is never respawnable")
+    unknown = DAEMON.control.finish({"name": "pi-no-such", "done": True})
+    assert_true(not unknown.get("ok"), "finish of a missing session errors")
+
+
 # --- restart handover (registry dedupe, roster, idle watch) -----------------
 
 def test_registry_dedupe():
@@ -1498,6 +1629,12 @@ def _main():
        test_idle_reap_detects_and_ends_detached_sessions)
     ok("idle reap spares busy and attached sessions",
        test_idle_reap_spares_busy_and_attached)
+    ok("finish queries (open/is_open/expired/close)",
+       test_finish_queries_windows)
+    ok("due reap asks first, expiry proceeds",
+       test_finish_query_signal_spares_and_expiry)
+    ok("control finish --working spares, --done ends",
+       test_control_finish_working_and_done)
     ok("registry dedupe (one entry per conversation)", test_registry_dedupe)
     ok("restart planner prefers the attached duplicate",
        test_restart_planner_prefers_attached)
