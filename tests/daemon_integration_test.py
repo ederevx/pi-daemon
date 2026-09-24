@@ -32,7 +32,10 @@ PI_RC = os.path.join(REPO, "pi", "bin", "pi-rc")
 SOCK = os.path.join(RUNTIME, "pi-pty-host.sock")
 
 ENV = dict(os.environ)
+AGENT = os.path.join(SCRATCH, "agent")
+os.makedirs(AGENT, exist_ok=True)
 ENV.update({"XDG_RUNTIME_DIR": RUNTIME, "XDG_STATE_HOME": STATE,
+            "PI_CODING_AGENT_DIR": AGENT,
             "PI_PTYD_TICKET_TTL": "3600", "PI_PTYD_GC": "3600"})
 
 FAIL = []
@@ -277,33 +280,22 @@ def _main():
     wire({"cmd": "start", "name": "pi-itest2", "dir": SCRATCH,
           "argv": ["sh", "-c", "sleep 30"], "cols": 80, "rows": 24})
 
-    # -- finish query answers: --working spares, --done ends ------------
-    r = pi_rc("finish", "no-such")
-    if r.returncode == 0:
-        fail("finish of a missing session", r.stdout)
-    else:
-        ok("finish no-session error")
+    # -- idle warning: the finish command is gone, the file is the answer --
     r = pi_rc("finish", "itest2", "--working")
-    if r.returncode != 0:
-        fail("finish --working", r.stderr)
+    if r.returncode == 0 or "unknown command" not in r.stderr:
+        fail("finish command removed", r.stdout + r.stderr)
     else:
-        ok("finish --working")
+        ok("finish command removed (delete the warning file instead)")
     r = pi_rc("list")
     if "itest2" not in r.stdout:
-        fail("finish --working spared the session", r.stdout)
+        fail("session survives the removed finish op", r.stdout)
     else:
-        ok("finish --working spared the session")
-    r = pi_rc("finish", "itest2", "--done")
+        ok("session survives the removed finish op")
+    r = pi_rc("stop", "itest2")
     if r.returncode != 0:
-        fail("finish --done", r.stderr)
+        fail("stop the idle-warning session", r.stderr)
     else:
-        ok("finish --done")
-    time.sleep(0.5)
-    r = pi_rc("list")
-    if "itest2" in r.stdout:
-        fail("finish --done ended the session", r.stdout)
-    else:
-        ok("finish --done ended the session")
+        ok("stop the idle-warning session")
 
     r = pi_rc("daemon-stop")
     if r.returncode != 0:

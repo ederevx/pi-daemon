@@ -21,11 +21,11 @@
 # child that dies again within MIN_REVIVE_LIFE seconds is left dead so a
 # crash loop cannot spin the daemon.
 #
-# The daemon never ends a long-idle detached session without asking
-# first: when the idle reap becomes due it writes a per-session finish
-# query the daemon extension surfaces to the agent, and an answer of
-# done — or silence past the answer grace — ends the session, while a
-# still-working answer re-arms the idle clock.
+# The daemon never ends a long-idle detached session without a warning:
+# when the idle reap becomes due it leaves a per-session warning file
+# the daemon extension surfaces to the agent, and deleting that file is
+# a working answer that re-arms the idle clock, while leaving it past
+# the warning grace is consent to end the session.
 #
 # The daemon holds no terminal history: a detached session keeps running
 # headless and an attach re-wires the bridge, sizing the PTY for the new
@@ -54,11 +54,6 @@
 #                                         of its conversation the session
 #                                         file is discarded so it stops
 #                                         showing in pi's /resume picker
-#   finish {name,done}                    the extension's answer to the
-#                                         idle-reap finish query: done
-#                                         ends the session (consented
-#                                         stop), otherwise the idle
-#                                         clock is re-armed
 #   handover {file,dir,afterPid}          host a pi session file once the
 #                                         owning process exits
 #   carry {name[,to,argv]}                /new without termination: move
@@ -162,6 +157,7 @@ def _platform_path():
 
 sys.path.insert(0, _platform_path())
 import pi_platform
+import pi_settings
 
 # Control transport: loopback TCP with a random-token hello handshake;
 # the ephemeral port and token are published in the runtime endpoint
@@ -178,8 +174,12 @@ LOG_PATH = LAYOUT.daemon_log_path()
 # Finished tickets expire after TICKET_TTL seconds and the finished set
 # is capped at TICKET_MAX_FINISHED (oldest evicted). Both TTL and the
 # sweep interval are overridable for isolated tests.
-TICKET_TTL = float(os.environ.get("PI_PTYD_TICKET_TTL", 24 * 3600.0))
-TICKET_GC_TICK = float(os.environ.get("PI_PTYD_TICKET_GC", 60.0))
+SETTINGS = pi_settings.PackageSettings.from_file(
+	os.path.join(LAYOUT.agent_home(), "settings.json"), "piDaemon")
+TICKET_TTL = SETTINGS.resolve("PI_PTYD_TICKET_TTL", "ticketTtlSeconds",
+							  24 * 3600.0)
+TICKET_GC_TICK = SETTINGS.resolve("PI_PTYD_TICKET_GC", "ticketGcSeconds",
+								  60.0)
 TICKET_MAX_FINISHED = 200
 TICKET_OUTPUT_MAX = 4 << 20  # per-ticket captured output bound
 TICKET_CHUNK = 256 << 10     # max output bytes per ticket-output reply
@@ -191,11 +191,6 @@ TICKET_MAX_WAIT = 600.0      # cap on a single ticket-wait round trip
 # minimum gap between reloads so bursts of edits coalesce into one. The
 # in-session daemon extension reads EXT_DIFF_PATH after a reload and
 # relays the file-level diff to the agent once it settles.
-EXT_WATCH_ENABLED = os.environ.get("PI_PTYD_EXT_WATCH", "1") != "0"
-EXT_WATCH_INTERVAL = float(os.environ.get("PI_PTYD_EXT_WATCH_INTERVAL",
-										  "3.0"))
-EXT_WATCH_DEBOUNCE = float(os.environ.get("PI_PTYD_EXT_WATCH_DEBOUNCE",
-										   "4.0"))
 _agent_home = LAYOUT.agent_home()
 _default_watch_roots = [
 	os.path.join(_agent_home, "extensions"),
@@ -203,9 +198,15 @@ _default_watch_roots = [
 	os.path.join(_agent_home, "git"),
 	os.path.join(_agent_home, "settings.json"),
 ]
-EXT_WATCH_ROOTS = [p for p in os.environ.get(
-	"PI_PTYD_EXT_WATCH_ROOTS", os.pathsep.join(_default_watch_roots)
-).split(os.pathsep) if p]
+EXT_WATCH_ENABLED = SETTINGS.resolve("PI_PTYD_EXT_WATCH", "extWatch", True,
+									 kind="flag")
+EXT_WATCH_INTERVAL = SETTINGS.resolve("PI_PTYD_EXT_WATCH_INTERVAL",
+									  "extWatchIntervalSeconds", 3.0)
+EXT_WATCH_DEBOUNCE = SETTINGS.resolve("PI_PTYD_EXT_WATCH_DEBOUNCE",
+									  "extWatchDebounceSeconds", 4.0)
+EXT_WATCH_ROOTS = SETTINGS.resolve(
+	"PI_PTYD_EXT_WATCH_ROOTS", "extWatchRoots", _default_watch_roots,
+	kind="paths")
 EXT_SNAPSHOT_PATH = os.path.join(REG_DIR, "extensions-snapshot.json")
 EXT_DIFF_PATH = os.path.join(REG_DIR, "extensions-diff.json")
 # Direct reload signaling: instead of typing "/reload" into a hosted
@@ -219,8 +220,8 @@ EXT_DIFF_PATH = os.path.join(REG_DIR, "extensions-diff.json")
 # Overridable for isolated tests (PI_PTYD_RELOAD_SIGNAL_GRACE=0 skips
 # the wait entirely).
 EXT_RELOAD_SIGNAL_DIR = os.path.join(REG_DIR, "extensions-reload")
-RELOAD_SIGNAL_GRACE = float(
-	os.environ.get("PI_PTYD_RELOAD_SIGNAL_GRACE", "2.0"))
+RELOAD_SIGNAL_GRACE = SETTINGS.resolve("PI_PTYD_RELOAD_SIGNAL_GRACE",
+									  "reloadSignalGraceSeconds", 2.0)
 # How often the consumption wait re-checks the signal files.
 RELOAD_SIGNAL_POLL = 0.05
 
@@ -232,26 +233,31 @@ REAP_TICK = 0.5
 # A pi that lived shorter than this never gets revived: its death is
 # treated as a crash-loop symptom rather than a lost background session.
 # Overridable for isolated tests (PI_PTYD_MIN_REVIVE_LIFE=0).
-MIN_REVIVE_LIFE = float(os.environ.get("PI_PTYD_MIN_REVIVE_LIFE", "30"))
+MIN_REVIVE_LIFE = SETTINGS.resolve("PI_PTYD_MIN_REVIVE_LIFE",
+								  "minReviveLifeSeconds", 30.0)
 # A hosted session that is detached (no bridge viewers) and whose model
 # has been idle (extension state "idle") for this long is ended by the
 # daemon instead of piling up as a phantom that respawns on every
 # daemon restart. Zero disables the reap (PI_PTYD_IDLE_REAP=0).
-IDLE_REAP = float(os.environ.get("PI_PTYD_IDLE_REAP", "21600"))
-# Before that reap lands, the daemon asks the session whether it is
-# done: a signal file the in-session extension surfaces opens this
-# long an answer window, and only done — or silence past it — ends the
-# session. 0 disables the query and reaps immediately (legacy
-# behavior). Overridable for isolated tests (PI_PTYD_FINISH_GRACE).
-FINISH_GRACE = float(os.environ.get("PI_PTYD_FINISH_GRACE", "300"))
-FINISH_QUERY_DIR = os.path.join(REG_DIR, "finish-query")
+IDLE_REAP = SETTINGS.resolve("PI_PTYD_IDLE_REAP", "idleReapSeconds", 21600.0)
+# Before that reap lands, the daemon leaves the session a timestamped
+# warning file the in-session extension surfaces: deleting the file is
+# a working answer (the session is spared and idle re-arms), while
+# leaving it past this grace is consent to end the session. 0 disables
+# the warning and reaps immediately (legacy behavior). The new
+# PI_PTYD_IDLE_WARN_GRACE name wins over the legacy PI_PTYD_FINISH_GRACE.
+IDLE_WARN_GRACE = SETTINGS.resolve(
+	"PI_PTYD_IDLE_WARN_GRACE", "idleWarnGraceSeconds",
+	SETTINGS.resolve("PI_PTYD_FINISH_GRACE", "idleWarnGraceSeconds", 300.0))
+IDLE_WARNING_DIR = os.path.join(REG_DIR, "idle-warning")
 # A reload injection's no-spawn guard stays armed for this long: a
 # reloaded session that dies within the window is treated as a broken
 # reload and never respawned (the reload stays strictly in-place); once
 # it survives past the grace the guard expires and abnormal deaths are
 # revivable again. Overridable for isolated tests
 # (PI_PTYD_RELOAD_GUARD_GRACE=0).
-RELOAD_GUARD_GRACE = float(os.environ.get("PI_PTYD_RELOAD_GUARD_GRACE", "60"))
+RELOAD_GUARD_GRACE = SETTINGS.resolve("PI_PTYD_RELOAD_GUARD_GRACE",
+									 "reloadGuardGraceSeconds", 60.0)
 # How long an in-flight absorption makes its announcer look authoritative
 # to concurrent announces, and how long the settle recheck waits before
 # SIGTERMing an absorbed holder.
@@ -260,9 +266,9 @@ ABSORB_SETTLE = 0.5
 # Whole-daemon idle shutdown: once nothing is attached, every session's
 # published state is idle, and no ticket is running for this long
 # continuously, the daemon shuts itself down like pi-rc daemon-stop.
-# PI_DAEMON_IDLE_TIMEOUT=0 disables the sweep.
-DAEMON_IDLE_TIMEOUT = float(
-	os.environ.get("PI_DAEMON_IDLE_TIMEOUT", "300"))
+# daemonIdleTimeoutSeconds=0 disables the sweep.
+DAEMON_IDLE_TIMEOUT = SETTINGS.resolve("PI_DAEMON_IDLE_TIMEOUT",
+									   "daemonIdleTimeoutSeconds", 300.0)
 # Sweep cadence: bounded so small test timeouts still sweep promptly.
 IDLE_SWEEP_TICK = (max(0.2, min(10.0, DAEMON_IDLE_TIMEOUT / 5.0))
 				   if DAEMON_IDLE_TIMEOUT > 0 else 60.0)
@@ -283,7 +289,7 @@ CLEAR_SEQ = b"\x1b[H\x1b[2J\x1b[m"
 # Wire commands served by Control (attach + shutdown are special-cased in
 # the connection loop).
 _WIRE_COMMANDS = ("ping", "start", "detach", "resize", "list", "which",
-				  "whichall", "state", "stop", "finish", "handover", "carry",
+				  "whichall", "state", "stop", "handover", "carry",
 				  "resume", "announce", "handoff-target", "daemon-restart",
 				  "input", "extensions-reload",
 				  "ticket-submit", "ticket-wait", "ticket-output",
@@ -481,31 +487,31 @@ def _clear_stale_reload_signals():
 		pass
 
 
-def _finish_signal_path(name):
-	return os.path.join(FINISH_QUERY_DIR, "%s.json" % name)
+def _idle_warning_path(name):
+	return os.path.join(IDLE_WARNING_DIR, "%s.json" % name)
 
 
-def _write_finish_signal(name):
-	"""Persist one session's finish query atomically (the extension
+def _write_idle_warning(name):
+	"""Persist one session's idle warning atomically (the extension
 	watches the directory and reads the final file only). Returns False
 	when the name is not a safe single file component or the write
-	fails; the query window still opens, the session is just asked
-	without a signal to answer through."""
+	fails; the warning window still opens, the session is just reaped on
+	silence with no file for the agent to delete."""
 	if not name or name in (".", "..") or os.sep in name \
 			or (os.altsep and os.altsep in name):
 		return False
 	try:
-		pi_platform.AtomicStateFile(_finish_signal_path(name)).write(
+		pi_platform.AtomicStateFile(_idle_warning_path(name)).write(
 			{"id": name, "ts": time.time()})
 	except OSError:
 		return False
 	return True
 
 
-def _clear_finish_signal(name):
-	# Best-effort: the signal is an ask, never state the session needs.
+def _clear_idle_warning(name):
+	# Best-effort: the warning is an ask, never state the session needs.
 	try:
-		os.unlink(_finish_signal_path(name))
+		os.unlink(_idle_warning_path(name))
 	except OSError:
 		pass
 
@@ -1349,49 +1355,51 @@ class IdleShutdownWatch:
 				idle_since = None
 
 
-class FinishQueries:
-	"""Outstanding finish queries, one grace window per session.
+class IdleWarnings:
+	"""Outstanding idle warnings, one grace window per session.
 
-	Before the daemon reaps a detached model-idle session it asks
-	whether it is done: the in-session extension surfaces the question
-	to its agent, and the session is spared while the answer window is
-	open. This class owns that state (outstanding queries, grace
-	expiry); the daemon only opens, closes, or expires queries."""
+	Before the daemon reaps a detached model-idle session it leaves a
+	timestamped warning file the in-session extension surfaces to its
+	agent: deleting the file is a working answer, while leaving it past
+	the grace is consent to end the session. This class owns that state
+	(session -> window record); the daemon only opens, closes, or reads
+	windows."""
 
 	def __init__(self, grace):
 		self.grace = float(grace)
-		# session name -> query time; reached only through the API below.
+		# session name -> {"sent": time, "written": bool}; the written
+		# flag disables deletion-detection when the file could not be
+		# written, so that case falls back to silence consent.
 		self._outstanding = {}
 
-	def open(self, name, now=None):
-		# Opens the answer window.
-		self._outstanding[name] = self._now(now)
+	def open(self, name, written, now=None):
+		# Opens the warning window and records whether a deletable file
+		# actually exists for the agent.
+		self._outstanding[name] = {"sent": self._now(now),
+								   "written": bool(written)}
 
 	def close(self, name):
-		# Drops a query once its answer arrived or its session left.
+		# Drops a window once it is answered or its session left.
 		self._outstanding.pop(name, None)
 
-	def is_open(self, name, now=None):
-		# An open window spares the session from this reap check.
-		sent_at = self._outstanding.get(name)
-		return sent_at is not None and self._now(now) - sent_at < self.grace
+	def get(self, name):
+		# The open window record, or None.
+		return self._outstanding.get(name)
 
-	def expired(self, now=None):
-		# Closes past-grace queries, returning their names; silence past
-		# the grace is consent to end the session.
-		current = self._now(now)
-		expired = [name for name, sent_at in self._outstanding.items()
-				   if current - sent_at >= self.grace]
-		for name in expired:
-			self._outstanding.pop(name, None)
-		return expired
+	def expired(self, name, now=None):
+		# Whether the window for one session has passed; silence past the
+		# grace is consent to end the session.
+		record = self._outstanding.get(name)
+		if record is None:
+			return False
+		return self._now(now) - record["sent"] >= self.grace
 
 	def ids(self):
-		# The names with an outstanding query.
+		# The names with an open window.
 		return set(self._outstanding)
 
 	def clear(self):
-		# Shutdown leaves no query state behind.
+		# Shutdown leaves no window state behind.
 		self._outstanding.clear()
 
 	@staticmethod
@@ -1862,7 +1870,7 @@ class Daemon:
 		self.handover_wait = {}
 		self.table = SessionTable()
 		self.ledger = HandoffLedger()
-		self.finish_queries = FinishQueries(FINISH_GRACE)
+		self.idle_warnings = IdleWarnings(IDLE_WARN_GRACE)
 		self.shutdown_event = threading.Event()
 		self.spawner = SessionSpawner(self.table, registry, owner=self)
 		self.tickets = TicketRunner(
@@ -2088,10 +2096,10 @@ class Daemon:
 		if dropped is not None:
 			self.ledger.repoint_on_drop(dropped)
 		self.registry.drop(sess.name)
-		# A dropped session can no longer answer its finish query: close
-		# the window and remove the signal so no stale ask survives it.
-		self.finish_queries.close(sess.name)
-		_clear_finish_signal(sess.name)
+		# A dropped session can no longer answer its idle warning: close
+		# the window and remove the file so no stale ask survives it.
+		self.idle_warnings.close(sess.name)
+		_clear_idle_warning(sess.name)
 		self._discard_session_file(sess)
 		log("child-exit '%s' pid %d status %s" % (sess.name, sess.pid, code))
 
@@ -2123,29 +2131,40 @@ class Daemon:
 		# with a viewer or a running model is never touched.
 		if not sess.idle_exceeded():
 			return
-		if FINISH_GRACE > 0:
-			# Ask before ending: the first due reap writes the signal file
-			# the in-session extension surfaces to its agent and opens the
-			# answer window; while it is open the session is spared. When
-			# the window passed with no answer, silence is consent and the
-			# terminate below proceeds (the expired window is closed by
-			# the expired() sweep above).
-			expired = self.finish_queries.expired()
-			if sess.name not in expired:
-				if self.finish_queries.is_open(sess.name):
-					return
-				if _write_finish_signal(sess.name):
-					log("finish-query '%s': detached and idle past %ss; "
-						"asking before ending" % (sess.name, IDLE_REAP))
-				self.finish_queries.open(sess.name)
-				return
-			log("reap '%s' ended: detached and idle past %ss (finish "
-				"query unanswered)" % (sess.name, IDLE_REAP))
-		else:
+		if IDLE_WARN_GRACE <= 0:
 			log("reap '%s' ended: detached and idle past %ss"
 				% (sess.name, IDLE_REAP))
-		_clear_finish_signal(sess.name)
-		sess.terminate()
+			_clear_idle_warning(sess.name)
+			sess.terminate()
+			return
+		record = self.idle_warnings.get(sess.name)
+		if record is not None:
+			# A warning is outstanding. Deleting the file is the working
+			# answer: close the window and re-arm the idle clock. A file
+			# still present past the grace is silence, which is consent.
+			if record["written"] \
+					and not os.path.exists(_idle_warning_path(sess.name)):
+				self.idle_warnings.close(sess.name)
+				sess.touch_activity()
+				log("idle-warning '%s': deleted; session spared"
+					% sess.name)
+				return
+			if not self.idle_warnings.expired(sess.name):
+				return
+			self.idle_warnings.close(sess.name)
+			log("reap '%s' ended: detached and idle past %ss (idle "
+				"warning unanswered)" % (sess.name, IDLE_REAP))
+			_clear_idle_warning(sess.name)
+			sess.terminate()
+			return
+		# First due reap: leave the warning the agent deletes to stay
+		# alive and open its window; deletion is detected by later sweeps.
+		written = _write_idle_warning(sess.name)
+		self.idle_warnings.open(sess.name, written)
+		log("idle-warning '%s': detached and idle past %ss; warning %s"
+			% (sess.name, IDLE_REAP,
+			   "left at %s" % _idle_warning_path(sess.name) if written
+			   else "could not be written"))
 
 	def revive(self, sess, status):
 		# Backgrounding must always happen unless the user ended the
@@ -2559,31 +2578,6 @@ class Control:
 			t = threading.Thread(target=sess.terminate, daemon=True)
 			t.start()
 		# The session thread drops the entry once the reap lands.
-		return {"ok": True}
-
-	def finish(self, req):
-		"""The in-session extension's answer to the daemon's finish
-		query: done=True ends the session through the same consented-stop
-		path an explicit stop uses (the agent answered, so the
-		conversation file is discarded); done=False (still working)
-		clears the query and re-arms the idle clock."""
-		name = req.get("name")
-		if not (isinstance(name, str) and name):
-			return bad_request()
-		done = bool(req.get("done"))
-		sess = self.daemon.table.get(name)
-		if sess is None:
-			return err("no-session")
-		self.daemon.finish_queries.close(name)
-		_clear_finish_signal(name)
-		if done:
-			t = threading.Thread(target=sess.terminate, daemon=True)
-			t.start()
-		else:
-			# A working answer is fresh activity: the reap stays away for
-			# a full IDLE_REAP window (state transitions touch activity
-			# too, so no double-handling is needed here).
-			sess.touch_activity()
 		return {"ok": True}
 
 	def handover(self, req, conn=None):
