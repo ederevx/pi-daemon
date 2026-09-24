@@ -160,7 +160,11 @@ def check_no_subagent_residue(root: str) -> None:
 
 def check_extension_format(root: str) -> None:
     """Per pi.dev/docs/latest/extensions: the extension dir holds only
-    .ts files, each with a default-export entry point."""
+    .ts entry files, each with a default export. A subdirectory without an
+    index is a support-module directory the extensions import (pi loads
+    directories only through index.ts/index.js or a package.json pi
+    manifest), so it is allowed and its .ts files are still covered by
+    the top-level-state check."""
     ext_dir = os.path.join(root, "pi", "extensions")
     if not os.path.isdir(ext_dir):
         fail(ext_dir, "missing pi/extensions directory")
@@ -169,12 +173,27 @@ def check_extension_format(root: str) -> None:
         if name == ".DS_Store":
             continue
         path = os.path.join(ext_dir, name)
+        if os.path.isdir(path):
+            continue
         if not name.endswith(".ts"):
             fail(path, "non-TS file in the extension directory")
             continue
         with open(path, "r", encoding="utf-8") as f:
             if not re.search(r"\bexport\s+default\b", f.read()):
                 fail(path, "extension module must declare a default export")
+
+
+def _extension_ts_files(root: str) -> list[str]:
+    """Repo-relative .ts paths under pi/extensions, support dirs included."""
+    ext_dir = os.path.join(root, "pi", "extensions")
+    found = []
+    for dirpath, dirs, files in os.walk(ext_dir):
+        dirs[:] = [d for d in dirs if d != "node_modules"]
+        for name in sorted(files):
+            if name.endswith(".ts"):
+                full = os.path.join(dirpath, name)
+                found.append(os.path.relpath(full, root).replace(os.sep, "/"))
+    return sorted(found)
 
 
 def _relative_files(directory: str, suffix: str) -> list[str]:
@@ -185,9 +204,9 @@ def _relative_files(directory: str, suffix: str) -> list[str]:
 
 
 def main() -> int:
-    # Glob so a newly added extension or seam module is covered without
+    # Glob so a newly added extension or support module is covered without
     # editing this list; the two extension-less scripts are explicit.
-    ts_files = _relative_files("pi/extensions", ".ts")
+    ts_files = _extension_ts_files(REPO)
     py_files = (["pi/daemon/pi-daemon", "pi/bin/pi-rc"]
                 + _relative_files("pi/lib", ".py"))
     for rel in ts_files:

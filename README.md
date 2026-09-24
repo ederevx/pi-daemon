@@ -220,6 +220,15 @@ Environment overrides: `PI_PTYD_IDLE_REAP`,
 `PI_PTYD_EXT_WATCH_INTERVAL`, `PI_PTYD_EXT_WATCH_DEBOUNCE`,
 `PI_PTYD_EXT_WATCH_ROOTS`, `PI_OFFLOAD`, and `PI_OFFLOAD_WAIT`.
 
+`/daemon-settings` opens the same tunables in pi's two-column settings
+dock: flag rows toggle in place, number and roots rows open an editor
+seeded with the current value, and every accepted change is written
+atomically to the `piDaemon` namespace, preserving all other keys and the
+file mode. A row whose environment variable is set is marked
+`(env-pinned)` because the env value still wins. Daemon-owned values
+apply on the next daemon restart; `offload.*` applies after the automatic
+extension reload.
+
 `idleWarnGraceSeconds` resolves `PI_PTYD_IDLE_WARN_GRACE`, then the
 setting, then the legacy `PI_PTYD_FINISH_GRACE` env var, then the
 default. A non-finite or negative number is rejected and the next source
