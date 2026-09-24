@@ -487,35 +487,6 @@ def _clear_stale_reload_signals():
 		pass
 
 
-def _idle_warning_path(name):
-	return os.path.join(IDLE_WARNING_DIR, "%s.json" % name)
-
-
-def _write_idle_warning(name):
-	"""Persist one session's idle warning atomically (the extension
-	watches the directory and reads the final file only). Returns False
-	when the name is not a safe single file component or the write
-	fails; the warning window still opens, the session is just reaped on
-	silence with no file for the agent to delete."""
-	if not name or name in (".", "..") or os.sep in name \
-			or (os.altsep and os.altsep in name):
-		return False
-	try:
-		pi_platform.AtomicStateFile(_idle_warning_path(name)).write(
-			{"id": name, "ts": time.time()})
-	except OSError:
-		return False
-	return True
-
-
-def _clear_idle_warning(name):
-	# Best-effort: the warning is an ask, never state the session needs.
-	try:
-		os.unlink(_idle_warning_path(name))
-	except OSError:
-		pass
-
-
 def _on_signal(_signum, _frame):
 	raise SystemExit(0)
 
@@ -1361,26 +1332,35 @@ class IdleWarnings:
 	Before the daemon reaps a detached model-idle session it leaves a
 	timestamped warning file the in-session extension surfaces to its
 	agent: deleting the file is a working answer, while leaving it past
-	the grace is consent to end the session. This class owns that state
-	(session -> window record); the daemon only opens, closes, or reads
-	windows."""
+	the grace is consent to end the session. This class owns both the
+	file and the per-session window record; the daemon only warns,
+	inspects, or clears."""
 
-	def __init__(self, grace):
+	def __init__(self, directory, grace):
+		self.directory = directory
 		self.grace = float(grace)
 		# session name -> {"sent": time, "written": bool}; the written
 		# flag disables deletion-detection when the file could not be
 		# written, so that case falls back to silence consent.
 		self._outstanding = {}
 
-	def open(self, name, written, now=None):
-		# Opens the warning window and records whether a deletable file
-		# actually exists for the agent.
-		self._outstanding[name] = {"sent": self._now(now),
-								   "written": bool(written)}
+	def path(self, name):
+		# The warning file for one session.
+		return os.path.join(self.directory, "%s.json" % name)
 
-	def close(self, name):
-		# Drops a window once it is answered or its session left.
-		self._outstanding.pop(name, None)
+	def warn(self, name, now=None):
+		# Writes the timestamped warning file and opens the window;
+		# returns whether a deletable file exists.
+		written = self._write(name, now)
+		self._outstanding[name] = {"sent": self._now(now),
+								   "written": written}
+		return written
+
+	def deleted(self, name):
+		# Whether the warned session deleted its file: the working answer.
+		record = self._outstanding.get(name)
+		return record is not None and record["written"] \
+			and not os.path.exists(self.path(name))
 
 	def get(self, name):
 		# The open window record, or None.
@@ -1394,6 +1374,18 @@ class IdleWarnings:
 			return False
 		return self._now(now) - record["sent"] >= self.grace
 
+	def close(self, name):
+		# Drops a window once it is answered.
+		self._outstanding.pop(name, None)
+
+	def remove(self, name):
+		# Drops a window and its file (the session left or was reaped).
+		self._outstanding.pop(name, None)
+		try:
+			os.unlink(self.path(name))
+		except OSError:
+			pass
+
 	def ids(self):
 		# The names with an open window.
 		return set(self._outstanding)
@@ -1401,6 +1393,20 @@ class IdleWarnings:
 	def clear(self):
 		# Shutdown leaves no window state behind.
 		self._outstanding.clear()
+
+	def _write(self, name, now):
+		# A safe single file component or the write fails, leaving the
+		# window open with nothing for the agent to delete (silence then
+		# ends the session).
+		if not name or name in (".", "..") or os.sep in name \
+				or (os.altsep and os.altsep in name):
+			return False
+		try:
+			pi_platform.AtomicStateFile(self.path(name)).write(
+				{"id": name, "ts": self._now(now)})
+		except OSError:
+			return False
+		return True
 
 	@staticmethod
 	def _now(now):
@@ -1870,7 +1876,7 @@ class Daemon:
 		self.handover_wait = {}
 		self.table = SessionTable()
 		self.ledger = HandoffLedger()
-		self.idle_warnings = IdleWarnings(IDLE_WARN_GRACE)
+		self.idle_warnings = IdleWarnings(IDLE_WARNING_DIR, IDLE_WARN_GRACE)
 		self.shutdown_event = threading.Event()
 		self.spawner = SessionSpawner(self.table, registry, owner=self)
 		self.tickets = TicketRunner(
@@ -2096,10 +2102,9 @@ class Daemon:
 		if dropped is not None:
 			self.ledger.repoint_on_drop(dropped)
 		self.registry.drop(sess.name)
-		# A dropped session can no longer answer its idle warning: close
+		# A dropped session can no longer answer its idle warning: drop
 		# the window and remove the file so no stale ask survives it.
-		self.idle_warnings.close(sess.name)
-		_clear_idle_warning(sess.name)
+		self.idle_warnings.remove(sess.name)
 		self._discard_session_file(sess)
 		log("child-exit '%s' pid %d status %s" % (sess.name, sess.pid, code))
 
@@ -2134,36 +2139,31 @@ class Daemon:
 		if IDLE_WARN_GRACE <= 0:
 			log("reap '%s' ended: detached and idle past %ss"
 				% (sess.name, IDLE_REAP))
-			_clear_idle_warning(sess.name)
+			self.idle_warnings.remove(sess.name)
 			sess.terminate()
 			return
-		record = self.idle_warnings.get(sess.name)
-		if record is not None:
-			# A warning is outstanding. Deleting the file is the working
-			# answer: close the window and re-arm the idle clock. A file
-			# still present past the grace is silence, which is consent.
-			if record["written"] \
-					and not os.path.exists(_idle_warning_path(sess.name)):
-				self.idle_warnings.close(sess.name)
-				sess.touch_activity()
-				log("idle-warning '%s': deleted; session spared"
-					% sess.name)
-				return
+		# A warning is outstanding. Deleting the file is the working
+		# answer: close the window and re-arm the idle clock. A file
+		# still present past the grace is silence, which is consent.
+		if self.idle_warnings.deleted(sess.name):
+			self.idle_warnings.close(sess.name)
+			sess.touch_activity()
+			log("idle-warning '%s': deleted; session spared" % sess.name)
+			return
+		if self.idle_warnings.get(sess.name) is not None:
 			if not self.idle_warnings.expired(sess.name):
 				return
-			self.idle_warnings.close(sess.name)
 			log("reap '%s' ended: detached and idle past %ss (idle "
 				"warning unanswered)" % (sess.name, IDLE_REAP))
-			_clear_idle_warning(sess.name)
+			self.idle_warnings.remove(sess.name)
 			sess.terminate()
 			return
 		# First due reap: leave the warning the agent deletes to stay
 		# alive and open its window; deletion is detected by later sweeps.
-		written = _write_idle_warning(sess.name)
-		self.idle_warnings.open(sess.name, written)
+		written = self.idle_warnings.warn(sess.name)
 		log("idle-warning '%s': detached and idle past %ss; warning %s"
 			% (sess.name, IDLE_REAP,
-			   "left at %s" % _idle_warning_path(sess.name) if written
+			   "left at %s" % self.idle_warnings.path(sess.name) if written
 			   else "could not be written"))
 
 	def revive(self, sess, status):

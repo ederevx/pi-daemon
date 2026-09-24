@@ -912,23 +912,31 @@ def test_package_settings_resolution():
 
 
 def test_idle_warnings_windows():
-    """IdleWarnings owns the warning windows: an open window spares the
-    session until it expires, and the written flag records whether a
-    deletable file exists."""
-    w = daemon.IdleWarnings(2.0)
+    """IdleWarnings owns the warning file and its window: warn writes a
+    deletable file, expired ages the window, and deleted reports the
+    working answer."""
+    w = daemon.IdleWarnings(os.path.join(SCRATCH, "warn-probe"), 2.0)
     now = 1000.0
     assert_true(w.get("a") is None, "no window before the first warning")
-    w.open("a", True, now)
+    assert_true(w.warn("a", now), "warn leaves a deletable file")
     assert_eq(w.get("a"), {"sent": now, "written": True},
               "the warning records its window and file")
     assert_true(not w.expired("a", now + 1.5), "inside the grace")
     assert_true(w.expired("a", now + 2.0), "past the grace")
     assert_eq(w.ids(), {"a"})
-    w.open("b", False, now)
-    assert_eq(w.get("b"), {"sent": now, "written": False},
-              "an unwritten warning still opens the window")
+    assert_true(not w.deleted("a"), "a present file is not a deletion")
+    assert_true(w.warn("b", now), "warn b")
+    os.unlink(w.path("b"))
+    assert_true(w.deleted("b"), "a removed file answers working")
     w.close("b")
     assert_true(w.get("b") is None, "close drops the window")
+    w.remove("a")
+    assert_true(w.get("a") is None, "remove drops the window")
+    assert_true(not os.path.exists(w.path("a")), "remove unlinks the file")
+    # an unsafe name still opens a window, with no deletable file
+    assert_true(not w.warn("../evil", now), "unsafe name writes nothing")
+    assert_eq(w.get("../evil")["written"], False,
+              "the window records the failed write")
     w.clear()
     assert_eq(w.ids(), set(), "clear leaves no window state behind")
 
@@ -971,8 +979,8 @@ def test_idle_warning_spares_and_expiry():
         sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
         DAEMON.reap_idle_if_due(sess)
         assert_true(os.path.exists(sig), "a new warning is left")
-        DAEMON.idle_warnings.open(
-            name, True, now=time.time() - daemon.IDLE_WARN_GRACE - 1.0)
+        DAEMON.idle_warnings.warn(
+            name, now=time.time() - daemon.IDLE_WARN_GRACE - 1.0)
         DAEMON.reap_idle_if_due(sess)
         assert_eq(sess.child.kills, 1, "expired warning terminates")
         assert_true(not os.path.exists(sig), "expired warning unlinked")
@@ -1020,8 +1028,8 @@ def test_idle_warning_deletion_rearms():
         sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
         DAEMON.reap_idle_if_due(sess)
         assert_true(os.path.exists(sig), "re-armed reap warns again")
-        DAEMON.idle_warnings.open(
-            name, True, now=time.time() - daemon.IDLE_WARN_GRACE - 1.0)
+        DAEMON.idle_warnings.warn(
+            name, now=time.time() - daemon.IDLE_WARN_GRACE - 1.0)
         DAEMON.reap_idle_if_due(sess)
     finally:
         daemon.IDLE_WARN_GRACE = orig
