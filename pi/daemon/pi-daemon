@@ -245,10 +245,12 @@ IDLE_REAP = SETTINGS.resolve("PI_PTYD_IDLE_REAP", "idleReapSeconds", 21600.0)
 # a working answer (the session is spared and idle re-arms), while
 # leaving it past this grace is consent to end the session. 0 disables
 # the warning and reaps immediately (legacy behavior). The new
-# PI_PTYD_IDLE_WARN_GRACE name wins over the legacy PI_PTYD_FINISH_GRACE.
+# PI_PTYD_IDLE_WARN_GRACE (new env) > idleWarnGraceSeconds (settings) >
+# PI_PTYD_FINISH_GRACE (legacy env) > 300. A non-finite or negative
+# number falls through to the next source.
 IDLE_WARN_GRACE = SETTINGS.resolve(
-	"PI_PTYD_IDLE_WARN_GRACE", "idleWarnGraceSeconds",
-	SETTINGS.resolve("PI_PTYD_FINISH_GRACE", "idleWarnGraceSeconds", 300.0))
+	"PI_PTYD_IDLE_WARN_GRACE", "idleWarnGraceSeconds", 300.0,
+	legacy_env="PI_PTYD_FINISH_GRACE")
 IDLE_WARNING_DIR = os.path.join(REG_DIR, "idle-warning")
 # A reload injection's no-spawn guard stays armed for this long: a
 # reloaded session that dies within the window is treated as a broken
@@ -470,21 +472,35 @@ def _clear_reload_signal(name):
 		pass
 
 
+def _purge_signal_dir(directory):
+	# Remove every .json a previous daemon run left under a per-session
+	# signal directory; a stale signal must never drive a fresh session.
+	try:
+		for fn in os.listdir(directory):
+			if fn.endswith(".json"):
+				try:
+					os.unlink(os.path.join(directory, fn))
+				except OSError:
+					pass
+	except OSError:
+		pass
+
+
 def _clear_stale_reload_signals():
 	"""Daemon startup: signals left behind by a previous daemon run
 	targeted sessions that are gone; a fresh session with the same name
 	would otherwise consume a stale round token on first watch. Drop
 	them: the extension only ever fires on a token the daemon wrote for
 	the live round."""
-	try:
-		for fn in os.listdir(EXT_RELOAD_SIGNAL_DIR):
-			if fn.endswith(".json"):
-				try:
-					os.unlink(os.path.join(EXT_RELOAD_SIGNAL_DIR, fn))
-				except OSError:
-					pass
-	except OSError:
-		pass
+	_purge_signal_dir(EXT_RELOAD_SIGNAL_DIR)
+
+
+def _clear_stale_idle_warnings():
+	"""Daemon startup: idle-warning files from a previous daemon run
+	name sessions that are gone. A respawned session with the same name
+	would otherwise be steered by an ask no live window backs, so drop
+	them; only a warning this run writes opens a real window."""
+	_purge_signal_dir(IDLE_WARNING_DIR)
 
 
 def _on_signal(_signum, _frame):
@@ -1403,7 +1419,7 @@ class IdleWarnings:
 			return False
 		try:
 			pi_platform.AtomicStateFile(self.path(name)).write(
-				{"id": name, "ts": self._now(now)})
+				{"id": name, "ts": self._now(now), "grace": self.grace})
 		except OSError:
 			return False
 		return True
@@ -1891,8 +1907,10 @@ class Daemon:
 		self.idle_watch = IdleShutdownWatch(self, self.shutdown_event)
 		self.control = Control(self)
 		# Signals a previous daemon run left behind never fire a fresh
-		# session's watcher; drop them before anything is hosted.
+		# session's watcher or steer its agent; drop them before anything
+		# is hosted.
 		_clear_stale_reload_signals()
+		_clear_stale_idle_warnings()
 
 	# -- control socket ------------------------------------------------------
 
@@ -2141,7 +2159,7 @@ class Daemon:
 		# with a viewer or a running model is never touched.
 		if not sess.idle_exceeded():
 			return
-		if IDLE_WARN_GRACE <= 0:
+		if self.idle_warnings.grace <= 0:
 			log("reap '%s' ended: detached and idle past %ss"
 				% (sess.name, IDLE_REAP))
 			self.idle_warnings.remove(sess.name)
@@ -2156,6 +2174,13 @@ class Daemon:
 			log("idle-warning '%s': deleted; session spared" % sess.name)
 			return
 		if self.idle_warnings.get(sess.name) is not None:
+			record = self.idle_warnings.get(sess.name)
+			if sess.last_activity > record["sent"]:
+				# Real work happened after the warning: it is stale, so drop
+				# it and warn fresh on the next due reap rather than letting
+				# the old ask turn into a silent termination.
+				self.idle_warnings.remove(sess.name)
+				return
 			if not self.idle_warnings.expired(sess.name):
 				return
 			log("reap '%s' ended: detached and idle past %ss (idle "

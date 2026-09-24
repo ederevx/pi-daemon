@@ -10,6 +10,7 @@ built-in default. Callers keep their own injected parameters as the
 highest-precedence source, so tests can still override a value directly.
 """
 
+import math
 import os
 
 
@@ -29,8 +30,9 @@ class PackageSettings:
         top = AtomicStateFile(path).read_dict()
         return cls(top.get(namespace), environ)
 
-    def resolve(self, env_name, key, default, kind="number"):
-        """The effective value: env var, then settings key, then default.
+    def resolve(self, env_name, key, default, kind="number", legacy_env=None):
+        """The effective value: env var, then settings key, then an
+        optional legacy env var, then default.
 
         `kind` selects the value shape and parser: "number" (int/float,
         booleans rejected), "flag" (bool; env words on/yes/1 and
@@ -39,7 +41,9 @@ class PackageSettings:
         that fails to parse at one level falls through to the next, so a
         malformed env var never masks a valid setting or default.
         """
-        for raw in (self._environ.get(env_name), self._section.get(key)):
+        legacy = self._environ.get(legacy_env) if legacy_env else None
+        for raw in (self._environ.get(env_name), self._section.get(key),
+                    legacy):
             if raw is None or raw == "":
                 continue
             parsed = self._parse(raw, kind)
@@ -53,9 +57,13 @@ class PackageSettings:
             if isinstance(raw, bool):
                 return None
             try:
-                return float(raw)
+                value = float(raw)
             except (TypeError, ValueError):
                 return None
+            # Non-finite and negative numbers are not valid tunables: a
+            # NaN/Infinity grace would silently disable expiry, and a
+            # negative interval is meaningless. 0 stays a real value.
+            return value if math.isfinite(value) and value >= 0 else None
         if kind == "flag":
             if isinstance(raw, bool):
                 return raw

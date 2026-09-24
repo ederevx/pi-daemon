@@ -87,6 +87,11 @@ class OffloadSettings {
 		return typeof value === "boolean" ? value : true;
 	}
 
+	/** The same policy in the negative, owned once for both call sites. */
+	disabled(): boolean {
+		return !this.enabled();
+	}
+
 	/** The hand-off bound: PI_OFFLOAD_WAIT wins, then
 	 *  offload.waitSeconds, then the built-in default. */
 	waitSeconds(): number {
@@ -986,7 +991,7 @@ class OffloadedBash implements BashOperations {
 	) {}
 
 	private offloadDisabled(): boolean {
-		return !OFFLOAD_SETTINGS.enabled();
+		return OFFLOAD_SETTINGS.disabled();
 	}
 
 	private waitBoundSeconds(): number {
@@ -1123,7 +1128,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	const localBash: BashOperations = createLocalBashOperations();
 
-	const disabled = () => !OFFLOAD_SETTINGS.enabled();
+	const disabled = () => OFFLOAD_SETTINGS.disabled();
 
 	// -- transparent bash offloading -------------------------------------
 	// The offload backend lives in the OffloadedBash class (module level);

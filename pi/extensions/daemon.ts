@@ -591,6 +591,7 @@ export class HostedReloadWatcher {
 interface IdleWarning {
 	id?: unknown;
 	ts?: unknown;
+	grace?: unknown;
 }
 
 /** Watches the daemon's per-session idle-warning file and surfaces the
@@ -625,7 +626,6 @@ export class IdleWarningWatcher {
 		this.stop();
 		try {
 			mkdirSync(dirname(this.warningFile), { recursive: true });
-			this.peek();
 			this.watcher = watch(dirname(this.warningFile),
 				(_event, filename) => {
 					// filename can be null on some platforms: peek is
@@ -634,6 +634,10 @@ export class IdleWarningWatcher {
 						this.peek();
 					}
 				});
+			// Peek only after the watch is armed: the daemon writes each
+			// warning exactly once, so a write landing between an earlier
+			// peek and the watch would be lost forever.
+			this.peek();
 		} catch {
 			// Missing or unwatchable directory: the warning still expires
 			// on its own (silence ends the session); we just never ask.
@@ -661,15 +665,23 @@ export class IdleWarningWatcher {
 	private peek(): void {
 		let id: string | null = null;
 		let ts: number | null = null;
+		let grace: number | null = null;
 		try {
 			const rec = JSON.parse(
 				readFileSync(this.warningFile, "utf8")) as IdleWarning;
 			if (typeof rec.id === "string") id = rec.id;
 			if (typeof rec.ts === "number") ts = rec.ts;
+			if (typeof rec.grace === "number") grace = rec.grace;
 		} catch {
 			return; // gone or unreadable: nothing pending
 		}
 		if (!id || ts === null || ts === this.surfacedTs) return;
+		// A warning older than its own window is stale (a leftover from a
+		// crashed daemon): the live window no longer backs it, so ignore it.
+		if (grace !== null && grace > 0
+			&& Date.now() / 1000 - ts > grace) {
+			return;
+		}
 		this.surfacedTs = ts;
 		this.warn(id, this.warningFile);
 	}

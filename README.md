@@ -220,6 +220,13 @@ Environment overrides: `PI_PTYD_IDLE_REAP`,
 `PI_PTYD_EXT_WATCH_INTERVAL`, `PI_PTYD_EXT_WATCH_DEBOUNCE`,
 `PI_PTYD_EXT_WATCH_ROOTS`, `PI_OFFLOAD`, and `PI_OFFLOAD_WAIT`.
 
+`idleWarnGraceSeconds` resolves `PI_PTYD_IDLE_WARN_GRACE`, then the
+setting, then the legacy `PI_PTYD_FINISH_GRACE` env var, then the
+default. A non-finite or negative number is rejected and the next source
+applies, so a hand-written `Infinity` or `nan` cannot make a session
+un-reapable. `0` (or a negative value) disables the warning window and
+reaps immediately.
+
 ## Maintenance conventions
 
 Same as the sibling protocol repos: work on a feature branch, validate, land

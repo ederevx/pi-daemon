@@ -506,6 +506,13 @@ test("daemon: idle warning steers the agent once per window", async () => {
       // a new window (fresh ts) asks again
       writeFileSync(sig, JSON.stringify({ id: "pi-warnq", ts: 2 }));
       await waitFor(() => pi.messages.length === 2, "new window re-asked");
+      // a warning older than its own window is stale (a crashed daemon
+      // left it) and is not surfaced
+      writeFileSync(sig, JSON.stringify({
+        id: "pi-warnq", ts: Date.now() / 1000 - 1000, grace: 60,
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assertEq(pi.messages.length, 2, "stale warning not surfaced");
       // session_shutdown stops the watcher: later warnings never fire
       await pi.shutdownHandlers[1]({ reason: "quit" });
       writeFileSync(sig, JSON.stringify({ id: "pi-warnq", ts: 3 }));
