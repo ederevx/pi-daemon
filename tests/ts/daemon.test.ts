@@ -276,12 +276,12 @@ test("daemon: factory wires the command and events", () => {
   factory(pi as never);
   assert(pi.commands.has("bg"), "/bg registered");
   assert(pi.commands.has("daemon-reload"), "reload command registered");
-  assertEq(pi.onCalls.get("session_start") ?? 0, 3, "three session_start listeners");
-  assertEq(pi.onCalls.get("session_shutdown") ?? 0, 1);
+  assertEq(pi.onCalls.get("session_start") ?? 0, 4, "four session_start listeners");
+  assertEq(pi.onCalls.get("session_shutdown") ?? 0, 2);
   assertEq(pi.onCalls.get("before_agent_start") ?? 0, 1);
   assertEq(pi.onCalls.get("agent_end") ?? 0, 1);
   assertEq(pi.onCalls.get("agent_settled") ?? 0, 1);
-  assertEq(pi.onCalls.get("session_before_switch") ?? 0, 1);
+  assertEq(pi.onCalls.get("session_before_switch") ?? 0, 2);
 });
 
 class MockPi {
@@ -308,6 +308,12 @@ class MockPi {
   ): Promise<void> {
     this.messages.push(text);
     this.messageOptions.push(options ?? {});
+  }
+  async sendMessage(
+    text: string,
+    options?: Record<string, unknown>,
+  ): Promise<void> {
+    return this.sendUserMessage(text, options);
   }
 }
 
@@ -440,9 +446,10 @@ test("daemon: session start auto-starts the service and says so", async () => wi
         ui: { notify: (t: string, k?: string) => void };
       };
       c.ui = { notify: (t: string, k?: string) => { notes.push([t, k ?? ""]); } };
-      // The ensureDaemon handler is the second session_start listener
-      // (the reload watcher arms first).
-      await pi.sessionStarters[1]({ reason: "startup" }, c);
+      // The ensureDaemon handler is the third session_start listener
+      // (the reload watcher arms first, the finish query watcher
+      // second).
+      await pi.sessionStarters[2]({ reason: "startup" }, c);
       assert(exe.calls.some((a) => a[1] === "start"),
         "a dead unit is started at session start");
       assertEq(notes.length, 1, "the user is told once");
@@ -459,14 +466,51 @@ test("daemon: session_shutdown stops the watcher (no leaked watchers)", async ()
       const pi = new MockPi();
       factory(pi as never);
       await pi.sessionStarters[0]({ reason: "startup" });
-      // the factory's session_shutdown handler tears the watcher down
-      assertEq(pi.shutdownHandlers.length, 1);
+      // the factory's session_shutdown handlers tear the watchers down
+      assertEq(pi.shutdownHandlers.length, 2);
       await pi.shutdownHandlers[0]({ reason: "reload" });
       const sig = join(state, "pi-pty-host", "extensions-reload",
         "pi-sigstop.json");
       writeFileSync(sig, JSON.stringify({ token: "round-3" }));
       await new Promise((resolve) => setTimeout(resolve, 200));
       assertEq(pi.messages.length, 0, "no watcher left after shutdown");
+    });
+  });
+});
+
+test("daemon: finish query steers the agent once per window", async () => {
+  const state = join(scratchDir(), "finish-state");
+  await hosted("pi-finishq", async () => {
+    await withEnv({ XDG_STATE_HOME: state }, async () => {
+      const pi = new MockPi();
+      factory(pi as never);
+      // session_start listeners: [reload watcher, finish watcher, ...]
+      await pi.sessionStarters[1]({ reason: "startup" });
+      const dir = join(state, "pi-pty-host", "finish-query");
+      mkdirSync(dir, { recursive: true });
+      const sig = join(dir, "pi-finishq.json");
+      // the daemon asked: the agent is steered exactly once, with the
+      // answer commands it needs
+      writeFileSync(sig, JSON.stringify({ id: "pi-finishq", ts: 1 }));
+      await waitFor(() => pi.messages.length === 1, "query surfaced");
+      assertEq(pi.messageOptions[0].triggerTurn, true);
+      assertEq(pi.messageOptions[0].deliverAs, "steer");
+      assert(pi.messages[0].includes("pi-rc finish finishq --done"),
+        "the done answer names the session");
+      assert(pi.messages[0].includes("--working"),
+        "the working answer is offered too");
+      // re-arming the same watcher never re-asks an open window
+      await pi.sessionStarters[1]({ reason: "startup" });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assertEq(pi.messages.length, 1, "open window not re-asked");
+      // a new window (fresh ts after a --working answer) asks again
+      writeFileSync(sig, JSON.stringify({ id: "pi-finishq", ts: 2 }));
+      await waitFor(() => pi.messages.length === 2, "new window re-asked");
+      // session_shutdown stops the watcher: later signals never fire
+      await pi.shutdownHandlers[1]({ reason: "quit" });
+      writeFileSync(sig, JSON.stringify({ id: "pi-finishq", ts: 3 }));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assertEq(pi.messages.length, 2, "no watcher left after shutdown");
     });
   });
 });
