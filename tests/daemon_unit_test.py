@@ -908,6 +908,20 @@ def test_package_settings_resolution():
     wrong = daemon.pi_settings.PackageSettings.from_file(
         path, "piDaemon", environ={})
     assert_eq(wrong.resolve("PI_PROBE_N", "idleReapSeconds", 3.0), 3.0)
+    # non-finite and negative numbers are rejected
+    for bad in (float("nan"), float("inf"), -1):
+        probe = daemon.pi_settings.PackageSettings(
+            {"idleReapSeconds": bad}, environ={})
+        assert_eq(probe.resolve("PI_PROBE_N", "idleReapSeconds", 9.0), 9.0)
+    # a legacy env var is consulted after the setting, before the default
+    legacy = daemon.pi_settings.PackageSettings(
+        {"idleReapSeconds": 42}, environ={"PI_PROBE_LEGACY": "7"})
+    assert_eq(legacy.resolve("PI_PROBE_N", "idleReapSeconds", 9.0,
+                             legacy_env="PI_PROBE_LEGACY"), 42.0)
+    legacy_only = daemon.pi_settings.PackageSettings(
+        {}, environ={"PI_PROBE_LEGACY": "7"})
+    assert_eq(legacy_only.resolve("PI_PROBE_N", "idleReapSeconds", 9.0,
+                                  legacy_env="PI_PROBE_LEGACY"), 7.0)
     os.unlink(path)
 
 
@@ -939,6 +953,53 @@ def test_idle_warnings_windows():
               "the window records the failed write")
     w.clear()
     assert_eq(w.ids(), set(), "clear leaves no window state behind")
+
+
+def test_startup_purges_stale_idle_warnings():
+    """A warning file from a previous daemon generation is removed at
+    startup so no live session is steered by an ask nothing backs."""
+    os.makedirs(daemon.IDLE_WARNING_DIR, exist_ok=True)
+    stale = os.path.join(daemon.IDLE_WARNING_DIR, "stale.json")
+    with open(stale, "w") as f:
+        json.dump({"id": "stale", "ts": 1.0}, f)
+    daemon._clear_stale_idle_warnings()
+    assert_true(not os.path.exists(stale), "stale warning not purged")
+
+
+def test_activity_after_warning_rearms_a_fresh_warning():
+    """Work recorded after a warning makes that ask stale: the window is
+    dropped and the next due reap warns fresh instead of reaping."""
+    name = "pi-warnrearm"
+    sess = daemon.Session(name, SCRATCH, ["pi"], pid=1, master_fd=-1,
+                          child=_FinishChild())
+    DAEMON.table.put(sess)
+    sig = os.path.join(daemon.IDLE_WARNING_DIR, name + ".json")
+    orig = daemon.IDLE_WARN_GRACE
+    daemon.IDLE_WARN_GRACE = 2.0
+    DAEMON.idle_warnings.grace = 2.0
+    try:
+        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
+        DAEMON.reap_idle_if_due(sess)
+        assert_true(os.path.exists(sig), "first warning written")
+        # Backdate the window and place activity after it: the session is
+        # idle again, but the live warning predates its last work.
+        old = time.time() - daemon.IDLE_REAP - 100.0
+        DAEMON.idle_warnings.get(name)["sent"] = old
+        sess.last_activity = old + 10.0
+        DAEMON.reap_idle_if_due(sess)
+        assert_true(not os.path.exists(sig),
+                    "stale warning dropped after later activity")
+        assert_eq(sess.child.kills, 0, "activity spared the session")
+        # The next due reap warns fresh instead of reaping the old ask.
+        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
+        DAEMON.reap_idle_if_due(sess)
+        assert_true(os.path.exists(sig), "fresh warning written")
+        assert_eq(sess.child.kills, 0, "fresh warning spares again")
+    finally:
+        daemon.IDLE_WARN_GRACE = orig
+        DAEMON.idle_warnings.grace = orig
+        DAEMON.idle_warnings.remove(name)
+        DAEMON.table.remove_if(sess)
 
 
 def test_idle_warning_spares_and_expiry():
@@ -1699,6 +1760,10 @@ def _main():
        test_idle_reap_spares_busy_and_attached)
     ok("package settings (env > file > default)",
        test_package_settings_resolution)
+    ok("startup purges stale idle warnings",
+       test_startup_purges_stale_idle_warnings)
+    ok("activity after a warning re-arms a fresh one",
+       test_activity_after_warning_rearms_a_fresh_warning)
     ok("idle warnings (open/expired/get/close)",
        test_idle_warnings_windows)
     ok("due reap warns first, deletion spares, expiry ends",
