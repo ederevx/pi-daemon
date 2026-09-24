@@ -31,12 +31,12 @@ os.environ["PI_CODING_AGENT_DIR"] = os.path.join(SCRATCH, "agent")
 os.makedirs(os.environ["PI_CODING_AGENT_DIR"], exist_ok=True)
 os.environ["PI_PTYD_MIN_REVIVE_LIFE"] = "0"
 # Reap detached idle sessions fast in tests so the guard is exercised
-# without waiting the six-hour production default.
-os.environ["PI_PTYD_IDLE_REAP"] = "5.0"
+# without waiting the twelve-hour production default (hours setting).
+os.environ["PI_PTYD_IDLE_REAP_HOURS"] = "0.001"
 # The idle reap's warning window is off for the shared suite (the legacy
 # immediate-reap behavior the reap tests below rely on); the idle
 # warning tests re-enable the window around their own calls.
-os.environ["PI_PTYD_IDLE_WARN_GRACE"] = "0"
+os.environ["PI_PTYD_IDLE_WARN_HOURS"] = "0"
 # The extension-reload watch must never touch the real agent home in
 # tests: point its roots at a scratch dir and run it fast.
 EXT_ROOT = os.path.join(SCRATCH, "ext-root")
@@ -1384,7 +1384,7 @@ def test_idle_shutdown_watch():
     or waiting session, an attached viewer, a running ticket, or a
     parked handover connection; a fully detached idle daemon is
     quiescent."""
-    assert_eq(daemon.DAEMON_IDLE_TIMEOUT, 300.0)
+    assert_eq(daemon.DAEMON_IDLE_TIMEOUT, 12 * 3600.0)
     watch = daemon.IdleShutdownWatch(DAEMON, DAEMON.shutdown_event)
     assert_true(watch.quiescent())
     sess = daemon.Session("pi-idlewatch", SCRATCH, ["pi"],

@@ -108,7 +108,7 @@
 #   ticket-cancel {id}                    TERM/KILL a running ticket
 #
 # Tickets are garbage collected: finished tickets expire after
-# PI_PTYD_TICKET_TTL seconds (default 24h) and the finished set is
+# PI_PTYD_TICKET_TTL_HOURS hours (default 72h) and the finished set is
 # capped, oldest evicted first; each sweep also unlinks the expired
 # output logs. A daemon restart or shutdown interrupts running tickets
 # (status "lost"); their logs survive until GC.
@@ -118,7 +118,7 @@
 #
 # Idle auto-shutdown: when nothing has been attached, every session's
 # published model state is idle, and no ticket is running for
-# PI_DAEMON_IDLE_TIMEOUT seconds (default 300, 0 disables) continuously,
+# PI_DAEMON_IDLE_TIMEOUT_HOURS hours (default 12, 0 disables) continuously,
 # the daemon performs the same graceful shutdown as pi-rc daemon-stop.
 #
 # Single-daemon guarantee: every daemon publishes its control
@@ -172,12 +172,13 @@ TICKETS_PATH = LAYOUT.tickets_path()
 TICKET_LOG_DIR = LAYOUT.ticket_log_dir()
 LOG_PATH = LAYOUT.daemon_log_path()
 # Finished tickets expire after TICKET_TTL seconds and the finished set
-# is capped at TICKET_MAX_FINISHED (oldest evicted). Both TTL and the
-# sweep interval are overridable for isolated tests.
+# is capped at TICKET_MAX_FINISHED (oldest evicted). The TTL is
+# configured in hours; both TTL and the sweep interval are overridable
+# for isolated tests.
 SETTINGS = pi_settings.PackageSettings.from_file(
 	os.path.join(LAYOUT.agent_home(), "settings.json"), "piDaemon")
-TICKET_TTL = SETTINGS.resolve("PI_PTYD_TICKET_TTL", "ticketTtlSeconds",
-							  24 * 3600.0)
+TICKET_TTL = SETTINGS.resolve("PI_PTYD_TICKET_TTL_HOURS", "ticketTtlHours",
+							  72.0) * 3600.0
 TICKET_GC_TICK = SETTINGS.resolve("PI_PTYD_TICKET_GC", "ticketGcSeconds",
 								  60.0)
 TICKET_MAX_FINISHED = 200
@@ -238,19 +239,19 @@ MIN_REVIVE_LIFE = SETTINGS.resolve("PI_PTYD_MIN_REVIVE_LIFE",
 # A hosted session that is detached (no bridge viewers) and whose model
 # has been idle (extension state "idle") for this long is ended by the
 # daemon instead of piling up as a phantom that respawns on every
-# daemon restart. Zero disables the reap (PI_PTYD_IDLE_REAP=0).
-IDLE_REAP = SETTINGS.resolve("PI_PTYD_IDLE_REAP", "idleReapSeconds", 21600.0)
+# daemon restart. The window is configured in hours. Zero disables the
+# reap (PI_PTYD_IDLE_REAP_HOURS=0).
+IDLE_REAP = SETTINGS.resolve("PI_PTYD_IDLE_REAP_HOURS", "idleReapHours",
+							 12.0) * 3600.0
 # Before that reap lands, the daemon leaves the session a timestamped
 # warning file the in-session extension surfaces: deleting the file is
 # a working answer (the session is spared and idle re-arms), while
-# leaving it past this grace is consent to end the session. 0 disables
-# the warning and reaps immediately (legacy behavior). The new
-# PI_PTYD_IDLE_WARN_GRACE (new env) > idleWarnGraceSeconds (settings) >
-# PI_PTYD_FINISH_GRACE (legacy env) > 300. A non-finite or negative
-# number falls through to the next source.
+# leaving it past this grace is consent to end the session. The grace
+# is configured in hours; 0 disables the warning and reaps immediately
+# (legacy behavior). A non-finite or negative number falls through to
+# the next source.
 IDLE_WARN_GRACE = SETTINGS.resolve(
-	"PI_PTYD_IDLE_WARN_GRACE", "idleWarnGraceSeconds", 300.0,
-	legacy_env="PI_PTYD_FINISH_GRACE")
+	"PI_PTYD_IDLE_WARN_HOURS", "idleWarnGraceHours", 1.0) * 3600.0
 IDLE_WARNING_DIR = os.path.join(REG_DIR, "idle-warning")
 # A reload injection's no-spawn guard stays armed for this long: a
 # reloaded session that dies within the window is treated as a broken
@@ -268,9 +269,10 @@ ABSORB_SETTLE = 0.5
 # Whole-daemon idle shutdown: once nothing is attached, every session's
 # published state is idle, and no ticket is running for this long
 # continuously, the daemon shuts itself down like pi-rc daemon-stop.
-# daemonIdleTimeoutSeconds=0 disables the sweep.
-DAEMON_IDLE_TIMEOUT = SETTINGS.resolve("PI_DAEMON_IDLE_TIMEOUT",
-									   "daemonIdleTimeoutSeconds", 300.0)
+# The window is configured in hours; daemonIdleTimeoutHours=0 disables
+# the sweep.
+DAEMON_IDLE_TIMEOUT = SETTINGS.resolve("PI_DAEMON_IDLE_TIMEOUT_HOURS",
+									   "daemonIdleTimeoutHours", 12.0) * 3600.0
 # Sweep cadence: bounded so small test timeouts still sweep promptly.
 IDLE_SWEEP_TICK = (max(0.2, min(10.0, DAEMON_IDLE_TIMEOUT / 5.0))
 				   if DAEMON_IDLE_TIMEOUT > 0 else 60.0)
