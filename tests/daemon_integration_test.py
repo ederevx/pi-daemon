@@ -36,7 +36,7 @@ AGENT = os.path.join(SCRATCH, "agent")
 os.makedirs(AGENT, exist_ok=True)
 ENV.update({"XDG_RUNTIME_DIR": RUNTIME, "XDG_STATE_HOME": STATE,
             "PI_CODING_AGENT_DIR": AGENT,
-            "PI_PTYD_TICKET_TTL": "3600", "PI_PTYD_GC": "3600"})
+            "PI_PTYD_TICKET_TTL_HOURS": "1", "PI_PTYD_GC": "3600"})
 
 FAIL = []
 

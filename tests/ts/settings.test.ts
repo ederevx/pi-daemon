@@ -31,13 +31,13 @@ import type { DaemonSettingsView } from "../../pi/extensions/settings/view.ts";
 import { default as factory } from "../../pi/extensions/daemon.ts";
 
 const ROW_IDS = [
-	"idleReapSeconds",
-	"idleWarnGraceSeconds",
-	"daemonIdleTimeoutSeconds",
+	"idleReapHours",
+	"idleWarnGraceHours",
+	"daemonIdleTimeoutHours",
 	"minReviveLifeSeconds",
 	"reloadGuardGraceSeconds",
 	"reloadSignalGraceSeconds",
-	"ticketTtlSeconds",
+	"ticketTtlHours",
 	"ticketGcSeconds",
 	"extWatch",
 	"extWatchIntervalSeconds",
@@ -50,14 +50,13 @@ const ROW_IDS = [
 /** The daemon-owned and extension-owned env vars, cleared for hermetic
  *  default-value assertions. */
 const ALL_ENV = {
-	PI_PTYD_IDLE_REAP: undefined,
-	PI_PTYD_IDLE_WARN_GRACE: undefined,
-	PI_PTYD_FINISH_GRACE: undefined,
-	PI_DAEMON_IDLE_TIMEOUT: undefined,
+	PI_PTYD_IDLE_REAP_HOURS: undefined,
+	PI_PTYD_IDLE_WARN_HOURS: undefined,
+	PI_DAEMON_IDLE_TIMEOUT_HOURS: undefined,
 	PI_PTYD_MIN_REVIVE_LIFE: undefined,
 	PI_PTYD_RELOAD_GUARD_GRACE: undefined,
 	PI_PTYD_RELOAD_SIGNAL_GRACE: undefined,
-	PI_PTYD_TICKET_TTL: undefined,
+	PI_PTYD_TICKET_TTL_HOURS: undefined,
 	PI_PTYD_TICKET_GC: undefined,
 	PI_PTYD_EXT_WATCH: undefined,
 	PI_PTYD_EXT_WATCH_INTERVAL: undefined,
@@ -94,9 +93,9 @@ test("settings: rows cover every piDaemon setting in order", async () => {
 		const watch = rows.find((row) => row.id === "extWatch")!;
 		assertEq((watch.values ?? []).join(","), "off,on", "flag cycles off/on");
 		assertEq(watch.value, "on", "extWatch default is on");
-		const reap = rows.find((row) => row.id === "idleReapSeconds")!;
+		const reap = rows.find((row) => row.id === "idleReapHours")!;
 		assert(reap.submenu !== undefined, "number row opens an editor");
-		assertEq(reap.value, "21600", "idle reap default");
+		assertEq(reap.value, "12", "idle reap default");
 		const wait = rows.find((row) => row.id === "offload.waitSeconds")!;
 		assertEq(wait.value, "120", "offload wait default from offload.ts");
 		const roots = rows.find((row) => row.id === "extWatchRoots")!;
@@ -109,12 +108,12 @@ test("settings: env vars pin rows and win the effective value", async () => {
 	await withEnv({
 		...ALL_ENV,
 		PI_CODING_AGENT_DIR: dir,
-		PI_PTYD_IDLE_REAP: "99",
+		PI_PTYD_IDLE_REAP_HOURS: "99",
 		PI_PTYD_EXT_WATCH: "off",
 	}, () => {
 		const rows = new DaemonSettingsPresenter().rows();
-		const reap = rows.find((row) => row.id === "idleReapSeconds")!;
-		assertEq(reap.label, "Idle reap (env-pinned)");
+		const reap = rows.find((row) => row.id === "idleReapHours")!;
+		assertEq(reap.label, "Idle reap (h) (env-pinned)");
 		assertEq(reap.value, "99");
 		const watch = rows.find((row) => row.id === "extWatch")!;
 		assertEq(watch.label, "Extension watch (env-pinned)");
@@ -138,7 +137,7 @@ test("settings: non-TUI present lists the rows on stderr", async () => {
 	}
 	const text = lines.join("\n");
 	assertMatches(text, /pi-daemon-settings:/);
-	assertMatches(text, /Idle reap: .*current: 21600/);
+	assertMatches(text, /Idle reap \(h\): .*current: 12/);
 	assertMatches(text, /Offload wait: .*current: 120/);
 });
 
@@ -202,13 +201,13 @@ test("settings: store writes atomically and preserves keys and mode", async () =
 	await withEnv({ PI_CODING_AGENT_DIR: dir }, () => {
 		const store = new SettingsStore();
 		store.set("offload.enabled", true);
-		store.set("idleReapSeconds", 42);
+		store.set("idleReapHours", 42);
 	});
 	const written = JSON.parse(readFileSync(file, "utf8"));
 	assertEq(written.theme, "dark", "other top-level key preserved");
 	assertEq(written.packages.join(","), "git:x", "packages preserved");
 	assertEq(written.piDaemon.offload.enabled, true, "nested key written");
-	assertEq(written.piDaemon.idleReapSeconds, 42, "new key written");
+	assertEq(written.piDaemon.idleReapHours, 42, "new key written");
 	assertEq(statSync(file).mode & 0o777, 0o600, "file mode preserved");
 });
 
@@ -221,7 +220,7 @@ test("settings: a corrupt file is reported, never overwritten", async () => {
 		const store = new SettingsStore();
 		let threw = false;
 		try {
-			store.set("idleReapSeconds", 1);
+			store.set("idleReapHours", 1);
 		} catch {
 			threw = true;
 		}
@@ -234,12 +233,12 @@ test("settings: the agent dir is resolved at call time", async () => {
 	const first = join(scratchDir(), "late-a");
 	const second = join(scratchDir(), "late-b");
 	await withEnv({ PI_CODING_AGENT_DIR: first }, () => {
-		new SettingsStore().set("idleReapSeconds", 1);
+		new SettingsStore().set("idleReapHours", 1);
 	});
 	await withEnv({ PI_CODING_AGENT_DIR: second }, () => {
 		const store = new SettingsStore();
 		assertEq(store.path(), join(second, "settings.json"));
-		assertEq(store.section().idleReapSeconds, undefined,
+		assertEq(store.section().idleReapHours, undefined,
 			"no bleed from the first directory");
 	});
 	assert(existsSync(join(first, "settings.json")), "first write landed");
@@ -249,9 +248,9 @@ test("settings: invalid input is rejected without persisting", async () => {
 	const dir = join(scratchDir(), "invalid-agent");
 	await withEnv({ PI_CODING_AGENT_DIR: dir }, () => {
 		const presenter = new DaemonSettingsPresenter();
-		const outcome = presenter.apply("idleReapSeconds", "-5");
+		const outcome = presenter.apply("idleReapHours", "-5");
 		assert("error" in outcome, "negative number rejected");
-		const bad = presenter.apply("idleReapSeconds", "nan");
+		const bad = presenter.apply("idleReapHours", "nan");
 		assert("error" in bad, "non-finite number rejected");
 		assert(!existsSync(join(dir, "settings.json")), "nothing persisted");
 	});
