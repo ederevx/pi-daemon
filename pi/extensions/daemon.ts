@@ -151,15 +151,15 @@ export function reloadSignalPath(
 		`${session}.json`);
 }
 
-/** The daemon's per-session finish-query file, mirroring the daemon's
- *  FINISH_QUERY_DIR (REG_DIR/finish-query/<name>.json). Empty outside
- *  hosting: only hosted sessions are ever queried. */
-export function finishSignalPath(
+/** The daemon's per-session idle-warning file, mirroring the daemon's
+ *  IDLE_WARNING_DIR (REG_DIR/idle-warning/<name>.json). Empty outside
+ *  hosting: only hosted sessions are ever warned. */
+export function idleWarningPath(
 	session: string = process.env.PI_HOSTED_SESSION || "",
 	platform: string = process.platform,
 ): string {
 	if (!session) return "";
-	return join(stateHome(platform), "pi-pty-host", "finish-query",
+	return join(stateHome(platform), "pi-pty-host", "idle-warning",
 		`${session}.json`);
 }
 
@@ -587,56 +587,55 @@ export class HostedReloadWatcher {
 	}
 }
 
-/** A finish query the daemon left for this session. */
-interface FinishSignal {
+/** An idle warning the daemon left for this session. */
+interface IdleWarning {
 	id?: unknown;
 	ts?: unknown;
 }
 
-/** Watches the daemon's per-session finish-query file and surfaces the
- *  daemon's ask-before-reap question to the agent.
+/** Watches the daemon's per-session idle-warning file and surfaces the
+ *  daemon's warning to the agent.
  *
  *  When a hosted session has been detached and model-idle past the reap
  *  grace, the daemon (reap_idle_if_due) writes
- *  <state>/pi-pty-host/finish-query/<session>.json and spares the
- *  session while the answer window is open; an answer of done — or
- *  silence past the grace — ends it. This class watches the directory:
- *  on a fresh signal it steers one message to the agent telling it how
- *  to answer (`pi-rc finish <name> --done|--working`). Each query fires
- *  once (per ts): a watcher restart never re-asks a surfaced query,
- *  while a later window (a new ts after a --working answer) fires
- *  again. The watcher is session-scoped: it is stopped on
- *  session_shutdown and session switches and re-armed by the next
- *  session_start. */
-export class FinishQueryWatcher {
+ *  <state>/pi-pty-host/idle-warning/<session>.json and spares the
+ *  session while the warning window is open; deleting the file is the
+ *  working answer, and leaving it past the grace ends the session. This
+ *  class watches the directory: on a fresh warning it steers one message
+ *  to the agent telling it to delete the file to stay alive. Each
+ *  warning fires once (per ts): a watcher restart never re-asks a
+ *  surfaced warning, while a later window (a new ts) fires again. The
+ *  watcher is session-scoped: it is stopped on session_shutdown and
+ *  session switches and re-armed by the next session_start. */
+export class IdleWarningWatcher {
 	private watcher: ReturnType<typeof watch> | null = null;
-	/** ts of the signal already surfaced to the agent. */
+	/** ts of the warning already surfaced to the agent. */
 	private surfacedTs: number | null = null;
 
 	constructor(
-		private readonly signalFile: string,
-		private readonly ask: (name: string) => void,
+		private readonly warningFile: string,
+		private readonly warn: (name: string, path: string) => void,
 	) {}
 
-	/** Watch the signal directory; a signal written before this point
+	/** Watch the warning directory; a file written before this point
 	 *  (between daemon write and watcher registration) is picked up by
-	 *  the initial peek. No-op outside hosting (empty signal path). */
+	 *  the initial peek. No-op outside hosting (empty warning path). */
 	start(): void {
-		if (!this.signalFile) return;
+		if (!this.warningFile) return;
 		this.stop();
 		try {
-			mkdirSync(dirname(this.signalFile), { recursive: true });
+			mkdirSync(dirname(this.warningFile), { recursive: true });
 			this.peek();
-			this.watcher = watch(dirname(this.signalFile),
+			this.watcher = watch(dirname(this.warningFile),
 				(_event, filename) => {
 					// filename can be null on some platforms: peek is
 					// cheap and harmless, it reads only our own file.
-					if (!filename || filename === basename(this.signalFile)) {
+					if (!filename || filename === basename(this.warningFile)) {
 						this.peek();
 					}
 				});
 		} catch {
-			// Missing or unwatchable directory: the query still expires
+			// Missing or unwatchable directory: the warning still expires
 			// on its own (silence ends the session); we just never ask.
 			this.watcher = null;
 		}
@@ -658,13 +657,13 @@ export class FinishQueryWatcher {
 		return this.watcher !== null;
 	}
 
-	/** Read the signal file and surface a fresh query exactly once. */
+	/** Read the warning file and surface a fresh warning exactly once. */
 	private peek(): void {
 		let id: string | null = null;
 		let ts: number | null = null;
 		try {
 			const rec = JSON.parse(
-				readFileSync(this.signalFile, "utf8")) as FinishSignal;
+				readFileSync(this.warningFile, "utf8")) as IdleWarning;
 			if (typeof rec.id === "string") id = rec.id;
 			if (typeof rec.ts === "number") ts = rec.ts;
 		} catch {
@@ -672,7 +671,7 @@ export class FinishQueryWatcher {
 		}
 		if (!id || ts === null || ts === this.surfacedTs) return;
 		this.surfacedTs = ts;
-		this.ask(id);
+		this.warn(id, this.warningFile);
 	}
 }
 
@@ -1101,29 +1100,25 @@ export default function (pi: ExtensionAPI) {
 		reloadWatcher.stop();
 	});
 
-	// The daemon asks a detached model-idle session whether it is done
-	// before ending it (finish-query signal); the watcher surfaces the
-	// question once per window and the agent answers through pi-rc.
-	const finishWatcher = new FinishQueryWatcher(finishSignalPath(), (name) => {
-		// The signal carries the daemon's full session name; pi-rc takes
-		// the short form (it prepends the "pi-" prefix itself).
-		const short = name.startsWith("pi-") ? name.slice(3) : name;
-		void pi.sendMessage(
-			"pi-daemon: this session has been detached and model-idle past " +
-			"the reap grace. Reply by running " +
-			`\`pi-rc finish ${short} --done\` to end it cleanly, or ` +
-			`\`pi-rc finish ${short} --working\` to keep it alive; ` +
-			"silence also ends it.",
-			{ triggerTurn: true, deliverAs: "steer" });
-	});
+	// The daemon warns a detached model-idle session before ending it
+	// (idle-warning file); the watcher surfaces one message telling the
+	// agent to delete the file to stay alive.
+	const idleWarningWatcher = new IdleWarningWatcher(
+		idleWarningPath(), (_name, path) => {
+			void pi.sendMessage(
+				"pi-daemon: this session has been detached and model-idle " +
+				"past the reap grace and will end soon. To keep it alive, " +
+				`delete \`${path}\` now; leaving it in place ends the session.`,
+				{ triggerTurn: true, deliverAs: "steer" });
+		});
 	pi.on("session_start", async () => {
-		finishWatcher.start();
+		idleWarningWatcher.start();
 	});
 	pi.on("session_shutdown", async () => {
-		finishWatcher.stop();
+		idleWarningWatcher.stop();
 	});
 	pi.on("session_before_switch", async () => {
-		finishWatcher.stop();
+		idleWarningWatcher.stop();
 	});
 
 	// Reload entrypoint queued by the signal watcher. With a fresh

@@ -48,6 +48,7 @@ dest_helper_cmd="$local_bin/pi-rc.cmd"
 dest_daemon="$local_bin/pi-daemon"
 dest_platform="$local_bin/pi_platform.py"
 dest_conpty="$local_bin/pi_conpty.py"
+dest_settings="$local_bin/pi_settings.py"
 dest_unit="$systemd_dir/pi-daemon.service"
 dest_wrapper="$local_bin/pi"
 dest_wrapper_cmd="$local_bin/pi.cmd"
@@ -134,6 +135,7 @@ install_to 755 "$repo_root/pi/daemon/pi-daemon" "$dest_daemon"
 # next to the scripts so both find pi_platform.py on sys.path.
 install_to 644 "$repo_root/pi/lib/pi_platform.py" "$dest_platform"
 install_to 644 "$repo_root/pi/lib/pi_conpty.py" "$dest_conpty"
+install_to 644 "$repo_root/pi/lib/pi_settings.py" "$dest_settings"
 
 # The real pi binary must be resolved by PATH while skipping the
 # wrapper's own directory and the daemon's hosted-session shim. An install
@@ -166,9 +168,9 @@ chmod 755 "$dest_wrapper"
 # wrapper, so the guarding logic is not duplicated per platform.
 install_to 755 "$repo_root/pi/bin/pi-wrapper.cmd" "$dest_wrapper_cmd"
 
-owned=("$dest_daemon" "$dest_helper" "$dest_helper_cmd" "$dest_wrapper" "$dest_wrapper_cmd" "$dest_unit" "$dest_platform" "$dest_conpty")
+owned=("$dest_daemon" "$dest_helper" "$dest_helper_cmd" "$dest_wrapper" "$dest_wrapper_cmd" "$dest_unit" "$dest_platform" "$dest_conpty" "$dest_settings")
 if [[ $package_mode -eq 0 ]]; then
-  owned=("$dest_daemon" "$dest_helper" "$dest_helper_cmd" "$dest_wrapper" "$dest_wrapper_cmd" "$dest_extension" "$dest_offload" "$dest_unit" "$dest_platform" "$dest_conpty")
+  owned=("$dest_daemon" "$dest_helper" "$dest_helper_cmd" "$dest_wrapper" "$dest_wrapper_cmd" "$dest_extension" "$dest_offload" "$dest_unit" "$dest_platform" "$dest_conpty" "$dest_settings")
 fi
 {
   printf '{\n'

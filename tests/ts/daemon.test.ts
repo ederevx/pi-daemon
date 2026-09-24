@@ -478,37 +478,37 @@ test("daemon: session_shutdown stops the watcher (no leaked watchers)", async ()
   });
 });
 
-test("daemon: finish query steers the agent once per window", async () => {
-  const state = join(scratchDir(), "finish-state");
-  await hosted("pi-finishq", async () => {
+test("daemon: idle warning steers the agent once per window", async () => {
+  const state = join(scratchDir(), "warning-state");
+  await hosted("pi-warnq", async () => {
     await withEnv({ XDG_STATE_HOME: state }, async () => {
       const pi = new MockPi();
       factory(pi as never);
-      // session_start listeners: [reload watcher, finish watcher, ...]
+      // session_start listeners: [reload watcher, idle warning watcher]
       await pi.sessionStarters[1]({ reason: "startup" });
-      const dir = join(state, "pi-pty-host", "finish-query");
+      const dir = join(state, "pi-pty-host", "idle-warning");
       mkdirSync(dir, { recursive: true });
-      const sig = join(dir, "pi-finishq.json");
-      // the daemon asked: the agent is steered exactly once, with the
-      // answer commands it needs
-      writeFileSync(sig, JSON.stringify({ id: "pi-finishq", ts: 1 }));
-      await waitFor(() => pi.messages.length === 1, "query surfaced");
+      const sig = join(dir, "pi-warnq.json");
+      // the daemon warned: the agent is steered exactly once, with the
+      // file it must delete to stay alive
+      writeFileSync(sig, JSON.stringify({ id: "pi-warnq", ts: 1 }));
+      await waitFor(() => pi.messages.length === 1, "warning surfaced");
       assertEq(pi.messageOptions[0].triggerTurn, true);
       assertEq(pi.messageOptions[0].deliverAs, "steer");
-      assert(pi.messages[0].includes("pi-rc finish finishq --done"),
-        "the done answer names the session");
-      assert(pi.messages[0].includes("--working"),
-        "the working answer is offered too");
+      assert(pi.messages[0].includes(sig),
+        "the warning names the file to delete");
+      assert(pi.messages[0].includes("delete"),
+        "the warning tells the agent to delete it");
       // re-arming the same watcher never re-asks an open window
       await pi.sessionStarters[1]({ reason: "startup" });
       await new Promise((resolve) => setTimeout(resolve, 150));
       assertEq(pi.messages.length, 1, "open window not re-asked");
-      // a new window (fresh ts after a --working answer) asks again
-      writeFileSync(sig, JSON.stringify({ id: "pi-finishq", ts: 2 }));
+      // a new window (fresh ts) asks again
+      writeFileSync(sig, JSON.stringify({ id: "pi-warnq", ts: 2 }));
       await waitFor(() => pi.messages.length === 2, "new window re-asked");
-      // session_shutdown stops the watcher: later signals never fire
+      // session_shutdown stops the watcher: later warnings never fire
       await pi.shutdownHandlers[1]({ reason: "quit" });
-      writeFileSync(sig, JSON.stringify({ id: "pi-finishq", ts: 3 }));
+      writeFileSync(sig, JSON.stringify({ id: "pi-warnq", ts: 3 }));
       await new Promise((resolve) => setTimeout(resolve, 150));
       assertEq(pi.messages.length, 2, "no watcher left after shutdown");
     });
