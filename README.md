@@ -99,8 +99,8 @@ them, and can uninstall exactly what it installed.
   that outlives the submitting agent. Results are delivered in one go
   when the command finishes (nothing streams into the tool result), so
   an agent reads a complete result exactly once. A command outliving
-  the wait bound (the tool's timeout, or `PI_OFFLOAD_WAIT` seconds,
-  default 120) is handed off instead of killed: the tool result frees
+  the wait bound (the tool's timeout, or `piDaemon.offload.waitSeconds`
+  / `PI_OFFLOAD_WAIT`, default 120) is handed off instead of killed: the tool result frees
   the agent immediately, the ticket keeps running daemon-side, and the
   full output is delivered as a follow-up message on completion. Every
   ticket is recorded in the daemon's persisted `tickets.json` and
@@ -116,7 +116,8 @@ them, and can uninstall exactly what it installed.
   message is queued), `watch` (live output via partial updates), and
   `status`, `list`, `cancel`, `remove`, and `reset`. When the daemon is
   bash tool falls back to pi's local execution transparently, and
-  `PI_OFFLOAD=off` disables offloading entirely. Tickets are garbage
+  `piDaemon.offload.enabled=false` (or `PI_OFFLOAD=off`) disables
+  offloading entirely. Tickets are garbage
   collected by the daemon: finished tickets expire after
   `PI_PTYD_TICKET_TTL` seconds (default 24h) with the finished set
   capped at 200 (oldest evicted), and each sweep unlinks the expired
@@ -176,12 +177,48 @@ pi/
   bin/pi-rc              # client: tickets, bridge, input, reload,
                          # start/attach/detach/announce/ls/which/stop
   daemon/pi-daemon       # stdlib Python PTY host + shell ticket runners
+  lib/pi_platform.py     # transport, process, PTY, terminal seams
+  lib/pi_conpty.py       # Windows ConPTY backend
+  lib/pi_settings.py     # the piDaemon settings reader
   systemd/pi-daemon.service
 scripts/
   install.sh             # manifest-owned install into the agent home
   uninstall.sh
 tests/                   # zero-dependency validation + OOP-enforcement suite
 ```
+
+## Configuration
+
+Tunables live in the pi settings file (`<agent-dir>/settings.json`, the
+agent dir being `PI_CODING_AGENT_DIR` or `~/.pi/agent`) under the
+top-level `piDaemon` object. A matching environment variable, when set,
+still wins for tests and one-off runs; otherwise the setting applies,
+with the built-in default as the fallback.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `idleReapSeconds` | `21600` | Detached model-idle sessions are ended after this. `0` disables. |
+| `idleWarnGraceSeconds` | `300` | The warning window before that reap: delete the idle-warning file to stay alive, leave it as consent. `0` reaps immediately. |
+| `daemonIdleTimeoutSeconds` | `300` | Self-shutdown after this long with nothing attached, all sessions idle, and no tickets. `0` disables. |
+| `minReviveLifeSeconds` | `30` | A hosted pi that lived shorter than this is never revived. |
+| `reloadGuardGraceSeconds` | `60` | No-spawn guard after an in-place reload. |
+| `reloadSignalGraceSeconds` | `2.0` | Wait for an in-session reload signal before typing `/reload`. |
+| `ticketTtlSeconds` | `86400` | Finished tickets expire after this. |
+| `ticketGcSeconds` | `60` | Ticket garbage-collection cadence. |
+| `extWatch` | `true` | Watch extension roots and reload hosted sessions on change. |
+| `extWatchIntervalSeconds` | `3.0` | Extension-root poll cadence. |
+| `extWatchDebounceSeconds` | `4.0` | Minimum gap between reload bursts. |
+| `extWatchRoots` | agent `extensions`/`npm`/`git` + `settings.json` | Roots to watch. |
+| `offload.enabled` | `true` | Enable bash offloading. |
+| `offload.waitSeconds` | `120` | Hand-off bound before a command becomes a background ticket. |
+
+Environment overrides: `PI_PTYD_IDLE_REAP`,
+`PI_PTYD_IDLE_WARN_GRACE` (legacy `PI_PTYD_FINISH_GRACE`),
+`PI_DAEMON_IDLE_TIMEOUT`, `PI_PTYD_MIN_REVIVE_LIFE`,
+`PI_PTYD_RELOAD_GUARD_GRACE`, `PI_PTYD_RELOAD_SIGNAL_GRACE`,
+`PI_PTYD_TICKET_TTL`, `PI_PTYD_TICKET_GC`, `PI_PTYD_EXT_WATCH`,
+`PI_PTYD_EXT_WATCH_INTERVAL`, `PI_PTYD_EXT_WATCH_DEBOUNCE`,
+`PI_PTYD_EXT_WATCH_ROOTS`, `PI_OFFLOAD`, and `PI_OFFLOAD_WAIT`.
 
 ## Maintenance conventions
 
