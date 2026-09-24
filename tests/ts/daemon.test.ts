@@ -276,6 +276,8 @@ test("daemon: factory wires the command and events", () => {
   factory(pi as never);
   assert(pi.commands.has("bg"), "/bg registered");
   assert(pi.commands.has("daemon-reload"), "reload command registered");
+  assert(pi.commands.has("daemon-settings"),
+    "daemon-settings command registered");
   assertEq(pi.onCalls.get("session_start") ?? 0, 4, "four session_start listeners");
   assertEq(pi.onCalls.get("session_shutdown") ?? 0, 2);
   assertEq(pi.onCalls.get("before_agent_start") ?? 0, 1);
