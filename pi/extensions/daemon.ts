@@ -83,6 +83,7 @@ import { basename, dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { DaemonSettingsPresenter } from "./settings/presenter.ts";
 
 /** Directory of this extension module, when loaded as an ES module. */
 function moduleDir(): string {
@@ -1204,6 +1205,31 @@ export default function (pi: ExtensionAPI) {
 			"Background this session (detach when hosted, hand over to the pi-daemon otherwise)",
 		handler: async (_args, ctx) => {
 			await app.background(ctx);
+		},
+	});
+
+	// The dock edits the piDaemon namespace of pi's settings file. Every
+	// accepted change is written atomically, then reported; a render
+	// failure only costs the message and never breaks the session.
+	pi.registerCommand("daemon-settings", {
+		description: "Edit pi-daemon settings",
+		handler: async (_args, ctx) => {
+			try {
+				const presenter = new DaemonSettingsPresenter();
+				await presenter.present(ctx.ui, ctx.mode, (id, value) => {
+					const outcome = presenter.apply(id, value);
+					if ("error" in outcome) {
+						ctx.ui?.notify?.(outcome.error, "error");
+						return;
+					}
+					ctx.ui?.notify?.(
+						`Saved ${outcome.label}. pi reloads extensions when ` +
+						"settings.json changes; daemon-owned values apply on the " +
+						"next daemon restart.", "info");
+				});
+			} catch {
+				console.error("pi-daemon: could not render settings");
+			}
 		},
 	});
 

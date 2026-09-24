@@ -13,6 +13,7 @@ import { registry, cleanupScratch } from "./harness.ts";
 
 import "./daemon.test.ts";
 import "./offload.test.ts";
+import "./settings.test.ts";
 
 await registry.runAll();
 cleanupScratch();
