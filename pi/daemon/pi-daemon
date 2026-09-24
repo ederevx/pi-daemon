@@ -1697,7 +1697,12 @@ class Session:
 		dead_input = False
 		status = 0
 		while True:
-			daemon.reap_idle_if_due(self)
+			# A reap-check error must never kill the relay thread (the
+			# session's bridge); log it and keep serving the child.
+			try:
+				daemon.reap_idle_if_due(self)
+			except Exception as exc:
+				log("reap check '%s' failed: %s" % (name, exc))
 			carry_to = self.carry_to
 			if carry_to is not None:
 				self._transfer_viewers(carry_to)

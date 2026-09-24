@@ -24,6 +24,7 @@ import os
 import signal
 import socket
 import sys
+import threading
 import time
 
 # A repaint nudge waits this long between toggling the PTY size and
@@ -152,7 +153,12 @@ class AtomicStateFile:
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        tmp = "%s.tmp.%d" % (self.path, os.getpid())
+        # The temp carries both the pid (two concurrent processes
+        # converging on one state dir) and the thread id (two threads in
+        # one process writing the same file), so no in-flight temp can
+        # be truncated or renamed out from under another writer.
+        tmp = "%s.tmp.%d.%d" % (self.path, os.getpid(),
+                                threading.get_ident())
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(json.dumps(obj) + "\n")
             f.flush()
