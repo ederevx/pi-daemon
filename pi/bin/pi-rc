@@ -70,6 +70,12 @@
 #                                       is unreachable); used by the pi
 #                                       wrapper's resume guard
 #   pi-rc stop <name>                   kill one session (ends that pi)
+#   pi-rc finish <name> [--done]        answer the daemon's idle-reap finish
+#                                       query: --done ends the session
+#                                       cleanly (consented stop), the
+#                                       default reports it still working
+#                                       and re-arms the idle clock; used
+#                                       by the daemon extension
 #   pi-rc ticket-submit [--session <n>] [--cwd <dir>] [--env KEY=VALUE]
 #                       -- <command>... run a shell command as a
 #                                       daemon-owned ticket: it outlives
@@ -191,7 +197,7 @@ DETACH_KEY = b"\x1c"  # Ctrl-\: pop out of an attached session without exiting p
 
 # Commands served by main(); ls has a list alias.
 _COMMANDS = ("which", "whichall", "owned", "state", "carry", "resume", "start",
-			 "attach", "announce", "detach", "stop", "handover",
+			 "attach", "announce", "detach", "stop", "finish", "handover",
 			 "daemon-start", "daemon-stop", "daemon-restart",
 			 "input", "extensions-reload",
 			 "ticket-submit", "ticket-wait", "ticket-output",
@@ -953,6 +959,30 @@ def cmd_stop(args, client):
 	print("pi-rc: stopped '%s'" % session)
 
 
+def cmd_finish(args, client):
+	# Extension-only helper for the daemon's finish query: --done is the
+	# agent's consent to end the session (an explicit stop, so the
+	# conversation file is discarded); --working (the default) reports
+	# the session still working and re-arms the idle clock.
+	done = False
+	rest = []
+	for arg in args:
+		if arg == "--done":
+			done = True
+		elif arg == "--working":
+			done = False
+		else:
+			rest.append(arg)
+	if len(rest) != 1:
+		usage_error("finish takes exactly one session name (and at most one "
+					"of --done/--working)")
+	session = session_name(rest[0])
+	resp = client.control({"cmd": "finish", "name": session, "done": done})
+	if not resp.get("ok"):
+		die("finish failed: %s" % resp.get("error"))
+	print("pi-rc: %s '%s'" % ("ended" if done else "kept running", session))
+
+
 def cmd_carry(args, client):
 	# Extension-only helper for /new: the daemon spawns a fresh hosted
 	# session sized like the current view, moves this session's bridge
@@ -1379,7 +1409,8 @@ def main():
 		 "state": cmd_state,
 		 "carry": cmd_carry, "resume": cmd_resume, "start": cmd_start,
 		 "attach": cmd_attach, "announce": cmd_announce,
-		 "detach": cmd_detach, "stop": cmd_stop, "handover": cmd_handover,
+		 "detach": cmd_detach, "stop": cmd_stop, "finish": cmd_finish,
+		 "handover": cmd_handover,
 		 "daemon-start": cmd_daemon_start, "daemon-stop": cmd_daemon_stop,
 		 "daemon-restart": cmd_daemon_restart,
 		 "input": cmd_input, "extensions-reload": cmd_extensions_reload,

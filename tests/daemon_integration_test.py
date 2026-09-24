@@ -276,6 +276,35 @@ def _main():
 
     wire({"cmd": "start", "name": "pi-itest2", "dir": SCRATCH,
           "argv": ["sh", "-c", "sleep 30"], "cols": 80, "rows": 24})
+
+    # -- finish query answers: --working spares, --done ends ------------
+    r = pi_rc("finish", "no-such")
+    if r.returncode == 0:
+        fail("finish of a missing session", r.stdout)
+    else:
+        ok("finish no-session error")
+    r = pi_rc("finish", "itest2", "--working")
+    if r.returncode != 0:
+        fail("finish --working", r.stderr)
+    else:
+        ok("finish --working")
+    r = pi_rc("list")
+    if "itest2" not in r.stdout:
+        fail("finish --working spared the session", r.stdout)
+    else:
+        ok("finish --working spared the session")
+    r = pi_rc("finish", "itest2", "--done")
+    if r.returncode != 0:
+        fail("finish --done", r.stderr)
+    else:
+        ok("finish --done")
+    time.sleep(0.5)
+    r = pi_rc("list")
+    if "itest2" in r.stdout:
+        fail("finish --done ended the session", r.stdout)
+    else:
+        ok("finish --done ended the session")
+
     r = pi_rc("daemon-stop")
     if r.returncode != 0:
         fail("daemon-stop", r.stderr)
