@@ -144,11 +144,13 @@
 # coordinates and must be stopped once manually (pi-rc daemon-stop
 
 import base64
+import glob
 import hashlib
 import json
 import os
 import re
 import select
+import shutil
 import signal
 import socket
 import stat
@@ -285,6 +287,17 @@ DAEMON_IDLE_TIMEOUT = SETTINGS.resolve("PI_DAEMON_IDLE_TIMEOUT_HOURS",
 # Sweep cadence: bounded so small test timeouts still sweep promptly.
 IDLE_SWEEP_TICK = (max(0.2, min(10.0, DAEMON_IDLE_TIMEOUT / 5.0))
 				   if DAEMON_IDLE_TIMEOUT > 0 else 60.0)
+# Registry state-dir GC: the daemon cleans named paths but never globs,
+# so an interrupted atomic write's scratch, directories left by removed
+# features, output logs of tickets no longer recorded, and a daemon.log
+# no process writes pile up in the registry dir. One owner sweeps the
+# whole directory at startup and on this interval; anything younger than
+# STATE_GC_GRACE seconds is left alone.
+STATE_GC_GRACE = 3600.0
+STATE_GC_TICK = 3600.0
+# Feature dirs removed from the daemon (idle-warning in v2.9.31,
+# finish-query) but still present in long-lived state dirs.
+STATE_GC_RETIRED_DIRS = ("idle-warning", "finish-query")
 # Roster of live daemons: every daemon publishes its control coordinates
 # here at bind time and the newest daemon shuts older entries down at
 # boot, so a restart converges to exactly one live daemon.
@@ -1434,6 +1447,115 @@ class GcReaper:
 		return True
 
 
+class StateDirGc:
+	"""Whole-registry-dir GC: the daemon's named-path cleanup never
+	globs, so leftovers accumulate. This owner sweeps the registry dir at
+	startup and on an interval, each category in its own stage: scratch
+	left by an interrupted atomic write, directories of removed features,
+	output logs whose ticket record is gone, and a daemon.log no process
+	is writing. Entries younger than the grace stay; one stage's failure
+	is logged and never stops the others or the sweep thread."""
+
+	def __init__(self, reg_dir, ticket_log_dir, tickets, daemon_log,
+				shutdown_event, grace=STATE_GC_GRACE, tick=STATE_GC_TICK):
+		self.reg_dir = reg_dir
+		self.ticket_log_dir = ticket_log_dir
+		self.tickets = tickets
+		self.daemon_log = daemon_log
+		self.shutdown_event = shutdown_event
+		self.grace = float(grace)
+		self.tick = float(tick)
+
+	def start(self):
+		# The caller owns the one-shot startup sweep; this owns only the
+		# repeating interval, like IdleShutdownWatch.
+		t = threading.Thread(target=self._sweep_loop, daemon=True)
+		t.start()
+
+	def _sweep_loop(self):
+		while not self.shutdown_event.wait(self.tick):
+			self.sweep()
+
+	def sweep(self):
+		# One whole-directory pass. Every stage is independent and
+		# exception-safe: a single bad entry is logged and the rest of
+		# the sweep still runs, so the interval thread can never die.
+		for stage in (self._sweep_scratch, self._sweep_retired_dirs,
+					  self._sweep_orphan_logs, self._sweep_daemon_log):
+			try:
+				stage()
+			except OSError as exc:
+				log("state gc %s: %s" % (stage.__name__, exc))
+
+	def owns_daemon_log(self):
+		# Whether this process's own stderr (fd 2) is the daemon.log
+		# file: under systemd stderr is the journal, so a file printed
+		# by an old pi-rc daemon-start is not ours to keep.
+		try:
+			here = os.fstat(2)
+			there = os.stat(self.daemon_log)
+		except OSError:
+			return False
+		return (here.st_dev, here.st_ino) == (there.st_dev, there.st_ino)
+
+	def _sweep_scratch(self):
+		# Aged AtomicStateFile temps: <file>.tmp.<pid>.<tid>.
+		for path in glob.glob(os.path.join(self.reg_dir, "*.tmp.*")):
+			if self._scratch_live(path) or not self._aged(path):
+				continue
+			self._unlink(path)
+
+	def _sweep_retired_dirs(self):
+		for name in STATE_GC_RETIRED_DIRS:
+			shutil.rmtree(os.path.join(self.reg_dir, name),
+						  ignore_errors=True)
+
+	def _sweep_orphan_logs(self):
+		if not os.path.isdir(self.ticket_log_dir):
+			return
+		for name in os.listdir(self.ticket_log_dir):
+			path = os.path.join(self.ticket_log_dir, name)
+			if self.tickets.get(os.path.splitext(name)[0]) is not None:
+				continue
+			if self._aged(path):
+				self._unlink(path)
+
+	def _sweep_daemon_log(self):
+		if self.owns_daemon_log() or not self._aged(self.daemon_log):
+			return
+		self._unlink(self.daemon_log)
+
+	def _scratch_live(self, path):
+		# A temp whose embedded pid is still alive belongs to an
+		# in-flight write and is never touched.
+		pid = self._scratch_pid(path)
+		return pid is not None and PROCESS.pid_alive(pid)
+
+	@staticmethod
+	def _scratch_pid(path):
+		name = os.path.basename(path)
+		if ".tmp." not in name:
+			return None
+		head = name.rsplit(".tmp.", 1)[1].split(".", 1)[0]
+		try:
+			return int(head)
+		except ValueError:
+			return None
+
+	def _aged(self, path):
+		try:
+			return time.time() - os.stat(path).st_mtime > self.grace
+		except OSError:
+			return False
+
+	@staticmethod
+	def _unlink(path):
+		try:
+			os.unlink(path)
+		except OSError:
+			pass
+
+
 class SessionTable:
 	"""Live sessions plus the single lock guarding them."""
 
@@ -1902,6 +2024,9 @@ class Daemon:
 		self.spawner = SessionSpawner(self.table, registry, owner=self)
 		self.tickets = TicketRunner(
 			TicketStore(TICKETS_PATH, TICKET_LOG_DIR), self.shutdown_event)
+		self.state_gc = StateDirGc(REG_DIR, TICKET_LOG_DIR,
+								   self.tickets.store, LOG_PATH,
+								   self.shutdown_event)
 		self.roster = DaemonRoster(ROSTER_PATH)
 		self.restart_planner = RestartPlanner(self.registry, self.table)
 		self.idle_watch = IdleShutdownWatch(self, self.shutdown_event)
@@ -1939,6 +2064,8 @@ class Daemon:
 							 self.server.port, self.token)
 		self.respawn_from_registry()
 		self.tickets.start()
+		self.state_gc.sweep()
+		self.state_gc.start()
 		self.idle_watch.start()
 		try:
 			self._accept_loop(self.server)

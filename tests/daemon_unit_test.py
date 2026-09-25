@@ -985,6 +985,92 @@ def test_gc_reaper_owns_requests():
     r.clear("../evil")
 
 
+def test_state_dir_gc_sweeps():
+    """The whole-registry-dir sweep removes aged atomic-write scratch
+    whose owner pid is dead, retired feature dirs, and orphan ticket
+    logs, while keeping a live writer's scratch and a referenced log."""
+    root = os.path.join(SCRATCH, "state-gc")
+    logs = os.path.join(root, "tickets")
+    os.makedirs(logs, exist_ok=True)
+    store = daemon.TicketStore(os.path.join(root, "tickets.json"), logs)
+    store.load()
+    store.add({"id": "t-live", "kind": "shell", "status": "done",
+               "command": "x", "cwd": SCRATCH, "session": "s",
+               "created": 1.0})
+    gc = daemon.StateDirGc(root, logs, store,
+                           os.path.join(root, "daemon.log"),
+                           threading.Event(), grace=0.0, tick=0.0)
+    old = time.time() - 100.0
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    aged = (os.path.join(root, "sessions.json.tmp.%d.1" % dead.pid),
+            os.path.join(root, "tickets.json.tmp.%d.1" % os.getpid()))
+    for path in aged:
+        with open(path, "w") as f:
+            f.write("x")
+        os.utime(path, (old, old))
+
+    for name in ("idle-warning", "finish-query"):
+        retired = os.path.join(root, name)
+        os.makedirs(retired, exist_ok=True)
+        with open(os.path.join(retired, "stale.json"), "w") as f:
+            f.write("x")
+
+    orphan = os.path.join(logs, "t-orphan.log")
+    referenced = os.path.join(logs, "t-live.log")
+    for path in (orphan, referenced):
+        with open(path, "w") as f:
+            f.write("x")
+        os.utime(path, (old, old))
+
+    gc.sweep()
+    assert_true(not os.path.exists(aged[0]), "dead-pid scratch kept")
+    assert_true(os.path.exists(aged[1]), "live-pid scratch removed")
+    assert_true(not os.path.exists(os.path.join(root, "idle-warning")))
+    assert_true(not os.path.exists(os.path.join(root, "finish-query")))
+    assert_true(not os.path.exists(orphan), "orphan ticket log kept")
+    assert_true(os.path.exists(referenced), "referenced ticket log removed")
+
+
+def test_state_dir_gc_daemon_log():
+    """The daemon.log predicate decides ownership: a log not on fd 2 is
+    removed once aged, while one that is this process's stderr is kept
+    even when aged."""
+    root = os.path.join(SCRATCH, "state-gc-log")
+    os.makedirs(root, exist_ok=True)
+    store = daemon.TicketStore(os.path.join(root, "tickets.json"),
+                               os.path.join(root, "tickets"))
+    store.load()
+    log_path = os.path.join(root, "daemon.log")
+    old = time.time() - 100.0
+    with open(log_path, "w") as f:
+        f.write("stale")
+    os.utime(log_path, (old, old))
+    gc = daemon.StateDirGc(root, os.path.join(root, "tickets"), store,
+                           log_path, threading.Event(), grace=0.0, tick=0.0)
+    assert_true(not gc.owns_daemon_log(), "unrelated fd 2 owns the log")
+    gc.sweep()
+    assert_true(not os.path.exists(log_path), "stale daemon.log kept")
+
+    # Point fd 2 at the file: the predicate must say so and the sweep
+    # must keep it.
+    with open(log_path, "w") as f:
+        f.write("ours")
+    os.utime(log_path, (old, old))
+    saved = os.dup(2)
+    logfd = os.open(log_path, os.O_WRONLY)
+    try:
+        os.dup2(logfd, 2)
+        assert_true(gc.owns_daemon_log(), "fd 2 not recognized as the log")
+        gc.sweep()
+        assert_true(os.path.exists(log_path), "fd 2 daemon.log removed")
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(logfd)
+
+
 def test_startup_purges_stale_gc_reap_requests():
     """A reap request from a previous daemon generation is removed at
     startup so no live session is steered by an ask nothing backs."""
@@ -1723,6 +1809,10 @@ def _main():
        test_startup_purges_stale_gc_reap_requests)
     ok("gc reaper owns the one idle policy and its request",
        test_gc_reaper_owns_requests)
+    ok("state dir gc sweeps scratch, retired dirs, orphan logs",
+       test_state_dir_gc_sweeps)
+    ok("state dir gc decides daemon.log by fd 2 ownership",
+       test_state_dir_gc_daemon_log)
     ok("gc reap ack discards and never revives",
        test_gc_reap_ack_discards_and_never_revives)
     ok("daemon purge force-stops due sessions, spares busy",
