@@ -62,6 +62,13 @@
  * fire-and-forget; a missing or unreachable daemon only costs the
  * crash-revive safety net and the state display.
  *
+ * /daemon-purge is the operator's manual force purge: it stops every
+ * hosted session that is detached and model-idle past the configured
+ * GC window (`piDaemon.gcIdleHours`) immediately. The automatic GC
+ * reaper only asks such sessions to reap themselves through the
+ * `daemon_gc_reap` tool; this command is the explicit forceful
+ * counterpart, and it spares attached and busy sessions.
+ *
  * Ctrl+D cannot be used for this: pi refuses extension shortcuts that
  * conflict with a built-in binding (app.exit is Ctrl+D) — registration is
  * skipped with a startup diagnostic. /bg is the supported backgrounding
@@ -767,6 +774,24 @@ export class RcBackground {
 		}
 	}
 
+	/** The operator's manual force purge: stop every hosted session that
+	 *  is detached and model-idle past the configured GC window. This is
+	 *  the explicit counterpart to the automatic voluntary reap request,
+	 *  and returns the purged session names from pi-rc's tab-delimited
+	 *  report. Attached and busy sessions are never purged. */
+	async purgeIdleSessions(): Promise<string[]> {
+		const result = await this.runPiRc(["daemon-purge"]);
+		if (result.code !== 0) {
+			throw new Error((result.stderr || result.stdout || "").trim()
+				|| `pi-rc daemon-purge exit ${result.code}`);
+		}
+		return (result.stdout || "")
+			.split("\n")
+			.filter((line: string) => line.startsWith("purged\t"))
+			.map((line: string) => line.slice("purged\t".length).trim())
+			.filter(Boolean);
+	}
+
 	/** Whether a service manager owns the daemon (see
 	 *  DaemonSupervisor.hasServiceUnit — the probe's single owner). */
 	async hasServiceUnit(): Promise<boolean> {
@@ -1277,6 +1302,38 @@ export default function (pi: ExtensionAPI) {
 				});
 			} catch {
 				console.error("pi-daemon: could not render settings");
+			}
+		},
+	});
+
+	// The manual force purge: the automatic GC reaper only asks detached,
+	// model-idle sessions to reap themselves, while this stops every such
+	// session past the same window immediately. Attached and busy
+	// sessions stay; the invoking session is attached, so it is never
+	// purged by its own command.
+	pi.registerCommand("daemon-purge", {
+		description:
+			"Stop every hosted session that is detached and idle past the " +
+			"configured GC window (the manual counterpart to the automatic reap)",
+		handler: async (_args, ctx) => {
+			try {
+				const purged = await app.purgeIdleSessions();
+				if (purged.length === 0) {
+					ctx?.ui?.notify?.(
+						"No hosted sessions are past the configured GC window.",
+						"info");
+					return;
+				}
+				ctx?.ui?.notify?.(
+					`Purged ${purged.length} idle ` +
+						`session${purged.length > 1 ? "s" : ""}: ` +
+						purged.join(", "),
+					"info");
+			} catch (err) {
+				ctx?.ui?.notify?.(
+					"Daemon purge failed: " +
+						(err instanceof Error ? err.message : String(err)),
+					"warning");
 			}
 		},
 	});

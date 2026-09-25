@@ -291,6 +291,11 @@ def _main():
         fail("gc-reap-ack", r.stderr)
     else:
         ok("gc-reap-ack")
+    r = pi_rc("daemon-purge")
+    if r.returncode != 0:
+        fail("daemon-purge", r.stderr)
+    else:
+        ok("daemon-purge (no idle sessions past the window)")
     r = pi_rc("stop", "itest2")
     if r.returncode != 0:
         fail("stop the gc-reap session", r.stderr)
