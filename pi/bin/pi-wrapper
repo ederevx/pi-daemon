@@ -199,6 +199,38 @@ guard_check() {
 	return 0
 }
 
+# The daemon must exist before any guard/attach call. A start made
+# while the service was down would otherwise launch unhosted and need a
+# manual /bg + reenter to be adopted; bringing the daemon up here lets
+# the very session that started it be hosted at once (adopted). Prefer
+# the systemd user unit where one is installed — the same choice the
+# in-session supervisor makes — and fall back to pi-rc's detached
+# spawn. Best-effort: if the daemon still cannot come up, the attach
+# below degrades to the real pi.
+ensure_daemon() {
+	# Reachable already: nothing to do.
+	if "$PI_RC" ls >/dev/null 2>&1; then
+		return 0
+	fi
+	# Prefer the systemd user unit where one is installed (the same
+	# choice the in-session supervisor makes); otherwise pi-rc spawns
+	# the detached daemon below.
+	if command -v systemctl >/dev/null 2>&1 \
+		&& systemctl --user list-unit-files --no-legend pi-daemon.service 2>/dev/null | grep -q .; then
+		systemctl --user start pi-daemon.service >/dev/null 2>&1 || true
+	fi
+	# Wait until the daemon answers so the attach below lands on it.
+	local deadline=$((SECONDS + 5))
+	while (( SECONDS < deadline )); do
+		"$PI_RC" ls >/dev/null 2>&1 && return 0
+		sleep 0.1
+	done
+	# The unit did not come up (none installed, or the start failed):
+	# let pi-rc spawn the detached daemon and wait for it.
+	"$PI_RC" daemon-start >/dev/null 2>&1 || true
+	return 0
+}
+
 # Resolve the daemon-owned session for a plain start: the daemon owns
 # one live session per directory's latest conversation, and terminals
 # are interchangeable viewports of it, so plain `pi` attaches to that
@@ -238,6 +270,7 @@ if [[ -t 0 && -z "${PI_HOSTED:-}" && -x "$PI_RC" ]]; then
 		esac
 	done
 	if [[ $direct -eq 0 ]]; then
+		ensure_daemon
 		if ! guard_check "${args[@]}"; then
 			# Guard attach failed (session died between check and attach):
 			# degrade open with the original args so the call still works.

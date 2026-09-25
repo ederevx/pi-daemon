@@ -50,8 +50,11 @@ them, and can uninstall exactly what it installed.
   keeps hosted one-shot/worker sessions and nested starts out of the way:
   anything already inside the daemon execs the real pi untouched. The
   wrapper resolves the real binary at install time and is manifest-owned.
-  If `pi-rc` is missing or the service is down, the wrapper degrades to
-  the real pi so a start always works.
+  If the service is down, the wrapper starts it first (the systemd user
+  unit where installed, otherwise a detached spawn) so the very start
+  that brought the daemon up is hosted immediately — no manual `/bg`
+  then reenter. If `pi-rc` is missing or the daemon still cannot come
+  up, the wrapper degrades to the real pi so a start always works.
 - **`daemon` pi extension**: `/bg` runs the moment it is entered,
   even while the agent is mid-turn (pi executes extension commands
   immediately). Inside a hosted session it is an instantaneous detach
