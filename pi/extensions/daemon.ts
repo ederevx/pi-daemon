@@ -1261,10 +1261,18 @@ export default function (pi: ExtensionAPI) {
 	// failure only costs the message and never breaks the session.
 	pi.registerCommand("daemon-settings", {
 		description: "Edit pi-daemon settings",
-		handler: async (_args, ctx) => {
+		handler: async (args, ctx) => {
+			const presenter = new DaemonSettingsPresenter();
+			const ui = ctx.ui;
+			const argument = String(args ?? "").trim().toLowerCase();
+			if (argument === "restore" || argument === "reset") {
+				presenter.restoreDefaults(ui?.notify
+					? (message, kind) => ui.notify(message, kind)
+					: undefined);
+				return;
+			}
 			try {
-				const presenter = new DaemonSettingsPresenter();
-				await presenter.present(ctx.ui, ctx.mode, (id, value) => {
+				await presenter.present(ui, ctx.mode, (id, value) => {
 					const outcome = presenter.apply(id, value);
 					if ("error" in outcome) {
 						ctx.ui?.notify?.(outcome.error, "error");

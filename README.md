@@ -227,7 +227,10 @@ dock: flag rows toggle in place, number and roots rows open an editor
 seeded with the current value, and every accepted change is written
 atomically to the `piDaemon` namespace, preserving all other keys and the
 file mode. A row whose environment variable is set is marked
-`(env-pinned)` because the env value still wins. Daemon-owned values
+`(env-pinned)` because the env value still wins. The trailing
+`Restore default configuration` action deletes the whole `piDaemon`
+namespace after a confirmation, returning every option to its built-in
+default while env-pinned options still win. Daemon-owned values
 apply on the next daemon restart; `offload.*` applies after the automatic
 extension reload.
 
