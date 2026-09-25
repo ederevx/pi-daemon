@@ -819,19 +819,24 @@ test("daemon: restartService throws with systemctl's failure detail", async () =
 });
 
 test("daemon: restartService stops and respawns the daemon on win32", async () => {
-  const exe = new ExecScript([{ code: 0 }]);
-  const app = new RcBackground(
-    exe.run.bind(exe),
-    undefined,
-    new EnsureWritesEndpoint(),
-    "win32",
-  );
-  // endpointPath() resolves under XDG_RUNTIME_DIR inside the hosted()
-  // scratch runtime, so EnsureWritesEndpoint's file satisfies the
-  // respawn probe without touching a real daemon.
-  await app.restartService();
-  assertEq(exe.calls[0][0], "daemon-stop");
-  assert(existsSync(endpointPath()), "endpoint republished by ensure()");
+  // Resolve the endpoint under a scratch runtime on every platform. A
+  // POSIX host would otherwise fall back to /run/user/<uid>, and the
+  // helper's write would clobber a live daemon's endpoint file.
+  await withEnv({
+    XDG_RUNTIME_DIR: join(scratchDir(), "runtime-restart"),
+    TEMP: join(scratchDir(), "temp-restart"),
+  }, async () => {
+    const exe = new ExecScript([{ code: 0 }]);
+    const app = new RcBackground(
+      exe.run.bind(exe),
+      undefined,
+      new EnsureWritesEndpoint(),
+      "win32",
+    );
+    await app.restartService();
+    assertEq(exe.calls[0][0], "daemon-stop");
+    assert(existsSync(endpointPath()), "endpoint republished by ensure()");
+  });
 });
 
 /** Runs fn with a hosted-session env and awaits the body. */
