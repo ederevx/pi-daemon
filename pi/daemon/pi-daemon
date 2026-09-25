@@ -27,7 +27,10 @@
 # session reaps itself by calling the daemon_gc_reap tool, which
 # acknowledges here and shuts the session down. An unanswered request
 # simply stays until the session's connection dies and the normal
-# child-exit cleanup drops it.
+# child-exit cleanup drops it. The automatic reaper only ever asks; the
+# operator can force the issue with `daemon-purge`, which stops every
+# detached, model-idle session past the same window immediately with the
+# consented-stop semantics of the tool.
 #
 # The daemon holds no terminal history: a detached session keeps running
 # headless and an attach re-wires the bridge, sizing the PTY for the new
@@ -61,6 +64,11 @@
 #                                         request: clear the request and
 #                                         the registry entry; the session
 #                                         then shuts itself down
+#   daemon-purge                          the operator's manual force
+#                                         purge: stop every detached,
+#                                         model-idle session past the GC
+#                                         idle window immediately;
+#                                         attached and busy sessions stay
 #   handover {file,dir,afterPid}          host a pi session file once the
 #                                         owning process exits
 #   carry {name[,to,argv]}                /new without termination: move
@@ -296,7 +304,7 @@ CLEAR_SEQ = b"\x1b[H\x1b[2J\x1b[m"
 _WIRE_COMMANDS = ("ping", "start", "detach", "resize", "list", "which",
 				  "whichall", "state", "stop", "gc-reap-ack", "handover",
 				  "carry", "resume", "announce", "handoff-target",
-				  "daemon-restart",
+				  "daemon-restart", "daemon-purge",
 				  "input", "extensions-reload",
 				  "ticket-submit", "ticket-wait", "ticket-output",
 				  "ticket-list", "ticket-cancel", "ticket-remove",
@@ -2588,6 +2596,28 @@ class Control:
 		if sess is not None:
 			self.daemon.registry.drop(name)
 		return {"ok": True}
+
+	def daemon_purge(self, _req):
+		# The operator's manual force purge: stop every detached,
+		# model-idle session past the one GC window immediately, with the
+		# consented-stop semantics of the daemon_gc_reap tool (its
+		# conversation is discarded and it is never revived). Attached and
+		# busy sessions are spared, and the automatic reaper stays
+		# ask-only. Stopping is marked synchronously so a purge response
+		# already reflects a session the relay thread no longer asks.
+		purged = []
+		for sess in self.daemon.table.snapshot():
+			if not self.daemon.gc_reaper.due(sess):
+				continue
+			sess.begin_gc_reap()
+			self.daemon.gc_reaper.clear(sess.name)
+			threading.Thread(target=sess.terminate, daemon=True).start()
+			purged.append(sess.name)
+		log("daemon-purge: purged %d session(s)%s"
+			% (len(purged),
+			   (": " + ", ".join(purged)) if purged else ""))
+		return {"ok": True, "purged": purged,
+				"idleHours": GC_IDLE / 3600.0}
 
 	def handover(self, req, conn=None):
 		file = req.get("file")

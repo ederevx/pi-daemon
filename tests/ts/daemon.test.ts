@@ -271,6 +271,29 @@ test("daemon: /new and /resume are carried, never aborted", async () => {
   });
 });
 
+test("daemon: /daemon-purge purges and parses pi-rc's report", async () => {
+  const exe = new ExecScript([{
+    code: 0,
+    stdout: "purged\tpi-a\npurged\tpi-b\npi-daemon: purged 2 idle session(s)\n",
+  }]);
+  const app = new RcBackground(exe.run.bind(exe));
+  const purged = await app.purgeIdleSessions();
+  assertEq(exe.calls[0][0], "daemon-purge");
+  assertEq(purged.join(","), "pi-a,pi-b", "purged names parsed from report");
+});
+
+test("daemon: purge failure surfaces pi-rc's message", async () => {
+  const exe = new ExecScript([{ code: 1, stderr: "daemon unreachable" }]);
+  const app = new RcBackground(exe.run.bind(exe));
+  let message = "";
+  try {
+    await app.purgeIdleSessions();
+  } catch (err) {
+    message = err instanceof Error ? err.message : String(err);
+  }
+  assert(message.includes("daemon unreachable"), message);
+});
+
 test("daemon: factory wires the command and events", () => {
   const pi = new MockPi();
   factory(pi as never);
@@ -278,6 +301,8 @@ test("daemon: factory wires the command and events", () => {
   assert(pi.commands.has("daemon-reload"), "reload command registered");
   assert(pi.commands.has("daemon-settings"),
     "daemon-settings command registered");
+  assert(pi.commands.has("daemon-purge"),
+    "daemon-purge command registered");
   assert(pi.tools.has("daemon_gc_reap"), "gc reap tool registered");
   assertEq(pi.onCalls.get("session_start") ?? 0, 4, "four session_start listeners");
   assertEq(pi.onCalls.get("session_shutdown") ?? 0, 2);
