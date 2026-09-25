@@ -280,22 +280,22 @@ def _main():
     wire({"cmd": "start", "name": "pi-itest2", "dir": SCRATCH,
           "argv": ["sh", "-c", "sleep 30"], "cols": 80, "rows": 24})
 
-    # -- idle warning: the finish command is gone, the file is the answer --
+    # -- GC reap: the tool acks through gc-reap-ack, never a force-kill --
     r = pi_rc("finish", "itest2", "--working")
     if r.returncode == 0 or "unknown command" not in r.stderr:
         fail("finish command removed", r.stdout + r.stderr)
     else:
-        ok("finish command removed (delete the warning file instead)")
-    r = pi_rc("list")
-    if "itest2" not in r.stdout:
-        fail("session survives the removed finish op", r.stdout)
+        ok("finish command removed (use daemon_gc_reap instead)")
+    r = pi_rc("gc-reap-ack", "itest2")
+    if r.returncode != 0:
+        fail("gc-reap-ack", r.stderr)
     else:
-        ok("session survives the removed finish op")
+        ok("gc-reap-ack")
     r = pi_rc("stop", "itest2")
     if r.returncode != 0:
-        fail("stop the idle-warning session", r.stderr)
+        fail("stop the gc-reap session", r.stderr)
     else:
-        ok("stop the idle-warning session")
+        ok("stop the gc-reap session")
 
     r = pi_rc("daemon-stop")
     if r.returncode != 0:

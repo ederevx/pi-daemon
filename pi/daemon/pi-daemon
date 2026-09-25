@@ -21,11 +21,13 @@
 # child that dies again within MIN_REVIVE_LIFE seconds is left dead so a
 # crash loop cannot spin the daemon.
 #
-# The daemon never ends a long-idle detached session without a warning:
-# when the idle reap becomes due it leaves a per-session warning file
-# the daemon extension surfaces to the agent, and deleting that file is
-# a working answer that re-arms the idle clock, while leaving it past
-# the warning grace is consent to end the session.
+# The daemon never force-kills a live session: when a detached session
+# has been model-idle past the single GC window it writes a per-session
+# reap-request file the daemon extension surfaces to the agent, and the
+# session reaps itself by calling the daemon_gc_reap tool, which
+# acknowledges here and shuts the session down. An unanswered request
+# simply stays until the session's connection dies and the normal
+# child-exit cleanup drops it.
 #
 # The daemon holds no terminal history: a detached session keeps running
 # headless and an attach re-wires the bridge, sizing the PTY for the new
@@ -54,6 +56,11 @@
 #                                         of its conversation the session
 #                                         file is discarded so it stops
 #                                         showing in pi's /resume picker
+#   gc-reap-ack {name}                    the daemon_gc_reap tool's
+#                                         acknowledgement of the GC reap
+#                                         request: clear the request and
+#                                         the registry entry; the session
+#                                         then shuts itself down
 #   handover {file,dir,afterPid}          host a pi session file once the
 #                                         owning process exits
 #   carry {name[,to,argv]}                /new without termination: move
@@ -236,23 +243,17 @@ REAP_TICK = 0.5
 # Overridable for isolated tests (PI_PTYD_MIN_REVIVE_LIFE=0).
 MIN_REVIVE_LIFE = SETTINGS.resolve("PI_PTYD_MIN_REVIVE_LIFE",
 								  "minReviveLifeSeconds", 30.0)
-# A hosted session that is detached (no bridge viewers) and whose model
-# has been idle (extension state "idle") for this long is ended by the
-# daemon instead of piling up as a phantom that respawns on every
-# daemon restart. The window is configured in hours. Zero disables the
-# reap (PI_PTYD_IDLE_REAP_HOURS=0).
-IDLE_REAP = SETTINGS.resolve("PI_PTYD_IDLE_REAP_HOURS", "idleReapHours",
-							 12.0) * 3600.0
-# Before that reap lands, the daemon leaves the session a timestamped
-# warning file the in-session extension surfaces: deleting the file is
-# a working answer (the session is spared and idle re-arms), while
-# leaving it past this grace is consent to end the session. The grace
-# is configured in hours; 0 disables the warning and reaps immediately
-# (legacy behavior). A non-finite or negative number falls through to
-# the next source.
-IDLE_WARN_GRACE = SETTINGS.resolve(
-	"PI_PTYD_IDLE_WARN_HOURS", "idleWarnGraceHours", 1.0) * 3600.0
-IDLE_WARNING_DIR = os.path.join(REG_DIR, "idle-warning")
+# The single idle policy: a hosted session that is detached (no bridge
+# viewers) and whose model has been idle for this many hours is asked
+# to reap itself through the daemon_gc_reap tool instead of piling up
+# as a phantom that respawns on every daemon restart. The window is
+# configured in hours; zero disables the request (PI_DAEMON_GC_IDLE_HOURS=0).
+GC_IDLE = SETTINGS.resolve("PI_DAEMON_GC_IDLE_HOURS", "gcIdleHours",
+						   3.0) * 3600.0
+# Per-session reap-request files (REG_DIR/gc-reap/<name>.json) the
+# in-session extension watches: a request asks the agent to call the
+# daemon_gc_reap tool, and the tool's acknowledgement deletes it.
+GC_REAP_REQUEST_DIR = os.path.join(REG_DIR, "gc-reap")
 # A reload injection's no-spawn guard stays armed for this long: a
 # reloaded session that dies within the window is treated as a broken
 # reload and never respawned (the reload stays strictly in-place); once
@@ -293,8 +294,9 @@ CLEAR_SEQ = b"\x1b[H\x1b[2J\x1b[m"
 # Wire commands served by Control (attach + shutdown are special-cased in
 # the connection loop).
 _WIRE_COMMANDS = ("ping", "start", "detach", "resize", "list", "which",
-				  "whichall", "state", "stop", "handover", "carry",
-				  "resume", "announce", "handoff-target", "daemon-restart",
+				  "whichall", "state", "stop", "gc-reap-ack", "handover",
+				  "carry", "resume", "announce", "handoff-target",
+				  "daemon-restart",
 				  "input", "extensions-reload",
 				  "ticket-submit", "ticket-wait", "ticket-output",
 				  "ticket-list", "ticket-cancel", "ticket-remove",
@@ -497,12 +499,12 @@ def _clear_stale_reload_signals():
 	_purge_signal_dir(EXT_RELOAD_SIGNAL_DIR)
 
 
-def _clear_stale_idle_warnings():
-	"""Daemon startup: idle-warning files from a previous daemon run
-	name sessions that are gone. A respawned session with the same name
-	would otherwise be steered by an ask no live window backs, so drop
-	them; only a warning this run writes opens a real window."""
-	_purge_signal_dir(IDLE_WARNING_DIR)
+def _clear_stale_gc_reap_requests():
+	"""Daemon startup: reap requests from a previous daemon run name
+	sessions that are gone. A respawned session with the same name would
+	otherwise be steered by an ask no live policy backs, so drop them;
+	only a request this run writes is a live ask."""
+	_purge_signal_dir(GC_REAP_REQUEST_DIR)
 
 
 def _on_signal(_signum, _frame):
@@ -1344,91 +1346,84 @@ class IdleShutdownWatch:
 				idle_since = None
 
 
-class IdleWarnings:
-	"""Outstanding idle warnings, one grace window per session.
+class GcReaper:
+	"""The single GC idle policy: ask a detached, model-idle session to
+	reap itself through the in-session daemon_gc_reap tool.
 
-	Before the daemon reaps a detached model-idle session it leaves a
-	timestamped warning file the in-session extension surfaces to its
-	agent: deleting the file is a working answer, while leaving it past
-	the grace is consent to end the session. This class owns both the
-	file and the per-session window record; the daemon only warns,
-	inspects, or clears."""
+	The daemon never force-kills a live session. When a session's idle
+	clock passes the one GC window this class writes the per-session
+	reap-request file the daemon extension surfaces to its agent; the
+	session answers by calling the tool, whose acknowledgement clears
+	the request here. An unanswered request simply stays until the
+	session's connection dies and the normal child-exit cleanup drops
+	it. This class owns the request file and the per-session request
+	record; the daemon only asks, clears, or purges."""
 
-	def __init__(self, directory, grace):
+	def __init__(self, directory, idle):
 		self.directory = directory
-		self.grace = float(grace)
-		# session name -> {"sent": time, "written": bool}; the written
-		# flag disables deletion-detection when the file could not be
-		# written, so that case falls back to silence consent.
-		self._outstanding = {}
+		self.idle = float(idle)
+		# One lock serializes a request against an acknowledgement: the
+		# relay thread asks while the control thread clears, so a request
+		# must never land after its session acknowledged.
+		self._lock = threading.Lock()
+		# session name -> request time; reached only through the API
+		# below. A recorded request is never re-asked, so a surfaced
+		# ask is not repeated on every relay tick.
+		self._requested = {}
 
 	def path(self, name):
-		# The warning file for one session.
+		# The reap-request file for one session.
 		return os.path.join(self.directory, "%s.json" % name)
 
-	def warn(self, name, now=None):
-		# Writes the timestamped warning file and opens the window;
-		# returns whether a deletable file exists.
-		written = self._write(name, now)
-		self._outstanding[name] = {"sent": self._now(now),
-								   "written": written}
-		return written
-
-	def deleted(self, name):
-		# Whether the warned session deleted its file: the working answer.
-		record = self._outstanding.get(name)
-		return record is not None and record["written"] \
-			and not os.path.exists(self.path(name))
-
-	def get(self, name):
-		# The open window record, or None.
-		return self._outstanding.get(name)
-
-	def expired(self, name, now=None):
-		# Whether the window for one session has passed; silence past the
-		# grace is consent to end the session.
-		record = self._outstanding.get(name)
-		if record is None:
+	def due(self, sess, now=None):
+		# The one idle test: a detached session whose model is idle
+		# past the window is due for a reap request. Busy, attached, and
+		# already-stopping sessions are never asked.
+		if self.idle <= 0:
 			return False
-		return self._now(now) - record["sent"] >= self.grace
+		if sess.stopping or sess.state != "idle" or sess.count_clients() > 0:
+			return False
+		now = time.time() if now is None else now
+		return now - sess.last_activity > self.idle
 
-	def close(self, name):
-		# Drops a window once it is answered.
-		self._outstanding.pop(name, None)
+	def requested(self, name):
+		# Whether this session already has a reap request open.
+		return name in self._requested
 
-	def remove(self, name):
-		# Drops a window and its file (the session left or was reaped).
-		self._outstanding.pop(name, None)
-		try:
-			os.unlink(self.path(name))
-		except OSError:
-			pass
+	def request_if_due(self, sess, now=None):
+		# Write one reap request for a due session that has none open;
+		# returns whether the request file was written.
+		with self._lock:
+			if self.requested(sess.name) or not self.due(sess, now):
+				return False
+			written = self._write(sess.name, now)
+			self._requested[sess.name] = time.time() if now is None else now
+			return written
 
-	def ids(self):
-		# The names with an open window.
-		return set(self._outstanding)
-
-	def clear(self):
-		# Shutdown leaves no window state behind.
-		self._outstanding.clear()
+	def clear(self, name):
+		# Drop a session's request: answered by the tool, or its
+		# session left. Serialized against request_if_due so a request
+		# in flight cannot land after this clear.
+		with self._lock:
+			self._requested.pop(name, None)
+			try:
+				os.unlink(self.path(name))
+			except OSError:
+				pass
 
 	def _write(self, name, now):
-		# A safe single file component or the write fails, leaving the
-		# window open with nothing for the agent to delete (silence then
-		# ends the session).
+		# A safe single file component or the write fails; the request
+		# is still recorded, so an unwritable name is asked without a
+		# file and the session simply never answers.
 		if not name or name in (".", "..") or os.sep in name \
 				or (os.altsep and os.altsep in name):
 			return False
 		try:
 			pi_platform.AtomicStateFile(self.path(name)).write(
-				{"id": name, "ts": self._now(now), "grace": self.grace})
+				{"id": name, "ts": time.time() if now is None else now})
 		except OSError:
 			return False
 		return True
-
-	@staticmethod
-	def _now(now):
-		return time.time() if now is None else now
 
 
 class SessionTable:
@@ -1584,16 +1579,11 @@ class Session:
 		# Any viewer or model-state activity keeps the session alive.
 		self.last_activity = time.time()
 
-	def idle_exceeded(self, now=None):
-		# True when the daemon should end this session on its own: a
-		# detached session whose model has been idle past the reap
-		# grace. Busy or attached sessions are never reapable.
-		if IDLE_REAP <= 0:
-			return False
-		if self.state != "idle" or self.count_clients() > 0:
-			return False
-		now = time.time() if now is None else now
-		return now - self.last_activity > IDLE_REAP
+	def begin_gc_reap(self):
+		# The agent answered the daemon's GC reap request by calling the
+		# daemon_gc_reap tool: this is a consented stop, so the exit
+		# path discards the stale conversation and never revives it.
+		self.stopping = True
 
 	def install_client(self, client, initial=b""):
 		# Control-side: install a new bridge client. Returns the client
@@ -1715,12 +1705,12 @@ class Session:
 		dead_input = False
 		status = 0
 		while True:
-			# A reap-check error must never kill the relay thread (the
+			# A gc-reap-check error must never kill the relay thread (the
 			# session's bridge); log it and keep serving the child.
 			try:
-				daemon.reap_idle_if_due(self)
+				daemon.request_gc_reap_if_due(self)
 			except Exception as exc:
-				log("reap check '%s' failed: %s" % (name, exc))
+				log("gc-reap check '%s' failed: %s" % (name, exc))
 			carry_to = self.carry_to
 			if carry_to is not None:
 				self._transfer_viewers(carry_to)
@@ -1899,7 +1889,7 @@ class Daemon:
 		self.handover_wait = {}
 		self.table = SessionTable()
 		self.ledger = HandoffLedger()
-		self.idle_warnings = IdleWarnings(IDLE_WARNING_DIR, IDLE_WARN_GRACE)
+		self.gc_reaper = GcReaper(GC_REAP_REQUEST_DIR, GC_IDLE)
 		self.shutdown_event = threading.Event()
 		self.spawner = SessionSpawner(self.table, registry, owner=self)
 		self.tickets = TicketRunner(
@@ -1912,7 +1902,7 @@ class Daemon:
 		# session's watcher or steer its agent; drop them before anything
 		# is hosted.
 		_clear_stale_reload_signals()
-		_clear_stale_idle_warnings()
+		_clear_stale_gc_reap_requests()
 
 	# -- control socket ------------------------------------------------------
 
@@ -2127,9 +2117,9 @@ class Daemon:
 		if dropped is not None:
 			self.ledger.repoint_on_drop(dropped)
 		self.registry.drop(sess.name)
-		# A dropped session can no longer answer its idle warning: drop
-		# the window and remove the file so no stale ask survives it.
-		self.idle_warnings.remove(sess.name)
+		# A dropped session can no longer answer its GC reap request:
+		# drop the request so no stale ask survives it.
+		self.gc_reaper.clear(sess.name)
 		self._discard_session_file(sess)
 		log("child-exit '%s' pid %d status %s" % (sess.name, sess.pid, code))
 
@@ -2154,49 +2144,16 @@ class Daemon:
 		except OSError as exc:
 			log("discard '%s' conversation failed: %s" % (sess.name, exc))
 
-	def reap_idle_if_due(self, sess):
-		# End a hosted session the daemon should not keep: detached and
-		# model-idle past the grace. An explicit stop path (never
-		# revived) removes it from the table and registry; a session
-		# with a viewer or a running model is never touched.
-		if not sess.idle_exceeded():
-			return
-		if self.idle_warnings.grace <= 0:
-			log("reap '%s' ended: detached and idle past %ss"
-				% (sess.name, IDLE_REAP))
-			self.idle_warnings.remove(sess.name)
-			sess.terminate()
-			return
-		# A warning is outstanding. Deleting the file is the working
-		# answer: close the window and re-arm the idle clock. A file
-		# still present past the grace is silence, which is consent.
-		if self.idle_warnings.deleted(sess.name):
-			self.idle_warnings.close(sess.name)
-			sess.touch_activity()
-			log("idle-warning '%s': deleted; session spared" % sess.name)
-			return
-		if self.idle_warnings.get(sess.name) is not None:
-			record = self.idle_warnings.get(sess.name)
-			if sess.last_activity > record["sent"]:
-				# Real work happened after the warning: it is stale, so drop
-				# it and warn fresh on the next due reap rather than letting
-				# the old ask turn into a silent termination.
-				self.idle_warnings.remove(sess.name)
-				return
-			if not self.idle_warnings.expired(sess.name):
-				return
-			log("reap '%s' ended: detached and idle past %ss (idle "
-				"warning unanswered)" % (sess.name, IDLE_REAP))
-			self.idle_warnings.remove(sess.name)
-			sess.terminate()
-			return
-		# First due reap: leave the warning the agent deletes to stay
-		# alive and open its window; deletion is detected by later sweeps.
-		written = self.idle_warnings.warn(sess.name)
-		log("idle-warning '%s': detached and idle past %ss; warning %s"
-			% (sess.name, IDLE_REAP,
-			   "left at %s" % self.idle_warnings.path(sess.name) if written
-			   else "could not be written"))
+	def request_gc_reap_if_due(self, sess):
+		# The one GC policy hook: ask a detached, model-idle session to
+		# reap itself through the daemon_gc_reap tool. The daemon never
+		# force-kills a live session, so an unanswered request simply
+		# stays until the session's connection dies and child-exit
+		# cleanup drops it. A session with a viewer or a running model
+		# is never asked.
+		if self.gc_reaper.request_if_due(sess):
+			log("gc-reap '%s': requested after %ss idle; left at %s"
+				% (sess.name, GC_IDLE, self.gc_reaper.path(sess.name)))
 
 	def revive(self, sess, status):
 		# Backgrounding must always happen unless the user ended the
@@ -2610,6 +2567,26 @@ class Control:
 			t = threading.Thread(target=sess.terminate, daemon=True)
 			t.start()
 		# The session thread drops the entry once the reap lands.
+		return {"ok": True}
+
+	def gc_reap_ack(self, req):
+		# The daemon_gc_reap tool's acknowledgement: the session
+		# answered the GC reap request and is shutting itself down.
+		# Clear the request and the registry entry so the reaper's
+		# state is clean before the process exits, and mark the exit a
+		# consented stop so the stale conversation is discarded and
+		# never revived.
+		name = req.get("name")
+		if not (isinstance(name, str) and name):
+			return bad_request()
+		sess = self.daemon.table.get(name)
+		if sess is not None:
+			# Mark the stop first: the relay thread's request check reads
+			# it, so no further ask can be written once the clear lands.
+			sess.begin_gc_reap()
+		self.daemon.gc_reaper.clear(name)
+		if sess is not None:
+			self.daemon.registry.drop(name)
 		return {"ok": True}
 
 	def handover(self, req, conn=None):
