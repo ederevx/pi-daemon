@@ -1030,6 +1030,40 @@ def test_gc_reap_ack_discards_and_never_revives():
         DAEMON.table.remove_if(sess)
 
 
+def test_daemon_purge_stops_due_sessions():
+    """The operator's manual purge force-stops every detached,
+    model-idle session past the GC window and spares busy and attached
+    ones; the automatic reaper stays ask-only."""
+    due = "pi-purge-due"
+    busy = "pi-purge-busy"
+    for name in (due, busy):
+        DAEMON.control.stop({"name": name})  # idempotent re-run guard
+        r = DAEMON.control.start(
+            {"name": name, "dir": SCRATCH,
+             "argv": ["sh", "-c", "echo ready; sleep 60"]})
+        assert_true(r.get("ok"), r)
+    due_sess = DAEMON.table.get(due)
+    busy_sess = DAEMON.table.get(busy)
+    assert_true(due_sess is not None and busy_sess is not None,
+                "purge probe sessions did not appear")
+    assert_true(DAEMON.control.state(
+        {"name": busy, "state": "busy"}).get("ok"))
+    due_sess.last_activity = time.time() - daemon.GC_IDLE - 1.0
+    busy_sess.last_activity = time.time() - daemon.GC_IDLE - 1.0
+    resp = DAEMON.control.daemon_purge({})
+    assert_true(resp.get("ok"), resp)
+    assert_true(due in resp.get("purged"), "due session not purged")
+    assert_true(busy not in resp.get("purged"),
+                "busy session was purged")
+    assert_true(due_sess.stopping, "purged session not marked stopping")
+    assert_true(not busy_sess.stopping, "busy session marked stopping")
+    assert_true(not DAEMON.gc_reaper.requested(due),
+                "purged session left a reap request")
+    assert_true(DAEMON.control.stop({"name": busy}).get("ok"))
+    assert_true(_drain_session(due))
+    assert_true(_drain_session(busy))
+
+
 # --- restart handover (registry dedupe, roster, idle watch) -----------------
 
 def test_registry_dedupe():
@@ -1691,6 +1725,8 @@ def _main():
        test_gc_reaper_owns_requests)
     ok("gc reap ack discards and never revives",
        test_gc_reap_ack_discards_and_never_revives)
+    ok("daemon purge force-stops due sessions, spares busy",
+       test_daemon_purge_stops_due_sessions)
     ok("registry dedupe (one entry per conversation)", test_registry_dedupe)
     ok("restart planner prefers the attached duplicate",
        test_restart_planner_prefers_attached)

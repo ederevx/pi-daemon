@@ -75,6 +75,12 @@
 #                                       the request and the registry entry
 #                                       before the session reaps itself
 #                                       through the daemon_gc_reap tool
+#   pi-rc daemon-purge                  the operator's manual force purge:
+#                                       stop every detached, model-idle
+#                                       session past the configured GC idle
+#                                       window immediately (attached and
+#                                       busy sessions stay; the automatic
+#                                       reaper only ever asks)
 #   pi-rc ticket-submit [--session <n>] [--cwd <dir>] [--env KEY=VALUE]
 #                       -- <command>... run a shell command as a
 #                                       daemon-owned ticket: it outlives
@@ -198,6 +204,7 @@ DETACH_KEY = b"\x1c"  # Ctrl-\: pop out of an attached session without exiting p
 _COMMANDS = ("which", "whichall", "owned", "state", "carry", "resume", "start",
 			 "attach", "announce", "detach", "stop", "gc-reap-ack", "handover",
 			 "daemon-start", "daemon-stop", "daemon-restart",
+			 "daemon-purge",
 			 "input", "extensions-reload",
 			 "ticket-submit", "ticket-wait", "ticket-output",
 			 "ticket-list", "ticket-cancel", "ticket-remove", "tickets-reset")
@@ -971,6 +978,25 @@ def cmd_gc_reap_ack(args, client):
 		die("gc-reap-ack failed: %s" % resp.get("error"))
 
 
+def cmd_daemon_purge(_args, client):
+	# Operator-only: force-stop every detached, model-idle session past
+	# the configured GC idle window. The automatic reaper only asks a
+	# session to reap itself; this is the explicit manual purge. Prints
+	# one tab-delimited line per purged session (the daemon extension
+	# reads them) plus a human summary.
+	resp = client.control({"cmd": "daemon-purge"})
+	if not resp.get("ok"):
+		die("daemon-purge failed: %s" % resp.get("error"))
+	purged = resp.get("purged") or []
+	for name in purged:
+		# tab after the keyword: session names may contain spaces
+		print("purged\t%s" % short_name(name))
+	if purged:
+		print("pi-daemon: purged %d idle session(s)" % len(purged))
+	else:
+		print("pi-daemon: no idle sessions past the configured GC window")
+
+
 def cmd_carry(args, client):
 	# Extension-only helper for /new: the daemon spawns a fresh hosted
 	# session sized like the current view, moves this session's bridge
@@ -1402,6 +1428,7 @@ def main():
 		 "handover": cmd_handover,
 		 "daemon-start": cmd_daemon_start, "daemon-stop": cmd_daemon_stop,
 		 "daemon-restart": cmd_daemon_restart,
+		 "daemon-purge": cmd_daemon_purge,
 		 "input": cmd_input, "extensions-reload": cmd_extensions_reload,
 		 "ticket-submit": cmd_ticket_submit, "ticket-wait": cmd_ticket_wait,
 		 "ticket-output": cmd_ticket_output, "ticket-list": cmd_ticket_list,

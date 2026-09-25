@@ -175,7 +175,7 @@ bash scripts/uninstall.sh
 
 ```
 pi/
-  extensions/daemon.ts   # /bg: detach/handover + reload-diff relay
+  extensions/daemon.ts   # /bg: detach/handover, /daemon-purge, reload relay
                          # + the daemon_gc_reap tool
   extensions/offload.ts  # ticket offloading + daemon_tasks tool
   bin/pi-rc              # client: tickets, bridge, input, reload,
@@ -239,6 +239,11 @@ hand-written `Infinity` or `nan` cannot make a session un-reapable.
 `0` disables the corresponding reaper. The session reaper never
 force-kills: it writes a per-session reap request the extension
 surfaces, and the session reaps itself by calling `daemon_gc_reap`.
+`/daemon-purge` (and `pi-rc daemon-purge`) is the operator's manual
+force purge: it stops every detached, model-idle session past the
+`gcIdleHours` window immediately, with the same consented-stop
+semantics as `daemon_gc_reap` (the conversation is discarded), while
+attached and busy sessions are never purged.
 
 ## Maintenance conventions
 
