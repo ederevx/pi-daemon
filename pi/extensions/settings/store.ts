@@ -74,6 +74,19 @@ export class SettingsStore {
 		this.save(settings);
 	}
 
+	/** Delete the whole `piDaemon` namespace, preserving every other
+	 *  top-level key, the file mode, and the atomic write path. Throws,
+	 *  writing nothing, when the file cannot be parsed. */
+	reset(): void {
+		const settings = this.load();
+		if (settings === null) {
+			throw new Error(`${this.path()} is not valid settings JSON; ` +
+				"refusing to overwrite it");
+		}
+		delete settings[this.namespace];
+		this.save(settings);
+	}
+
 	/** The named child object, replaced when absent or not an object. */
 	private ensureObject(
 		parent: Record<string, unknown>,
