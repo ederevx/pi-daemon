@@ -11,7 +11,10 @@
  * print the same rows to stderr.
  */
 
-import { ExtensionInputComponent } from "@earendil-works/pi-coding-agent";
+import {
+	ExtensionInputComponent,
+	ExtensionSelectorComponent,
+} from "@earendil-works/pi-coding-agent";
 import { delimiter, join } from "node:path";
 import { homedir } from "node:os";
 import type { Component } from "@earendil-works/pi-tui";
@@ -134,9 +137,22 @@ export class DaemonSettingsPresenter {
 		];
 	}
 
-	/** The rows, each showing its effective value and env-pin marker. */
+	/** The rows: every setting, then the trailing restore action. */
 	rows(notify: Notify = DaemonSettingsPresenter.stderrNotify): SettingRow[] {
-		return this.specs().map((spec) => this.row(spec, notify));
+		const rows = this.specs().map((spec) => this.row(spec, notify));
+		rows.push(this.restoreRow(notify));
+		return rows;
+	}
+
+	/** Delete the stored `piDaemon` overrides, reporting the outcome. */
+	restoreDefaults(notify: Notify = DaemonSettingsPresenter.stderrNotify): void {
+		try {
+			this.store.reset();
+			notify("Restored pi-daemon default configuration; options pinned " +
+				"by an environment variable still win.", "info");
+		} catch (err) {
+			notify(err instanceof Error ? err.message : String(err), "error");
+		}
 	}
 
 	/** Persist one accepted row value, or report why it was rejected. */
@@ -195,6 +211,33 @@ export class DaemonSettingsPresenter {
 			submenu: (currentValue, done) =>
 				this.editor(spec, currentValue, done, notify),
 		};
+	}
+
+	/** The trailing action row: a confirmation submenu that deletes the
+	 *  stored `piDaemon` overrides. */
+	private restoreRow(notify: Notify): SettingRow {
+		return {
+			id: "restoreDefaults",
+			label: "Restore default configuration",
+			description: "Delete the stored piDaemon overrides and return every " +
+				"option to its built-in default. Options pinned by an environment " +
+				"variable still win.",
+			value: "",
+			submenu: (_currentValue, done) => this.confirmRestore(done, notify),
+		};
+	}
+
+	/** The restore confirmation selector; either answer closes the row. */
+	private confirmRestore(done: SubmenuDone, notify: Notify): Component {
+		return new ExtensionSelectorComponent(
+			"Restore default configuration?",
+			["Restore defaults", "Cancel"],
+			(option) => {
+				if (option === "Restore defaults") this.restoreDefaults(notify);
+				done();
+			},
+			() => done(),
+		);
 	}
 
 	/** The seeded text editor for one non-flag row. */
