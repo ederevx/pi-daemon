@@ -44,6 +44,7 @@ const ROW_IDS = [
 	"extWatchRoots",
 	"offload.enabled",
 	"offload.waitSeconds",
+	"restoreDefaults",
 ];
 
 /** The daemon-owned and extension-owned env vars, cleared for hermetic
@@ -99,6 +100,11 @@ test("settings: rows cover every piDaemon setting in order", async () => {
 		assertEq(wait.value, "120", "offload wait default from offload.ts");
 		const roots = rows.find((row) => row.id === "extWatchRoots")!;
 		assert(roots.value.includes(delimiter), "roots render path-joined");
+		const restore = rows.find((row) => row.id === "restoreDefaults");
+		assert(restore !== undefined, "restore action row appended");
+		assertEq(restore.label, "Restore default configuration", "restore label");
+		assertEq(restore.value, "", "restore row shows no value");
+		assert(restore.submenu !== undefined, "restore row opens a confirmation");
 	});
 });
 
@@ -264,6 +270,88 @@ test("settings: the roots list row stores a platform-split array", async () => {
 	});
 	const written = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
 	assertEq(written.piDaemon.extWatchRoots.join(","), "/one,/two");
+});
+
+test("settings: reset removes only the piDaemon namespace", async () => {
+	const dir = join(scratchDir(), "reset-agent");
+	mkdirSync(dir, { recursive: true });
+	const file = join(dir, "settings.json");
+	writeFileSync(file, JSON.stringify({
+		theme: "dark",
+		piDaemon: { extWatch: false, offload: { enabled: false } },
+	}, null, 2) + "\n");
+	chmodSync(file, 0o640);
+	await withEnv({ PI_CODING_AGENT_DIR: dir }, () => {
+		new SettingsStore().reset();
+	});
+	const written = JSON.parse(readFileSync(file, "utf8"));
+	assertEq(written.piDaemon, undefined, "piDaemon namespace deleted");
+	assertEq(written.theme, "dark", "other top-level key preserved");
+	assertEq(statSync(file).mode & 0o777, 0o640, "file mode preserved");
+});
+
+test("settings: reset refuses a corrupt file", async () => {
+	const dir = join(scratchDir(), "reset-corrupt-agent");
+	mkdirSync(dir, { recursive: true });
+	const file = join(dir, "settings.json");
+	writeFileSync(file, "{ not json");
+	await withEnv({ PI_CODING_AGENT_DIR: dir }, () => {
+		let threw = false;
+		try {
+			new SettingsStore().reset();
+		} catch {
+			threw = true;
+		}
+		assert(threw, "reset must report a corrupt file");
+	});
+	assertEq(readFileSync(file, "utf8"), "{ not json", "file untouched");
+});
+
+test("settings: restoreDefaults clears the stored overrides", async () => {
+	const dir = join(scratchDir(), "restore-agent");
+	await withEnv({ ...ALL_ENV, PI_CODING_AGENT_DIR: dir }, () => {
+		const store = new SettingsStore();
+		store.set("extWatch", false);
+		store.set("gcIdleHours", 7);
+		const notices: Array<{ message: string; kind?: string }> = [];
+		new DaemonSettingsPresenter(store).restoreDefaults(
+			(message, kind) => notices.push({ message, kind }));
+		assertEq(notices.length, 1, "one outcome notice");
+		assertEq(notices[0].kind, "info", "success reported as info");
+	});
+	const written = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
+	assertEq(written.piDaemon, undefined, "overrides cleared");
+});
+
+test("settings: the command restore argument clears the overrides", async () => {
+	const pi = new FakePi();
+	factory(pi as never);
+	const command = pi.commands.get("daemon-settings") as {
+		handler: (args: unknown, ctx: unknown) => Promise<void>;
+	};
+	for (const argument of ["restore", "reset"]) {
+		const dir = join(scratchDir(), `command-${argument}-agent`);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "settings.json"), JSON.stringify({
+			theme: "dark", piDaemon: { extWatch: false },
+		}) + "\n");
+		const notices: Array<{ message: string; kind?: string }> = [];
+		await withEnv({ ...ALL_ENV, PI_CODING_AGENT_DIR: dir }, async () => {
+			await command.handler(argument, {
+				mode: "tui",
+				ui: {
+					notify: (message: string, kind?: string) =>
+						notices.push({ message, kind }),
+				},
+			});
+		});
+		assertEq(notices.length, 1, `${argument}: one notice`);
+		assertEq(notices[0].kind, "info", `${argument}: success reported`);
+		const written = JSON.parse(
+			readFileSync(join(dir, "settings.json"), "utf8"));
+		assertEq(written.piDaemon, undefined, `${argument}: overrides cleared`);
+		assertEq(written.theme, "dark", `${argument}: other keys preserved`);
+	}
 });
 
 test("settings: the command persists a change and reports the save", async () => {
