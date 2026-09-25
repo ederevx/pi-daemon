@@ -30,13 +30,10 @@ os.environ["XDG_RUNTIME_DIR"] = os.path.join(SCRATCH, "runtime")
 os.environ["PI_CODING_AGENT_DIR"] = os.path.join(SCRATCH, "agent")
 os.makedirs(os.environ["PI_CODING_AGENT_DIR"], exist_ok=True)
 os.environ["PI_PTYD_MIN_REVIVE_LIFE"] = "0"
-# Reap detached idle sessions fast in tests so the guard is exercised
-# without waiting the twelve-hour production default (hours setting).
-os.environ["PI_PTYD_IDLE_REAP_HOURS"] = "0.001"
-# The idle reap's warning window is off for the shared suite (the legacy
-# immediate-reap behavior the reap tests below rely on); the idle
-# warning tests re-enable the window around their own calls.
-os.environ["PI_PTYD_IDLE_WARN_HOURS"] = "0"
+# Ask detached idle sessions to reap themselves fast in tests so the
+# request path is exercised without waiting the three-hour production
+# default (hours setting).
+os.environ["PI_DAEMON_GC_IDLE_HOURS"] = "0.001"
 # The extension-reload watch must never touch the real agent home in
 # tests: point its roots at a scratch dir and run it fast.
 EXT_ROOT = os.path.join(SCRATCH, "ext-root")
@@ -804,11 +801,13 @@ def test_ext_watch_loop_owes_busy_sessions():
 
 
 
-def test_idle_reap_detects_and_ends_detached_sessions():
+def test_gc_reap_requests_detached_sessions():
     """Regression: a hosted session that outlives its user (detached and
-    model-idle past the grace) is ended by the daemon instead of piling
-    up as a phantom that respawns on every daemon restart."""
-    name = "pi-idle-reap"
+    model-idle past the GC window) is asked to reap itself instead of
+    piling up as a phantom that respawns on every daemon restart. The
+    daemon never force-kills: it writes the request file the extension
+    surfaces, and the tool's acknowledgement is the consented reap."""
+    name = "pi-gc-reap"
     DAEMON.control.stop({"name": name})  # idempotent re-run guard
     r = DAEMON.control.start(
         {"name": name, "dir": SCRATCH,
@@ -816,25 +815,31 @@ def test_idle_reap_detects_and_ends_detached_sessions():
     assert_true(r.get("ok"), r)
     sess = DAEMON.table.get(name)
     assert_true(sess is not None, "session did not appear")
-    sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
-    assert_true(sess.idle_exceeded(),
-                "aged idle detached session not detected as reapable")
-    assert_true(_drain_session(name), "idle detached session not reaped")
-    # Teardown is async (the session relay thread drops the table entry
-    # and registry): wait for both to settle like a client would.
-    for _ in range(50):
-        listed = DAEMON.control.list({})
-        gone = (name not in [s["name"] for s in listed["sessions"]]
-                and name not in DAEMON.registry.load())
-        if gone:
-            break
-        time.sleep(0.05)
+    sess.last_activity = time.time() - daemon.GC_IDLE - 1.0
+    assert_true(DAEMON.gc_reaper.due(sess),
+                "aged idle detached session not due for a reap request")
+    DAEMON.request_gc_reap_if_due(sess)
+    request = DAEMON.gc_reaper.path(name)
+    assert_true(os.path.exists(request), "reap request not written")
+    assert_true(DAEMON.gc_reaper.requested(name), "request not recorded")
+    rec = json.load(open(request))
+    assert_eq(rec.get("id"), name, "request names the session")
+    assert_true(isinstance(rec.get("ts"), float), "request is stamped")
+    # The tool acknowledges: this is the consented reap. The daemon
+    # clears the request and registry entry and marks the exit a stop.
+    assert_true(DAEMON.control.gc_reap_ack({"name": name}).get("ok"))
+    assert_true(sess.stopping, "acknowledged session not marked stopping")
+    assert_true(not os.path.exists(request), "ack did not clear the request")
+    assert_true(not DAEMON.gc_reaper.requested(name),
+                "ack did not drop the request record")
     assert_true(name not in DAEMON.registry.load(),
-                "reaped session still respawnable from the registry")
+                "consented reap still respawnable from the registry")
+    assert_true(DAEMON.control.stop({"name": name}).get("ok"))
+    assert_true(_drain_session(name))
 
 
-def test_idle_reap_spares_busy_and_attached():
-    """A model that is busy must never be reaped, and an idle session
+def test_gc_reap_spares_busy_and_attached():
+    """A model that is busy must never be asked, and an idle session
     with a live bridge viewer stays put."""
     name = "pi-busy-keep"
     r = DAEMON.control.start(
@@ -844,12 +849,27 @@ def test_idle_reap_spares_busy_and_attached():
     sess = DAEMON.table.get(name)
     assert_true(DAEMON.control.state(
         {"name": name, "state": "busy"}).get("ok"))
-    sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
-    assert_true(not sess.idle_exceeded(),
-                "busy session must not be reapable")
-    time.sleep(0.7)
-    assert_true(DAEMON.table.get(name) is not None,
-                "busy session was reaped anyway")
+    sess.last_activity = time.time() - daemon.GC_IDLE - 1.0
+    assert_true(not DAEMON.gc_reaper.due(sess),
+                "busy session must not be due for a reap request")
+    # An attached idle session is likewise never asked.
+    assert_true(DAEMON.control.state(
+        {"name": name, "state": "idle"}).get("ok"))
+    pair = socket.socketpair()
+    try:
+        sess.install_client(pair[0])
+        sess.last_activity = time.time() - daemon.GC_IDLE - 1.0
+        assert_true(not DAEMON.gc_reaper.due(sess),
+                    "attached session must not be due for a reap request")
+        time.sleep(0.7)
+        assert_true(DAEMON.table.get(name) is sess,
+                    "session was asked anyway")
+        assert_true(not DAEMON.gc_reaper.requested(name),
+                    "spared session got a reap request")
+    finally:
+        sess.take_clients()
+        pair[0].close()
+        pair[1].close()
     DAEMON.control.stop({"name": name})
     assert_true(_drain_session(name))
 
@@ -925,184 +945,89 @@ def test_package_settings_resolution():
     os.unlink(path)
 
 
-def test_idle_warnings_windows():
-    """IdleWarnings owns the warning file and its window: warn writes a
-    deletable file, expired ages the window, and deleted reports the
-    working answer."""
-    w = daemon.IdleWarnings(os.path.join(SCRATCH, "warn-probe"), 2.0)
-    now = 1000.0
-    assert_true(w.get("a") is None, "no window before the first warning")
-    assert_true(w.warn("a", now), "warn leaves a deletable file")
-    assert_eq(w.get("a"), {"sent": now, "written": True},
-              "the warning records its window and file")
-    assert_true(not w.expired("a", now + 1.5), "inside the grace")
-    assert_true(w.expired("a", now + 2.0), "past the grace")
-    assert_eq(w.ids(), {"a"})
-    assert_true(not w.deleted("a"), "a present file is not a deletion")
-    assert_true(w.warn("b", now), "warn b")
-    os.unlink(w.path("b"))
-    assert_true(w.deleted("b"), "a removed file answers working")
-    w.close("b")
-    assert_true(w.get("b") is None, "close drops the window")
-    w.remove("a")
-    assert_true(w.get("a") is None, "remove drops the window")
-    assert_true(not os.path.exists(w.path("a")), "remove unlinks the file")
-    # an unsafe name still opens a window, with no deletable file
-    assert_true(not w.warn("../evil", now), "unsafe name writes nothing")
-    assert_eq(w.get("../evil")["written"], False,
-              "the window records the failed write")
-    w.clear()
-    assert_eq(w.ids(), set(), "clear leaves no window state behind")
+def test_gc_reaper_owns_requests():
+    """GcReaper owns the one idle policy and its request file: a due
+    session is asked once, the request is recorded and stamped, and
+    clearing drops both the record and the file. Busy, attached, and
+    disabled sessions are never due."""
+    r = daemon.GcReaper(os.path.join(SCRATCH, "gc-reap-probe"), 3600.0)
+    sess = daemon.Session("a", SCRATCH, ["pi"], pid=1, master_fd=-1,
+                          child=_FinishChild())
+    assert_true(not r.due(sess), "a fresh session is not due")
+    sess.last_activity = time.time() - 3601.0
+    assert_true(r.due(sess), "an aged idle session is due")
+    assert_true(r.request_if_due(sess), "the request file is written")
+    assert_true(r.requested("a"), "the request is recorded")
+    rec = json.load(open(r.path("a")))
+    assert_eq(rec.get("id"), "a", "the request names the session")
+    assert_true(isinstance(rec.get("ts"), float), "the request is stamped")
+    assert_true(not r.request_if_due(sess), "an open request is not re-asked")
+    r.clear("a")
+    assert_true(not r.requested("a"), "clear drops the record")
+    assert_true(not os.path.exists(r.path("a")), "clear unlinks the file")
+    # A busy or attached session is never asked.
+    sess.state = "busy"
+    sess.last_activity = time.time() - 3601.0
+    assert_true(not r.due(sess), "a busy session is never due")
+    sess.state = "idle"
+    sess.install_client(object())
+    sess.last_activity = time.time() - 3601.0
+    assert_true(not r.due(sess), "an attached session is never due")
+    # A zero window disables the request entirely.
+    off = daemon.GcReaper(os.path.join(SCRATCH, "gc-reap-off"), 0.0)
+    assert_true(not off.due(sess), "a zero window disables the request")
+    # An unsafe name is recorded but writes no file.
+    unsafe = daemon.Session("../evil", SCRATCH, ["pi"], pid=1, master_fd=-1,
+                            child=_FinishChild())
+    unsafe.last_activity = time.time() - 3601.0
+    assert_true(not r.request_if_due(unsafe), "unsafe name writes nothing")
+    assert_true(r.requested("../evil"), "unsafe request still recorded")
+    r.clear("../evil")
 
 
-def test_startup_purges_stale_idle_warnings():
-    """A warning file from a previous daemon generation is removed at
+def test_startup_purges_stale_gc_reap_requests():
+    """A reap request from a previous daemon generation is removed at
     startup so no live session is steered by an ask nothing backs."""
-    os.makedirs(daemon.IDLE_WARNING_DIR, exist_ok=True)
-    stale = os.path.join(daemon.IDLE_WARNING_DIR, "stale.json")
+    os.makedirs(daemon.GC_REAP_REQUEST_DIR, exist_ok=True)
+    stale = os.path.join(daemon.GC_REAP_REQUEST_DIR, "stale.json")
     with open(stale, "w") as f:
         json.dump({"id": "stale", "ts": 1.0}, f)
-    daemon._clear_stale_idle_warnings()
-    assert_true(not os.path.exists(stale), "stale warning not purged")
+    daemon._clear_stale_gc_reap_requests()
+    assert_true(not os.path.exists(stale), "stale request not purged")
 
 
-def test_activity_after_warning_rearms_a_fresh_warning():
-    """Work recorded after a warning makes that ask stale: the window is
-    dropped and the next due reap warns fresh instead of reaping."""
-    name = "pi-warnrearm"
+def test_gc_reap_ack_discards_and_never_revives():
+    """The tool's acknowledgement is the consented reap: the daemon clears
+    the request, drops the registry entry, and marks the exit a stop so
+    the stale conversation is discarded and never revived."""
+    name = "pi-gc-ack"
     sess = daemon.Session(name, SCRATCH, ["pi"], pid=1, master_fd=-1,
                           child=_FinishChild())
     DAEMON.table.put(sess)
-    sig = os.path.join(daemon.IDLE_WARNING_DIR, name + ".json")
-    orig = daemon.IDLE_WARN_GRACE
-    daemon.IDLE_WARN_GRACE = 2.0
-    DAEMON.idle_warnings.grace = 2.0
+    DAEMON.registry.add(name, SCRATCH, ["pi", "--session", "conv.jsonl"])
+    sig = DAEMON.gc_reaper.path(name)
     try:
-        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
-        DAEMON.reap_idle_if_due(sess)
-        assert_true(os.path.exists(sig), "first warning written")
-        # Backdate the window and place activity after it: the session is
-        # idle again, but the live warning predates its last work.
-        old = time.time() - daemon.IDLE_REAP - 100.0
-        DAEMON.idle_warnings.get(name)["sent"] = old
-        sess.last_activity = old + 10.0
-        DAEMON.reap_idle_if_due(sess)
-        assert_true(not os.path.exists(sig),
-                    "stale warning dropped after later activity")
-        assert_eq(sess.child.kills, 0, "activity spared the session")
-        # The next due reap warns fresh instead of reaping the old ask.
-        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
-        DAEMON.reap_idle_if_due(sess)
-        assert_true(os.path.exists(sig), "fresh warning written")
-        assert_eq(sess.child.kills, 0, "fresh warning spares again")
-    finally:
-        daemon.IDLE_WARN_GRACE = orig
-        DAEMON.idle_warnings.grace = orig
-        DAEMON.idle_warnings.remove(name)
-        DAEMON.table.remove_if(sess)
-
-
-def test_idle_warning_spares_and_expiry():
-    """With IDLE_WARN_GRACE > 0 a due reap warns before ending: the file
-    lands, the session is spared while the window stands, deleting it
-    re-arms the clock, and a file left past the grace proceeds to
-    terminate."""
-    name = "pi-warnspares"
-    sess = daemon.Session(name, SCRATCH, ["pi"], pid=1, master_fd=-1,
-                          child=_FinishChild())
-    DAEMON.table.put(sess)
-    sig = os.path.join(daemon.IDLE_WARNING_DIR, name + ".json")
-    orig = daemon.IDLE_WARN_GRACE
-    daemon.IDLE_WARN_GRACE = 2.0
-    DAEMON.idle_warnings.grace = 2.0
-    try:
-        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
-        DAEMON.reap_idle_if_due(sess)
-        assert_true(os.path.exists(sig), "idle warning file written")
-        rec = json.load(open(sig))
-        assert_eq(rec.get("id"), name, "warning names the session")
-        assert_true(isinstance(rec.get("ts"), float), "warning is stamped")
-        assert_true(DAEMON.idle_warnings.get(name) is not None,
-                    "the reap opened the warning window")
+        sess.last_activity = time.time() - daemon.GC_IDLE - 1.0
+        DAEMON.request_gc_reap_if_due(sess)
+        assert_true(os.path.exists(sig), "due session not asked")
+        assert_true(DAEMON.gc_reaper.requested(name), "request not recorded")
+        assert_true(DAEMON.control.gc_reap_ack({"name": name}).get("ok"))
+        assert_true(sess.stopping, "acknowledged session not marked stopping")
+        assert_true(not os.path.exists(sig), "ack did not clear the request")
+        assert_true(not DAEMON.gc_reaper.requested(name),
+                    "ack did not drop the request record")
+        assert_true(name not in DAEMON.registry.load(),
+                    "acknowledged session still respawnable")
+        assert_eq(sess.child.kills, 0, "the daemon never force-kills")
+        # A consented stop is final: revive returns early and spawns
+        # nothing, so the table entry stays the same object.
+        DAEMON.revive(sess, 1)
         assert_true(DAEMON.table.get(name) is sess,
-                    "session spared while the warning stands")
-        assert_eq(sess.child.kills, 0, "spared session not terminated")
-        # Deletion is the working answer: the file goes, the clock re-arms.
-        os.unlink(sig)
-        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
-        DAEMON.reap_idle_if_due(sess)
-        assert_eq(sess.child.kills, 0, "deleted warning spares the session")
-        assert_true(DAEMON.idle_warnings.get(name) is None,
-                    "deleted warning closes the window")
-        assert_true(time.time() - sess.last_activity < 5.0,
-                    "deleted warning re-arms the idle clock")
-        # File left past the grace: silence is consent.
-        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
-        DAEMON.reap_idle_if_due(sess)
-        assert_true(os.path.exists(sig), "a new warning is left")
-        DAEMON.idle_warnings.warn(
-            name, now=time.time() - daemon.IDLE_WARN_GRACE - 1.0)
-        DAEMON.reap_idle_if_due(sess)
-        assert_eq(sess.child.kills, 1, "expired warning terminates")
-        assert_true(not os.path.exists(sig), "expired warning unlinked")
-        assert_true(DAEMON.idle_warnings.get(name) is None,
-                    "expired window closed")
+                    "consented reap was revived")
     finally:
-        daemon.IDLE_WARN_GRACE = orig
-        DAEMON.idle_warnings.grace = orig
-        DAEMON.idle_warnings.close(name)
+        DAEMON.gc_reaper.clear(name)
+        DAEMON.registry.drop(name)
         DAEMON.table.remove_if(sess)
-
-
-def test_idle_warning_deletion_rearms():
-    """Deleting an idle warning file is the working answer: the session
-    is spared and its idle clock re-armed; a later due reap warns again,
-    and leaving that warning is consent to end the session."""
-    name = "pi-warnctl"
-    DAEMON.control.stop({"name": name})  # idempotent re-run guard
-    r = DAEMON.control.start(
-        {"name": name, "dir": SCRATCH,
-         "argv": ["sh", "-c", "echo hosted-ready; sleep 60"]})
-    assert_true(r.get("ok"), r)
-    sess = DAEMON.table.get(name)
-    assert_true(sess is not None, "session did not appear")
-    sig = os.path.join(daemon.IDLE_WARNING_DIR, name + ".json")
-    orig = daemon.IDLE_WARN_GRACE
-    daemon.IDLE_WARN_GRACE = 2.0
-    DAEMON.idle_warnings.grace = 2.0
-    try:
-        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
-        DAEMON.reap_idle_if_due(sess)
-        assert_true(os.path.exists(sig), "due reap warns first")
-        # Deleting the file reports the session working.
-        os.unlink(sig)
-        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
-        DAEMON.reap_idle_if_due(sess)
-        assert_true(not os.path.exists(sig),
-                    "deleted warning is not rewritten")
-        assert_true(DAEMON.idle_warnings.get(name) is None)
-        assert_true(time.time() - sess.last_activity < 5.0,
-                    "deletion re-arms the idle clock")
-        assert_true(DAEMON.table.get(name) is sess,
-                    "deletion spares the session")
-        # A new due reap warns again; leaving it past the grace ends it.
-        sess.last_activity = time.time() - daemon.IDLE_REAP - 1.0
-        DAEMON.reap_idle_if_due(sess)
-        assert_true(os.path.exists(sig), "re-armed reap warns again")
-        DAEMON.idle_warnings.warn(
-            name, now=time.time() - daemon.IDLE_WARN_GRACE - 1.0)
-        DAEMON.reap_idle_if_due(sess)
-    finally:
-        daemon.IDLE_WARN_GRACE = orig
-        DAEMON.idle_warnings.grace = orig
-    for _ in range(50):
-        if DAEMON.table.get(name) is None:
-            break
-        time.sleep(0.05)
-    assert_true(DAEMON.table.get(name) is None, "consent ended the session")
-    assert_true(not os.path.exists(sig), "ended session cleared the warning")
-    assert_true(name not in DAEMON.registry.load(),
-                "consented stop is never respawnable")
 
 
 # --- restart handover (registry dedupe, roster, idle watch) -----------------
@@ -1754,22 +1679,18 @@ def _main():
        test_extensions_reload_deferral)
     ok("watch loop owes busy sessions until idle",
        test_ext_watch_loop_owes_busy_sessions)
-    ok("idle reap detects and ends detached idle sessions",
-       test_idle_reap_detects_and_ends_detached_sessions)
-    ok("idle reap spares busy and attached sessions",
-       test_idle_reap_spares_busy_and_attached)
+    ok("gc reap requests detached idle sessions",
+       test_gc_reap_requests_detached_sessions)
+    ok("gc reap spares busy and attached sessions",
+       test_gc_reap_spares_busy_and_attached)
     ok("package settings (env > file > default)",
        test_package_settings_resolution)
-    ok("startup purges stale idle warnings",
-       test_startup_purges_stale_idle_warnings)
-    ok("activity after a warning re-arms a fresh one",
-       test_activity_after_warning_rearms_a_fresh_warning)
-    ok("idle warnings (open/expired/get/close)",
-       test_idle_warnings_windows)
-    ok("due reap warns first, deletion spares, expiry ends",
-       test_idle_warning_spares_and_expiry)
-    ok("deleting the warning re-arms, silence ends",
-       test_idle_warning_deletion_rearms)
+    ok("startup purges stale gc reap requests",
+       test_startup_purges_stale_gc_reap_requests)
+    ok("gc reaper owns the one idle policy and its request",
+       test_gc_reaper_owns_requests)
+    ok("gc reap ack discards and never revives",
+       test_gc_reap_ack_discards_and_never_revives)
     ok("registry dedupe (one entry per conversation)", test_registry_dedupe)
     ok("restart planner prefers the attached duplicate",
        test_restart_planner_prefers_attached)

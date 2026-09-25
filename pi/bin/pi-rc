@@ -70,6 +70,11 @@
 #                                       is unreachable); used by the pi
 #                                       wrapper's resume guard
 #   pi-rc stop <name>                   kill one session (ends that pi)
+#   pi-rc gc-reap-ack <name>            the daemon extension's answer to
+#                                       the daemon's GC reap request: clear
+#                                       the request and the registry entry
+#                                       before the session reaps itself
+#                                       through the daemon_gc_reap tool
 #   pi-rc ticket-submit [--session <n>] [--cwd <dir>] [--env KEY=VALUE]
 #                       -- <command>... run a shell command as a
 #                                       daemon-owned ticket: it outlives
@@ -191,7 +196,7 @@ DETACH_KEY = b"\x1c"  # Ctrl-\: pop out of an attached session without exiting p
 
 # Commands served by main(); ls has a list alias.
 _COMMANDS = ("which", "whichall", "owned", "state", "carry", "resume", "start",
-			 "attach", "announce", "detach", "stop", "handover",
+			 "attach", "announce", "detach", "stop", "gc-reap-ack", "handover",
 			 "daemon-start", "daemon-stop", "daemon-restart",
 			 "input", "extensions-reload",
 			 "ticket-submit", "ticket-wait", "ticket-output",
@@ -953,6 +958,19 @@ def cmd_stop(args, client):
 	print("pi-rc: stopped '%s'" % session)
 
 
+def cmd_gc_reap_ack(args, client):
+	# Extension-only: the daemon_gc_reap tool acknowledges the daemon's GC
+	# reap request before shutting this session down. Best-effort from the
+	# caller's side: the daemon's child-exit cleanup drops an unacknowledged
+	# session anyway.
+	if len(args) != 1:
+		usage_error("gc-reap-ack takes exactly one session name")
+	session = session_name(args[0])
+	resp = client.control({"cmd": "gc-reap-ack", "name": session})
+	if not resp.get("ok"):
+		die("gc-reap-ack failed: %s" % resp.get("error"))
+
+
 def cmd_carry(args, client):
 	# Extension-only helper for /new: the daemon spawns a fresh hosted
 	# session sized like the current view, moves this session's bridge
@@ -1380,6 +1398,7 @@ def main():
 		 "carry": cmd_carry, "resume": cmd_resume, "start": cmd_start,
 		 "attach": cmd_attach, "announce": cmd_announce,
 		 "detach": cmd_detach, "stop": cmd_stop,
+		 "gc-reap-ack": cmd_gc_reap_ack,
 		 "handover": cmd_handover,
 		 "daemon-start": cmd_daemon_start, "daemon-stop": cmd_daemon_stop,
 		 "daemon-restart": cmd_daemon_restart,

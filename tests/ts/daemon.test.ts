@@ -278,6 +278,7 @@ test("daemon: factory wires the command and events", () => {
   assert(pi.commands.has("daemon-reload"), "reload command registered");
   assert(pi.commands.has("daemon-settings"),
     "daemon-settings command registered");
+  assert(pi.tools.has("daemon_gc_reap"), "gc reap tool registered");
   assertEq(pi.onCalls.get("session_start") ?? 0, 4, "four session_start listeners");
   assertEq(pi.onCalls.get("session_shutdown") ?? 0, 2);
   assertEq(pi.onCalls.get("before_agent_start") ?? 0, 1);
@@ -288,11 +289,13 @@ test("daemon: factory wires the command and events", () => {
 
 class MockPi {
   readonly commands = new Map<string, unknown>();
+  readonly tools = new Map<string, any>();
   readonly onCalls = new Map<string, number>();
   readonly sessionStarters: Array<(event: any) => Promise<void>> = [];
   readonly shutdownHandlers: Array<(event: any) => Promise<void>> = [];
   readonly messages: string[] = [];
   readonly messageOptions: Array<Record<string, unknown>> = [];
+  readonly execCalls: Array<{ file: string; args: string[] }> = [];
   on(name: string, handler: any): void {
     this.onCalls.set(name, (this.onCalls.get(name) ?? 0) + 1);
     if (name === "session_start") this.sessionStarters.push(handler);
@@ -301,7 +304,11 @@ class MockPi {
   registerCommand(name: string, def: unknown): void {
     this.commands.set(name, def);
   }
-  async exec(): Promise<ExeResult> {
+  registerTool(def: any): void {
+    this.tools.set(def.name, def);
+  }
+  async exec(file: string, args: string[]): Promise<ExeResult> {
+    this.execCalls.push({ file, args });
     return { code: 0, stdout: "", stderr: "", killed: false };
   }
   async sendUserMessage(
@@ -480,46 +487,77 @@ test("daemon: session_shutdown stops the watcher (no leaked watchers)", async ()
   });
 });
 
-test("daemon: idle warning steers the agent once per window", async () => {
-  const state = join(scratchDir(), "warning-state");
-  await hosted("pi-warnq", async () => {
+test("daemon: gc reap request steers the agent once per request", async () => {
+  const state = join(scratchDir(), "gc-reap-state");
+  await hosted("pi-gcq", async () => {
     await withEnv({ XDG_STATE_HOME: state }, async () => {
       const pi = new MockPi();
       factory(pi as never);
-      // session_start listeners: [reload watcher, idle warning watcher]
+      // session_start listeners: [reload watcher, gc reap watcher]
       await pi.sessionStarters[1]({ reason: "startup" });
-      const dir = join(state, "pi-pty-host", "idle-warning");
+      const dir = join(state, "pi-pty-host", "gc-reap");
       mkdirSync(dir, { recursive: true });
-      const sig = join(dir, "pi-warnq.json");
-      // the daemon warned: the agent is steered exactly once, with the
-      // file it must delete to stay alive
-      writeFileSync(sig, JSON.stringify({ id: "pi-warnq", ts: 1 }));
-      await waitFor(() => pi.messages.length === 1, "warning surfaced");
+      const sig = join(dir, "pi-gcq.json");
+      // the daemon asked: the agent is steered exactly once, naming the
+      // tool to call and the request file it backs
+      writeFileSync(sig, JSON.stringify({ id: "pi-gcq", ts: 1 }));
+      await waitFor(() => pi.messages.length === 1, "request surfaced");
       assertEq(pi.messageOptions[0].triggerTurn, true);
       assertEq(pi.messageOptions[0].deliverAs, "steer");
+      assert(pi.messages[0].includes("daemon_gc_reap"),
+        "the request names the tool to call");
       assert(pi.messages[0].includes(sig),
-        "the warning names the file to delete");
-      assert(pi.messages[0].includes("delete"),
-        "the warning tells the agent to delete it");
-      // re-arming the same watcher never re-asks an open window
+        "the request names the file");
+      // re-arming the same watcher never re-asks an open request
       await pi.sessionStarters[1]({ reason: "startup" });
       await new Promise((resolve) => setTimeout(resolve, 150));
-      assertEq(pi.messages.length, 1, "open window not re-asked");
-      // a new window (fresh ts) asks again
-      writeFileSync(sig, JSON.stringify({ id: "pi-warnq", ts: 2 }));
-      await waitFor(() => pi.messages.length === 2, "new window re-asked");
-      // a warning older than its own window is stale (a crashed daemon
-      // left it) and is not surfaced
-      writeFileSync(sig, JSON.stringify({
-        id: "pi-warnq", ts: Date.now() / 1000 - 1000, grace: 60,
-      }));
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      assertEq(pi.messages.length, 2, "stale warning not surfaced");
-      // session_shutdown stops the watcher: later warnings never fire
+      assertEq(pi.messages.length, 1, "open request not re-asked");
+      // a new request (fresh ts) asks again
+      writeFileSync(sig, JSON.stringify({ id: "pi-gcq", ts: 2 }));
+      await waitFor(() => pi.messages.length === 2, "new request re-asked");
+      // session_shutdown stops the watcher: later requests never fire
       await pi.shutdownHandlers[1]({ reason: "quit" });
-      writeFileSync(sig, JSON.stringify({ id: "pi-warnq", ts: 3 }));
+      writeFileSync(sig, JSON.stringify({ id: "pi-gcq", ts: 3 }));
       await new Promise((resolve) => setTimeout(resolve, 150));
       assertEq(pi.messages.length, 2, "no watcher left after shutdown");
+    });
+  });
+});
+
+test("daemon: daemon_gc_reap acknowledges and shuts the session down", async () => {
+  const state = join(scratchDir(), "gc-reap-tool");
+  await hosted("pi-gctool", async () => {
+    await withEnv({ XDG_STATE_HOME: state }, async () => {
+      const pi = new MockPi();
+      factory(pi as never);
+      const tool = pi.tools.get("daemon_gc_reap");
+      assert(tool !== undefined, "gc reap tool registered");
+      const c = ctx();
+      await tool.execute("call-1", {}, undefined, undefined, c as never);
+      assertEq(c.shutdownCalled, true, "tool shuts the session down");
+      const ack = pi.execCalls.find((call) =>
+        call.args.includes("gc-reap-ack"));
+      assert(ack !== undefined, "tool acknowledged the daemon's request");
+      assertEq(ack.args[ack.args.length - 1], "gctool",
+        "ack uses the short hosted session name");
+    });
+  });
+});
+
+test("daemon: daemon_gc_reap never shuts an unhosted session down", async () => {
+  const state = join(scratchDir(), "gc-reap-unhosted");
+  await hosted("", async () => {
+    await withEnv({ XDG_STATE_HOME: state }, async () => {
+      const pi = new MockPi();
+      factory(pi as never);
+      const tool = pi.tools.get("daemon_gc_reap");
+      const c = ctx();
+      const result = await tool.execute(
+        "call-1", {}, undefined, undefined, c as never);
+      assertEq(c.shutdownCalled, undefined,
+        "unhosted session must not shut down");
+      assert(String(result.content[0].text).includes("not a hosted"),
+        "the tool reports nothing to reap");
     });
   });
 });

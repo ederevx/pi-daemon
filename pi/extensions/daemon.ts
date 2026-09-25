@@ -83,6 +83,7 @@ import { basename, dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { DaemonSettingsPresenter } from "./settings/presenter.ts";
 
 /** Directory of this extension module, when loaded as an ES module. */
@@ -152,15 +153,15 @@ export function reloadSignalPath(
 		`${session}.json`);
 }
 
-/** The daemon's per-session idle-warning file, mirroring the daemon's
- *  IDLE_WARNING_DIR (REG_DIR/idle-warning/<name>.json). Empty outside
- *  hosting: only hosted sessions are ever warned. */
-export function idleWarningPath(
+/** The daemon's per-session GC reap-request file, mirroring the
+ *  daemon's GC_REAP_REQUEST_DIR (REG_DIR/gc-reap/<name>.json). Empty
+ *  outside hosting: only hosted sessions are ever asked. */
+export function gcReapRequestPath(
 	session: string = process.env.PI_HOSTED_SESSION || "",
 	platform: string = process.platform,
 ): string {
 	if (!session) return "";
-	return join(stateHome(platform), "pi-pty-host", "idle-warning",
+	return join(stateHome(platform), "pi-pty-host", "gc-reap",
 		`${session}.json`);
 }
 
@@ -588,60 +589,59 @@ export class HostedReloadWatcher {
 	}
 }
 
-/** An idle warning the daemon left for this session. */
-interface IdleWarning {
+/** A GC reap request the daemon left for this session. */
+interface GcReapRequest {
 	id?: unknown;
 	ts?: unknown;
-	grace?: unknown;
 }
 
-/** Watches the daemon's per-session idle-warning file and surfaces the
- *  daemon's warning to the agent.
+/** Watches the daemon's per-session GC reap-request file and steers the
+ *  agent to reap itself.
  *
- *  When a hosted session has been detached and model-idle past the reap
- *  grace, the daemon (reap_idle_if_due) writes
- *  <state>/pi-pty-host/idle-warning/<session>.json and spares the
- *  session while the warning window is open; deleting the file is the
- *  working answer, and leaving it past the grace ends the session. This
- *  class watches the directory: on a fresh warning it steers one message
- *  to the agent telling it to delete the file to stay alive. Each
- *  warning fires once (per ts): a watcher restart never re-asks a
- *  surfaced warning, while a later window (a new ts) fires again. The
- *  watcher is session-scoped: it is stopped on session_shutdown and
- *  session switches and re-armed by the next session_start. */
-export class IdleWarningWatcher {
+ *  When a hosted session has been detached and model-idle past the GC
+ *  window, the daemon (GcReaper.request_if_due) writes
+ *  <state>/pi-pty-host/gc-reap/<session>.json. This class watches the
+ *  directory: on a fresh request it steers one message to the agent
+ *  telling it to call the daemon_gc_reap tool, which acknowledges the
+ *  request and shuts the session down. Each request fires once (per ts):
+ *  a watcher restart never re-asks a surfaced request, while a later
+ *  request (a new ts) fires again. The watcher is session-scoped: it is
+ *  stopped on session_shutdown and session switches and re-armed by the
+ *  next session_start. */
+export class GcReapWatcher {
 	private watcher: ReturnType<typeof watch> | null = null;
-	/** ts of the warning already surfaced to the agent. */
+	/** ts of the request already surfaced to the agent. */
 	private surfacedTs: number | null = null;
 
 	constructor(
-		private readonly warningFile: string,
-		private readonly warn: (name: string, path: string) => void,
+		private readonly requestFile: string,
+		private readonly request: (name: string, path: string) => void,
 	) {}
 
-	/** Watch the warning directory; a file written before this point
+	/** Watch the request directory; a file written before this point
 	 *  (between daemon write and watcher registration) is picked up by
-	 *  the initial peek. No-op outside hosting (empty warning path). */
+	 *  the initial peek. No-op outside hosting (empty request path). */
 	start(): void {
-		if (!this.warningFile) return;
+		if (!this.requestFile) return;
 		this.stop();
 		try {
-			mkdirSync(dirname(this.warningFile), { recursive: true });
-			this.watcher = watch(dirname(this.warningFile),
+			mkdirSync(dirname(this.requestFile), { recursive: true });
+			this.watcher = watch(dirname(this.requestFile),
 				(_event, filename) => {
 					// filename can be null on some platforms: peek is
 					// cheap and harmless, it reads only our own file.
-					if (!filename || filename === basename(this.warningFile)) {
+					if (!filename || filename === basename(this.requestFile)) {
 						this.peek();
 					}
 				});
 			// Peek only after the watch is armed: the daemon writes each
-			// warning exactly once, so a write landing between an earlier
+			// request exactly once, so a write landing between an earlier
 			// peek and the watch would be lost forever.
 			this.peek();
 		} catch {
-			// Missing or unwatchable directory: the warning still expires
-			// on its own (silence ends the session); we just never ask.
+			// Missing or unwatchable directory: the request is simply
+			// never surfaced and the session stays (the daemon never
+			// force-kills); we just never ask.
 			this.watcher = null;
 		}
 	}
@@ -662,29 +662,21 @@ export class IdleWarningWatcher {
 		return this.watcher !== null;
 	}
 
-	/** Read the warning file and surface a fresh warning exactly once. */
+	/** Read the request file and surface a fresh request exactly once. */
 	private peek(): void {
 		let id: string | null = null;
 		let ts: number | null = null;
-		let grace: number | null = null;
 		try {
 			const rec = JSON.parse(
-				readFileSync(this.warningFile, "utf8")) as IdleWarning;
+				readFileSync(this.requestFile, "utf8")) as GcReapRequest;
 			if (typeof rec.id === "string") id = rec.id;
 			if (typeof rec.ts === "number") ts = rec.ts;
-			if (typeof rec.grace === "number") grace = rec.grace;
 		} catch {
 			return; // gone or unreadable: nothing pending
 		}
 		if (!id || ts === null || ts === this.surfacedTs) return;
-		// A warning older than its own window is stale (a leftover from a
-		// crashed daemon): the live window no longer backs it, so ignore it.
-		if (grace !== null && grace > 0
-			&& Date.now() / 1000 - ts > grace) {
-			return;
-		}
 		this.surfacedTs = ts;
-		this.warn(id, this.warningFile);
+		this.request(id, this.requestFile);
 	}
 }
 
@@ -731,6 +723,24 @@ export class RcBackground {
 	 *  get the short form exactly like detach does. */
 	private hostedSession(): string {
 		return (process.env.PI_HOSTED_SESSION || "").replace(/^pi-/, "");
+	}
+
+	/** Acknowledge the daemon's GC reap request for this hosted session:
+	 *  the daemon clears the request and its registry entry before the
+	 *  daemon_gc_reap tool shuts this session down. Returns whether this
+	 *  was a hosted session (false means there is nothing to reap, so the
+	 *  tool must not shut an unhosted pi down). Best-effort — an
+	 *  unreachable daemon still lets the shutdown proceed, and the
+	 *  daemon's child-exit cleanup drops the session anyway. */
+	async acknowledgeGcReap(): Promise<boolean> {
+		const session = this.hostedSession();
+		if (!session) return false;
+		try {
+			await this.runPiRc(["gc-reap-ack", session]);
+		} catch {
+			// Unreachable daemon: the exit cleanup still applies.
+		}
+		return true;
 	}
 
 	/** Ensure the daemon is reachable, starting the background service
@@ -1113,25 +1123,63 @@ export default function (pi: ExtensionAPI) {
 		reloadWatcher.stop();
 	});
 
-	// The daemon warns a detached model-idle session before ending it
-	// (idle-warning file); the watcher surfaces one message telling the
-	// agent to delete the file to stay alive.
-	const idleWarningWatcher = new IdleWarningWatcher(
-		idleWarningPath(), (_name, path) => {
+	// The daemon asks a detached model-idle session to reap itself by
+	// writing a per-session request file; the watcher surfaces one
+	// message telling the agent to call the daemon_gc_reap tool.
+	const gcReapWatcher = new GcReapWatcher(
+		gcReapRequestPath(), (_name, path) => {
 			void pi.sendMessage(
 				"pi-daemon: this session has been detached and model-idle " +
-				"past the reap grace and will end soon. To keep it alive, " +
-				`delete \`${path}\` now; leaving it in place ends the session.`,
+				"past the GC window. Call the `daemon_gc_reap` tool to reap " +
+				"this session now, or keep working to stay alive; the " +
+				`request at \`${path}\` stays until then.`,
 				{ triggerTurn: true, deliverAs: "steer" });
 		});
 	pi.on("session_start", async () => {
-		idleWarningWatcher.start();
+		gcReapWatcher.start();
 	});
 	pi.on("session_shutdown", async () => {
-		idleWarningWatcher.stop();
+		gcReapWatcher.stop();
 	});
 	pi.on("session_before_switch", async () => {
-		idleWarningWatcher.stop();
+		gcReapWatcher.stop();
+	});
+
+	// The one GC reaper tool: calling it is the voluntary reap. It
+	// acknowledges the daemon's request (so the daemon clears the
+	// request and its registry entry) and then shuts the session down.
+	pi.registerTool({
+		name: "daemon_gc_reap",
+		label: "daemon gc reap",
+		description:
+			"Reap this hosted pi-daemon session voluntarily. Call this " +
+			"when the daemon asks a long-idle detached session to reap " +
+			"itself (or when you are otherwise done): it acknowledges " +
+			"the request to the daemon and ends this session.",
+		promptSnippet: "Reap this long-idle hosted session",
+		promptGuidelines: [
+			"Call daemon_gc_reap only when the pi-daemon asks this " +
+				"long-idle detached session to reap itself, or when you " +
+				"are deliberately done; it ends the session.",
+		],
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const hosted = await app.acknowledgeGcReap();
+			if (!hosted) {
+				return {
+					content: [{
+						type: "text",
+						text: "not a hosted session; nothing to reap",
+					}],
+					details: undefined,
+				};
+			}
+			ctx.shutdown();
+			return {
+				content: [{ type: "text", text: "reaping this session" }],
+				details: undefined,
+			};
+		},
 	});
 
 	// Reload entrypoint queued by the signal watcher. With a fresh

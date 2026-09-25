@@ -173,6 +173,7 @@ bash scripts/uninstall.sh
 ```
 pi/
   extensions/daemon.ts   # /bg: detach/handover + reload-diff relay
+                         # + the daemon_gc_reap tool
   extensions/offload.ts  # ticket offloading + daemon_tasks tool
   bin/pi-rc              # client: tickets, bridge, input, reload,
                          # start/attach/detach/announce/ls/which/stop
@@ -197,8 +198,7 @@ with the built-in default as the fallback.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `idleReapHours` | `12` | Detached model-idle sessions are ended after this many hours. `0` disables. |
-| `idleWarnGraceHours` | `1` | The warning window in hours before that reap: delete the idle-warning file to stay alive, leave it as consent. `0` reaps immediately. |
+| `gcIdleHours` | `3` | Detached model-idle sessions are asked to reap themselves through the `daemon_gc_reap` tool after this many hours. `0` disables. |
 | `daemonIdleTimeoutHours` | `12` | Self-shutdown after this many hours with nothing attached, all sessions idle, and no tickets. `0` disables. |
 | `minReviveLifeSeconds` | `30` | A hosted pi that lived shorter than this is never revived. |
 | `reloadGuardGraceSeconds` | `60` | No-spawn guard after an in-place reload. |
@@ -212,8 +212,7 @@ with the built-in default as the fallback.
 | `offload.enabled` | `true` | Enable bash offloading. |
 | `offload.waitSeconds` | `120` | Hand-off bound before a command becomes a background ticket. |
 
-Environment overrides: `PI_PTYD_IDLE_REAP_HOURS`,
-`PI_PTYD_IDLE_WARN_HOURS`,
+Environment overrides: `PI_DAEMON_GC_IDLE_HOURS`,
 `PI_DAEMON_IDLE_TIMEOUT_HOURS`, `PI_PTYD_MIN_REVIVE_LIFE`,
 `PI_PTYD_RELOAD_GUARD_GRACE`, `PI_PTYD_RELOAD_SIGNAL_GRACE`,
 `PI_PTYD_TICKET_TTL_HOURS`, `PI_PTYD_TICKET_GC`, `PI_PTYD_EXT_WATCH`,
@@ -229,12 +228,14 @@ file mode. A row whose environment variable is set is marked
 apply on the next daemon restart; `offload.*` applies after the automatic
 extension reload.
 
-The GC reaper windows (`idleReapHours`, `idleWarnGraceHours`,
+The GC reaper windows (`gcIdleHours`,
 `daemonIdleTimeoutHours`, `ticketTtlHours`) are configured in hours;
 the daemon converts them to seconds internally. A non-finite or
 negative number is rejected and the next source applies, so a
 hand-written `Infinity` or `nan` cannot make a session un-reapable.
-`0` disables the corresponding reaper.
+`0` disables the corresponding reaper. The session reaper never
+force-kills: it writes a per-session reap request the extension
+surfaces, and the session reaps itself by calling `daemon_gc_reap`.
 
 ## Maintenance conventions
 

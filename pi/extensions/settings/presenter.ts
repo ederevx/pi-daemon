@@ -79,12 +79,9 @@ export class DaemonSettingsPresenter {
 		const agent = process.env.PI_CODING_AGENT_DIR
 			|| join(homedir(), ".pi", "agent");
 		return [
-			this.number("idleReapHours", "Idle reap (h)",
-				"End detached model-idle sessions after this many hours; 0 disables",
-				"PI_PTYD_IDLE_REAP_HOURS", 12),
-			this.number("idleWarnGraceHours", "Idle warning grace (h)",
-				"Hours before the reap; delete the file to stay alive",
-				"PI_PTYD_IDLE_WARN_HOURS", 1),
+			this.number("gcIdleHours", "GC idle (h)",
+				"Ask detached model-idle sessions to reap after this many hours; 0 disables",
+				"PI_DAEMON_GC_IDLE_HOURS", 3),
 			this.number("daemonIdleTimeoutHours", "Daemon idle timeout (h)",
 				"Self-shutdown after this many idle hours; 0 disables",
 				"PI_DAEMON_IDLE_TIMEOUT_HOURS", 12),
