@@ -125,7 +125,7 @@
 #
 # Idle auto-shutdown: when nothing has been attached, every session's
 # published model state is idle, and no ticket is running for
-# PI_DAEMON_IDLE_TIMEOUT_HOURS hours (default 12, 0 disables) continuously,
+# PI_DAEMON_IDLE_TIMEOUT_HOURS hours (default 1, 0 disables) continuously,
 # the daemon performs the same graceful shutdown as pi-rc daemon-stop.
 #
 # Single-daemon guarantee: every daemon publishes its control
@@ -273,7 +273,7 @@ ABSORB_SETTLE = 0.5
 # The window is configured in hours; daemonIdleTimeoutHours=0 disables
 # the sweep.
 DAEMON_IDLE_TIMEOUT = SETTINGS.resolve("PI_DAEMON_IDLE_TIMEOUT_HOURS",
-									   "daemonIdleTimeoutHours", 12.0) * 3600.0
+									   "daemonIdleTimeoutHours", 1.0) * 3600.0
 # Sweep cadence: bounded so small test timeouts still sweep promptly.
 IDLE_SWEEP_TICK = (max(0.2, min(10.0, DAEMON_IDLE_TIMEOUT / 5.0))
 				   if DAEMON_IDLE_TIMEOUT > 0 else 60.0)

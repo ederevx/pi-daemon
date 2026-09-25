@@ -84,7 +84,7 @@ export class DaemonSettingsPresenter {
 				"PI_DAEMON_GC_IDLE_HOURS", 3),
 			this.number("daemonIdleTimeoutHours", "Daemon idle timeout (h)",
 				"Self-shutdown after this many idle hours; 0 disables",
-				"PI_DAEMON_IDLE_TIMEOUT_HOURS", 12),
+				"PI_DAEMON_IDLE_TIMEOUT_HOURS", 1),
 			this.number("minReviveLifeSeconds", "Min revive life",
 				"A hosted pi that lived shorter than this is never revived",
 				"PI_PTYD_MIN_REVIVE_LIFE", 30),

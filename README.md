@@ -199,7 +199,7 @@ with the built-in default as the fallback.
 | Key | Default | Purpose |
 |---|---|---|
 | `gcIdleHours` | `3` | Detached model-idle sessions are asked to reap themselves through the `daemon_gc_reap` tool after this many hours. `0` disables. |
-| `daemonIdleTimeoutHours` | `12` | Self-shutdown after this many hours with nothing attached, all sessions idle, and no tickets. `0` disables. |
+| `daemonIdleTimeoutHours` | `1` | Self-shutdown after this many hours with nothing attached, all sessions idle, and no tickets. `0` disables. |
 | `minReviveLifeSeconds` | `30` | A hosted pi that lived shorter than this is never revived. |
 | `reloadGuardGraceSeconds` | `60` | No-spawn guard after an in-place reload. |
 | `reloadSignalGraceSeconds` | `2.0` | Wait for an in-session reload signal before typing `/reload`. |

@@ -1309,7 +1309,7 @@ def test_idle_shutdown_watch():
     or waiting session, an attached viewer, a running ticket, or a
     parked handover connection; a fully detached idle daemon is
     quiescent."""
-    assert_eq(daemon.DAEMON_IDLE_TIMEOUT, 12 * 3600.0)
+    assert_eq(daemon.DAEMON_IDLE_TIMEOUT, 1 * 3600.0)
     watch = daemon.IdleShutdownWatch(DAEMON, DAEMON.shutdown_event)
     assert_true(watch.quiescent())
     sess = daemon.Session("pi-idlewatch", SCRATCH, ["pi"],
