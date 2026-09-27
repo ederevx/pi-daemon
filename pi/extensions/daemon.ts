@@ -67,7 +67,9 @@
  * GC window (`piDaemon.gcIdleHours`) immediately. The automatic GC
  * reaper only asks such sessions to reap themselves through the
  * `daemon_gc_reap` tool; this command is the explicit forceful
- * counterpart, and it spares attached and busy sessions.
+ * counterpart, and it spares attached and busy sessions. Separately,
+ * an automatic session-store sweep discards aged conversations no live
+ * session backs.
  *
  * Ctrl+D cannot be used for this: pi refuses extension shortcuts that
  * conflict with a built-in binding (app.exit is Ctrl+D) — registration is

@@ -95,7 +95,7 @@ test("settings: rows cover every piDaemon setting in order", async () => {
 		assertEq(watch.value, "on", "extWatch default is on");
 		const reap = rows.find((row) => row.id === "gcIdleHours")!;
 		assert(reap.submenu !== undefined, "number row opens an editor");
-		assertEq(reap.value, "3", "gc idle default");
+		assertEq(reap.value, "24", "gc idle default");
 		const wait = rows.find((row) => row.id === "offload.waitSeconds")!;
 		assertEq(wait.value, "120", "offload wait default from offload.ts");
 		const roots = rows.find((row) => row.id === "extWatchRoots")!;
@@ -142,7 +142,7 @@ test("settings: non-TUI present lists the rows on stderr", async () => {
 	}
 	const text = lines.join("\n");
 	assertMatches(text, /pi-daemon-settings:/);
-	assertMatches(text, /GC idle \(h\): .*current: 3/);
+	assertMatches(text, /GC idle \(h\): .*current: 24/);
 	assertMatches(text, /Offload wait: .*current: 120/);
 });
 
