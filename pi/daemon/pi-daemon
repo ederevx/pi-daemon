@@ -30,7 +30,9 @@
 # child-exit cleanup drops it. The automatic reaper only ever asks; the
 # operator can force the issue with `daemon-purge`, which stops every
 # detached, model-idle session past the same window immediately with the
-# consented-stop semantics of the tool.
+# consented-stop semantics of the tool. Independently, the session store
+# GC unlinks aged conversations in pi's session store that no live
+# session backs, so they stop surfacing in pi's /resume picker.
 #
 # The daemon holds no terminal history: a detached session keeps running
 # headless and an attach re-wires the bridge, sizing the PTY for the new
@@ -253,17 +255,23 @@ REAP_TICK = 0.5
 # Overridable for isolated tests (PI_PTYD_MIN_REVIVE_LIFE=0).
 MIN_REVIVE_LIFE = SETTINGS.resolve("PI_PTYD_MIN_REVIVE_LIFE",
 								  "minReviveLifeSeconds", 30.0)
-# The single idle policy: a hosted session that is detached (no bridge
-# viewers) and whose model has been idle for this many hours is asked
-# to reap itself through the daemon_gc_reap tool instead of piling up
-# as a phantom that respawns on every daemon restart. The window is
-# configured in hours; zero disables the request (PI_DAEMON_GC_IDLE_HOURS=0).
+# The single idle policy, in hours (PI_DAEMON_GC_IDLE_HOURS=0 disables
+# it). A hosted session that is detached (no bridge viewers) and whose
+# model has been idle this long is asked to reap itself through the
+# daemon_gc_reap tool instead of piling up as a phantom that respawns on
+# every daemon restart; separately, a conversation file in pi's session
+# store that no live holder backs and that has been untouched this long
+# is discarded so it stops surfacing in pi's /resume picker.
 GC_IDLE = SETTINGS.resolve("PI_DAEMON_GC_IDLE_HOURS", "gcIdleHours",
-						   3.0) * 3600.0
+						   24.0) * 3600.0
 # Per-session reap-request files (REG_DIR/gc-reap/<name>.json) the
 # in-session extension watches: a request asks the agent to call the
 # daemon_gc_reap tool, and the tool's acknowledgement deletes it.
 GC_REAP_REQUEST_DIR = os.path.join(REG_DIR, "gc-reap")
+# pi's conversation store: every slug directory pi's /resume picker
+# lists lives under here in the agent home. The session store GC sweeps
+# aged, unheld conversations from it.
+SESSION_STORE_ROOT = os.path.join(_agent_home, "sessions")
 # A reload injection's no-spawn guard stays armed for this long: a
 # reloaded session that dies within the window is treated as a broken
 # reload and never respawned (the reload stays strictly in-place); once
@@ -1368,8 +1376,9 @@ class IdleShutdownWatch:
 
 
 class GcReaper:
-	"""The single GC idle policy: ask a detached, model-idle session to
-	reap itself through the in-session daemon_gc_reap tool.
+	"""The session-reap half of the GC policy: ask a detached,
+	model-idle session to reap itself through the in-session
+	daemon_gc_reap tool.
 
 	The daemon never force-kills a live session. When a session's idle
 	clock passes the one GC window this class writes the per-session
@@ -1545,6 +1554,100 @@ class StateDirGc:
 	def _aged(self, path):
 		try:
 			return time.time() - os.stat(path).st_mtime > self.grace
+		except OSError:
+			return False
+
+	@staticmethod
+	def _unlink(path):
+		try:
+			os.unlink(path)
+		except OSError:
+			pass
+
+
+class SessionStoreGc:
+	"""Aged-conversation GC for pi's session store.
+
+	The daemon reaps only the sessions it hosts, so a conversation file
+	with no live holder - a crash leftover, an out-of-band pi, or a
+	conversation whose holder the daemon no longer tracks - stays in
+	pi's /resume picker forever. This owner walks every slug directory
+	pi lists and unlinks `.jsonl` conversations untouched past the GC
+	window whose first line carries pi's `session` header; a file a live
+	hosted session backs is never touched here (the ask-only GcReaper
+	owns those). One directory's failure is logged and never stops the
+	others or the sweep thread."""
+
+	def __init__(self, root, live_files, idle, shutdown_event,
+				tick=STATE_GC_TICK):
+		self.root = root
+		self.live_files = live_files
+		self.idle = float(idle)
+		self.shutdown_event = shutdown_event
+		self.tick = float(tick)
+
+	def start(self):
+		if self.idle <= 0:
+			return
+		t = threading.Thread(target=self._sweep_loop, daemon=True)
+		t.start()
+
+	def _sweep_loop(self):
+		while not self.shutdown_event.wait(self.tick):
+			self.sweep()
+
+	def sweep(self):
+		# The caller owns the one-shot startup sweep; this owns only the
+		# repeating interval, like StateDirGc and IdleShutdownWatch. A zero
+		# window disables the whole sweep.
+		if self.idle <= 0:
+			return
+		try:
+			entries = os.listdir(self.root)
+		except OSError:
+			return
+		live = self.live_files()
+		for name in entries:
+			path = os.path.join(self.root, name)
+			# A slug directory, never a root-level file; a symlink is left
+			# to pi's own picker rather than followed out of the store.
+			if os.path.islink(path) or not os.path.isdir(path):
+				continue
+			try:
+				self._sweep_dir(path, live)
+			except OSError as exc:
+				log("session store gc %s: %s" % (name, exc))
+
+	def _sweep_dir(self, path, live):
+		try:
+			names = os.listdir(path)
+		except OSError:
+			return
+		for name in names:
+			if not name.endswith(".jsonl"):
+				continue
+			full = os.path.join(path, name)
+			if full in live or not self._aged(full):
+				continue
+			if not self._is_session(full):
+				continue
+			self._unlink(full)
+
+	@staticmethod
+	def _is_session(path):
+		# Only a conversation pi's /resume picker lists: a first line
+		# carrying pi's `session` header. A foreign or unreadable .jsonl
+		# is never a candidate.
+		try:
+			with open(path, "r", encoding="utf-8", errors="replace") as f:
+				first = f.readline(MAX_BUF)
+			return json.loads(first).get("type") == "session"
+		except (OSError, ValueError):
+			return False
+
+	def _aged(self, path):
+		try:
+			return time.time() - os.stat(path).st_mtime > self.idle
 		except OSError:
 			return False
 
@@ -2027,6 +2130,9 @@ class Daemon:
 		self.state_gc = StateDirGc(REG_DIR, TICKET_LOG_DIR,
 								   self.tickets.store, LOG_PATH,
 								   self.shutdown_event)
+		self.session_store_gc = SessionStoreGc(
+			SESSION_STORE_ROOT, self._live_session_files, GC_IDLE,
+			self.shutdown_event)
 		self.roster = DaemonRoster(ROSTER_PATH)
 		self.restart_planner = RestartPlanner(self.registry, self.table)
 		self.idle_watch = IdleShutdownWatch(self, self.shutdown_event)
@@ -2066,6 +2172,8 @@ class Daemon:
 		self.tickets.start()
 		self.state_gc.sweep()
 		self.state_gc.start()
+		self.session_store_gc.sweep()
+		self.session_store_gc.start()
 		self.idle_watch.start()
 		try:
 			self._accept_loop(self.server)
@@ -2278,6 +2386,11 @@ class Daemon:
 				log("discard '%s' conversation %s" % (sess.name, sess.file))
 		except OSError as exc:
 			log("discard '%s' conversation failed: %s" % (sess.name, exc))
+
+	def _live_session_files(self):
+		# Conversation files a live hosted session backs: the session store
+		# GC must never unlink one (the ask-only GcReaper owns those).
+		return {sess.file for sess in self.table.snapshot() if sess.file}
 
 	def request_gc_reap_if_due(self, sess):
 		# The one GC policy hook: ask a detached, model-idle session to

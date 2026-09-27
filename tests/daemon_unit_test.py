@@ -31,7 +31,7 @@ os.environ["PI_CODING_AGENT_DIR"] = os.path.join(SCRATCH, "agent")
 os.makedirs(os.environ["PI_CODING_AGENT_DIR"], exist_ok=True)
 os.environ["PI_PTYD_MIN_REVIVE_LIFE"] = "0"
 # Ask detached idle sessions to reap themselves fast in tests so the
-# request path is exercised without waiting the three-hour production
+# request path is exercised without waiting the 24-hour production
 # default (hours setting).
 os.environ["PI_DAEMON_GC_IDLE_HOURS"] = "0.001"
 # The extension-reload watch must never touch the real agent home in
@@ -1071,6 +1071,44 @@ def test_state_dir_gc_daemon_log():
         os.close(logfd)
 
 
+def test_session_store_gc_prunes_aged_unheld():
+    """The session store GC unlinks aged conversations no live session
+    backs, keeps live-backed and recent ones, ignores non-.jsonl files,
+    and does nothing when the window is disabled."""
+    root = os.path.join(SCRATCH, "session-store-gc")
+    slug = os.path.join(root, "--home-proj--")
+    os.makedirs(slug, exist_ok=True)
+    old = time.time() - 100.0
+
+    def make(name, aged, line='{"type":"session"}\n', parent=slug):
+        path = os.path.join(parent, name)
+        with open(path, "w") as f:
+            f.write(line)
+        os.utime(path, (old, old) if aged else (time.time(),) * 2)
+        return path
+
+    aged = make("aged.jsonl", True)
+    held = make("held.jsonl", True)
+    recent = make("recent.jsonl", False)
+    foreign = make("foreign.jsonl", True, '{"type":"note"}\n')
+    sidecar = make("index.json", True)
+    loose = make("loose.jsonl", True, parent=root)
+    gc = daemon.SessionStoreGc(root, lambda: {held}, 50.0,
+                               threading.Event(), tick=0.0)
+    gc.sweep()
+    assert_true(not os.path.exists(aged), "aged unheld conversation kept")
+    assert_true(os.path.exists(held), "live-backed conversation removed")
+    assert_true(os.path.exists(recent), "recent conversation removed")
+    assert_true(os.path.exists(sidecar), "non-.jsonl file removed")
+    assert_true(os.path.exists(foreign), "non-session .jsonl removed")
+    assert_true(os.path.exists(loose), "root-level conversation removed")
+    # A zero window disables the sweep even for an aged conversation.
+    off = make("off.jsonl", True)
+    daemon.SessionStoreGc(root, lambda: set(), 0.0,
+                          threading.Event(), tick=0.0).sweep()
+    assert_true(os.path.exists(off), "disabled sweep removed a file")
+
+
 def test_startup_purges_stale_gc_reap_requests():
     """A reap request from a previous daemon generation is removed at
     startup so no live session is steered by an ask nothing backs."""
@@ -1813,6 +1851,8 @@ def _main():
        test_state_dir_gc_sweeps)
     ok("state dir gc decides daemon.log by fd 2 ownership",
        test_state_dir_gc_daemon_log)
+    ok("session store gc prunes aged unheld conversations",
+       test_session_store_gc_prunes_aged_unheld)
     ok("gc reap ack discards and never revives",
        test_gc_reap_ack_discards_and_never_revives)
     ok("daemon purge force-stops due sessions, spares busy",

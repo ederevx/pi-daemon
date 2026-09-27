@@ -83,8 +83,8 @@ export class DaemonSettingsPresenter {
 			|| join(homedir(), ".pi", "agent");
 		return [
 			this.number("gcIdleHours", "GC idle (h)",
-				"Ask detached model-idle sessions to reap after this many hours; 0 disables",
-				"PI_DAEMON_GC_IDLE_HOURS", 3),
+				"Reap detached model-idle sessions and age-unheld conversations after this many hours; 0 disables",
+				"PI_DAEMON_GC_IDLE_HOURS", 24),
 			this.number("daemonIdleTimeoutHours", "Daemon idle timeout (h)",
 				"Self-shutdown after this many idle hours; 0 disables",
 				"PI_DAEMON_IDLE_TIMEOUT_HOURS", 1),
