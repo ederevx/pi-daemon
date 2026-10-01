@@ -1,8 +1,9 @@
 /**
  * pi-daemon — pre-daemon.ts onboarding tool tests.
  * PreDaemonTool must register the catalog tool, gate only this
- * extension's tools until the catalog is read, reset per session, and
- * collapse tool rows on session start.
+ * extension's tools until the catalog is read, and reset per session.
+ * It defines no custom renderer, so pi's native collapsed rendering
+ * applies.
  */
 
 import { test, assert, assertEq } from "./harness.ts";
@@ -13,7 +14,6 @@ type Handler = (event: any, ctx?: any) => any;
 class MockPi {
   readonly tools = new Map<string, any>();
   readonly handlers = new Map<string, Handler[]>();
-  readonly expandedCalls: boolean[] = [];
 
   on(name: string, handler: Handler): void {
     const list = this.handlers.get(name) ?? [];
@@ -47,6 +47,8 @@ test("pre-daemon: registers the catalog tool, gate, and session reset", () => {
   factory(pi as never);
   assert(pi.tools.has("pre_daemon"), "pre_daemon tool registered");
   assertEq(pi.tools.get("pre_daemon").annotations.readOnlyHint, true);
+  assertEq(pi.tools.get("pre_daemon").renderResult, undefined, "no custom result renderer");
+  assertEq(pi.tools.get("pre_daemon").renderCall, undefined, "no custom call renderer");
   assertEq(pi.handlers.get("tool_call")?.length, 1, "one gate handler");
   assertEq(pi.handlers.get("session_start")?.length, 1, "one reset handler");
 });
@@ -75,19 +77,6 @@ test("pre-daemon: reading the catalog unlocks the tools", async () => {
   assertEq((await pi.gate()({ toolName: "daemon_tasks" }))?.block, true, "reset");
   assertEq(await pi.gate()({ toolName: "pre_daemon" }), undefined, "ack via gate");
   assertEq(await pi.gate()({ toolName: "daemon_tasks" }), undefined, "unlocked again");
-});
-
-test("pre-daemon: session_start collapses tool rows when a UI exists", async () => {
-  const pi = new MockPi();
-  factory(pi as never);
-  const ctx = {
-    hasUI: true,
-    ui: { setToolsExpanded: (value: boolean) => pi.expandedCalls.push(value) },
-  };
-  await pi.sessionStart()({}, ctx);
-  assertEq(pi.expandedCalls.join(","), "false", "collapsed once");
-  await pi.sessionStart()({}, { hasUI: false });
-  assertEq(pi.expandedCalls.length, 1, "no UI, no call");
 });
 
 test("pre-daemon: catalog lists every registered tool and the conventions", () => {
