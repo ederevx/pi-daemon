@@ -778,6 +778,13 @@ def test_transcript_commands():
         {"file": outside})["error"], "bad-transcript")
     assert_eq(DAEMON.control.transcript_stat(
         {"transcriptId": "t-nope"})["error"], "no-such-transcript")
+    assert_eq(DAEMON.control.transcript_path(
+        dict(tid, leafId=["bad"]))["error"], "bad-request")
+    sidecar = daemon.pi_transcript.TranscriptIndex.index_path(file_)
+    with open(sidecar, "w") as f:
+        f.write("{not json\n")
+    assert_true(DAEMON.control.transcript_rebuild(tid)["ok"])
+    assert_eq(DAEMON.control.transcript_stat(tid)["entryCount"], 2)
     assert_true("transcript.v1" in DAEMON.handshake.ack()["caps"])
 
 

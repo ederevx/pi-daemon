@@ -374,6 +374,37 @@ class ReaderTests(unittest.TestCase):
         outside = os.path.join(os.path.dirname(self.fx.root), "x.jsonl")
         self.assertFalse(self.idx.owns(outside))
 
+    def test_owns_rejects_a_symlinked_ancestor(self):
+        outside = tempfile.mkdtemp(dir=os.path.expanduser("~/tmp"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        open(os.path.join(outside, "secret.jsonl"), "w").close()
+        link = os.path.join(self.fx.root, "linkdir")
+        os.symlink(outside, link)
+        self.assertFalse(self.idx.owns(os.path.join(link, "secret.jsonl")))
+
+    def test_body_read_after_replacement_is_refused(self):
+        other = os.path.join(self.fx.slug, "other.jsonl")
+        with open(other, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(SESSION_LINE) + "\n")
+            fh.write(json.dumps(entry("m9", None)) + "\n")
+        os.replace(other, self.fx.file)
+        with self.assertRaises(ValueError):
+            self.reader.entries(fields="full")
+
+
+class OversizeTests(unittest.TestCase):
+    def test_oversized_index_is_not_claimed_ok(self):
+        fx = Fixture(self)
+        idx = pi_transcript.TranscriptIndex(max_bytes=200)
+        fx.write([entry("m%d" % i, None) for i in range(30)])
+        self.assertEqual(idx.sync(fx.file), "oversized")
+        self.assertFalse(os.path.exists(
+            pi_transcript.TranscriptIndex.index_path(fx.file)))
+        reader = pi_transcript.TranscriptReader(idx, fx.file)
+        self.assertEqual(reader.refresh()["state"], "oversized")
+        self.assertIsNone(reader.header)
+        self.assertEqual(reader.meta()["entryCount"], 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
