@@ -10,21 +10,16 @@
  * It is also the gate: until `pre_daemon` has been called in a session,
  * every tool this extension registers is blocked with a reason pointing
  * here. Non-extension tools are never touched. The gate resets on each
- * session start, and `session_start` collapses all tool rows by default
- * (Ctrl+O still expands).
+ * session start. Tool rows use pi's native collapsed rendering, so the
+ * extension blends in; Ctrl+O expands.
  */
 
 import type {
-	AgentToolResult,
 	ExtensionAPI,
-	ExtensionContext,
-	Theme,
 	ToolCallEvent,
 	ToolCallEventResult,
-	ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Text } from "@earendil-works/pi-tui";
 
 /** The name of this extension's onboarding tool. */
 const TOOL_NAME = "pre_daemon";
@@ -61,13 +56,9 @@ export class PreDaemonTool {
 					details: { tools: [...this.owned, TOOL_NAME] },
 				};
 			},
-			renderCall: (_args, theme) =>
-				new Text(theme.fg("toolTitle", theme.bold(TOOL_NAME)), 0, 0),
-			renderResult: (result, options, theme) =>
-				this.renderResult(result, options, theme),
 		});
-		pi.on("session_start", async (_event, ctx) => {
-			this.beginSession(ctx);
+		pi.on("session_start", async () => {
+			this.beginSession();
 		});
 		pi.on("tool_call", (event) => this.gate(event));
 	}
@@ -102,10 +93,9 @@ export class PreDaemonTool {
 		return this.owned.has(name);
 	}
 
-	/** Reset per-session acknowledgement and collapse tool rows. */
-	private beginSession(ctx?: ExtensionContext): void {
+	/** Reset per-session acknowledgement. */
+	private beginSession(): void {
 		this.acknowledged = false;
-		if (ctx?.hasUI) ctx.ui.setToolsExpanded(false);
 	}
 
 	/** Block this extension's tools until `pre_daemon` has been called;
@@ -125,26 +115,6 @@ export class PreDaemonTool {
 			};
 		}
 		return undefined;
-	}
-
-	/** Collapsed rows show a one-line hint; Ctrl+O shows the catalog. */
-	private renderResult(
-		result: AgentToolResult<unknown>,
-		{ expanded }: ToolRenderResultOptions,
-		theme: Theme,
-	): Text {
-		if (!expanded) {
-			return new Text(
-				theme.fg("muted", "pre_daemon catalog (Ctrl+O to expand)"),
-				0,
-				0,
-			);
-		}
-		const lines: string[] = [];
-		for (const part of result.content) {
-			if (part.type === "text") lines.push(part.text);
-		}
-		return new Text(lines.join("\n"), 0, 0);
 	}
 }
 
