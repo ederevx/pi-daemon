@@ -187,7 +187,7 @@ pi/
   lib/pi_platform.py     # transport, process, PTY, terminal seams
   lib/pi_conpty.py       # Windows ConPTY backend
   lib/pi_settings.py     # the piDaemon settings reader
-  lib/pi_transcript.py   # conversation index: build/tail the .jsonl.idx sidecar
+  lib/pi_transcript.py   # conversation index + read-only body serving
   systemd/pi-daemon.service
 scripts/
   install.sh             # manifest-owned install into the agent home
