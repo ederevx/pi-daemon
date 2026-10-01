@@ -15,6 +15,7 @@ import "./daemon.test.ts";
 import "./offload.test.ts";
 import "./pre-daemon.test.ts";
 import "./settings.test.ts";
+import "./transcript.test.ts";
 
 await registry.runAll();
 cleanupScratch();
