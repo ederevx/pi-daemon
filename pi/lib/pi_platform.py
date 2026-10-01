@@ -235,7 +235,11 @@ class ControlHandshake:
         return msg.get("cmd") == "hello" and msg.get("token") == self.token
 
     def ack(self):
-        return {"ok": True, "srv": "pi-daemon"}
+        # proto/caps let a client detect the transcript commands (and an
+        # older daemon that omits them) without a second round trip; a
+        # peer that ignores them keeps the full-parse fallback.
+        return {"ok": True, "srv": "pi-daemon", "proto": 1,
+                "caps": ["transcript.v1"], "index": 1}
 
     def reject(self):
         return {"ok": False, "error": "bad-handshake"}

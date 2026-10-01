@@ -6,6 +6,7 @@ skip rules, the orphan sweep, concurrent syncs and the watch's live-file
 gate. Scratch lives under ~/tmp, never /tmp; stdlib only.
 """
 
+import base64
 import json
 import os
 import shutil
@@ -316,6 +317,93 @@ class WatchTests(unittest.TestCase):
         watch.sweep()
         self.assertFalse(os.path.exists(
             pi_transcript.TranscriptIndex.index_path(self.other)))
+
+
+class ReaderTests(unittest.TestCase):
+    def setUp(self):
+        self.fx = Fixture(self)
+        self.idx = pi_transcript.TranscriptIndex(root=self.fx.root)
+        self.fx.write([entry("m1", None), entry("m2", "m1"),
+                       entry("m3", "m2")])
+        self.reader = pi_transcript.TranscriptReader(self.idx, self.fx.file)
+        self.reader.refresh()
+
+    def test_meta_and_path(self):
+        meta = self.reader.meta()
+        self.assertEqual(meta["sessionId"], "sess-1")
+        self.assertEqual(meta["entryCount"], 3)
+        self.assertEqual(meta["coveredEnd"], self.fx.size())
+        path = self.reader.path()
+        self.assertEqual([e["id"] for e in path["entries"]],
+                         ["m3", "m2", "m1"])
+        self.assertEqual(path["leafId"], "m3")
+
+    def test_full_fields_parse_bodies(self):
+        entries = self.reader.entries(fields="full")["entries"]
+        self.assertEqual(entries[0]["type"], "message")
+        self.assertEqual(entries[0]["id"], "m1")
+
+    def test_paging_and_cursor(self):
+        page = self.reader.entries(limit=2)
+        self.assertEqual([e["id"] for e in page["entries"]], ["m1", "m2"])
+        self.assertTrue(page["hasMore"])
+        self.assertEqual(page["next"], "m2")
+        rest = self.reader.entries(since="m2")
+        self.assertEqual([e["id"] for e in rest["entries"]], ["m3"])
+        with self.assertRaises(KeyError):
+            self.reader.entries(since="nope")
+        by_ids = self.reader.entries(ids=["m3", "m1"])
+        self.assertEqual([e["id"] for e in by_ids["entries"]],
+                         ["m3", "m1"])
+
+    def test_byte_range_entry_aligned(self):
+        rng = self.reader.byte_range(0, 64, align="entry")
+        body = base64.b64decode(rng["bytes"])
+        self.assertTrue(body.endswith(b"\n"))
+        self.assertEqual(json.loads(body)["id"], "m1")
+
+    def test_tree_roots(self):
+        tree = self.reader.tree()
+        self.assertEqual([n["id"] for n in tree["nodes"]],
+                         ["m1", "m2", "m3"])
+        self.assertEqual(tree["roots"], ["m1"])
+        self.assertEqual(tree["leafId"], "m3")
+
+    def test_owns_gates_the_store_root(self):
+        self.assertTrue(self.idx.owns(self.fx.file))
+        outside = os.path.join(os.path.dirname(self.fx.root), "x.jsonl")
+        self.assertFalse(self.idx.owns(outside))
+
+    def test_owns_rejects_a_symlinked_ancestor(self):
+        outside = tempfile.mkdtemp(dir=os.path.expanduser("~/tmp"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        open(os.path.join(outside, "secret.jsonl"), "w").close()
+        link = os.path.join(self.fx.root, "linkdir")
+        os.symlink(outside, link)
+        self.assertFalse(self.idx.owns(os.path.join(link, "secret.jsonl")))
+
+    def test_body_read_after_replacement_is_refused(self):
+        other = os.path.join(self.fx.slug, "other.jsonl")
+        with open(other, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(SESSION_LINE) + "\n")
+            fh.write(json.dumps(entry("m9", None)) + "\n")
+        os.replace(other, self.fx.file)
+        with self.assertRaises(ValueError):
+            self.reader.entries(fields="full")
+
+
+class OversizeTests(unittest.TestCase):
+    def test_oversized_index_is_not_claimed_ok(self):
+        fx = Fixture(self)
+        idx = pi_transcript.TranscriptIndex(max_bytes=200)
+        fx.write([entry("m%d" % i, None) for i in range(30)])
+        self.assertEqual(idx.sync(fx.file), "oversized")
+        self.assertFalse(os.path.exists(
+            pi_transcript.TranscriptIndex.index_path(fx.file)))
+        reader = pi_transcript.TranscriptReader(idx, fx.file)
+        self.assertEqual(reader.refresh()["state"], "oversized")
+        self.assertIsNone(reader.header)
+        self.assertEqual(reader.meta()["entryCount"], 0)
 
 
 if __name__ == "__main__":
