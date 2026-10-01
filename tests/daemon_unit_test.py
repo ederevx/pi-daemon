@@ -709,6 +709,30 @@ def _spawn_session(name):
         {"name": name, "file": file})["ok"])
 
 
+def test_transcript_index_wiring():
+    """The daemon owns one conversation index and keeps the sidecar
+    paired with the conversation: discarding a conversation drops its
+    index too."""
+    assert_true(isinstance(DAEMON.transcript_index,
+                           daemon.pi_transcript.TranscriptIndex))
+    file_ = os.path.join(SCRATCH, "transcript-wired.jsonl")
+    with open(file_, "w") as f:
+        f.write('{"type":"session","version":3,"id":"wired"}\n')
+        f.write('{"type":"message","id":"m1","parentId":null}\n')
+    assert_eq(DAEMON.transcript_index.sync(file_), "ok")
+    sidecar = daemon.pi_transcript.TranscriptIndex.index_path(file_)
+    assert_true(os.path.exists(sidecar), "index sidecar not written")
+    sess = daemon.Session("pi-transcript-wired", SCRATCH, ["pi"],
+                          pid=1, master_fd=-1)
+    sess.file = file_
+    sess.stopping = True
+    assert_true(DAEMON.table.put(sess))
+    DAEMON.drop(sess, 0)
+    assert_true(not os.path.exists(file_), "conversation not discarded")
+    assert_true(not os.path.exists(sidecar),
+                "index sidecar outlived its conversation")
+
+
 def test_extensions_reload_deferral():
     """A round that finds a reloadable session busy must NOT advance
     the on-disk snapshot: the busy session still owes the reload and
@@ -1833,6 +1857,8 @@ def _main():
        test_reload_same_file_announce_no_spawn)
     ok("stop/reap discards the conversation file (/resume)",
        test_stop_and_reap_discard_conversation_file)
+    ok("conversation index sidecar is paired with its file",
+       test_transcript_index_wiring)
     ok("extensions_reload defers busy sessions (no stamp)",
        test_extensions_reload_deferral)
     ok("watch loop owes busy sessions until idle",
