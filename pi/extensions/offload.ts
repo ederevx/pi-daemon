@@ -1143,10 +1143,6 @@ export default function (pi: ExtensionAPI) {
 	Object.assign(bashTool, {
 		promptGuidelines: [
 			"You can inspect PI_* environment variables for current model and session details.",
-			"Every command runs as a daemon ticket: results arrive complete in " +
-				"one go, and commands outliving the wait bound keep running in the " +
-				"background (a note names the ticket id) with the full result " +
-				"delivered automatically on completion.",
 		],
 	});
 	pi.registerTool(bashTool);
@@ -1157,25 +1153,16 @@ export default function (pi: ExtensionAPI) {
 		name: "daemon_tasks",
 		label: "daemon tasks",
 		description:
-			"Manage commands offloaded to the pi-daemon as tickets. " +
-			"submit runs a command in the background and returns a ticket id " +
-			"immediately (the result is delivered automatically when done); " +
-			"result fetches a finished ticket's full output in one go, and " +
-			"with wait blocks actively: it returns as soon as the ticket " +
-			"finishes, stays interruptible, yields early if you queue a " +
-			"message, and shows a live elapsed status; watch streams a " +
-			"running ticket's output; status, list and cancel do what they " +
-			"say. Requires the pi-daemon service.",
-		promptSnippet: "Run long shell commands as background daemon tickets",
+			"Manage pi-daemon tickets (submit, status, result, watch, " +
+			"cancel, remove, reset, list). Call pre_daemon for the " +
+			"catalog and conventions.",
 		promptGuidelines: [
-			"Prefer daemon_tasks submit for builds, test suites, downloads and " +
-				"other long-running commands: you keep working immediately and " +
-				"the full result is delivered to you when the task finishes. " +
-				"Use result to fetch a ticket's output, watch to follow it live. " +
-				"A blocking result wait is interruptible and steerable: Escape " +
-				"or a queued message releases it, the ticket keeps running, and " +
-				"the result is still delivered on completion; re-call result " +
-				"with wait to block again.",
+			"Prefer daemon_tasks submit for builds, test suites, downloads " +
+				"and other long-running commands: you keep working " +
+				"immediately and the full result is delivered to you when " +
+				"the task finishes. A blocking result wait is interruptible " +
+				"and steerable; the ticket keeps running and its result is " +
+				"still delivered on completion.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(["submit", "status", "result", "watch", "cancel", "remove", "reset", "list"] as const),
