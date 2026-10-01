@@ -84,7 +84,7 @@ export class PreDaemonTool {
 			"- daemon_gc_reap: reap this hosted session when the daemon requests it.",
 			"",
 			"Conventions:",
-			"- Call pre_daemon once per session before using bash, daemon_tasks, or daemon_gc_reap.",
+			"- Call pre_daemon once per session before using daemon_tasks or daemon_gc_reap; bash stays transparent and is offloaded automatically.",
 			"- Prefer daemon_tasks submit for builds, tests, downloads and other long-running commands: you keep working and the full result is delivered when the task finishes.",
 			"- A blocking result wait is interruptible and steerable: Escape or a queued message releases it; the ticket keeps running and still delivers on completion.",
 			"- Call daemon_gc_reap only when pi-daemon asks this idle detached session to reap, or when you are deliberately done.",
