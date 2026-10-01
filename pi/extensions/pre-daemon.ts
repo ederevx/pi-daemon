@@ -36,6 +36,7 @@ export class PreDaemonTool {
 	private readonly owned = new Set([
 		"daemon_tasks",
 		"daemon_gc_reap",
+		"transcript_read",
 	]);
 
 	/** Register the tool, the per-session reset, and the gate. */
@@ -73,9 +74,10 @@ export class PreDaemonTool {
 			"- bash: every shell command runs as a daemon-owned ticket (full result in one go).",
 			"- daemon_tasks: submit/status/result/watch/cancel/remove/reset/list tickets.",
 			"- daemon_gc_reap: reap this hosted session when the daemon requests it.",
+			"- transcript_read: read this conversation from the daemon index (stat/path/entries/tree/range) instead of loading the whole session file.",
 			"",
 			"Conventions:",
-			"- Call pre_daemon once per session before using daemon_tasks or daemon_gc_reap; bash stays transparent and is offloaded automatically.",
+			"- Call pre_daemon once per session before using daemon_tasks, daemon_gc_reap, or transcript_read; bash stays transparent and is offloaded automatically.",
 			"- Prefer daemon_tasks submit for builds, tests, downloads and other long-running commands: you keep working and the full result is delivered when the task finishes.",
 			"- A blocking result wait is interruptible and steerable: Escape or a queued message releases it; the ticket keeps running and still delivers on completion.",
 			"- Call daemon_gc_reap only when pi-daemon asks this idle detached session to reap, or when you are deliberately done.",
@@ -84,6 +86,7 @@ export class PreDaemonTool {
 			"- Hosted sessions run headless in the pi-daemon and survive terminal exit, SSH logout, and reboot; /bg detaches or hands over, pi-rc attach resumes.",
 			"- Offloaded commands become daemon-owned tickets that outlive the submitting session and persist in tickets.json.",
 			"- Remote-control helpers: pi-rc attach/ls/state, /daemon-reload, /daemon-settings, /daemon-purge.",
+			"- transcript_read serves the daemon's positional index, so long conversations can be paged instead of re-read in full.",
 			"- If the daemon is unreachable, bash falls back to the local shell transparently.",
 		].join("\n");
 	}
