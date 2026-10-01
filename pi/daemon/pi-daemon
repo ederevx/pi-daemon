@@ -177,6 +177,7 @@ def _platform_path():
 sys.path.insert(0, _platform_path())
 import pi_platform
 import pi_settings
+import pi_transcript
 
 # Control transport: loopback TCP with a random-token hello handshake;
 # the ephemeral port and token are published in the runtime endpoint
@@ -272,6 +273,27 @@ GC_REAP_REQUEST_DIR = os.path.join(REG_DIR, "gc-reap")
 # lists lives under here in the agent home. The session store GC sweeps
 # aged, unheld conversations from it.
 SESSION_STORE_ROOT = os.path.join(_agent_home, "sessions")
+# Conversation index: a positional `.jsonl.idx` sidecar per conversation
+# the daemon keeps fresh so a reader can resolve entry metadata without a
+# full parse (pi/lib/pi_transcript.py). The watch only touches
+# conversations no live session backs - a live pi owns its own file - so
+# the daemon stays the index's sole writer. The index is durable (it
+# lives beside the conversation and survives a restart); the interval is
+# overridable for tests, and 0 disables the repeating sweep.
+TRANSCRIPT_INDEX_ENABLED = SETTINGS.resolve(
+	"PI_PTYD_TRANSCRIPT_INDEX", "transcriptIndex", True, kind="flag")
+TRANSCRIPT_INDEX_INTERVAL = SETTINGS.resolve(
+	"PI_PTYD_TRANSCRIPT_INDEX_INTERVAL", "transcriptIndexIntervalSeconds",
+	3.0)
+TRANSCRIPT_INDEX_MAX_BYTES = int(SETTINGS.resolve(
+	"PI_PTYD_TRANSCRIPT_INDEX_MAX_MB", "transcriptIndexMaxMb", 4.0)
+	* (1 << 20))
+# The longest conversation line the index will cover; a longer line is
+# left uncovered and the reader falls back to a full parse, so the
+# default is generous enough for a large tool result.
+TRANSCRIPT_INDEX_MAX_LINE = int(SETTINGS.resolve(
+	"PI_PTYD_TRANSCRIPT_INDEX_MAX_LINE_MB", "transcriptIndexMaxLineMb",
+	16.0) * (1 << 20))
 # A reload injection's no-spawn guard stays armed for this long: a
 # reloaded session that dies within the window is treated as a broken
 # reload and never respawned (the reload stays strictly in-place); once
@@ -1579,12 +1601,13 @@ class SessionStoreGc:
 	others or the sweep thread."""
 
 	def __init__(self, root, live_files, idle, shutdown_event,
-				tick=STATE_GC_TICK):
+				tick=STATE_GC_TICK, forget=None):
 		self.root = root
 		self.live_files = live_files
 		self.idle = float(idle)
 		self.shutdown_event = shutdown_event
 		self.tick = float(tick)
+		self.forget = forget
 
 	def start(self):
 		if self.idle <= 0:
@@ -1651,12 +1674,15 @@ class SessionStoreGc:
 		except OSError:
 			return False
 
-	@staticmethod
-	def _unlink(path):
+	def _unlink(self, path):
+		# Unlinking a conversation also drops its index sidecar, so the
+		# pair can never drift apart.
 		try:
 			os.unlink(path)
 		except OSError:
 			pass
+		if self.forget is not None:
+			self.forget(path)
 
 
 class SessionTable:
@@ -2130,9 +2156,17 @@ class Daemon:
 		self.state_gc = StateDirGc(REG_DIR, TICKET_LOG_DIR,
 								   self.tickets.store, LOG_PATH,
 								   self.shutdown_event)
+		self.transcript_index = pi_transcript.TranscriptIndex(
+			max_bytes=TRANSCRIPT_INDEX_MAX_BYTES,
+			max_line=TRANSCRIPT_INDEX_MAX_LINE)
 		self.session_store_gc = SessionStoreGc(
 			SESSION_STORE_ROOT, self._live_session_files, GC_IDLE,
-			self.shutdown_event)
+			self.shutdown_event, forget=self.transcript_index.forget)
+		self.transcript_watch = pi_transcript.TranscriptIndexWatch(
+			self.transcript_index, SESSION_STORE_ROOT,
+			self._live_session_files, self.shutdown_event,
+			interval=TRANSCRIPT_INDEX_INTERVAL
+			if TRANSCRIPT_INDEX_ENABLED else 0.0)
 		self.roster = DaemonRoster(ROSTER_PATH)
 		self.restart_planner = RestartPlanner(self.registry, self.table)
 		self.idle_watch = IdleShutdownWatch(self, self.shutdown_event)
@@ -2174,6 +2208,7 @@ class Daemon:
 		self.state_gc.start()
 		self.session_store_gc.sweep()
 		self.session_store_gc.start()
+		self.transcript_watch.start()
 		self.idle_watch.start()
 		try:
 			self._accept_loop(self.server)
@@ -2383,6 +2418,7 @@ class Daemon:
 		try:
 			if os.path.isfile(sess.file):
 				os.unlink(sess.file)
+				self.transcript_index.forget(sess.file)
 				log("discard '%s' conversation %s" % (sess.name, sess.file))
 		except OSError as exc:
 			log("discard '%s' conversation failed: %s" % (sess.name, exc))
