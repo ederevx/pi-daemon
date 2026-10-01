@@ -9,6 +9,7 @@ in os._exit and would kill the test process).
 """
 
 import importlib.util
+import base64
 import json
 import os
 import select
@@ -731,6 +732,53 @@ def test_transcript_index_wiring():
     assert_true(not os.path.exists(file_), "conversation not discarded")
     assert_true(not os.path.exists(sidecar),
                 "index sidecar outlived its conversation")
+
+
+def test_transcript_commands():
+    """The transcript wire commands serve metadata and bodies from the
+    index and never read a path outside the session store."""
+    slug = os.path.join(daemon.SESSION_STORE_ROOT, "--home-proj--")
+    os.makedirs(slug, exist_ok=True)
+    file_ = os.path.join(slug, "tc.jsonl")
+    with open(file_, "w") as f:
+        f.write('{"type":"session","version":3,"id":"tc"}\n')
+        f.write('{"type":"message","id":"m1","parentId":null}\n')
+        f.write('{"type":"message","id":"m2","parentId":"m1"}\n')
+    op = DAEMON.control.transcript_open({"file": file_, "id": "1"})
+    assert_eq(op["id"], "1")
+    assert_true(op["ok"], op)
+    assert_eq(op["sessionId"], "tc")
+    assert_eq(op["entryCount"], 2)
+    assert_true(op["transcriptId"].startswith("t-"))
+    tid = {"transcriptId": op["transcriptId"]}
+    path = DAEMON.control.transcript_path(tid)
+    assert_eq([e["id"] for e in path["entries"]], ["m2", "m1"])
+    assert_eq(path["leafId"], "m2")
+    full = DAEMON.control.transcript_entries(dict(tid, fields="full"))
+    assert_eq(full["entries"][0]["type"], "message")
+    page = DAEMON.control.transcript_entries(dict(tid, limit=1))
+    assert_eq([e["id"] for e in page["entries"]], ["m1"])
+    assert_true(page["hasMore"])
+    assert_eq(page["next"], "m1")
+    cursor = DAEMON.control.transcript_entries(dict(tid, since="m1"))
+    assert_eq([e["id"] for e in cursor["entries"]], ["m2"])
+    bad = DAEMON.control.transcript_entries(dict(tid, since="nope"))
+    assert_eq(bad["error"], "bad-cursor")
+    tree = DAEMON.control.transcript_tree(tid)
+    assert_eq([n["id"] for n in tree["nodes"]], ["m1", "m2"])
+    rng = DAEMON.control.transcript_range(
+        dict(tid, offset=0, length=64, align="entry"))
+    assert_true(base64.b64decode(rng["bytes"]).endswith(b"\n"))
+    stat = DAEMON.control.transcript_stat(tid)
+    assert_eq(stat["entryCount"], 2)
+    assert_true(DAEMON.control.transcript_rebuild(tid)["ok"])
+    outside = os.path.join(SCRATCH, "outside.jsonl")
+    open(outside, "w").close()
+    assert_eq(DAEMON.control.transcript_open(
+        {"file": outside})["error"], "bad-transcript")
+    assert_eq(DAEMON.control.transcript_stat(
+        {"transcriptId": "t-nope"})["error"], "no-such-transcript")
+    assert_true("transcript.v1" in DAEMON.handshake.ack()["caps"])
 
 
 def test_extensions_reload_deferral():
@@ -1859,6 +1907,8 @@ def _main():
        test_stop_and_reap_discard_conversation_file)
     ok("conversation index sidecar is paired with its file",
        test_transcript_index_wiring)
+    ok("transcript wire commands serve the index",
+       test_transcript_commands)
     ok("extensions_reload defers busy sessions (no stamp)",
        test_extensions_reload_deferral)
     ok("watch loop owes busy sessions until idle",

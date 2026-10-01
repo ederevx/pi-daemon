@@ -351,7 +351,11 @@ _WIRE_COMMANDS = ("ping", "start", "detach", "resize", "list", "which",
 				  "input", "extensions-reload",
 				  "ticket-submit", "ticket-wait", "ticket-output",
 				  "ticket-list", "ticket-cancel", "ticket-remove",
-				  "tickets-reset")
+				  "tickets-reset",
+				  "transcript-open", "transcript-path",
+				  "transcript-entries", "transcript-range",
+				  "transcript-tree", "transcript-stat",
+				  "transcript-rebuild")
 
 
 def log(msg):
@@ -2158,7 +2162,9 @@ class Daemon:
 								   self.shutdown_event)
 		self.transcript_index = pi_transcript.TranscriptIndex(
 			max_bytes=TRANSCRIPT_INDEX_MAX_BYTES,
-			max_line=TRANSCRIPT_INDEX_MAX_LINE)
+			max_line=TRANSCRIPT_INDEX_MAX_LINE,
+			root=SESSION_STORE_ROOT)
+		self.transcript_handles = pi_transcript.TranscriptHandles()
 		self.session_store_gc = SessionStoreGc(
 			SESSION_STORE_ROOT, self._live_session_files, GC_IDLE,
 			self.shutdown_event, forget=self.transcript_index.forget)
@@ -2829,6 +2835,113 @@ class Control:
 		return {"ok": True,
 				"names": [{"name": s.name, "state": s.state}
 						  for s in holders]}
+
+	def transcript_target(self, req):
+		# A handle issued by transcript-open, else the session's announced
+		# file, else an explicit file (validated against the store).
+		tid = req.get("transcriptId")
+		if isinstance(tid, str) and tid:
+			file = self.daemon.transcript_handles.resolve(tid)
+			if file:
+				return file
+		file = req.get("file")
+		if isinstance(file, str) and file:
+			return file
+		name = req.get("session")
+		if isinstance(name, str) and name:
+			sess = self.daemon.table.get(name)
+			if sess is not None and sess.file:
+				return sess.file
+		return None
+
+	def transcript_reader(self, req):
+		# (reader, None) or (None, error). The file must live inside the
+		# session store: the daemon never reads an arbitrary path.
+		file = self.transcript_target(req)
+		if file is None:
+			return None, err("no-such-transcript")
+		if not self.daemon.transcript_index.owns(file):
+			return None, err("bad-transcript")
+		return pi_transcript.TranscriptReader(
+			self.daemon.transcript_index, file), None
+
+	@staticmethod
+	def transcript_tag(req, payload):
+		rid = req.get("id")
+		if isinstance(rid, str) and rid and isinstance(payload, dict):
+			payload = dict(payload)
+			payload["id"] = rid
+		return payload
+
+	@staticmethod
+	def transcript_fields(req):
+		fields = req.get("fields", "ref")
+		return fields if fields in ("ref", "full") else "ref"
+
+	def transcript_view(self, req, action):
+		reader, error = self.transcript_reader(req)
+		if error:
+			return self.transcript_tag(req, error)
+		reader.refresh()
+		try:
+			payload = action(reader)
+		except KeyError:
+			return self.transcript_tag(req, err("bad-cursor"))
+		except (ValueError, OSError):
+			return self.transcript_tag(req, bad_request())
+		payload["ok"] = True
+		return self.transcript_tag(req, payload)
+
+	def transcript_open(self, req):
+		reader, error = self.transcript_reader(req)
+		if error:
+			return self.transcript_tag(req, error)
+		state = reader.refresh()
+		try:
+			meta = reader.meta()
+		except OSError:
+			return self.transcript_tag(req, err("bad-transcript"))
+		meta["ok"] = True
+		meta["transcriptId"] = self.daemon.transcript_handles.issue(
+			reader.file)
+		meta["index"] = state
+		return self.transcript_tag(req, meta)
+
+	def transcript_path(self, req):
+		return self.transcript_view(req, lambda r: r.path(
+			leaf_id=req.get("leafId"), fields=self.transcript_fields(req)))
+
+	def transcript_entries(self, req):
+		def run(reader):
+			return reader.entries(
+				since=req.get("since"), ids=req.get("ids"),
+				offset=req.get("offset"), limit=req.get("limit", 200),
+				fields=self.transcript_fields(req))
+		return self.transcript_view(req, run)
+
+	def transcript_range(self, req):
+		def run(reader):
+			return reader.byte_range(
+				req.get("offset", 0), req.get("length", 65536),
+				align=req.get("align", "none"))
+		return self.transcript_view(req, run)
+
+	def transcript_tree(self, req):
+		return self.transcript_view(req, lambda r: r.tree())
+
+	def transcript_stat(self, req):
+		def run(reader):
+			meta = reader.meta()
+			meta.pop("file", None)
+			return meta
+		return self.transcript_view(req, run)
+
+	def transcript_rebuild(self, req):
+		reader, error = self.transcript_reader(req)
+		if error:
+			return self.transcript_tag(req, error)
+		return self.transcript_tag(req, {"ok": True,
+										 "index": reader.refresh()})
 
 	def state(self, req):
 		name = req.get("name")
