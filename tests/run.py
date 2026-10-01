@@ -33,6 +33,8 @@ def main():
                     "--experimental-transform-types", "tests/ts/run.ts"])
     all_ok &= step("daemon unit tests",
                    [sys.executable, "tests/daemon_unit_test.py"])
+    all_ok &= step("conversation index tests",
+                   [sys.executable, "tests/transcript_index_test.py"])
     all_ok &= step("daemon integration test",
                    [sys.executable, "tests/daemon_integration_test.py"])
     all_ok &= step("install script tests",

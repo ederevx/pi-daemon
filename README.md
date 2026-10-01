@@ -187,6 +187,7 @@ pi/
   lib/pi_platform.py     # transport, process, PTY, terminal seams
   lib/pi_conpty.py       # Windows ConPTY backend
   lib/pi_settings.py     # the piDaemon settings reader
+  lib/pi_transcript.py   # conversation index: build/tail the .jsonl.idx sidecar
   systemd/pi-daemon.service
 scripts/
   install.sh             # manifest-owned install into the agent home
@@ -215,6 +216,10 @@ with the built-in default as the fallback.
 | `extWatchIntervalSeconds` | `3.0` | Extension-root poll cadence. |
 | `extWatchDebounceSeconds` | `4.0` | Minimum gap between reload bursts. |
 | `extWatchRoots` | agent `extensions`/`npm`/`git` + `settings.json` | Roots to watch. |
+| `transcriptIndex` | `true` | Keep a positional `.jsonl.idx` sidecar beside each cold conversation so a reader can resolve entry metadata without a full parse. |
+| `transcriptIndexIntervalSeconds` | `3.0` | Conversation-index poll cadence. |
+| `transcriptIndexMaxMb` | `4` | Reject and rebuild an index larger than this. |
+| `transcriptIndexMaxLineMb` | `16` | Longest conversation line the index will cover. |
 | `offload.enabled` | `true` | Enable bash offloading. |
 | `offload.waitSeconds` | `120` | Hand-off bound before a command becomes a background ticket. |
 
@@ -223,7 +228,10 @@ Environment overrides: `PI_DAEMON_GC_IDLE_HOURS`,
 `PI_PTYD_RELOAD_GUARD_GRACE`, `PI_PTYD_RELOAD_SIGNAL_GRACE`,
 `PI_PTYD_TICKET_TTL_HOURS`, `PI_PTYD_TICKET_GC`, `PI_PTYD_EXT_WATCH`,
 `PI_PTYD_EXT_WATCH_INTERVAL`, `PI_PTYD_EXT_WATCH_DEBOUNCE`,
-`PI_PTYD_EXT_WATCH_ROOTS`, `PI_OFFLOAD`, and `PI_OFFLOAD_WAIT`.
+`PI_PTYD_EXT_WATCH_ROOTS`, `PI_PTYD_TRANSCRIPT_INDEX`,
+`PI_PTYD_TRANSCRIPT_INDEX_INTERVAL`, `PI_PTYD_TRANSCRIPT_INDEX_MAX_MB`,
+`PI_PTYD_TRANSCRIPT_INDEX_MAX_LINE_MB`, `PI_OFFLOAD`, and
+`PI_OFFLOAD_WAIT`.
 
 `/daemon-settings` opens the same tunables in pi's two-column settings
 dock: flag rows toggle in place, number and roots rows open an editor
