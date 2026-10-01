@@ -180,6 +180,7 @@ pi/
   extensions/daemon.ts   # /bg: detach/handover, /daemon-purge, reload relay
                          # + the daemon_gc_reap tool
   extensions/offload.ts  # ticket offloading + daemon_tasks tool
+  extensions/pre-daemon.ts # pre_daemon onboarding: catalog + first-call gate
   bin/pi-rc              # client: tickets, bridge, input, reload,
                          # start/attach/detach/announce/ls/which/stop
   daemon/pi-daemon       # stdlib Python PTY host + shell ticket runners

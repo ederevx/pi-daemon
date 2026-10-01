@@ -1179,11 +1179,9 @@ export default function (pi: ExtensionAPI) {
 		name: "daemon_gc_reap",
 		label: "daemon gc reap",
 		description:
-			"Reap this hosted pi-daemon session voluntarily. Call this " +
-			"when the daemon asks a long-idle detached session to reap " +
-			"itself (or when you are otherwise done): it acknowledges " +
-			"the request to the daemon and ends this session.",
-		promptSnippet: "Reap this long-idle hosted session",
+			"Reap this hosted pi-daemon session when the daemon requests " +
+			"it. Call pre_daemon for the pi-daemon catalog and " +
+			"conventions.",
 		promptGuidelines: [
 			"Call daemon_gc_reap only when the pi-daemon asks this " +
 				"long-idle detached session to reap itself, or when you " +
