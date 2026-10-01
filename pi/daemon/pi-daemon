@@ -2425,6 +2425,7 @@ class Daemon:
 			if os.path.isfile(sess.file):
 				os.unlink(sess.file)
 				self.transcript_index.forget(sess.file)
+				self.transcript_handles.forget(sess.file)
 				log("discard '%s' conversation %s" % (sess.name, sess.file))
 		except OSError as exc:
 			log("discard '%s' conversation failed: %s" % (sess.name, exc))
@@ -2883,11 +2884,13 @@ class Control:
 		if error:
 			return self.transcript_tag(req, error)
 		reader.refresh()
+		if reader.header is None:
+			return self.transcript_tag(req, err("no-index"))
 		try:
 			payload = action(reader)
 		except KeyError:
 			return self.transcript_tag(req, err("bad-cursor"))
-		except (ValueError, OSError):
+		except (TypeError, ValueError, OSError):
 			return self.transcript_tag(req, bad_request())
 		payload["ok"] = True
 		return self.transcript_tag(req, payload)
@@ -2897,6 +2900,8 @@ class Control:
 		if error:
 			return self.transcript_tag(req, error)
 		state = reader.refresh()
+		if reader.header is None:
+			return self.transcript_tag(req, err("no-index"))
 		try:
 			meta = reader.meta()
 		except OSError:
@@ -2937,11 +2942,18 @@ class Control:
 		return self.transcript_view(req, run)
 
 	def transcript_rebuild(self, req):
-		reader, error = self.transcript_reader(req)
-		if error:
-			return self.transcript_tag(req, error)
-		return self.transcript_tag(req, {"ok": True,
-										 "index": reader.refresh()})
+		file = self.transcript_target(req)
+		if file is None:
+			return self.transcript_tag(req, err("no-such-transcript"))
+		if not self.daemon.transcript_index.owns(file):
+			return self.transcript_tag(req, err("bad-transcript"))
+		self.daemon.transcript_index.forget(file)
+		reader = pi_transcript.TranscriptReader(
+			self.daemon.transcript_index, file)
+		state = reader.refresh()
+		if reader.header is None:
+			return self.transcript_tag(req, err("no-index"))
+		return self.transcript_tag(req, {"ok": True, "index": state})
 
 	def state(self, req):
 		name = req.get("name")

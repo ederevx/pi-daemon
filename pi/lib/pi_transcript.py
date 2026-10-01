@@ -112,21 +112,37 @@ class TranscriptIndexFile:
 
     def publish(self, header, records):
         """Atomically replace the whole index: write a pid+thread-unique
-        temp in the same directory, fsync, os.replace. A crash leaves the
-        old index intact and a reader never sees a partial file."""
+        temp in the same directory, fsync, os.replace. Returns False
+        (and leaves no index) when the payload would exceed the byte cap,
+        so a reader never silently sees an empty transcript from a
+        too-large sidecar. A crash leaves the old index intact."""
         lines = [json.dumps(header, separators=(",", ":"))]
         for rec in records:
             lines.append(json.dumps(rec, separators=(",", ":")))
+        payload = "\n".join(lines) + "\n"
+        if len(payload.encode("utf-8")) > self.max_bytes:
+            self.unlink()
+            return False
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)
         tmp = "%s.tmp.%d.%d" % (self.path, os.getpid(),
                                 threading.get_ident())
         with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
+            fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, self.path)
+        try:
+            os.replace(tmp, self.path)
+        except OSError:
+            # Windows cannot rename over a file a reader holds open;
+            # drop it and retry so the index keeps refreshing.
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+            os.replace(tmp, self.path)
+        return True
 
     def unlink(self):
         try:
@@ -161,17 +177,18 @@ class TranscriptIndex:
         The daemon never reads an arbitrary client-supplied path."""
         if not (isinstance(file, str) and file and os.path.isabs(file)):
             return False
-        if os.path.islink(file) or not os.path.isfile(file):
+        if self.root is None:
+            return os.path.isfile(file) and not os.path.islink(file)
+        # realpath both sides: a symlinked slug directory must not let a
+        # request escape the store, and the real root may itself be
+        # reached through a symlinked ancestor.
+        try:
+            real = os.path.realpath(file)
+            root = os.path.realpath(self.root)
+            common = os.path.commonpath([real, root])
+        except (OSError, ValueError):
             return False
-        if self.root is not None:
-            try:
-                common = os.path.commonpath(
-                    [os.path.abspath(file), self.root])
-            except ValueError:
-                return False
-            if common != self.root:
-                return False
-        return True
+        return common == root and os.path.isfile(real)
 
     @staticmethod
     def index_path(file):
@@ -185,7 +202,9 @@ class TranscriptIndex:
             return "skip"
         if not os.path.isabs(file) or os.path.islink(file):
             return "skip"
-        with self._lock_for(file):
+        # Key the lock on the resolved path so two spellings of one file
+        # cannot scan and publish concurrently.
+        with self._lock_for(os.path.realpath(file)):
             try:
                 return self._sync_locked(file)
             except OSError:
@@ -358,7 +377,8 @@ class TranscriptIndex:
             "created": created or time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._now())),
         }
-        idx.publish(header, records)
+        if not idx.publish(header, records):
+            return "oversized"
         return "ok"
 
 
@@ -442,19 +462,29 @@ class TranscriptHandles:
     def __init__(self, cap=256):
         self.cap = int(cap)
         self._handles = collections.OrderedDict()
+        self._lock = threading.Lock()
 
     def issue(self, file):
         tid = "t-" + hashlib.sha256(file.encode("utf-8")).hexdigest()[:16]
-        self._handles[tid] = file
-        self._handles.move_to_end(tid)
-        while len(self._handles) > self.cap:
-            self._handles.popitem(last=False)
+        with self._lock:
+            self._handles[tid] = file
+            self._handles.move_to_end(tid)
+            while len(self._handles) > self.cap:
+                self._handles.popitem(last=False)
         return tid
 
     def resolve(self, transcript_id):
         if not isinstance(transcript_id, str) or not transcript_id:
             return None
-        return self._handles.get(transcript_id)
+        with self._lock:
+            return self._handles.get(transcript_id)
+
+    def forget(self, file):
+        with self._lock:
+            stale = [tid for tid, path in self._handles.items()
+                     if path == file]
+            for tid in stale:
+                del self._handles[tid]
 
 
 class TranscriptReader:
@@ -475,6 +505,7 @@ class TranscriptReader:
         self.header = None
         self.records = []
         self._by_id = {}
+        self._identity = None
 
     def refresh(self):
         state = self.index.sync(self.file)
@@ -486,6 +517,11 @@ class TranscriptReader:
             self.header, self.records = loaded
             self._by_id = {r["id"]: r for r in self.records
                            if isinstance(r.get("id"), str)}
+        try:
+            st = os.stat(self.file)
+            self._identity = (st.st_ino, st.st_dev)
+        except OSError:
+            self._identity = None
         return {"state": state}
 
     def conversation(self):
@@ -510,11 +546,15 @@ class TranscriptReader:
         }
 
     def read_body(self, offset, length):
-        # Bounded by the current size so a shrunk or rotated file can
-        # never be read past its end.
+        # Bound by the size and identity captured at refresh: a shrunk,
+        # rotated or replaced file never yields another file's bytes at
+        # stale offsets.
         try:
-            size = os.path.getsize(self.file)
-            if offset < 0 or length <= 0 or offset + length > size:
+            st = os.stat(self.file)
+            if self._identity is not None and \
+                    (st.st_ino, st.st_dev) != self._identity:
+                return None
+            if offset < 0 or length <= 0 or offset + length > st.st_size:
                 return None
             with open(self.file, "rb") as fh:
                 fh.seek(offset)
@@ -527,11 +567,11 @@ class TranscriptReader:
             return dict(record)
         body = self.read_body(record["o"], record["l"])
         if body is None:
-            return dict(record)
+            raise ValueError("body")
         try:
             return json.loads(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
-            return dict(record)
+            raise ValueError("body")
 
     def path(self, leaf_id=None, fields="ref"):
         leaf = leaf_id if leaf_id in self._by_id else None

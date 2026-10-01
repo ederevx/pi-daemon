@@ -35,6 +35,8 @@ def main():
                    [sys.executable, "tests/daemon_unit_test.py"])
     all_ok &= step("conversation index tests",
                    [sys.executable, "tests/transcript_index_test.py"])
+    all_ok &= step("transcript wire test",
+                   [sys.executable, "tests/transcript_wire_test.py"])
     all_ok &= step("daemon integration test",
                    [sys.executable, "tests/daemon_integration_test.py"])
     all_ok &= step("install script tests",
