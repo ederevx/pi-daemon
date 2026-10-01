@@ -57,7 +57,7 @@ test("pre-daemon: gate blocks only this extension's tools", async () => {
   const pi = new MockPi();
   factory(pi as never);
   const gate = pi.gate();
-  for (const name of ["daemon_tasks", "daemon_gc_reap"]) {
+  for (const name of ["daemon_tasks", "daemon_gc_reap", "transcript_read"]) {
     const result = await gate({ toolName: name });
     assertEq(result?.block, true, `${name} blocked before pre_daemon`);
   }
@@ -81,7 +81,7 @@ test("pre-daemon: reading the catalog unlocks the tools", async () => {
 
 test("pre-daemon: catalog lists every registered tool and the conventions", () => {
   const catalog = new PreDaemonTool().catalog();
-  for (const name of ["bash", "daemon_tasks", "daemon_gc_reap"]) {
+  for (const name of ["bash", "daemon_tasks", "daemon_gc_reap", "transcript_read"]) {
     assert(catalog.includes(name), `catalog names ${name}`);
   }
   assert(catalog.includes("Conventions:"), "catalog has conventions");

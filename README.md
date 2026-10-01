@@ -140,6 +140,15 @@ them, and can uninstall exactly what it installed.
   daemon respawns it from its registry, and `pi-rc attach` or
   `pi-rc start` resumes the latest session for that directory (`pi -c`),
   falling back to a fresh pi; pass `--fresh` to force an empty session.
+- **Transcript retrieval** (`transcript` pi extension): the daemon keeps a
+  positional `.jsonl.idx` sidecar beside every cold conversation and serves
+  it over the control socket, so a session can read its own history without
+  parsing the whole file. The `transcript_read` tool exposes the read views —
+  `stat`, `path` (leaf-to-root), `entries` (cursor/id paging), `tree`, and
+  `range` (entry-aligned raw bytes) — defaults to the current session, and
+  names only files the daemon validates inside the session store. It is
+  read-only and appends nothing, so it never competes with pi's compaction
+  or cache handling.
 
 ## Install
 
@@ -181,6 +190,8 @@ pi/
                          # + the daemon_gc_reap tool
   extensions/offload.ts  # ticket offloading + daemon_tasks tool
   extensions/pre-daemon.ts # pre_daemon onboarding: catalog + first-call gate
+  extensions/transcript.ts # transcript_read: index-backed conversation reads
+  extensions/transcript/ # control client + transcript_read implementation
   bin/pi-rc              # client: tickets, bridge, input, reload,
                          # start/attach/detach/announce/ls/which/stop
   daemon/pi-daemon       # stdlib Python PTY host + shell ticket runners
