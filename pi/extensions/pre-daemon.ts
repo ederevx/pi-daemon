@@ -72,7 +72,7 @@ export class PreDaemonTool {
 			"Tools:",
 			"- pre_daemon: this catalog; call once before any daemon/offload tool.",
 			"- bash: every shell command is handed to the daemon immediately as a ticket; the claim succeeds at once and the result is delivered when it finishes.",
-			"- daemon_tasks: submit/status/result/watch/cancel/remove/reset/list tickets.",
+			"- daemon_tasks: submit/status/result/watch/cancel/remove/list tickets.",
 			"- daemon_gc_reap: reap this hosted session when the daemon requests it.",
 			"- transcript_read: read this conversation from the daemon index (stat/path/entries/tree/range) instead of loading the whole session file.",
 			"",

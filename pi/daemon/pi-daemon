@@ -859,15 +859,29 @@ class TicketStore:
 		self._next = 1
 
 	def load(self):
+		# A persisted counter can lag the ids it issued (the reservation and
+		# the record are separate writes) and a missing or unreadable file
+		# must never silently reissue an id already handed out, so derive the
+		# next id from the highest id the store can still observe: a reload
+		# stays monotonic even after an interrupted write.
 		data = self._file.read_dict()
 		tickets = data.get("tickets")
 		self._tickets = tickets if isinstance(tickets, dict) else {}
 		try:
-			self._next = int(data.get("next", 1))
+			stored = int(data.get("next", 1))
 		except (TypeError, ValueError):
-			self._next = 1
-		if self._next < 1:
-			self._next = 1
+			stored = 0
+		highest = max((self._id_counter(tid) for tid in self._tickets), default=0)
+		self._next = max(1, stored, highest + 1)
+
+	@staticmethod
+	def _id_counter(tid):
+		# The trailing integer of an id (``t-<seg>-<n>`` or ``t-<n>``),
+		# 0 when it carries none.
+		try:
+			return int(str(tid).rsplit("-", 1)[-1])
+		except (TypeError, ValueError):
+			return 0
 
 	def _write_locked(self):
 		# Caller holds the lock: one atomic write-through (the AtomicStateFile
@@ -877,11 +891,14 @@ class TicketStore:
 	def alloc_id_locked(self, session=None):
 		# Caller holds the lock: ids must strictly increase across the
 		# whole persisted history, so the counter rides the same file.
-		# A short session segment rides the id itself (t-<seg>-<n>) so a
-		# ticket names the session it belongs to without a separate
-		# lookup; the global counter keeps ids unique across sessions.
+		# The reservation is persisted before the record exists, so a crash
+		# between reservation and add can never reissue the id. A short
+		# session segment rides the id itself (t-<seg>-<n>) so a ticket
+		# names the session it belongs to without a separate lookup; the
+		# global counter keeps ids unique across sessions.
 		n = self._next
-		self._next += 1
+		self._next = n + 1
+		self._write_locked()
 		seg = self._session_segment(session)
 		if seg:
 			return "t-%s-%d" % (seg, n)

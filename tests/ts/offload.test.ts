@@ -252,10 +252,8 @@ test("offload: daemon_tasks status/result/list/cancel/remove/reset", async () =>
   const removed = await runTool(tools, { action: "remove", id: "t-1" });
   assertEq(removed.content?.[0]?.text, "ticket t-1 removed");
 
-  assertMatches(
-    (await runTool<{ content: Array<{ text: string }> }>(tools, { action: "reset" })).content[0].text,
-    /ticketing reset/,
-  );
+  await assertReject(() => runTool(tools, { action: "reset" }),
+    "the global reset is not an agent action");
   // no subagent actions accepted
   await assertReject(() => runTool(tools, { action: "submit", command: "" }), "submit without command rejected");
   // a ticket whose point is to wait is refused before the daemon sees it
