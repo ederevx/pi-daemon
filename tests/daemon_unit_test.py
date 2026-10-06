@@ -25,6 +25,10 @@ SCRATCH = tempfile.mkdtemp(
     prefix="pi-daemon-unit-", dir=os.path.expanduser("~/tmp"))
 os.environ["XDG_STATE_HOME"] = os.path.join(SCRATCH, "state")
 os.environ["XDG_RUNTIME_DIR"] = os.path.join(SCRATCH, "runtime")
+# A descriptor publishing root: on Windows the daemon ignores
+# XDG_RUNTIME_DIR for services, so pin it to scratch or a real daemon
+# boot would publish over the live provider entry.
+os.environ["PI_SERVICES_DIR"] = os.path.join(SCRATCH, "services")
 # Keep settings isolated: the daemon reads the pi settings file's
 # "piDaemon" namespace, so point the agent dir at scratch (a real
 # settings.json must never influence a test).
