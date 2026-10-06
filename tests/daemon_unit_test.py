@@ -228,6 +228,30 @@ def test_ticket_store():
     assert_eq(nxt3, 99)
 
 
+def test_ticket_store_reload_monotonic():
+    """A reload never reissues an id the store already handed out: the
+    reservation is durable at claim time and the counter can only rise
+    above the ids the file still carries."""
+    path = os.path.join(SCRATCH, "tickets-reload.json")
+    logs = os.path.join(SCRATCH, "tickets-reload-logs")
+    store = daemon.TicketStore(path, logs)
+    store.load()
+    with store.lock:
+        assert_eq(store.alloc_id_locked("s"), "t-s-1")
+    reloaded = daemon.TicketStore(path, logs)
+    reloaded.load()
+    with reloaded.lock:
+        assert_eq(reloaded.alloc_id_locked("s"), "t-s-2")
+    # A tickets.json that lost its counter (an older generation that never
+    # published the reservation) still cannot drop below the ids it keeps.
+    with open(path, "w") as f:
+        f.write(json.dumps({"tickets": {"t-s-7": {"id": "t-s-7"}}}) + "\n")
+    recovered = daemon.TicketStore(path, logs)
+    recovered.load()
+    with recovered.lock:
+        assert_eq(recovered.alloc_id_locked("s"), "t-s-8")
+
+
 # --- extension fingerprint/diff -------------------------------------------
 
 def test_ext_fingerprint():
@@ -1910,6 +1934,7 @@ def _main():
        test_owned_selection)
     ok("registry round-trip", test_registry)
     ok("ticket store lifecycle", test_ticket_store)
+    ok("ticket store reload monotonic", test_ticket_store_reload_monotonic)
     ok("extension fingerprint/diff", test_ext_fingerprint)
     ok("exit classification", test_exit_classification, posix_only=True)
     ok("exit seam (base + daemon delegation)", test_exit_seam)
