@@ -179,6 +179,7 @@ def _platform_path():
 
 sys.path.insert(0, _platform_path())
 import pi_platform
+import pi_services
 import pi_settings
 import pi_transcript
 
@@ -625,10 +626,15 @@ class Registry:
 		# a name drop() just removed (a stale respawn on daemon restart).
 		self._file.write(data)
 
-	def add(self, name, dir_, argv):
+	def add(self, name, dir_, argv, env=None):
 		with self._lock:
 			data = self.load()
-			data[name] = {"dir": dir_, "argv": list(argv)}
+			rec = {"dir": dir_, "argv": list(argv)}
+			# Only caller-supplied overrides are persisted: the daemon's
+			# own environment is process-local and never written out.
+			if env:
+				rec["env"] = dict(env)
+			data[name] = rec
 			self._store(data)
 
 	def drop(self, name):
@@ -1855,10 +1861,11 @@ class Session:
 	"""One hosted pi: its PTY, its bridge viewers, and the relay loop
 	that owns the master fd."""
 
-	def __init__(self, name, dir_, argv, pid, master_fd, child=None):
+	def __init__(self, name, dir_, argv, pid, master_fd, child=None, env=None):
 		self.name = name
 		self.dir = dir_
 		self.argv = list(argv)
+		self.env = dict(env or {})
 		self.pid = pid
 		self.master_fd = master_fd
 		# The PTY seam owns every OS-specific fd/handle operation. A
@@ -2165,9 +2172,10 @@ class SessionSpawner:
 		return self._backend
 
 	def spawn(self, name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS,
-			  verb="start", registry_argv=None, refuse_if_exists=False):
-		env = os.environ.copy()
-		env.update({
+			  verb="start", registry_argv=None, refuse_if_exists=False,
+			  env=None, env_once=None):
+		child_env = os.environ.copy()
+		child_env.update({
 			"TERM": "xterm-256color",
 			"COLORTERM": "truecolor",
 			"COLUMNS": str(cols),
@@ -2175,9 +2183,20 @@ class SessionSpawner:
 			"PI_HOSTED": "1",
 			"PI_HOSTED_SESSION": name,
 		})
-		child = self.backend().spawn(argv, dir_, env, cols, rows)
+		# A caller override (a teammate's identity) wins over the
+		# daemon defaults; the session records only the override so a
+		# respawn can reconstitute the child's environment without ever
+		# persisting the daemon's own environment. env_once is applied
+		# to the child but never stored: a consumer's secret must not
+		# reach the provider's registry.
+		if env:
+			child_env.update(env)
+		if env_once:
+			child_env.update(env_once)
+		child = self.backend().spawn(argv, dir_, child_env, cols, rows)
 		sess = Session(name, dir_, argv, child.pid,
-					   getattr(child, "master_fd", -1), child=child)
+					   getattr(child, "master_fd", -1), child=child,
+					   env=env)
 		if not self.table.put(sess, refuse_if_exists=refuse_if_exists):
 			# Lost a race for the name: kill our child so nothing is left
 			# behind, and leave the existing session untouched.
@@ -2186,7 +2205,8 @@ class SessionSpawner:
 			log("%s '%s' skipped: name taken during spawn" % (verb, name))
 			return None
 		self.registry.add(name, dir_,
-						  list(registry_argv) if registry_argv else list(argv))
+						  list(registry_argv) if registry_argv else list(argv),
+						  env)
 		log("%s '%s' pid %d in %s" % (verb, name, child.pid, dir_))
 		t = threading.Thread(target=sess.relay_loop, args=(self.owner,),
 							 daemon=True)
@@ -2209,6 +2229,7 @@ class Daemon:
 		self.table = SessionTable()
 		self.ledger = HandoffLedger()
 		self.gc_reaper = GcReaper(GC_REAP_REQUEST_DIR, GC_IDLE)
+		self.services = pi_services.ServiceDirectory()
 		self.shutdown_event = threading.Event()
 		self.spawner = SessionSpawner(self.table, registry, owner=self)
 		self.tickets = TicketRunner(
@@ -2264,6 +2285,21 @@ class Daemon:
 			   self.registry.path))
 		self.roster.register(os.getpid(), self.server.host,
 							 self.server.port, self.token)
+		# Advertise the hosting capability where any client can find it,
+		# after the endpoint exists. The startup sweep clears a dead
+		# predecessor before this daemon publishes its own entry; the
+		# interval sweep then matches the rest of the state GC cadence.
+		self.services.sweep()
+		try:
+			self.services.publish(
+				self.sock_path,
+				self.services.activation_argv(os.path.abspath(__file__),
+											 "daemon-start"))
+		except OSError as exc:
+			# Discovery is best-effort: an unwritable services dir leaves
+			# the daemon serving, just unadvertised.
+			log("service descriptor not published: %s" % exc)
+		self.services.start(self.shutdown_event, STATE_GC_TICK)
 		self.respawn_from_registry()
 		self.tickets.start()
 		self.state_gc.sweep()
@@ -2372,6 +2408,9 @@ class Daemon:
 		self.registry.write({})
 		self.endpoint.remove_if(self.server.host, self.server.port,
 								self.token)
+		# Pid-guarded: a successor that already published over this path
+		# keeps its entry.
+		self.services.remove(pid=os.getpid())
 		os._exit(0)
 
 	def _terminate_sessions(self, sessions):
@@ -2425,9 +2464,11 @@ class Daemon:
 	# -- session lifecycle -----------------------------------------------------
 
 	def spawn(self, name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS,
-			  verb="start", registry_argv=None, refuse_if_exists=False):
+			  verb="start", registry_argv=None, refuse_if_exists=False,
+			  env=None, env_once=None):
 		return self.spawner.spawn(name, dir_, argv, cols, rows, verb,
-								  registry_argv, refuse_if_exists)
+								  registry_argv, refuse_if_exists, env,
+								  env_once)
 
 	def _handshake(self, conn, reader):
 		# Mandatory first line: the random-token hello that authenticates
@@ -2538,7 +2579,8 @@ class Daemon:
 		try:
 			spawned = self.spawn(sess.name, sess.dir,
 								 PROCESS.pi_argv(["--session", file]),
-								 verb="revive", refuse_if_exists=True)
+								 verb="revive", refuse_if_exists=True,
+								 env=sess.env or None)
 		except OSError as exc:
 			log("revive '%s' failed: %s" % (sess.name, exc))
 			return
@@ -2562,7 +2604,8 @@ class Daemon:
 				if not (isinstance(dir_, str) and isinstance(argv, list)
 						and argv):
 					raise ValueError("bad record")
-				self.spawn(name, dir_, argv, verb="respawn")
+				self.spawn(name, dir_, argv, verb="respawn",
+						   env=rec.get("env") or None)
 			except Exception as exc:
 				log("respawn '%s' failed: %s" % (name, exc))
 				self.registry.drop(name)
@@ -2758,6 +2801,14 @@ class Control:
 		name = req.get("name")
 		dir_ = req.get("dir")
 		argv = req.get("argv")
+		env = req.get("env")
+		env_once = req.get("env_once")
+		for candidate in (env, env_once):
+			if candidate is not None and not (
+					isinstance(candidate, dict)
+					and all(isinstance(k, str) and isinstance(v, str)
+							for k, v in candidate.items())):
+				return bad_request()
 		try:
 			cols = int(req.get("cols", DEFAULT_COLS))
 			rows = int(req.get("rows", DEFAULT_ROWS))
@@ -2772,7 +2823,8 @@ class Control:
 		if self.daemon.table.get(name) is not None:
 			return {"ok": True, "name": name, "created": False}
 		try:
-			self.daemon.spawn(name, dir_, argv, cols, rows)
+			self.daemon.spawn(name, dir_, argv, cols, rows, env=env,
+							  env_once=env_once)
 		except OSError as exc:
 			log("start '%s' failed: %s" % (name, exc))
 			return err("spawn-failed")

@@ -150,8 +150,14 @@ def test_registry():
     reg = daemon.Registry(os.path.join(SCRATCH, "sessions.json"))
     reg.add("pi-a", "/x", ["pi"])
     assert_eq(reg.load()["pi-a"]["dir"], "/x")
+    assert_true("env" not in reg.load()["pi-a"], "no env when none passed")
     reg.set_argv("pi-a", ["pi", "--session", "/x/a.jsonl"])
     assert_eq(reg.load()["pi-a"]["argv"][2], "/x/a.jsonl")
+    reg.add("pi-b", "/x", ["pi"], env={"TEAM_ID": "fork-1"})
+    assert_eq(reg.load()["pi-b"]["env"]["TEAM_ID"], "fork-1")
+    reg.set_argv("pi-b", ["pi", "--session", "/x/b.jsonl"])
+    assert_eq(reg.load()["pi-b"]["env"]["TEAM_ID"], "fork-1",
+              "set_argv preserves the persisted env")
     reg.drop("pi-a")
     assert_true("pi-a" not in reg.load())
 
@@ -465,6 +471,43 @@ def test_session_control():
     assert_true(not DAEMON.control.start({"name": "", "dir": SCRATCH,
                                           "argv": ["sh"]}).get("ok"))
     assert_true(not DAEMON.control.state({"name": name, "state": "loud"}).get("ok"))
+    # opaque identity env is stored on the session and in the registry,
+    # and a malformed env is rejected before any spawn.
+    envname = "pi-envtest"
+    er = DAEMON.control.start(
+        {"name": envname, "dir": SCRATCH, "argv": ["sh", "-c", "sleep 30"],
+         "env": {"TEAM_ID": "fork-env"}})
+    assert_true(er.get("ok"), er)
+    esess = DAEMON.table.get(envname)
+    assert_true(esess is not None and esess.env.get("TEAM_ID") == "fork-env")
+    assert_eq(DAEMON.registry.load()[envname]["env"]["TEAM_ID"], "fork-env")
+    bad_env = DAEMON.control.start(
+        {"name": "pi-badenv", "dir": SCRATCH, "argv": ["sh"],
+         "env": {"TEAM_ID": 3}})
+    assert_true(not bad_env.get("ok"), "non-string env rejected")
+    DAEMON.control.stop({"name": envname})
+    # env_once reaches the child but is never persisted: a provider must
+    # not store a consumer's secret.
+    once = "pi-oncetest"
+    out = os.path.join(SCRATCH, "once-env.txt")
+    r_once = DAEMON.control.start(
+        {"name": once, "dir": SCRATCH,
+         "argv": ["sh", "-c",
+                  "printenv TEAM_SEND_TOKEN > '%s'; sleep 20" % out],
+         "env": {"TEAM_ID": "fork-once"},
+         "env_once": {"TEAM_SEND_TOKEN": "sekret"}})
+    assert_true(r_once.get("ok"), r_once)
+    for _ in range(100):
+        if os.path.exists(out):
+            break
+        time.sleep(0.02)
+    with open(out) as fh:
+        assert_eq(fh.read().strip(), "sekret")
+    orec = DAEMON.registry.load()[once]
+    assert_true("TEAM_SEND_TOKEN" not in orec.get("env", {}),
+                "the provider must not persist a consumer secret")
+    assert_eq(orec["env"]["TEAM_ID"], "fork-once")
+    DAEMON.control.stop({"name": once})
 
 
 def test_reload_guard():
@@ -1570,6 +1613,87 @@ def test_roster_recycled_pid_never_killed():
             proc.wait()
 
 
+def test_service_descriptor():
+    """The generic session-host descriptor is published exactly (fields
+    and order), removed owner-scoped, and the sweep drops only
+    dead-pid, missing-endpoint, and malformed entries while keeping a
+    live provider."""
+    mod = daemon.pi_services
+    # The single root helper: env override, else POSIX runtime dir, else
+    # temp dir on every platform.
+    assert_eq(mod.ServiceDirectory(environ={"PI_SERVICES_DIR": "/svc"},
+                                   platform="linux").root, "/svc")
+    assert_eq(mod.ServiceDirectory(environ={"XDG_RUNTIME_DIR": "/run/u"},
+                                   platform="linux").root,
+              os.path.join("/run/u", "pi-services"))
+    fallback = os.path.join(tempfile.gettempdir(), "pi-services")
+    assert_eq(mod.ServiceDirectory(environ={}, platform="linux").root,
+              fallback)
+    assert_eq(mod.ServiceDirectory(environ={}, platform="win32").root,
+              fallback)
+
+    root = os.path.join(SCRATCH, "services-root")
+    sd = mod.ServiceDirectory(root=root)
+    endpoint = os.path.join(SCRATCH, "svc-endpoint.json")
+    daemon.pi_platform.EndpointFile(endpoint).write(
+        "127.0.0.1", 40123, "tok")
+    argv = ["/opt/bin/pi-rc", "daemon-start"]
+
+    desc = sd.publish(endpoint, argv, pid=os.getpid())
+    path = sd.path("session-host", "pi-daemon")
+    assert_eq(path, os.path.join(root, "session-host", "pi-daemon.json"))
+    with open(path, "r", encoding="utf-8") as fh:
+        stored = json.loads(fh.read())
+    assert_eq(stored, {
+        "service": "session-host", "version": 1,
+        "protocol": "pi-pty-host/1", "provider": "pi-daemon",
+        "pid": os.getpid(), "endpoint_file": os.path.abspath(endpoint),
+        "activation": {"kind": "exec", "argv": argv}})
+    assert_eq(desc, stored, "publish returns the written descriptor")
+    assert_eq(list(stored.keys()),
+              ["service", "version", "protocol", "provider", "pid",
+               "endpoint_file", "activation"], "exact field order")
+
+    # Owner-scoped remove: a foreign pid never unlinks the entry.
+    assert_true(not sd.remove(pid=os.getpid() + 1), "foreign pid spared")
+    assert_true(os.path.exists(path), "foreign remove kept the file")
+    assert_true(sd.remove(pid=os.getpid()), "own pid removes")
+    assert_true(not os.path.exists(path), "removed descriptor")
+
+    # Sweep: a live provider survives; dead pid, missing endpoint,
+    # endpoint without dialable coordinates, and malformed JSON go.
+    ep_live = os.path.join(SCRATCH, "svc-live.json")
+    daemon.pi_platform.EndpointFile(ep_live).write(
+        "127.0.0.1", 40124, "tok")
+    sd.publish(ep_live, argv, pid=os.getpid())
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    ep_dead = os.path.join(SCRATCH, "svc-dead.json")
+    daemon.pi_platform.EndpointFile(ep_dead).write(
+        "127.0.0.1", 40125, "tok")
+    sd.publish(ep_dead, argv, provider="dead", pid=dead.pid)
+    sd.publish(os.path.join(SCRATCH, "svc-missing.json"), argv,
+               provider="noep", pid=os.getpid())
+    ep_bad = os.path.join(SCRATCH, "svc-bad.json")
+    with open(ep_bad, "w", encoding="utf-8") as fh:
+        fh.write("{}")
+    sd.publish(ep_bad, argv, provider="badep", pid=os.getpid())
+    malformed = sd.path("session-host", "badjson")
+    with open(malformed, "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+
+    sd.sweep()
+    assert_true(os.path.exists(sd.path("session-host", "pi-daemon")),
+                "live descriptor removed")
+    assert_true(not os.path.exists(sd.path("session-host", "dead")),
+                "dead-pid descriptor kept")
+    assert_true(not os.path.exists(sd.path("session-host", "noep")),
+                "missing-endpoint descriptor kept")
+    assert_true(not os.path.exists(sd.path("session-host", "badep")),
+                "unreachable endpoint kept")
+    assert_true(not os.path.exists(malformed), "malformed JSON kept")
+
+
 def test_endpoint_remove_if_owner_scoped():
     """EndpointFile.remove_if unlinks only a file that still publishes
     the caller's own coordinates: a dying daemon must never delete the
@@ -2004,6 +2128,8 @@ def _main():
        test_roster_recycled_pid_never_killed, posix_only=True)
     ok("endpoint remove_if is owner-scoped",
        test_endpoint_remove_if_owner_scoped)
+    ok("service descriptor (publish/remove/stale GC)",
+       test_service_descriptor)
     ok("posix pty child seam", test_posix_pty_child, posix_only=True)
     ok("terminal seam (raw mode, io, SIGWINCH resize)",
        test_terminal_seam, posix_only=True)
