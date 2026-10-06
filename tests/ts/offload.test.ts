@@ -258,6 +258,16 @@ test("offload: daemon_tasks status/result/list/cancel/remove/reset", async () =>
   );
   // no subagent actions accepted
   await assertReject(() => runTool(tools, { action: "submit", command: "" }), "submit without command rejected");
+  // a ticket whose point is to wait is refused before the daemon sees it
+  await assertReject(() => runTool(tools, { action: "submit", command: "sleep 30" }),
+    "a wait-only submit is refused");
+  await assertReject(() => runTool(tools, { action: "submit", command: "while pgrep x; do sleep 1; done" }),
+    "a polling-loop submit is refused");
+  const okSubmit = await runTool<{ content: Array<{ text: string }> }>(tools,
+    { action: "submit", command: "grep -rn sleep README.md" });
+  assertMatches(okSubmit.content[0].text, /queued/);
+  assert(!pi.execCalls.some((c) => c.args[0] === "ticket-submit" && c.args.join(" ").includes("sleep 30")),
+    "the refused wait never submitted");
 });
 
 test("offload: result wait completes by active polling with live status", async () => {
