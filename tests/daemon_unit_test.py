@@ -1802,6 +1802,40 @@ def test_platform_seams():
     assert_eq(hs.reject().get("error"), "bad-handshake")
 
 
+def test_windows_pid_alive():
+    """Windows liveness is decided by a process handle, not a signal:
+    a live child is alive until reaped, absurd or negative pids are dead,
+    and a non-Windows platform still takes the POSIX os.kill path."""
+    plat = daemon.pi_platform
+    win = plat.ProcessControl(platform="win32")
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert_true(win.pid_alive(child.pid), "live child reported dead")
+    finally:
+        child.terminate()
+        child.wait()
+    assert_true(not win.pid_alive(child.pid),
+                "reaped child reported alive")
+    for dead_pid in (999999, 2147483000, 0, -1):
+        assert_true(not win.pid_alive(dead_pid),
+                    "invalid pid reported alive: %r" % dead_pid)
+    # A non-Windows platform keeps probing with signal 0; a failed probe
+    # is a dead pid. Patch the seam so no real signal reaches a process.
+    probed = []
+    real_kill = plat.os.kill
+    def fake_kill(pid, sig):
+        probed.append((pid, sig))
+        raise OSError("no such process")
+    plat.os.kill = fake_kill
+    try:
+        lin = plat.ProcessControl(platform="linux")
+        assert_true(not lin.pid_alive(4242), "POSIX probe path not used")
+        assert_eq(probed, [(4242, 0)])
+    finally:
+        plat.os.kill = real_kill
+
+
 def test_shell_path_skips_wsl_stub():
     plat = daemon.pi_platform
     root = os.environ.get("SystemRoot", "C:\\WINDOWS")
@@ -2120,6 +2154,8 @@ def _main():
        test_idle_shutdown_watch)
     ok("platform seams (layout, handshake, shell)",
        test_platform_seams)
+    ok("windows pid liveness (handle probe, POSIX fallback)",
+       test_windows_pid_alive, windows_only=True)
     ok("roster waits for peer death before publishing",
        test_roster_waits_for_peer_death)
     ok("roster force-kills a lingering peer",
