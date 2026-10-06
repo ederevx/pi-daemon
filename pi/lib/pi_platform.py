@@ -327,9 +327,12 @@ class ProcessControl:
 
     def pid_alive(self, pid):
         """True while a pid still exists as a live process; a reaped or
-        zombie process counts as gone. Best effort: without os.kill
-        every pid is presumed alive."""
-        if self.platform.startswith("win") or not hasattr(os, "kill"):
+        zombie process counts as gone. Windows uses a handle probe, not a
+        signal. Best effort: without os.kill every pid is presumed
+        alive."""
+        if self.platform.startswith("win"):
+            return self._win_pid_alive(pid)
+        if not hasattr(os, "kill"):
             return True
         try:
             os.kill(pid, 0)
@@ -340,6 +343,35 @@ class ProcessControl:
                 return not fh.read().rsplit(")", 1)[1].lstrip().startswith("Z")
         except OSError:
             return True
+
+    def _win_pid_alive(self, pid):
+        """Windows liveness through a process handle.
+
+        os.kill(pid, 0) is unusable here: on Windows it calls
+        TerminateProcess rather than probing (Python issue 14480). A
+        failed OpenProcess means the pid names no live process; a
+        successful one is decided by GetExitCodeProcess, where
+        STILL_ACTIVE means alive and any other code means reaped. pids
+        at or below zero are never valid Windows process ids.
+        """
+        import ctypes
+        if pid <= 0:
+            return False
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle,
+                                               ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
 
     def process_start_token(self, pid):
         """A token identifying this exact process incarnation: the
