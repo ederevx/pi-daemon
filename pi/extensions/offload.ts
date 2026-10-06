@@ -3,20 +3,20 @@
  * ticket.
  *
  * The extension overrides the built-in `bash` tool with a variant whose
- * execution backend submits every command to pi-daemon as a ticket and
- * returns at once: the daemon always owns execution, no task holds the
- * agent, and no task waits out a short window before being handed off.
- * Output is delivered in ONE GO when the command finishes (nothing is
- * streamed into the tool result while it runs), so agents read a
- * complete result exactly once. Two departures from the stock backend,
- * both deliberate:
+ * execution backend hands every command to pi-daemon as a ticket and
+ * then waits on that daemon-owned ticket for its deferred result: the
+ * daemon always owns execution, and the call returns the task's real
+ * result instead of an intermediate hand-off. Output is delivered in ONE
+ * GO when the command finishes (nothing is streamed into the tool result
+ * while it runs), so agents read a complete result exactly once. Two
+ * departures from the stock backend, both deliberate:
  *
- * - The tool call returns immediately with the ticket id; the full
- *   result arrives as a steer before the next model call, or several
- *   turns later if the command outlives the turn. The agent can also
- *   block explicitly with `daemon_tasks result <id> wait=<seconds>`. A
- *   bash `timeout` supplied to the tool is forwarded to the daemon,
- *   which enforces it daemon-side.
+ * - The daemon owns the process from the first instant, and the call
+ *   waits with the same active wait `daemon_tasks result` uses, so the
+ *   agent never sees a hand-off it could respond to before the result.
+ *   A bash `timeout` supplied to the tool is forwarded to the daemon,
+ *   which enforces it daemon-side, and a timed-out ticket returns a
+ *   failed result rather than the stock tool's null-exit error.
  * - If the daemon is unreachable, execution falls back to pi's local
  *   shell backend transparently — the agent only ever sees normal bash
  *   behavior. PI_OFFLOAD=off disables offloading entirely.
@@ -963,12 +963,14 @@ class DaemonTasksDock {
 	}
 }
 
-/** The offloading bash backend: submits every command to the daemon and
- *  returns at once, so the daemon always owns execution and no task holds
- *  the agent. The submit-armed delivery watcher reports the full result as
- *  one steer; a bash timeout travels with the ticket and is enforced
- *  daemon-side. Falls back to the local shell only when the daemon was
- *  never in play. Owns its fallback backend and its per-call state. */
+/** The offloading bash backend: hands every command to the daemon and
+ *  blocks on the daemon-owned ticket for its deferred result, so the
+ *  daemon always owns execution and the call never returns the stock
+ *  tool's intermediate hand-off. The submit-armed delivery watcher still
+ *  covers an aborted call and a late daemon restart; a bash timeout
+ *  travels with the ticket and is enforced daemon-side. Falls back to the
+ *  local shell only when the daemon was never in play. Owns its fallback
+ *  backend and its per-call state. */
 class OffloadedBash implements BashOperations {
 	constructor(
 		private readonly localBash: BashOperations,
@@ -1004,24 +1006,51 @@ class OffloadedBash implements BashOperations {
 				onData(Buffer.from(
 					`[pi-daemon submit outcome unknown; NOT re-running ` +
 					`locally to avoid duplication - check daemon_tasks ` +
-					`list to locate the ticket]
-`));
-				return { exitCode: null };
+					`list to locate the ticket]\n`));
+				return { exitCode: 1 };
 			}
 			id = adopted;
 		}
-		// Handed off: the ticket is daemon-owned from here. The delivery
-		// watcher armed by submit() steers the full result in, and the agent
-		// can block explicitly with daemon_tasks result <id> wait=<seconds>.
-		const timeoutNote = timeout && timeout > 0
-			? `, daemon timeout ${timeout}s` : "";
-		onData(Buffer.from(
-			`[pi-daemon ticket ${id} handed off${timeoutNote}: ${command}\n` +
-			`The daemon owns execution; the full result is delivered here ` +
-			`when it finishes (daemon_tasks result ${id} wait=<seconds> ` +
-			`blocks for it)].\n`));
-		return { exitCode: null };
+		// Claimed: the daemon owns the ticket from the first instant, so
+		// the call owns the deferred result too. Wait for it here - the
+		// same active wait daemon_tasks uses - so the agent never sees a
+		// hand-off it could respond to before the task finishes.
+		return this.awaitDeferred(id, onData, signal);
 	};
+
+	/** Blocks the call on a daemon-owned ticket until it finishes and
+	 *  returns its real exit code, streaming the final output. A signal
+	 *  abort cancels the ticket daemon-side and ends the call; the
+	 *  submit-armed watcher still delivers a result that lands later.
+	 *  Never returns the stock tool's null exit code: a lost ticket
+	 *  reports a failed 1. */
+	private async awaitDeferred(
+		id: string,
+		onData: (data: Buffer) => void,
+		signal: AbortSignal | undefined,
+	): Promise<{ exitCode: number }> {
+		const { ticket, completed } = await this.tasks.activeWait(id, {
+			bound: Infinity,
+			signal,
+			shouldYield: () => false,
+		});
+		if (!completed) {
+			await this.tasks.cancel(id).catch(() => {});
+			throw new Error("aborted");
+		}
+		let output = "";
+		try {
+			output = await this.tasks.client.outputAll(id);
+		} catch {
+			// output fetch is best-effort; the exit code still stands
+		}
+		if (ticket.status === "lost") {
+			output += `\n[pi-daemon ticket ${id} was interrupted ` +
+				`(daemon restart); re-run if it is safe to repeat]`;
+		}
+		onData(Buffer.from(output));
+		return { exitCode: ticket.exit ?? 1 };
+	}
 }
 export default function (pi: ExtensionAPI) {
 	const exec = (file: string, args: string[]) => pi.exec(file, args);

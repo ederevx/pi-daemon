@@ -99,13 +99,12 @@ them, and can uninstall exactly what it installed.
   spawn storm.
 - **Command offloading** (`offload` pi extension): every `bash` call is
   handed to the daemon as a **ticket** immediately — a daemon-owned shell
-  command that outlives the submitting agent — and the tool returns at
-  once, so no task holds the agent. Results are delivered in one go when
+  command that outlives the submitting agent — and the call then waits on
+  that daemon-owned ticket and returns its deferred result, so the agent
+  never sees an intermediate hand-off it could respond to before the task
+  finishes. Results are delivered in one go when
   the command finishes (nothing streams into the tool result), so an
-  agent reads a complete result exactly once. The full output arrives as
-  a steer before the next model call, or later if the command outlives
-  the turn; the agent can block explicitly with
-  `daemon_tasks result <id> wait=<seconds>`. A `timeout` passed to the
+  agent reads a complete result exactly once. A `timeout` passed to the
   bash tool travels with the ticket and is enforced daemon-side (TERM,
   then KILL), recorded as a failed `timed out` ticket. Every
   ticket is recorded in the daemon's persisted `tickets.json` and

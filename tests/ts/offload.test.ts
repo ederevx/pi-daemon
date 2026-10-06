@@ -61,7 +61,9 @@ class FakePi {
     const python = /python/i.test(file);
     const cmd = (python ? args[1] : args[0]) ?? "";
     const rest = python ? args.slice(2) : args.slice(1);
-    this.execCalls.push({ file: python ? args[0] : file, args: rest });
+    // Record the normalized pi-rc call (subcommand first, then its
+    // arguments) so assertions can name the verb and its flags alike.
+    this.execCalls.push({ file: python ? args[0] : file, args: [cmd, ...rest] });
     if (this.daemonDown) return { code: 4, stdout: "", stderr: "down", killed: false };
     if (cmd === "ticket-submit") return ok("ticket t-1\n");
     if (cmd === "ticket-wait") {
@@ -287,8 +289,9 @@ test("offload: watch abort releases the wait with the ticket still running", asy
     "no blocking round trips after abort");
 });
 
-test("offload: bash tool hands off immediately with the timeout forwarded", async () => {
+test("offload: bash claims the ticket and returns its deferred result", async () => {
   const pi = mount(new FakePi());
+  pi.logs.set("t-1", "deferred-output");
   const bashTool = pi.tools.get("bash") as { execute: unknown };
   const execute = bashTool.execute as (
     _id: string,
@@ -296,29 +299,52 @@ test("offload: bash tool hands off immediately with the timeout forwarded", asyn
     _s: unknown,
     _o: unknown,
     _c: unknown,
-  ) => Promise<{ content: Array<{ type: string; text: string }> }>;
+  ) => Promise<{
+    content: Array<{ type: string; text: string }>;
+    structuredContent?: { exit_code?: number };
+    isError?: boolean;
+  }>;
+  const out = await execute("call1", { command: "echo hi", cwd: scratchDir(), timeout: 7 }, undefined, undefined, {
+    sessionManager: { getSessionId: () => "test-session", getSessionFile: () => "/x/abc.jsonl" },
+    cwd: scratchDir(),
+    mode: "cli",
+  });
+  const text = out.content.map((b) => b.text).join("\n");
+  assertMatches(text, /deferred-output/);
+  const submit = pi.execCalls.find((c) => c.args.includes("--timeout"));
+  assert(submit !== undefined, "ticket-submit carries --timeout");
+  const idx = submit!.args.indexOf("--timeout");
+  assertEq(submit!.args[idx + 1], "7", "daemon timeout reaches the daemon");
+  // The deferred result is returned inline with a real success code,
+  // never the stock tool's null-exit hand-off error.
+  assertEq(out.structuredContent?.exit_code, 0, "deferred exit code returned");
+  assertEq(out.isError, undefined, "not an error result");
+});
+
+test("offload: an abort cancels the claimed ticket and ends the call", async () => {
+  const pi = mount(new FakePi());
+  const bashTool = pi.tools.get("bash") as { execute: unknown };
+  const execute = bashTool.execute as (
+    _id: string,
+    p: { command: string; cwd?: string },
+    s: unknown,
+    _o: unknown,
+    _c: unknown,
+  ) => Promise<unknown>;
+  const controller = new AbortController();
+  controller.abort();
   let message = "";
   try {
-    await execute("call1", { command: "echo hi", cwd: scratchDir(), timeout: 7 }, undefined, undefined, {
+    await execute("call1", { command: "sleep 99", cwd: scratchDir() }, controller.signal, undefined, {
       sessionManager: { getSessionId: () => "test-session", getSessionFile: () => "/x/abc.jsonl" },
       cwd: scratchDir(),
       mode: "cli",
     });
   } catch (err) {
-    // The stock tool treats a null exit code as "terminated without an
-    // exit code"; the hand-off text still rides in the thrown message.
     message = err instanceof Error ? err.message : String(err);
   }
-  assertMatches(message, /handed off/);
-  assertMatches(message, /daemon timeout 7s/);
-  const submit = pi.execCalls.find((c) => c.args.includes("--timeout"));
-  assert(submit !== undefined, "ticket-submit carries --timeout");
-  const idx = submit!.args.indexOf("--timeout");
-  assertEq(submit!.args[idx + 1], "7", "daemon timeout reaches the daemon");
-  await waitFor(() =>
-    pi.sent.some((s) => (s.options as { deliverAs?: string }).deliverAs === "steer"),
-    "handed-off result steered in",
-  );
+  assertMatches(message, /aborted/);
+  assert(pi.execCalls.some((c) => c.args[0] === "ticket-cancel"), "ticket cancelled daemon-side");
 });
 
 test("offload: bash tool falls back to local execution when the daemon is down", async () => {
