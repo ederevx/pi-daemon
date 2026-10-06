@@ -161,6 +161,10 @@ test("offload: factory registers the expected surface", () => {
   assert(pi.commands.has("daemon-tasks"), "/daemon-tasks command registered");
   assert(!pi.tools.has("daemon_subagent_list"), "subagent tool removed");
   assert(!pi.tools.has("daemon_subagent_wait"), "subagent wait removed");
+  const guidelines = (pi.tools.get("bash") as { promptGuidelines?: string[] } | undefined)
+    ?.promptGuidelines ?? [];
+  assert(guidelines.some((g) => /keep calling tools instead of sleeping/.test(g)),
+    "the bash guideline tells agents not to sleep for a ticket");
 });
 
 test("offload: the completion card is collapsed, outcome-colored, and expandable", () => {
@@ -358,6 +362,12 @@ test("offload: bash defers with a success claim and the watcher steers the resul
   // error: the daemon owns the ticket and the agent is not held.
   assertEq(out.structuredContent?.exit_code, 0, "claim returns success");
   assertEq(out.isError, undefined, "not an error result");
+  // The claim advertises the ticket and both continuations - keep
+  // calling tools, or block explicitly - so an agent that would sleep
+  // knows the result is steered in anyway.
+  const claim = out.content?.[0]?.text ?? "";
+  assertMatches(claim, /ticket t-1 taken by the daemon/);
+  assertMatches(claim, /daemon_tasks result t-1 wait=<seconds>/);
   const submit = pi.execCalls.find((c) => c.args.includes("--timeout"));
   assert(submit !== undefined, "ticket-submit carries --timeout");
   const idx = submit!.args.indexOf("--timeout");
