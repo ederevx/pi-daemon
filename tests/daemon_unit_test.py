@@ -501,12 +501,15 @@ def test_session_control():
          "env": {"TEAM_ID": "fork-once"},
          "env_once": {"TEAM_SEND_TOKEN": "sekret"}})
     assert_true(r_once.get("ok"), r_once)
+    content = ""
     for _ in range(100):
         if os.path.exists(out):
-            break
+            with open(out) as fh:
+                content = fh.read().strip()
+            if content == "sekret":
+                break
         time.sleep(0.02)
-    with open(out) as fh:
-        assert_eq(fh.read().strip(), "sekret")
+    assert_eq(content, "sekret")
     orec = DAEMON.registry.load()[once]
     assert_true("TEAM_SEND_TOKEN" not in orec.get("env", {}),
                 "the provider must not persist a consumer secret")
