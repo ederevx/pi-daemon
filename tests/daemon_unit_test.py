@@ -150,8 +150,14 @@ def test_registry():
     reg = daemon.Registry(os.path.join(SCRATCH, "sessions.json"))
     reg.add("pi-a", "/x", ["pi"])
     assert_eq(reg.load()["pi-a"]["dir"], "/x")
+    assert_true("env" not in reg.load()["pi-a"], "no env when none passed")
     reg.set_argv("pi-a", ["pi", "--session", "/x/a.jsonl"])
     assert_eq(reg.load()["pi-a"]["argv"][2], "/x/a.jsonl")
+    reg.add("pi-b", "/x", ["pi"], env={"TEAM_ID": "fork-1"})
+    assert_eq(reg.load()["pi-b"]["env"]["TEAM_ID"], "fork-1")
+    reg.set_argv("pi-b", ["pi", "--session", "/x/b.jsonl"])
+    assert_eq(reg.load()["pi-b"]["env"]["TEAM_ID"], "fork-1",
+              "set_argv preserves the persisted env")
     reg.drop("pi-a")
     assert_true("pi-a" not in reg.load())
 
@@ -465,6 +471,21 @@ def test_session_control():
     assert_true(not DAEMON.control.start({"name": "", "dir": SCRATCH,
                                           "argv": ["sh"]}).get("ok"))
     assert_true(not DAEMON.control.state({"name": name, "state": "loud"}).get("ok"))
+    # opaque identity env is stored on the session and in the registry,
+    # and a malformed env is rejected before any spawn.
+    envname = "pi-envtest"
+    er = DAEMON.control.start(
+        {"name": envname, "dir": SCRATCH, "argv": ["sh", "-c", "sleep 30"],
+         "env": {"TEAM_ID": "fork-env"}})
+    assert_true(er.get("ok"), er)
+    esess = DAEMON.table.get(envname)
+    assert_true(esess is not None and esess.env.get("TEAM_ID") == "fork-env")
+    assert_eq(DAEMON.registry.load()[envname]["env"]["TEAM_ID"], "fork-env")
+    bad_env = DAEMON.control.start(
+        {"name": "pi-badenv", "dir": SCRATCH, "argv": ["sh"],
+         "env": {"TEAM_ID": 3}})
+    assert_true(not bad_env.get("ok"), "non-string env rejected")
+    DAEMON.control.stop({"name": envname})
 
 
 def test_reload_guard():
