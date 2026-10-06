@@ -43,7 +43,7 @@ function ticketRecord(status: string, id = "t-1"): string {
 
 class FakePi {
   readonly sent: Array<{ message: unknown; options: unknown }> = [];
-  readonly entries: Array<{ kind: string; data: unknown }> = [];
+  readonly messageRenderers = new Map<string, unknown>();
   readonly tools = new Map<string, { name: string; execute?: unknown }>();
   readonly commands = new Map<string, unknown>();
   readonly execCalls: Array<{ file: string; args: string[] }> = [];
@@ -104,16 +104,15 @@ class FakePi {
     this.sent.push({ message, options });
     return Promise.resolve();
   }
-  appendEntry(kind: string, data: unknown): void {
-    this.entries.push({ kind, data });
-  }
   registerTool(tool: { name: string; execute?: unknown }): void {
     this.tools.set(tool.name, tool);
   }
   registerCommand(name: string, def: unknown): void {
     this.commands.set(name, def);
   }
-  registerEntryRenderer(_name: string, _renderer: unknown): void {}
+  registerMessageRenderer(name: string, renderer: unknown): void {
+    this.messageRenderers.set(name, renderer);
+  }
   on(_name: string, _handler: unknown): void {}
 }
 
@@ -162,6 +161,52 @@ test("offload: factory registers the expected surface", () => {
   assert(pi.commands.has("daemon-tasks"), "/daemon-tasks command registered");
   assert(!pi.tools.has("daemon_subagent_list"), "subagent tool removed");
   assert(!pi.tools.has("daemon_subagent_wait"), "subagent wait removed");
+});
+
+test("offload: the completion card is collapsed, outcome-colored, and expandable", () => {
+  initTheme("dark");
+  const pi = mount(new FakePi());
+  const render = pi.messageRenderers.get("daemon-task") as
+    | ((m: unknown, o: unknown, t: unknown) => { render(width: number): string[] } | undefined)
+    | undefined;
+  assert(typeof render === "function", "daemon-task message renderer registered");
+  const roles: string[] = [];
+  const theme = {
+    fg: (role: string, text: string) => { roles.push(role); return text; },
+    bg: (_role: string, text: string) => text,
+    bold: (text: string) => text,
+  };
+  const ticket = {
+    id: "t-1", session: "abc", cwd: "/x", command: "echo hi",
+    status: "done", created: 1, started: 1, finished: 2, exit: 0,
+    term: null, truncated: false, error: null,
+  };
+  const message = {
+    customType: "daemon-task",
+    content: "Background task finished: echo hi\nticket t-1 done exit 0\nhello-out",
+    display: true,
+    details: { ticket },
+  };
+  const collapsed = render!(message, { expanded: false, outputPad: 1 }, theme)!
+    .render(80).join("\n");
+  assertMatches(collapsed, /t-1/);
+  assertMatches(collapsed, /done \(exit 0\)/);
+  assert(!collapsed.includes("hello-out"), "output stays hidden while collapsed");
+  assert(roles.includes("success"), "a clean exit is success-colored");
+
+  roles.length = 0;
+  const expanded = render!(message, { expanded: true, outputPad: 1 }, theme)!
+    .render(80).join("\n");
+  assertMatches(expanded, /hello-out/, "expanding reveals the result");
+  assert(roles.includes("success"), "the expanded card keeps the outcome color");
+
+  roles.length = 0;
+  render!(
+    { ...message, details: { ticket: { ...ticket, status: "failed", exit: 3 } } },
+    { expanded: false, outputPad: 1 },
+    theme,
+  )!.render(80);
+  assert(roles.includes("error"), "a nonzero exit is error-colored");
 });
 
 test("offload: submit queues and the armed watcher delivers on completion", async () => {
