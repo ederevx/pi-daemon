@@ -98,14 +98,16 @@ them, and can uninstall exactly what it installed.
   instead of being respawned, so a broken update cannot cascade into a
   spawn storm.
 - **Command offloading** (`offload` pi extension): every `bash` call is
-  rerouted to the daemon as a **ticket** — a daemon-owned shell command
-  that outlives the submitting agent. Results are delivered in one go
-  when the command finishes (nothing streams into the tool result), so
-  an agent reads a complete result exactly once. A command outliving
-  the wait bound (the tool's timeout, or `piDaemon.offload.waitSeconds`
-  / `PI_OFFLOAD_WAIT`, default 120) is handed off instead of killed: the tool result frees
-  the agent immediately, the ticket keeps running daemon-side, and the
-  full output is delivered as a follow-up message on completion. Every
+  handed to the daemon as a **ticket** immediately — a daemon-owned shell
+  command that outlives the submitting agent — and the tool returns at
+  once, so no task holds the agent. Results are delivered in one go when
+  the command finishes (nothing streams into the tool result), so an
+  agent reads a complete result exactly once. The full output arrives as
+  a steer before the next model call, or later if the command outlives
+  the turn; the agent can block explicitly with
+  `daemon_tasks result <id> wait=<seconds>`. A `timeout` passed to the
+  bash tool travels with the ticket and is enforced daemon-side (TERM,
+  then KILL), recorded as a failed `timed out` ticket. Every
   ticket is recorded in the daemon's persisted `tickets.json` and
   assigned to the owning session (hosted session name, else the
   conversation file stem), so `daemon_tasks list` shows them and a
@@ -118,9 +120,9 @@ them, and can uninstall exactly what it installed.
   returns as soon as the ticket finishes and yields early when a user
   message is queued), `watch` (live output via partial updates), and
   `status`, `list`, `cancel`, `remove`, and `reset`. When the daemon is
-  bash tool falls back to pi's local execution transparently, and
-  `piDaemon.offload.enabled=false` (or `PI_OFFLOAD=off`) disables
-  offloading entirely. Tickets are garbage
+  unreachable the bash tool falls back to pi's local execution
+  transparently, and `piDaemon.offload.enabled=false` (or
+  `PI_OFFLOAD=off`) disables offloading entirely. Tickets are garbage
   collected by the daemon: finished tickets expire after
   `PI_PTYD_TICKET_TTL_HOURS` hours (default 72h) with the finished set
   capped at 200 (oldest evicted), and each sweep unlinks the expired
@@ -231,8 +233,7 @@ with the built-in default as the fallback.
 | `transcriptIndexIntervalSeconds` | `3.0` | Conversation-index poll cadence. |
 | `transcriptIndexMaxMb` | `4` | Reject and rebuild an index larger than this. |
 | `transcriptIndexMaxLineMb` | `16` | Longest conversation line the index will cover. |
-| `offload.enabled` | `true` | Enable bash offloading. |
-| `offload.waitSeconds` | `120` | Hand-off bound before a command becomes a background ticket. |
+| `offload.enabled` | `true` | Enable bash offloading; every command is still handed to the daemon immediately when on. |
 
 Environment overrides: `PI_DAEMON_GC_IDLE_HOURS`,
 `PI_DAEMON_IDLE_TIMEOUT_HOURS`, `PI_PTYD_MIN_REVIVE_LIFE`,
@@ -241,8 +242,7 @@ Environment overrides: `PI_DAEMON_GC_IDLE_HOURS`,
 `PI_PTYD_EXT_WATCH_INTERVAL`, `PI_PTYD_EXT_WATCH_DEBOUNCE`,
 `PI_PTYD_EXT_WATCH_ROOTS`, `PI_PTYD_TRANSCRIPT_INDEX`,
 `PI_PTYD_TRANSCRIPT_INDEX_INTERVAL`, `PI_PTYD_TRANSCRIPT_INDEX_MAX_MB`,
-`PI_PTYD_TRANSCRIPT_INDEX_MAX_LINE_MB`, `PI_OFFLOAD`, and
-`PI_OFFLOAD_WAIT`.
+`PI_PTYD_TRANSCRIPT_INDEX_MAX_LINE_MB`, and `PI_OFFLOAD`.
 
 `/daemon-settings` opens the same tunables in pi's two-column settings
 dock: flag rows toggle in place, number and roots rows open an editor
