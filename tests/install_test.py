@@ -97,6 +97,7 @@ class InstallScriptTests(unittest.TestCase):
         for rel in (".local/bin/pi-daemon", ".local/bin/pi-rc", ".local/bin/pi",
                     ".local/bin/pi_platform.py", ".local/bin/pi_conpty.py",
                     ".local/bin/pi_settings.py", ".local/bin/pi_transcript.py",
+                    ".local/bin/pi_services.py",
                     ".config/systemd/user/pi-daemon.service"):
             self.assertTrue(self.scratch.path(rel).is_file(), rel)
         owned = self.scratch.manifest()["owned"]
