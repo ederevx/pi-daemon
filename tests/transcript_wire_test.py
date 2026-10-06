@@ -58,6 +58,10 @@ class WireDaemon:
             "XDG_RUNTIME_DIR": self.runtime,
             "XDG_STATE_HOME": self.state,
             "PI_CODING_AGENT_DIR": self.agent,
+            # This boots a real daemon, which publishes a provider
+            # descriptor; on Windows the services root ignores
+            # XDG_RUNTIME_DIR, so pin it before it reaches the live root.
+            "PI_SERVICES_DIR": os.path.join(self.scratch, "services"),
             "PI_PTYD_TRANSCRIPT_INDEX_INTERVAL": "0",
         })
         self.proc = None

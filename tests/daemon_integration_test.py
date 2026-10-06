@@ -23,6 +23,7 @@ SCRATCH = tempfile.mkdtemp(
     prefix="pi-daemon-itest-", dir=os.path.expanduser("~/tmp"))
 RUNTIME = os.path.join(SCRATCH, "runtime")
 STATE = os.path.join(SCRATCH, "state")
+SERVICES = os.path.join(SCRATCH, "services")
 os.makedirs(RUNTIME, exist_ok=True)
 os.makedirs(STATE, exist_ok=True)
 
@@ -30,12 +31,21 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DAEMON_PATH = os.path.join(REPO, "pi", "daemon", "pi-daemon")
 PI_RC = os.path.join(REPO, "pi", "bin", "pi-rc")
 SOCK = os.path.join(RUNTIME, "pi-pty-host.sock")
+# Isolation regression: the daemon publishes its provider descriptor
+# under PI_SERVICES_DIR. On Windows the services root ignores
+# XDG_RUNTIME_DIR and falls back to %TEMP%\pi-services, so without an
+# explicit override the test daemon would publish over the live entry.
+# Capture the live descriptor to prove the run never touches it.
+LIVE_DESCRIPTOR = os.path.join(
+    tempfile.gettempdir(), "pi-services", "session-host", "pi-daemon.json")
+TEST_DESCRIPTOR = os.path.join(
+    SERVICES, "session-host", "pi-daemon.json")
 
 ENV = dict(os.environ)
 AGENT = os.path.join(SCRATCH, "agent")
 os.makedirs(AGENT, exist_ok=True)
 ENV.update({"XDG_RUNTIME_DIR": RUNTIME, "XDG_STATE_HOME": STATE,
-            "PI_CODING_AGENT_DIR": AGENT,
+            "PI_CODING_AGENT_DIR": AGENT, "PI_SERVICES_DIR": SERVICES,
             "PI_PTYD_TICKET_TTL_HOURS": "1", "PI_PTYD_GC": "3600"})
 
 FAIL = []
@@ -48,6 +58,14 @@ def fail(name, message):
 
 def ok(name):
     print("  ok   " + name)
+
+
+def read_bytes(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
 
 
 def pi_rc(*args, timeout=30, cwd=None):
@@ -110,6 +128,7 @@ def main():
 
 
 def _main():
+    live_before = read_bytes(LIVE_DESCRIPTOR)
     proc = subprocess.Popen([sys.executable, DAEMON_PATH], env=ENV,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
@@ -120,6 +139,13 @@ def _main():
     if not socket_alive():
         fail("daemon boot", "socket never came up")
         return 1
+
+    # -- service isolation -------------------------------------------------
+    if read_bytes(TEST_DESCRIPTOR) is None:
+        fail("service descriptor under SCRATCH",
+             "missing %s" % TEST_DESCRIPTOR)
+    else:
+        ok("service descriptor published under SCRATCH")
 
     # -- tickets -----------------------------------------------------------
     r = pi_rc("ticket-submit", "--cwd", SCRATCH, "--", "echo hello-from-ticket")
@@ -311,6 +337,20 @@ def _main():
     except subprocess.TimeoutExpired:
         os.killpg(proc.pid, signal.SIGKILL)
         fail("daemon shutdown", "still alive after stop")
+
+    # The test must never have created or modified the live provider
+    # descriptor; without PI_SERVICES_DIR it overwrote and removed it.
+    if live_before is None:
+        if os.path.exists(LIVE_DESCRIPTOR):
+            fail("live descriptor untouched",
+                 "test created %s" % LIVE_DESCRIPTOR)
+        else:
+            ok("live provider descriptor absent and untouched")
+    elif read_bytes(LIVE_DESCRIPTOR) == live_before:
+        ok("live provider descriptor byte-identical")
+    else:
+        fail("live descriptor untouched",
+             "bytes changed for %s" % LIVE_DESCRIPTOR)
 
     print(f"\n{'OK' if not FAIL else 'FAILURES'}: integration "
           f"{len(FAIL)} failed")
