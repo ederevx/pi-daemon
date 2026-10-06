@@ -47,7 +47,6 @@ const ROW_IDS = [
 	"transcriptIndexMaxMb",
 	"transcriptIndexMaxLineMb",
 	"offload.enabled",
-	"offload.waitSeconds",
 	"restoreDefaults",
 ];
 
@@ -70,7 +69,6 @@ const ALL_ENV = {
 	PI_PTYD_TRANSCRIPT_INDEX_MAX_MB: undefined,
 	PI_PTYD_TRANSCRIPT_INDEX_MAX_LINE_MB: undefined,
 	PI_OFFLOAD: undefined,
-	PI_OFFLOAD_WAIT: undefined,
 };
 
 function theme(): { fg: (color: string, text: string) => string } {
@@ -104,8 +102,6 @@ test("settings: rows cover every piDaemon setting in order", async () => {
 		const reap = rows.find((row) => row.id === "gcIdleHours")!;
 		assert(reap.submenu !== undefined, "number row opens an editor");
 		assertEq(reap.value, "24", "gc idle default");
-		const wait = rows.find((row) => row.id === "offload.waitSeconds")!;
-		assertEq(wait.value, "120", "offload wait default from offload.ts");
 		const roots = rows.find((row) => row.id === "extWatchRoots")!;
 		assert(roots.value.includes(delimiter), "roots render path-joined");
 		const restore = rows.find((row) => row.id === "restoreDefaults");
@@ -151,7 +147,7 @@ test("settings: non-TUI present lists the rows on stderr", async () => {
 	const text = lines.join("\n");
 	assertMatches(text, /pi-daemon-settings:/);
 	assertMatches(text, /GC idle \(h\): .*current: 24/);
-	assertMatches(text, /Offload wait: .*current: 120/);
+	assertMatches(text, /Offload enabled: .*current: on/);
 });
 
 test("settings: TUI present renders the rows through ui.custom", async () => {

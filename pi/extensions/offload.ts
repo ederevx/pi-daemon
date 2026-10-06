@@ -3,21 +3,20 @@
  * ticket.
  *
  * The extension overrides the built-in `bash` tool with a variant whose
- * execution backend submits each command to pi-daemon as a ticket and
- * waits for the result. Output is delivered in ONE GO when the command
- * finishes (nothing is streamed into the tool result while it runs), so
- * agents read a complete result exactly once. Three departures from the
- * stock backend, all deliberate:
+ * execution backend submits every command to pi-daemon as a ticket and
+ * returns at once: the daemon always owns execution, no task holds the
+ * agent, and no task waits out a short window before being handed off.
+ * Output is delivered in ONE GO when the command finishes (nothing is
+ * streamed into the tool result while it runs), so agents read a
+ * complete result exactly once. Two departures from the stock backend,
+ * both deliberate:
  *
- * - When the command outlives the wait bound (the tool's own timeout, or
- *   PI_OFFLOAD_WAIT seconds, default 120), the ticket keeps running in
- *   the daemon, the tool result hands off cleanly ("still running, you
- *   will be notified"), and the agent is freed immediately. When the
- *   ticket finishes the extension delivers the full output as a
- *   follow-up message (triggerTurn + followUp), so the result arrives
- *   unprompted even several turns later.
- * - A user abort (Escape) cancels the ticket in the daemon instead of
- *   killing a local process tree.
+ * - The tool call returns immediately with the ticket id; the full
+ *   result arrives as a steer before the next model call, or several
+ *   turns later if the command outlives the turn. The agent can also
+ *   block explicitly with `daemon_tasks result <id> wait=<seconds>`. A
+ *   bash `timeout` supplied to the tool is forwarded to the daemon,
+ *   which enforces it daemon-side.
  * - If the daemon is unreachable, execution falls back to pi's local
  *   shell backend transparently — the agent only ever sees normal bash
  *   behavior. PI_OFFLOAD=off disables offloading entirely.
@@ -69,9 +68,6 @@ import { join } from "node:path";
 const EXIT_NO_DAEMON = 4;
 const EXIT_AMBIGUOUS = 7;
 
-/** Default hand-off bound for bash offloading, in seconds. */
-const DEFAULT_WAIT_SECONDS = 120;
-
 /** The pi settings file's "piDaemon.offload" section, read once at first
  *  use. Environment variables still take precedence per call, so tests
  *  and one-off runs can override without editing the settings file. */
@@ -90,16 +86,6 @@ class OffloadSettings {
 	/** The same policy in the negative, owned once for both call sites. */
 	disabled(): boolean {
 		return !this.enabled();
-	}
-
-	/** The hand-off bound: PI_OFFLOAD_WAIT wins, then
-	 *  offload.waitSeconds, then the built-in default. */
-	waitSeconds(): number {
-		const raw = Number(process.env.PI_OFFLOAD_WAIT);
-		if (Number.isFinite(raw) && raw > 0) return raw;
-		const value = Number(this.offload().waitSeconds);
-		if (Number.isFinite(value) && value > 0) return value;
-		return DEFAULT_WAIT_SECONDS;
 	}
 
 	private offload(): Record<string, unknown> {
@@ -187,6 +173,7 @@ export interface Ticket {
 	term: number | null;
 	truncated: boolean;
 	error: string | null;
+	timeout?: number | null;
 	usage?: TicketUsage;
 	cost?: TicketCost;
 	input?: number;
@@ -292,10 +279,14 @@ export class TicketClient {
 		cwd: string,
 		command: string,
 		extraEnv: Record<string, string>,
+		timeout?: number,
 	): Promise<string> {
 		const args = ["ticket-submit", "--session", session, "--cwd", cwd];
 		for (const [key, value] of Object.entries(extraEnv)) {
 			args.push("--env", `${key}=${value}`);
+		}
+		if (typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0) {
+			args.push("--timeout", String(timeout));
 		}
 		args.push("--", command);
 		const out = await this.run(args);
@@ -433,14 +424,6 @@ class DaemonTasks {
 	/** Tickets whose result was already fetched by an explicit call. */
 	private fetched = new Set<string>();
 
-	/** Records that the caller consumed a ticket's result itself (an
-	 *  inline bash wait or an explicit fetch); the armed delivery
-	 *  watcher then stays silent so one ticket notifies exactly once. */
-	markFetched(id: string): void {
-		this.fetched.add(id);
-	}
-
-
 	constructor(
 		runner: ProcessRunner,
 		send: DaemonTasks["send"],
@@ -465,12 +448,13 @@ class DaemonTasks {
 
 	async submit(sessionFile: string | null, cwd: string, command: string,
 		extraEnv: Record<string, string> = {},
+		timeout?: number,
 	): Promise<string> {
 		const env = this.shell
 			? { ...extraEnv, PI_SHELL: this.shell }
 			: extraEnv;
 		const id = await this.client.submit(
-			this.sessionKey(sessionFile), cwd, command, env);
+			this.sessionKey(sessionFile), cwd, command, env, timeout);
 		this.armDelivery(id, command);
 		return id;
 	}
@@ -979,11 +963,12 @@ class DaemonTasksDock {
 	}
 }
 
-/** The offloading bash backend: submits a command to the daemon, waits for
- *  it within the call bound, hands off past the bound (ticket keeps running
- *  daemon-side, delivery armed, agent freed), and always falls back to the
- *  local shell when the daemon was never in play. Owns its fallback backend
- *  and the wait-bound policy; state is per-call and never shared. */
+/** The offloading bash backend: submits every command to the daemon and
+ *  returns at once, so the daemon always owns execution and no task holds
+ *  the agent. The submit-armed delivery watcher reports the full result as
+ *  one steer; a bash timeout travels with the ticket and is enforced
+ *  daemon-side. Falls back to the local shell only when the daemon was
+ *  never in play. Owns its fallback backend and its per-call state. */
 class OffloadedBash implements BashOperations {
 	constructor(
 		private readonly localBash: BashOperations,
@@ -992,10 +977,6 @@ class OffloadedBash implements BashOperations {
 
 	private offloadDisabled(): boolean {
 		return OFFLOAD_SETTINGS.disabled();
-	}
-
-	private waitBoundSeconds(): number {
-		return OFFLOAD_SETTINGS.waitSeconds();
 	}
 
 	exec: BashOperations["exec"] = async (command, cwd, { onData, signal, timeout, env }) => {
@@ -1007,7 +988,7 @@ class OffloadedBash implements BashOperations {
 		let id: string;
 		try {
 			id = await this.tasks.submit(
-				sessionFile, cwd, command, sessionEnvExtra(env));
+				sessionFile, cwd, command, sessionEnvExtra(env), timeout);
 		} catch (exc) {
 			if (!(exc instanceof DaemonUnavailable) || !exc.ambiguous) {
 				// Daemon unreachable (contact never established) or a
@@ -1029,80 +1010,17 @@ class OffloadedBash implements BashOperations {
 			}
 			id = adopted;
 		}
-		const deadline = Date.now() + (timeout ?? this.waitBoundSeconds()) * 1000;
-		// One abort listener for the whole call: when the user aborts,
-		// the race resolves null and the ticket is cancelled daemon-side.
-		// The listener is removed when the call ends so a completed exec
-		// never leaves a dangling abort handler on the signal.
-		let removeAbortListener = (): void => {};
-		const aborted = new Promise<null>((resolve) => {
-			if (!signal) return;
-			if (signal.aborted) {
-				resolve(null);
-				return;
-			}
-			const onAbort = (): void => resolve(null);
-			signal.addEventListener("abort", onAbort, { once: true });
-			removeAbortListener = () =>
-				signal.removeEventListener("abort", onAbort);
-		});
-		let ticket: Ticket | null = null;
-		try {
-			while (ticket === null || ticket.status === "running") {
-				const remaining = Math.max(1, Math.min(
-					WAIT_CHUNK_SECONDS,
-					(deadline - Date.now()) / 1000,
-				));
-				ticket = await Promise.race([
-					this.tasks.client.wait(id, remaining),
-					aborted.then(() => null),
-				]);
-				if (ticket === null) {
-					// User abort: kill the daemon-side process too.
-					await this.tasks.cancel(id).catch(() => {});
-					throw new Error("aborted");
-				}
-				if (ticket.status === "running" && Date.now() >= deadline) {
-					// Hand off: the ticket keeps running in the daemon,
-					// the agent is freed now and notified on completion.
-					let partial = "";
-					try {
-						partial = await this.tasks.client.outputAll(id);
-					} catch {
-						// partial output is best-effort
-					}
-					this.tasks.armDelivery(id, command);
-					onData(Buffer.from(
-						`${partial}
-[pi-daemon ticket ${id} still running: ` +
-						`continuing in the background; the full result will ` +
-						`be delivered here when it finishes ` +
-						`(daemon_tasks result ${id} fetches it sooner)]
-`,
-					));
-					return { exitCode: null };
-				}
-			}
-		} finally {
-			removeAbortListener();
-		}
-		// The inline wait consumed the result: bash itself delivers the
-		// output as the tool result, so the delivery watcher armed by
-		// submit() must not also steer it in — one command, one delivery,
-		// by the parent that waited for it.
-		this.tasks.markFetched(id);
-		let output = "";
-		try {
-			output = await this.tasks.client.outputAll(id);
-		} catch {
-			// output fetch is best-effort; the exit code still stands
-		}
-		if (ticket.status === "lost") {
-			output += `\n[pi-daemon ticket ${id} was interrupted ` +
-				`(daemon restart); re-run if it is safe to repeat]`;
-		}
-		onData(Buffer.from(output));
-		return { exitCode: ticket.exit };
+		// Handed off: the ticket is daemon-owned from here. The delivery
+		// watcher armed by submit() steers the full result in, and the agent
+		// can block explicitly with daemon_tasks result <id> wait=<seconds>.
+		const timeoutNote = timeout && timeout > 0
+			? `, daemon timeout ${timeout}s` : "";
+		onData(Buffer.from(
+			`[pi-daemon ticket ${id} handed off${timeoutNote}: ${command}\n` +
+			`The daemon owns execution; the full result is delivered here ` +
+			`when it finishes (daemon_tasks result ${id} wait=<seconds> ` +
+			`blocks for it)].\n`));
+		return { exitCode: null };
 	};
 }
 export default function (pi: ExtensionAPI) {
@@ -1168,6 +1086,7 @@ export default function (pi: ExtensionAPI) {
 			action: StringEnum(["submit", "status", "result", "watch", "cancel", "remove", "reset", "list"] as const),
 			command: Type.Optional(Type.String({ description: "Shell command (submit)" })),
 			cwd: Type.Optional(Type.String({ description: "Working directory (submit; default session cwd)" })),
+			timeout: Type.Optional(Type.Number({ description: "Daemon-side timeout in seconds (submit)" })),
 			id: Type.Optional(Type.String({ description: "Ticket id (status/result/watch/cancel)" })),
 			wait: Type.Optional(Type.Number({ description: "Seconds to actively wait for result (result; default 0)" })),
 		}),
@@ -1185,6 +1104,8 @@ export default function (pi: ExtensionAPI) {
 						sessionFile,
 						params.cwd || ctx?.cwd || process.cwd(),
 						params.command,
+						{},
+						params.timeout,
 					);
 					return {
 						content: [{
