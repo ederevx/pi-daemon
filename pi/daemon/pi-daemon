@@ -105,7 +105,7 @@
 #                                         hosted session and publishes a
 #                                         fresh endpoint
 #   ticket-submit {session,cwd,command
-#                  [,env]}                run a command as a daemon-owned
+#                  [,env][,timeout]}       run a command as a daemon-owned
 #                                         ticket: the command outlives
 #                                         the submitting session, its
 #                                         output is captured to a log
@@ -115,7 +115,10 @@
 #                                         is the caller's environment,
 #                                         forwarded so commands run with
 #                                         the submitting agent's PATH and
-#                                         PI_* context
+#                                         PI_* context; timeout (seconds)
+#                                         is enforced daemon-side, TERM
+#                                         then KILL, and recorded as a
+#                                         failed "timed out" ticket
 #   ticket-wait {id[,timeout]}            block until the ticket finishes
 #                                         or the timeout (capped) passes;
 #                                         timeout 0 polls the record
@@ -1051,6 +1054,7 @@ class TicketRunner:
 		self._lock = threading.Lock()
 		self._procs = {}    # tid -> Popen, under _lock
 		self._stops = {}    # tid -> cancellation reason, under _lock
+		self._timers = {}   # tid -> threading.Timer deadline, under _lock
 
 	def start(self):
 		self.store.load()
@@ -1062,7 +1066,7 @@ class TicketRunner:
 		with self._lock:
 			return len(self._procs)
 
-	def submit(self, session, cwd, command, env=None):
+	def submit(self, session, cwd, command, env=None, timeout=None):
 		with self._lock:
 			if len(self._procs) >= TICKET_MAX_RUNNING:
 				return None
@@ -1072,7 +1076,8 @@ class TicketRunner:
 			   "command": command,
 			   "status": "running", "created": time.time(),
 			   "started": time.time(), "finished": None, "exit": None,
-			   "term": None, "truncated": False, "error": None}
+			   "term": None, "truncated": False, "error": None,
+			   "timeout": timeout}
 		os.makedirs(self.store.log_dir, exist_ok=True)
 		run_env = env if env else os.environ.copy()
 		argv = PROCESS.shell_command(command, run_env.get("PI_SHELL"))
@@ -1103,6 +1108,13 @@ class TicketRunner:
 			raise
 		with self._lock:
 			self._procs[tid] = proc
+			timer = None
+			if timeout:
+				timer = threading.Timer(timeout, self._expire, args=(tid,))
+				timer.daemon = True
+				self._timers[tid] = timer
+		if timer is not None:
+			timer.start()
 		t = threading.Thread(target=self._run, args=(tid, proc), daemon=True)
 		t.start()
 		log("ticket-submit '%s' session '%s' in %s"
@@ -1247,16 +1259,39 @@ class TicketRunner:
 	def _finish(self, tid, code, truncated):
 		with self._lock:
 			self._procs.pop(tid, None)
+			timer = self._timers.pop(tid, None)
 			reason = self._stops.pop(tid, None)
+		if timer is not None:
+			timer.cancel()
 		fields = {"status": "done" if code == 0 else "failed",
 				  "exit": code if code >= 0 else None,
 				  "term": -code if code < 0 else None,
 				  "finished": time.time(), "truncated": truncated}
-		if reason is not None:
+		if reason == "timeout":
+			fields["status"] = "failed"
+			fields["error"] = "timed out"
+		elif reason is not None:
 			fields["status"] = "cancelled"
 			fields["error"] = reason
 		self.store.update(tid, **fields)
 		log("ticket-done '%s' status %s" % (tid, fields["status"]))
+
+	def _expire(self, tid):
+		# Deadline enforcement for a ticket submitted with a timeout: TERM
+		# then KILL the child and record the stop reason the reader thread
+		# turns into a failed "timed out" record. The timer is cancelled by
+		# _finish, so it never outlives the ticket.
+		with self._lock:
+			proc = self._procs.get(tid)
+			if proc is None or proc.poll() is not None:
+				return
+			self._stops[tid] = "timeout"
+		PROCESS.signal_term(proc.pid)
+		deadline = time.time() + KILL_GRACE
+		while time.time() < deadline and proc.poll() is None:
+			time.sleep(0.05)
+		if proc.poll() is None:
+			PROCESS.signal_kill(proc.pid)
 
 	def _gc_loop(self):
 		while not self.shutdown_event.wait(TICKET_GC_TICK):
@@ -1275,10 +1310,14 @@ class TicketRunner:
 		# then force any record the reader threads lost the race on to
 		# "lost" so the persisted state never claims a live process.
 		with self._lock:
+			timers = list(self._timers.values())
+			self._timers.clear()
 			procs = list(self._procs.values())
 			tids = list(self._procs.keys())
 			for tid in tids:
 				self._stops.setdefault(tid, "interrupted by daemon shutdown")
+		for timer in timers:
+			timer.cancel()
 		for proc in procs:
 			PROCESS.signal_term(proc.pid)
 		deadline = time.time() + KILL_GRACE
@@ -3231,6 +3270,7 @@ class Control:
 		dir_ = req.get("cwd")
 		command = req.get("command")
 		env = req.get("env")
+		timeout = req.get("timeout")
 		if not (isinstance(session, str) and session
 				and isinstance(dir_, str) and os.path.isabs(dir_)
 				and os.path.isdir(dir_)
@@ -3240,6 +3280,15 @@ class Control:
 									and all(isinstance(k, str) and isinstance(v, str)
 										for k, v in env.items())):
 			return bad_request()
+		if timeout is not None:
+			try:
+				timeout = float(timeout)
+			except (TypeError, ValueError):
+				return bad_request()
+			if timeout <= 0:
+				return bad_request()
+		else:
+			timeout = None
 		# Replay guard: a re-emitted identical command (compaction
 		# continuation, crash-resume replay) joins the running ticket
 		# instead of spawning a duplicate execution.
@@ -3250,7 +3299,7 @@ class Control:
 		if self.daemon.tickets.running_count() >= TICKET_MAX_RUNNING:
 			return err("too-busy")
 		try:
-			rec = self.daemon.tickets.submit(session, dir_, command, env)
+			rec = self.daemon.tickets.submit(session, dir_, command, env, timeout)
 		except OSError as exc:
 			log("ticket-submit failed: %s" % exc)
 			return err("spawn-failed")
