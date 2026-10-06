@@ -179,6 +179,7 @@ def _platform_path():
 
 sys.path.insert(0, _platform_path())
 import pi_platform
+import pi_services
 import pi_settings
 import pi_transcript
 
@@ -2224,6 +2225,7 @@ class Daemon:
 		self.table = SessionTable()
 		self.ledger = HandoffLedger()
 		self.gc_reaper = GcReaper(GC_REAP_REQUEST_DIR, GC_IDLE)
+		self.services = pi_services.ServiceDirectory()
 		self.shutdown_event = threading.Event()
 		self.spawner = SessionSpawner(self.table, registry, owner=self)
 		self.tickets = TicketRunner(
@@ -2279,6 +2281,21 @@ class Daemon:
 			   self.registry.path))
 		self.roster.register(os.getpid(), self.server.host,
 							 self.server.port, self.token)
+		# Advertise the hosting capability where any client can find it,
+		# after the endpoint exists. The startup sweep clears a dead
+		# predecessor before this daemon publishes its own entry; the
+		# interval sweep then matches the rest of the state GC cadence.
+		self.services.sweep()
+		try:
+			self.services.publish(
+				self.sock_path,
+				self.services.activation_argv(os.path.abspath(__file__),
+											 "daemon-start"))
+		except OSError as exc:
+			# Discovery is best-effort: an unwritable services dir leaves
+			# the daemon serving, just unadvertised.
+			log("service descriptor not published: %s" % exc)
+		self.services.start(self.shutdown_event, STATE_GC_TICK)
 		self.respawn_from_registry()
 		self.tickets.start()
 		self.state_gc.sweep()
@@ -2387,6 +2404,9 @@ class Daemon:
 		self.registry.write({})
 		self.endpoint.remove_if(self.server.host, self.server.port,
 								self.token)
+		# Pid-guarded: a successor that already published over this path
+		# keeps its entry.
+		self.services.remove(pid=os.getpid())
 		os._exit(0)
 
 	def _terminate_sessions(self, sessions):
