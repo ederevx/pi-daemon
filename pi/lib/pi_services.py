@@ -64,7 +64,10 @@ class ServiceDirectory:
         return os.path.join(tempfile.gettempdir(), "pi-services")
 
     def _is_windows(self):
-        return str(self.platform).startswith("win") or os.name == "nt"
+        # The declared platform decides (matching RuntimeLayout), so an
+        # injected "linux" exercises the POSIX root even on a Windows
+        # host and the seam stays honest under test.
+        return str(self.platform).startswith("win")
 
     def path(self, service=DEFAULT_SERVICE, provider=DEFAULT_PROVIDER):
         # The one place that composes a descriptor path; safe single
