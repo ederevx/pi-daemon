@@ -1076,7 +1076,15 @@ class OffloadedBash implements BashOperations {
 		// in before the next model call, so the agent never bridges the
 		// deferral itself. The claim is a success - never the stock tool's
 		// null exit code, which renders as both a failure and a hand-off
-		// the agent could respond to.
+		// the agent could respond to. The claim also advertises the ticket
+		// and its two continuations, so an agent that reaches for a sleep
+		// instead learns it may simply keep calling tools (the result is
+		// steered in) or block explicitly with daemon_tasks result.
+		onData(Buffer.from(
+			`[pi-daemon] ticket ${id} taken by the daemon; the result is ` +
+			`steered in automatically.\n` +
+			`Block with daemon_tasks result ${id} wait=<seconds>, or keep ` +
+			`calling commands.\n`));
 		return { exitCode: 0 };
 	};
 }
@@ -1111,6 +1119,10 @@ export default function (pi: ExtensionAPI) {
 	Object.assign(bashTool, {
 		promptGuidelines: [
 			"You can inspect PI_* environment variables for current model and session details.",
+			"Every bash call is handed to pi-daemon as a ticket whose result is " +
+				"steered in automatically, so keep calling tools instead of sleeping " +
+				"or polling; to block for a ticket before the next step, call " +
+				"daemon_tasks result <id> wait=<seconds>.",
 		],
 	});
 	pi.registerTool(bashTool);

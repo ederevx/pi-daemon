@@ -101,10 +101,12 @@ them, and can uninstall exactly what it installed.
   handed to the daemon as a **ticket** immediately — a daemon-owned shell
   command that outlives the submitting agent — and the tool returns a
   successful claim at once, so no task holds the agent and the call never
-  surfaces the stock tool's null-exit error. The full output arrives as a
-  steer before the next model call, or later if the command outlives the
-  turn; the agent can also block explicitly with
-  `daemon_tasks result <id> wait=<seconds>`. A `timeout` passed to the
+  surfaces the stock tool's null-exit error; the claim names the ticket
+  and advertises both continuations - keep calling tools, or block
+  explicitly with `daemon_tasks result <id> wait=<seconds>`. The full
+  output arrives as a steer before the next model call, or later if the
+  command outlives the turn; a bash guideline and the claim itself tell
+  agents not to sleep or poll for a ticket. A `timeout` passed to the
   bash tool travels with the ticket and is enforced daemon-side (TERM,
   then KILL), recorded as a failed `timed out` ticket. Every
   ticket is recorded in the daemon's persisted `tickets.json` and
