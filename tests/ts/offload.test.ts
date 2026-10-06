@@ -289,7 +289,7 @@ test("offload: watch abort releases the wait with the ticket still running", asy
     "no blocking round trips after abort");
 });
 
-test("offload: bash claims the ticket and returns its deferred result", async () => {
+test("offload: bash defers with a success claim and the watcher steers the result", async () => {
   const pi = mount(new FakePi());
   pi.logs.set("t-1", "deferred-output");
   const bashTool = pi.tools.get("bash") as { execute: unknown };
@@ -309,20 +309,27 @@ test("offload: bash claims the ticket and returns its deferred result", async ()
     cwd: scratchDir(),
     mode: "cli",
   });
-  const text = out.content.map((b) => b.text).join("\n");
-  assertMatches(text, /deferred-output/);
+  // The claim is a success, never the stock tool's null-exit hand-off
+  // error: the daemon owns the ticket and the agent is not held.
+  assertEq(out.structuredContent?.exit_code, 0, "claim returns success");
+  assertEq(out.isError, undefined, "not an error result");
   const submit = pi.execCalls.find((c) => c.args.includes("--timeout"));
   assert(submit !== undefined, "ticket-submit carries --timeout");
   const idx = submit!.args.indexOf("--timeout");
   assertEq(submit!.args[idx + 1], "7", "daemon timeout reaches the daemon");
-  // The deferred result is returned inline with a real success code,
-  // never the stock tool's null-exit hand-off error.
-  assertEq(out.structuredContent?.exit_code, 0, "deferred exit code returned");
-  assertEq(out.isError, undefined, "not an error result");
+  // The daemon_tasks wait kicks in on its own and steers the deferred
+  // result in before the next model call, so the agent never bridges the
+  // deferral or responds in between.
+  await waitFor(() => pi.sent.length > 0);
+  const steer = pi.sent[0];
+  assertMatches(JSON.stringify(steer.message), /deferred-output/);
+  assertEq((steer.options as { deliverAs?: string }).deliverAs, "steer",
+    "the deferred result arrives as a steer");
 });
 
-test("offload: an abort cancels the claimed ticket and ends the call", async () => {
+test("offload: an abort leaves the daemon-owned ticket and its watcher running", async () => {
   const pi = mount(new FakePi());
+  pi.logs.set("t-1", "late-output");
   const bashTool = pi.tools.get("bash") as { execute: unknown };
   const execute = bashTool.execute as (
     _id: string,
@@ -330,21 +337,19 @@ test("offload: an abort cancels the claimed ticket and ends the call", async () 
     s: unknown,
     _o: unknown,
     _c: unknown,
-  ) => Promise<unknown>;
+  ) => Promise<{ structuredContent?: { exit_code?: number } }>;
   const controller = new AbortController();
   controller.abort();
-  let message = "";
-  try {
-    await execute("call1", { command: "sleep 99", cwd: scratchDir() }, controller.signal, undefined, {
-      sessionManager: { getSessionId: () => "test-session", getSessionFile: () => "/x/abc.jsonl" },
-      cwd: scratchDir(),
-      mode: "cli",
-    });
-  } catch (err) {
-    message = err instanceof Error ? err.message : String(err);
-  }
-  assertMatches(message, /aborted/);
-  assert(pi.execCalls.some((c) => c.args[0] === "ticket-cancel"), "ticket cancelled daemon-side");
+  const out = await execute("call1", { command: "sleep 99", cwd: scratchDir() }, controller.signal, undefined, {
+    sessionManager: { getSessionId: () => "test-session", getSessionFile: () => "/x/abc.jsonl" },
+    cwd: scratchDir(),
+    mode: "cli",
+  });
+  assertEq(out.structuredContent?.exit_code, 0, "the claim still succeeds");
+  assert(!pi.execCalls.some((c) => c.args[0] === "ticket-cancel"),
+    "the daemon ticket is not cancelled by the call");
+  await waitFor(() => pi.sent.length > 0);
+  assertMatches(JSON.stringify(pi.sent[0].message), /late-output/);
 });
 
 test("offload: bash tool falls back to local execution when the daemon is down", async () => {
