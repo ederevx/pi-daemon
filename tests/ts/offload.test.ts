@@ -395,7 +395,7 @@ test("offload: an abort leaves the daemon-owned ticket and its watcher running",
   ) => Promise<{ structuredContent?: { exit_code?: number } }>;
   const controller = new AbortController();
   controller.abort();
-  const out = await execute("call1", { command: "sleep 99", cwd: scratchDir() }, controller.signal, undefined, {
+  const out = await execute("call1", { command: "echo long-running", cwd: scratchDir() }, controller.signal, undefined, {
     sessionManager: { getSessionId: () => "test-session", getSessionFile: () => "/x/abc.jsonl" },
     cwd: scratchDir(),
     mode: "cli",
@@ -405,6 +405,80 @@ test("offload: an abort leaves the daemon-owned ticket and its watcher running",
     "the daemon ticket is not cancelled by the call");
   await waitFor(() => pi.sent.length > 0);
   assertMatches(JSON.stringify(pi.sent[0].message), /late-output/);
+});
+
+test("offload: a sleep command is refused before the daemon sees it", async () => {
+  const pi = mount(new FakePi());
+  const bashTool = pi.tools.get("bash") as { execute: unknown };
+  const execute = bashTool.execute as (
+    _id: string,
+    p: { command: string; cwd?: string },
+    _s: unknown,
+    _o: unknown,
+    _c: unknown,
+  ) => Promise<{
+    content: Array<{ type: string; text: string }>;
+    structuredContent?: { exit_code?: number };
+    isError?: boolean;
+  }>;
+  const out = await execute("call1", { command: "sleep 30", cwd: scratchDir() }, undefined, undefined, {
+    sessionManager: { getSessionId: () => "test-session", getSessionFile: () => "/x/abc.jsonl" },
+    cwd: scratchDir(),
+    mode: "cli",
+  });
+  assertEq(out.structuredContent?.exit_code, 1, "the refusal is a failure, not a claim");
+  assertEq(out.isError, true, "rendered as an error");
+  const text = out.content?.[0]?.text ?? "";
+  assertMatches(text, /refused `sleep`/);
+  assertMatches(text, /daemon_tasks result <id> wait=<seconds>/);
+  assertEq(pi.execCalls.length, 0, "the daemon never sees the sleep");
+  assertEq(pi.sent.length, 0, "no ticket and no delivery watcher");
+});
+
+test("offload: sleep in a polling loop is refused, a sleep word is not", async () => {
+  const pi = mount(new FakePi());
+  const bashTool = pi.tools.get("bash") as { execute: unknown };
+  const execute = bashTool.execute as (
+    _id: string,
+    p: { command: string; cwd?: string; timeout?: number },
+    _s: unknown,
+    _o: unknown,
+    _c: unknown,
+  ) => Promise<{ isError?: boolean }>;
+  const ctx = {
+    sessionManager: { getSessionId: () => "test-session", getSessionFile: () => "/x/abc.jsonl" },
+    cwd: scratchDir(),
+    mode: "cli",
+  };
+  const loop = await execute("c1", { command: "while pgrep x; do sleep 1; done", cwd: scratchDir() }, undefined, undefined, ctx);
+  assertEq(loop.isError, true, "a polling loop is a sleep call");
+  assertEq(pi.execCalls.length, 0, "the loop never reached the daemon");
+  await execute("c2", { command: "grep -rn sleep README.md", cwd: scratchDir(), timeout: 5 }, undefined, undefined, ctx);
+  assert(pi.execCalls.some((c) => c.args[0] === "ticket-submit"),
+    "a sleep word in an argument is not a wait and still reaches the daemon");
+});
+
+test("offload: PI_OFFLOAD=off keeps sleep in the local shell", async () => {
+  await withEnv({ PI_OFFLOAD: "off" }, async () => {
+    const pi = mount(new FakePi());
+    const bashTool = pi.tools.get("bash") as { execute: unknown };
+    const execute = bashTool.execute as (
+      _id: string,
+      p: { command: string; cwd?: string },
+      _s: unknown,
+      _o: unknown,
+      _c: unknown,
+    ) => Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }>;
+    const out = await execute("c1", { command: "sleep 0", cwd: scratchDir() }, undefined, undefined, {
+      sessionManager: { getSessionId: () => "test-session", getSessionFile: () => "/x/abc.jsonl" },
+      cwd: scratchDir(),
+      mode: "cli",
+    });
+    const text = out.content.map((b) => b.text).join("\n");
+    assert(!/refused/.test(text), "the guard is scoped to the offload path");
+    assertEq(out.isError, undefined, "a local sleep is not an error");
+    assertEq(pi.execCalls.length, 0, "still no daemon traffic when offloading is off");
+  });
 });
 
 test("offload: bash tool falls back to local execution when the daemon is down", async () => {
