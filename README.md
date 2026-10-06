@@ -123,7 +123,7 @@ them, and can uninstall exactly what it installed.
   (one-go fetch, or an active interruptible wait with `wait` that
   returns as soon as the ticket finishes and yields early when a user
   message is queued), `watch` (live output via partial updates), and
-  `status`, `list`, `cancel`, `remove`, and `reset`. When the daemon is
+  `status`, `list`, `cancel`, and `remove`. When the daemon is
   unreachable the bash tool falls back to pi's local execution
   transparently, and `piDaemon.offload.enabled=false` (or
   `PI_OFFLOAD=off`) disables offloading entirely. Tickets are garbage

@@ -437,15 +437,6 @@ export class TicketClient {
 		return id;
 	}
 
-	/** Resets the whole ticketing state: cancels every running ticket,
-	 *  wipes the store and artifacts. */
-	async resetAll(): Promise<{ cancelled: number; removed: number }> {
-		const out = await this.run(["tickets-reset"]);
-		const c = /cancelled (\d+)/.exec(out);
-		const r = /removed (\d+)/.exec(out);
-		return { cancelled: Number(c?.[1] ?? 0), removed: Number(r?.[1] ?? 0) };
-	}
-
 	async list(session?: string): Promise<Ticket[]> {
 		const args = ["ticket-list"];
 		if (session) args.push(session);
@@ -1185,7 +1176,7 @@ export default function (pi: ExtensionAPI) {
 		label: "daemon tasks",
 		description:
 			"Manage pi-daemon tickets (submit, status, result, watch, " +
-			"cancel, remove, reset, list). Call pre_daemon for the " +
+			"cancel, remove, list). Call pre_daemon for the " +
 			"catalog and conventions.",
 		promptGuidelines: [
 			"Prefer daemon_tasks submit for builds, test suites, downloads " +
@@ -1200,7 +1191,7 @@ export default function (pi: ExtensionAPI) {
 				"<id> wait=<seconds>`.",
 		],
 		parameters: Type.Object({
-			action: StringEnum(["submit", "status", "result", "watch", "cancel", "remove", "reset", "list"] as const),
+			action: StringEnum(["submit", "status", "result", "watch", "cancel", "remove", "list"] as const),
 			command: Type.Optional(Type.String({ description: "Shell command (submit)" })),
 			cwd: Type.Optional(Type.String({ description: "Working directory (submit; default session cwd)" })),
 			timeout: Type.Optional(Type.Number({ description: "Daemon-side timeout in seconds (submit)" })),
@@ -1361,17 +1352,6 @@ export default function (pi: ExtensionAPI) {
 					await tasks.client.remove(params.id);
 					return {
 						content: [{ type: "text", text: `ticket ${params.id} removed` }],
-						details: undefined,
-					};
-				}
-				case "reset": {
-					const { cancelled, removed } = await tasks.client.resetAll();
-					return {
-						content: [{
-							type: "text",
-							text: `ticketing reset: ${cancelled} running ticket(s) cancelled, ` +
-								`${removed} record(s) wiped; the id counter restarted at t-1`,
-						}],
 						details: undefined,
 					};
 				}
