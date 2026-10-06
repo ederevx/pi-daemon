@@ -26,6 +26,22 @@ SESSION_LINE = {
 }
 
 
+def symlink_or_skip(testcase, src, dst):
+    """Symlink src to dst, skipping the test if the OS refuses.
+
+    Windows without the symlink privilege raises OSError 1314; that is a
+    host-environment limit, not a failure of the code under test.
+    """
+    try:
+        os.symlink(src, dst)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            testcase.skipTest("symlinks unavailable: %s" % exc)
+            return False
+        raise
+    return True
+
+
 def entry(entry_id, parent, kind="message", **extra):
     obj = {"type": kind, "id": entry_id, "parentId": parent,
            "timestamp": "2026-10-01T00:00:01Z"}
@@ -191,8 +207,8 @@ class IndexBuildTests(unittest.TestCase):
             "missing")
         link = os.path.join(self.fx.slug, "link.jsonl")
         if hasattr(os, "symlink"):
-            os.symlink(self.fx.file, link)
-            self.assertEqual(self.idx.sync(link), "skip")
+            if symlink_or_skip(self, self.fx.file, link):
+                self.assertEqual(self.idx.sync(link), "skip")
 
 
 class IndexReaderTests(unittest.TestCase):
@@ -379,7 +395,8 @@ class ReaderTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, outside, True)
         open(os.path.join(outside, "secret.jsonl"), "w").close()
         link = os.path.join(self.fx.root, "linkdir")
-        os.symlink(outside, link)
+        if not symlink_or_skip(self, outside, link):
+            return
         self.assertFalse(self.idx.owns(os.path.join(link, "secret.jsonl")))
 
     def test_body_read_after_replacement_is_refused(self):
