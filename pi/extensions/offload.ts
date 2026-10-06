@@ -1194,6 +1194,10 @@ export default function (pi: ExtensionAPI) {
 				"the task finishes. A blocking result wait is interruptible " +
 				"and steerable; the ticket keeps running and its result is " +
 				"still delivered on completion.",
+			"A command whose point is to wait - a `sleep` or a polling " +
+				"loop - is refused for submit too: submit real work and let " +
+				"its result steer in, or block with `daemon_tasks result " +
+				"<id> wait=<seconds>`.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(["submit", "status", "result", "watch", "cancel", "remove", "reset", "list"] as const),
@@ -1212,6 +1216,15 @@ export default function (pi: ExtensionAPI) {
 				case "submit": {
 					if (!params.command) {
 						throw new Error("submit needs a command");
+					}
+					if (SLEEP_GUARD.blocks(params.command)) {
+						throw new Error(
+							"[pi-daemon] refused `sleep` in daemon_tasks submit: " +
+							"a ticket whose point is to wait has no work for the " +
+							"daemon to own - submit real work and let its result " +
+							"steer in, or block with daemon_tasks result <id> " +
+							"wait=<seconds>.",
+						);
 					}
 					const id = await tasks.submit(
 						sessionFile,
