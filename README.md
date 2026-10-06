@@ -105,8 +105,10 @@ them, and can uninstall exactly what it installed.
   and advertises both continuations - keep calling tools, or block
   explicitly with `daemon_tasks result <id> wait=<seconds>`. The full
   output arrives as a steer before the next model call, or later if the
-  command outlives the turn; a bash guideline and the claim itself tell
-  agents not to sleep or poll for a ticket. A `timeout` passed to the
+  command outlives the turn; a `sleep` command is refused before it
+  reaches the daemon, since the result is steered in anyway and a
+  deliberate block belongs to `daemon_tasks result`. A bash guideline
+  and the claim itself say so. A `timeout` passed to the
   bash tool travels with the ticket and is enforced daemon-side (TERM,
   then KILL), recorded as a failed `timed out` ticket. Every
   ticket is recorded in the daemon's persisted `tickets.json` and
