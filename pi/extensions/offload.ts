@@ -1024,6 +1024,44 @@ class DaemonTasksDock {
 	}
 }
 
+/** Refuses a bash call whose point is to wait. A handed-off command is
+ *  already daemon-owned and its result is steered in automatically, so a
+ *  blocking wait belongs to `daemon_tasks result ... wait`, never to a
+ *  `sleep`. Only command positions count, so a `sleep` word in an
+ *  argument (`grep sleep file`) is not a wait and stays allowed. */
+class SleepGuard {
+	/** Words that still leave `sleep` the first real command word. */
+	private static readonly LAUNCHERS = new Set([
+		"sudo", "nohup", "time", "env", "command", "exec", "timeout",
+	]);
+
+	/** True when any command in the compound line is a sleep call. */
+	blocks(command: string): boolean {
+		return command
+			.split(/\n|[;&|()]+/)
+			.some((segment) => this.sleeps(segment.trim().split(/\s+/)));
+	}
+
+	/** True when the segment's first real word is `sleep`, skipping
+	 *  leading assignments, options, durations, shell keywords, and
+	 *  launchers. */
+	private sleeps(words: string[]): boolean {
+		for (const word of words) {
+			if (!word) continue;
+			if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) continue;
+			if (/^-/.test(word)) continue;
+			if (/^[0-9.]+[smhd]?$/.test(word)) continue;
+			if (word === "do" || word === "then" || word === "else") continue;
+			if (SleepGuard.LAUNCHERS.has(word)) continue;
+			return word === "sleep";
+		}
+		return false;
+	}
+}
+
+/** The shared guard: stateless, so one instance serves every call. */
+const SLEEP_GUARD = new SleepGuard();
+
 /** The offloading bash backend: submits every command to the daemon and
  *  returns a successful claim at once, so the daemon always owns
  *  execution and no task holds the agent. The submit-armed delivery
@@ -1044,6 +1082,19 @@ class OffloadedBash implements BashOperations {
 	exec: BashOperations["exec"] = async (command, cwd, { onData, signal, timeout, env }) => {
 		if (this.offloadDisabled()) {
 			return this.localBash.exec(command, cwd, { onData, signal, timeout, env });
+		}
+		if (SLEEP_GUARD.blocks(command)) {
+			// A waiting command is a hand-off the agent is trying to bridge
+			// itself. Refuse it before the daemon sees it and name the two
+			// real continuations: keep calling tools, or block with the
+			// task tool.
+			onData(Buffer.from(
+				`[pi-daemon] refused \`sleep\`: a handed-off command is already ` +
+				`daemon-owned, so its result is steered in automatically - keep ` +
+				`calling tools instead. To block for a ticket, call ` +
+				`daemon_tasks result <id> wait=<seconds> (daemon_tasks list ` +
+				`finds the id).\n`));
+			return { exitCode: 1 };
 		}
 		const sessionFile =
 			typeof env?.PI_SESSION_FILE === "string" ? env.PI_SESSION_FILE : null;
@@ -1121,8 +1172,8 @@ export default function (pi: ExtensionAPI) {
 			"You can inspect PI_* environment variables for current model and session details.",
 			"Every bash call is handed to pi-daemon as a ticket whose result is " +
 				"steered in automatically, so keep calling tools instead of sleeping " +
-				"or polling; to block for a ticket before the next step, call " +
-				"daemon_tasks result <id> wait=<seconds>.",
+				"or polling - a `sleep` call is refused; to block for a ticket " +
+				"before the next step, call daemon_tasks result <id> wait=<seconds>.",
 		],
 	});
 	pi.registerTool(bashTool);
