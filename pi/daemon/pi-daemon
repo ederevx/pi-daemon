@@ -2173,7 +2173,7 @@ class SessionSpawner:
 
 	def spawn(self, name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS,
 			  verb="start", registry_argv=None, refuse_if_exists=False,
-			  env=None):
+			  env=None, env_once=None):
 		child_env = os.environ.copy()
 		child_env.update({
 			"TERM": "xterm-256color",
@@ -2186,9 +2186,13 @@ class SessionSpawner:
 		# A caller override (a teammate's identity) wins over the
 		# daemon defaults; the session records only the override so a
 		# respawn can reconstitute the child's environment without ever
-		# persisting the daemon's own environment.
+		# persisting the daemon's own environment. env_once is applied
+		# to the child but never stored: a consumer's secret must not
+		# reach the provider's registry.
 		if env:
 			child_env.update(env)
+		if env_once:
+			child_env.update(env_once)
 		child = self.backend().spawn(argv, dir_, child_env, cols, rows)
 		sess = Session(name, dir_, argv, child.pid,
 					   getattr(child, "master_fd", -1), child=child,
@@ -2461,9 +2465,10 @@ class Daemon:
 
 	def spawn(self, name, dir_, argv, cols=DEFAULT_COLS, rows=DEFAULT_ROWS,
 			  verb="start", registry_argv=None, refuse_if_exists=False,
-			  env=None):
+			  env=None, env_once=None):
 		return self.spawner.spawn(name, dir_, argv, cols, rows, verb,
-								  registry_argv, refuse_if_exists, env)
+								  registry_argv, refuse_if_exists, env,
+								  env_once)
 
 	def _handshake(self, conn, reader):
 		# Mandatory first line: the random-token hello that authenticates
@@ -2797,10 +2802,13 @@ class Control:
 		dir_ = req.get("dir")
 		argv = req.get("argv")
 		env = req.get("env")
-		if env is not None and not (isinstance(env, dict)
-									and all(isinstance(k, str) and isinstance(v, str)
-										for k, v in env.items())):
-			return bad_request()
+		env_once = req.get("env_once")
+		for candidate in (env, env_once):
+			if candidate is not None and not (
+					isinstance(candidate, dict)
+					and all(isinstance(k, str) and isinstance(v, str)
+							for k, v in candidate.items())):
+				return bad_request()
 		try:
 			cols = int(req.get("cols", DEFAULT_COLS))
 			rows = int(req.get("rows", DEFAULT_ROWS))
@@ -2815,7 +2823,8 @@ class Control:
 		if self.daemon.table.get(name) is not None:
 			return {"ok": True, "name": name, "created": False}
 		try:
-			self.daemon.spawn(name, dir_, argv, cols, rows, env=env)
+			self.daemon.spawn(name, dir_, argv, cols, rows, env=env,
+							  env_once=env_once)
 		except OSError as exc:
 			log("start '%s' failed: %s" % (name, exc))
 			return err("spawn-failed")

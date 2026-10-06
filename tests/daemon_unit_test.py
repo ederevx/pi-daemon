@@ -486,6 +486,28 @@ def test_session_control():
          "env": {"TEAM_ID": 3}})
     assert_true(not bad_env.get("ok"), "non-string env rejected")
     DAEMON.control.stop({"name": envname})
+    # env_once reaches the child but is never persisted: a provider must
+    # not store a consumer's secret.
+    once = "pi-oncetest"
+    out = os.path.join(SCRATCH, "once-env.txt")
+    r_once = DAEMON.control.start(
+        {"name": once, "dir": SCRATCH,
+         "argv": ["sh", "-c",
+                  "printenv TEAM_SEND_TOKEN > '%s'; sleep 20" % out],
+         "env": {"TEAM_ID": "fork-once"},
+         "env_once": {"TEAM_SEND_TOKEN": "sekret"}})
+    assert_true(r_once.get("ok"), r_once)
+    for _ in range(100):
+        if os.path.exists(out):
+            break
+        time.sleep(0.02)
+    with open(out) as fh:
+        assert_eq(fh.read().strip(), "sekret")
+    orec = DAEMON.registry.load()[once]
+    assert_true("TEAM_SEND_TOKEN" not in orec.get("env", {}),
+                "the provider must not persist a consumer secret")
+    assert_eq(orec["env"]["TEAM_ID"], "fork-once")
+    DAEMON.control.stop({"name": once})
 
 
 def test_reload_guard():
