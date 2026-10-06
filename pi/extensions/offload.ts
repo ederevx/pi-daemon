@@ -43,6 +43,7 @@ import {
 	DynamicBorder,
 	getSettingsListTheme,
 	getShellConfig,
+	keyHint,
 	type BashOperations,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -220,6 +221,69 @@ function formatResult(ticket: Ticket, output: string): string {
 		text += `\n[Output truncated: ${truncation.outputLines} of ${truncation.totalLines} lines kept]`;
 	}
 	return `${header}\n${text}`;
+}
+
+/** One daemon-ticket completion as pi renders it: pi's custom-message
+ *  background, collapsed by default to a single line colored by the
+ *  ticket's outcome, and showing the delivered result once the user
+ *  expands it (ctrl+o). The replayed key hint comes from pi, so a
+ *  remapped expand key still reads correctly. */
+class TicketNotification {
+	constructor(
+		private readonly ticket: Ticket,
+		private readonly content: string,
+		private readonly theme: {
+			fg: (role: string, text: string) => string;
+			bg: (role: string, text: string) => string;
+			bold: (text: string) => string;
+		},
+	) {}
+
+	/** The outcome color: success for a clean finish, error for a
+	 *  nonzero exit or a failure, warning for a cancelled or lost
+	 *  ticket, and dim while it is still running. */
+	private outcomeColor(): string {
+		const t = this.ticket;
+		if (t.status === "failed" || (t.exit !== null && t.exit !== 0)) {
+			return "error";
+		}
+		if (t.status === "cancelled" || t.status === "lost") return "warning";
+		if (t.status === "done") return "success";
+		return "dim";
+	}
+
+	/** The one-line summary: label, ticket, outcome-colored status and
+	 *  exit code, finish time, and the expand/collapse hint. */
+	private headline(expanded: boolean): string {
+		const t = this.ticket;
+		const when = new Date((t.finished ?? t.created) * 1000)
+			.toLocaleTimeString("en-GB");
+		const outcome = t.exit !== null
+			? `${t.status} (exit ${t.exit})`
+			: t.status;
+		const hint = keyHint("app.tools.expand",
+			expanded ? "to collapse" : "to expand");
+		return [
+			this.theme.fg("customMessageLabel", this.theme.bold("[daemon-task]")),
+			this.theme.fg("accent", t.id),
+			this.theme.fg("muted", "-"),
+			this.theme.fg(this.outcomeColor(), outcome),
+			this.theme.fg("dim", when),
+			`${this.theme.fg("muted", "(")}${hint}${this.theme.fg("muted", ")")}`,
+		].join(" ");
+	}
+
+	/** The card body: the headline, then the full result the agent
+	 *  received once expanded. The host owns transcript spacing. */
+	component(expanded: boolean, outputPad: number): Component {
+		const box = new Box(outputPad, 1, (text) =>
+			this.theme.bg("customMessageBg", text));
+		box.addChild(new Text(this.headline(expanded), 0, 0));
+		if (expanded) {
+			box.addChild(new Text(this.theme.fg("dim", `\n${this.content}`), 0, 0));
+		}
+		return box;
+	}
 }
 
 /** The owning session's stable key: the hosted session's short name
@@ -414,7 +478,6 @@ class DaemonTasks {
 		message: { customType: string; content: string; display: boolean; details?: unknown },
 		options: { triggerTurn: boolean; deliverAs: "steer" | "followUp" },
 	) => void;
-	private readonly append: (customType: string, data: unknown) => void;
 
 	/** ticket id -> live watcher; owning object mutates this only. */
 	private watchers = new Map<string, { stopped: boolean }>();
@@ -428,11 +491,9 @@ class DaemonTasks {
 	constructor(
 		runner: ProcessRunner,
 		send: DaemonTasks["send"],
-		append: DaemonTasks["append"],
 	) {
 		this.client = new TicketClient(runner);
 		this.send = send;
-		this.append = append;
 	}
 
 	/** The owning session's stable key: the hosted session's short name
@@ -571,16 +632,15 @@ class DaemonTasks {
 				// agent after its current tool calls finish but BEFORE
 				// its next model call, so it learns the task completed
 				// instead of re-running it. followUp waits for full idle,
-				// which let agents duplicate work.
-				// The user sees a one-line card (full detail lives in
-				// /daemon-tasks); the agent gets the full result
-				// invisibly.
-				this.append("daemon-task", { ticket });
+				// which let agents duplicate work. The message is visible:
+				// its renderer draws a card collapsed to one outcome-
+				// colored line, expanding to the full result the agent
+				// receives.
 				this.send(
 					{
 						customType: "daemon-task",
 						content: `Background task finished: ${command}\n${formatResult(ticket, output)}`,
-						display: false,
+						display: true,
 						details: { ticket },
 					},
 					{ triggerTurn: true, deliverAs: "steer" },
@@ -1024,22 +1084,15 @@ export default function (pi: ExtensionAPI) {
 	const exec = (file: string, args: string[]) => pi.exec(file, args);
 	const tasks = new DaemonTasks(new ProcessRunner(exec), (message, options) => {
 		void pi.sendMessage(message, options);
-	}, (customType, data) => {
-		void pi.appendEntry(customType, data);
 	});
-	// Static one-line card; full detail lives in /daemon-tasks.
-	pi.registerEntryRenderer("daemon-task", (entry, _opts, theme) => {
-		const t = (entry.data as { ticket?: Ticket } | undefined)?.ticket;
-		if (!t) return new Text("daemon task", 0, 0);
-		const when = new Date((t.finished ?? t.created) * 1000)
-			.toLocaleTimeString("en-GB");
-		const head = `${t.id} ${t.status} - ${when}` +
-			(t.exit !== null ? ` - exit ${t.exit}` : "");
-		// Box pads the line to full width, so the bg spans the card.
-		const box = new Box(0, 0, (text) =>
-			theme.bg("customMessageBg", text));
-		box.addChild(new Text(theme.bold(`[daemon-task] ${head}`)));
-		return box;
+	// Completion card: pi's custom-message shell, one line collapsed
+	// (outcome-colored) and the full result when the user expands it.
+	pi.registerMessageRenderer("daemon-task", (message, { expanded, outputPad }, theme) => {
+		const ticket = (message.details as { ticket?: Ticket } | undefined)?.ticket;
+		if (!ticket) return undefined;
+		const content = typeof message.content === "string" ? message.content : "";
+		return new TicketNotification(ticket, content, theme)
+			.component(expanded, outputPad);
 	});
 	const localBash: BashOperations = createLocalBashOperations();
 
