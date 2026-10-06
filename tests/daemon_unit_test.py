@@ -391,6 +391,27 @@ def test_ticket_cancel_and_reset():
     DAEMON.control.ticket_remove({"id": r2["id"]})
 
 
+def test_ticket_timeout():
+    # A submitted timeout is enforced daemon-side: the child is killed and
+    # the record is a failed "timed out" ticket, never a live process.
+    r = DAEMON.control.ticket_submit(
+        {"session": "s1", "cwd": SCRATCH, "command": "sleep 30",
+         "timeout": 0.3})
+    assert_true(r.get("ok"), r)
+    tid = r["id"]
+    rec = DAEMON.control.ticket_wait({"id": tid, "timeout": 5})
+    assert_true(rec["ok"], rec)
+    assert_eq(rec["ticket"]["status"], "failed")
+    assert_eq(rec["ticket"]["error"], "timed out")
+    assert_eq(rec["ticket"]["timeout"], 0.3)
+    DAEMON.control.ticket_remove({"id": tid})
+    # A non-positive timeout is rejected before any execution.
+    bad = DAEMON.control.ticket_submit(
+        {"session": "s1", "cwd": SCRATCH, "command": "printf x",
+         "timeout": -1})
+    assert_true(not bad.get("ok"), "negative timeout rejected")
+
+
 def test_session_control():
     name = "pi-unittest"
     r = DAEMON.control.start(
@@ -1896,6 +1917,7 @@ def _main():
     ok("session resize delegates to the child", test_resize_delegates)
     ok("ticket control (submit/wait/output/list/remove)", test_ticket_control)
     ok("ticket cancel + reset", test_ticket_cancel_and_reset)
+    ok("ticket timeout enforced daemon-side", test_ticket_timeout)
     ok("session control (start/list/state/input/detach/stop)", test_session_control)
     ok("reload guard (in-place only, no spawn)", test_reload_guard)
     ok("reload signal consumed directly (no PTY typing)",

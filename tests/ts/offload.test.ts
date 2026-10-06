@@ -287,6 +287,40 @@ test("offload: watch abort releases the wait with the ticket still running", asy
     "no blocking round trips after abort");
 });
 
+test("offload: bash tool hands off immediately with the timeout forwarded", async () => {
+  const pi = mount(new FakePi());
+  const bashTool = pi.tools.get("bash") as { execute: unknown };
+  const execute = bashTool.execute as (
+    _id: string,
+    p: { command: string; cwd?: string; timeout?: number },
+    _s: unknown,
+    _o: unknown,
+    _c: unknown,
+  ) => Promise<{ content: Array<{ type: string; text: string }> }>;
+  let message = "";
+  try {
+    await execute("call1", { command: "echo hi", cwd: scratchDir(), timeout: 7 }, undefined, undefined, {
+      sessionManager: { getSessionId: () => "test-session", getSessionFile: () => "/x/abc.jsonl" },
+      cwd: scratchDir(),
+      mode: "cli",
+    });
+  } catch (err) {
+    // The stock tool treats a null exit code as "terminated without an
+    // exit code"; the hand-off text still rides in the thrown message.
+    message = err instanceof Error ? err.message : String(err);
+  }
+  assertMatches(message, /handed off/);
+  assertMatches(message, /daemon timeout 7s/);
+  const submit = pi.execCalls.find((c) => c.args.includes("--timeout"));
+  assert(submit !== undefined, "ticket-submit carries --timeout");
+  const idx = submit!.args.indexOf("--timeout");
+  assertEq(submit!.args[idx + 1], "7", "daemon timeout reaches the daemon");
+  await waitFor(() =>
+    pi.sent.some((s) => (s.options as { deliverAs?: string }).deliverAs === "steer"),
+    "handed-off result steered in",
+  );
+});
+
 test("offload: bash tool falls back to local execution when the daemon is down", async () => {
   const pi = mount(new FakePi(true));
   const bashTool = pi.tools.get("bash") as { execute: unknown };

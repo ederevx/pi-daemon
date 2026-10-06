@@ -147,9 +147,6 @@ export class DaemonSettingsPresenter {
 				key: "offload.enabled", kind: "flag", defaultValue: true,
 				env: "PI_OFFLOAD", envMode: "off-word",
 			},
-			this.number("offload.waitSeconds", "Offload wait",
-				"Hand-off bound before a command becomes a background ticket",
-				"PI_OFFLOAD_WAIT", 120),
 		];
 	}
 
