@@ -517,6 +517,56 @@ def test_session_control():
     DAEMON.control.stop({"name": once})
 
 
+def test_session_name_resolution():
+    """A session-addressed command resolves the client's "pi-" convention
+    to the stored name, and live_files covers the announced file, so the
+    store GC protects a bare-named hosted session (pi-teams) whose
+    extension addresses it as "pi-<name>"."""
+    bare = "bare-unittest"
+    r = DAEMON.control.start(
+        {"name": bare, "dir": SCRATCH,
+         "argv": ["sh", "-c", "echo ready; sleep 30"]})
+    assert_true(r.get("ok"), r)
+    sess = DAEMON.table.get(bare)
+    assert_true(sess is not None)
+    # exact and alternate "pi-" forms address the same live session
+    assert_true(DAEMON.table.resolve(bare) is sess)
+    assert_true(DAEMON.table.resolve("pi-" + bare) is sess)
+    # the wire dispatch canonicalizes the prefixed name pi-rc would send
+    st = DAEMON._dispatch(None, {"cmd": "state", "name": "pi-" + bare,
+                                 "state": "busy"})
+    assert_true(st["ok"], st)
+    assert_eq(DAEMON.table.get(bare).state, "busy")
+    # announce under the prefixed name records the file on the bare session
+    conv = os.path.join(SCRATCH, "bare-conv.jsonl")
+    with open(conv, "w") as f:
+        f.write('{"type":"session"}\n')
+    an = DAEMON._dispatch(None, {"cmd": "announce", "name": "pi-" + bare,
+                                 "file": conv})
+    assert_true(an["ok"], an)
+    assert_eq(DAEMON.table.get(bare).file, conv)
+    assert_true(conv in DAEMON._live_session_files(), "announced file tracked")
+    DAEMON.control.stop({"name": bare})
+    assert_true(_drain_session(bare))
+
+
+def test_live_files_tracks_session_argv():
+    """A session spawned straight onto a conversation (a --session argv)
+    is protected by live_files before any announce sets its file, so a
+    revive/handover spawn cannot be swept as unheld."""
+    conv = os.path.join(SCRATCH, "argv-conv.jsonl")
+    name = "pi-argvtest"
+    r = DAEMON.control.start(
+        {"name": name, "dir": SCRATCH,
+         "argv": ["sh", "-c", "sleep 30", "pi", "--session", conv]})
+    assert_true(r.get("ok"), r)
+    assert_true(DAEMON.table.get(name).file is None, "not announced yet")
+    assert_true(conv in DAEMON._live_session_files(),
+                "argv --session file not protected")
+    DAEMON.control.stop({"name": name})
+    assert_true(_drain_session(name))
+
+
 def test_reload_guard():
     """A reload injection is strictly in-place: it never spawns a
     session and it marks a session that dies right after so the revival
@@ -2109,6 +2159,10 @@ def _main():
     ok("ticket cancel + reset", test_ticket_cancel_and_reset)
     ok("ticket timeout enforced daemon-side", test_ticket_timeout)
     ok("session control (start/list/state/input/detach/stop)", test_session_control)
+    ok("session name resolution across the pi- convention",
+       test_session_name_resolution)
+    ok("live_files tracks a --session argv conversation",
+       test_live_files_tracks_session_argv)
     ok("reload guard (in-place only, no spawn)", test_reload_guard)
     ok("reload signal consumed directly (no PTY typing)",
        test_reload_signal_consumed_direct)

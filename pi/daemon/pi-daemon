@@ -1783,6 +1783,28 @@ class SessionTable:
 		with self.lock:
 			return list(self._sessions.values())
 
+	def resolve(self, name):
+		# A client's session address is convention-agnostic: pi-rc prefixes
+		# "pi-" while some hosts (pi-teams) store names bare. Return the
+		# live session the client meant, exact form first then the other
+		# "pi-"/bare form; without a lock-held caller here, take it.
+		with self.lock:
+			sess = self._sessions.get(name)
+			if sess is not None:
+				return sess
+			alt = name[3:] if name.startswith("pi-") else "pi-" + name
+			return self._sessions.get(alt)
+
+	@staticmethod
+	def _session_arg(sess):
+		# The conversation file named by a --session argument, or None;
+		# parsed here once for holders_of and live_files.
+		argv = sess.argv or []
+		for i, arg in enumerate(argv[:-1]):
+			if arg == "--session":
+				return argv[i + 1]
+		return None
+
 	def holders_of(self, file):
 		# All live sessions backing this conversation file: the announced
 		# file first (the extension recorded it), then a --session argv
@@ -1793,14 +1815,24 @@ class SessionTable:
 			if sess.file == file:
 				hits.append(sess)
 		for sess in self._sessions.values():
-			if sess in hits:
-				continue
-			argv = sess.argv or []
-			for i, arg in enumerate(argv[:-1]):
-				if arg == "--session" and argv[i + 1] == file:
-					hits.append(sess)
-					break
+			if sess not in hits and self._session_arg(sess) == file:
+				hits.append(sess)
 		return hits
+
+	def live_files(self):
+		# Conversation files a live session backs: the announced file plus
+		# any --session argv file, so a session spawned straight onto a
+		# conversation is protected before its extension announces. The
+		# session store GC and the transcript index consume this.
+		with self.lock:
+			files = set()
+			for sess in self._sessions.values():
+				if sess.file:
+					files.add(sess.file)
+				arg_file = self._session_arg(sess)
+				if arg_file:
+					files.add(arg_file)
+			return files
 
 
 class HandoffLedger:
@@ -2370,10 +2402,25 @@ class Daemon:
 				except OSError:
 					pass
 
+	def _canonicalize_name(self, req):
+		# A session-addressed command may arrive under a different "pi-"
+		# convention than the daemon stored (pi-rc prefixes, pi-teams
+		# stores bare). Rewrite req["name"] to the live session's stored
+		# name so every handler and registry call sees one canonical form;
+		# a name no live session matches is left untouched for creation
+		# (start) or lookup-miss handling.
+		name = req.get("name")
+		if not isinstance(name, str) or not name:
+			return
+		sess = self.table.resolve(name)
+		if sess is not None:
+			req["name"] = sess.name
+
 	def _dispatch(self, conn, req):
 		cmd = req.get("cmd")
 		if not isinstance(cmd, str):
 			return bad_request()
+		self._canonicalize_name(req)
 		if cmd == "attach":
 			# attach may have already delivered the response itself before
 			# installing the client bridge; its second return value says
@@ -2528,9 +2575,11 @@ class Daemon:
 			log("discard '%s' conversation failed: %s" % (sess.name, exc))
 
 	def _live_session_files(self):
-		# Conversation files a live hosted session backs: the session store
-		# GC must never unlink one (the ask-only GcReaper owns those).
-		return {sess.file for sess in self.table.snapshot() if sess.file}
+		# Conversation files a live hosted session backs: the announced file
+		# and any --session argument (SessionTable.live_files), so the
+		# session store GC never unlinks one (the ask-only GcReaper owns
+		# those).
+		return self.table.live_files()
 
 	def request_gc_reap_if_due(self, sess):
 		# The one GC policy hook: ask a detached, model-idle session to
