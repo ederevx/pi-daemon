@@ -131,8 +131,10 @@ process.stdout.write(file || "");
 }
 
 # Guard entry: attach when the requested resume flags target a live hosted
-# session (return nonzero if that attach fails); return (proceed as today)
-# in every other case.
+# session. Returns 0 when nothing is requested (proceed as today), 2 when a
+# selection was requested but has no live holder (the caller must host the
+# selection instead of auto-attaching), and 1 when an attach attempt failed
+# (the caller degrades open with the original args).
 guard_check() {
 	local -a args=("$@")
 	local i arg mode="" value
@@ -151,51 +153,19 @@ guard_check() {
 	done
 	[[ -n $mode ]] || return 0
 	if [[ $mode == resume ]]; then
-		# An interactive picker cannot be resolved without spawning pi.
-		# Attach when every live hosted session in this directory backs
-		# ONE distinct conversation (several terminals may share it);
-		# otherwise warn that the picker may duplicate a live session and
-		# degrade open — daemon's post-resume notice catches that.
-		local -a names=() files=() states=()
-		local name _dir _pid _marker state file
-		while IFS=$'\t' read -r name _dir _pid _marker state file; do
-			if [[ -z $file || $file == "-" ]]; then
-				file="-"
-			fi
-			names+=("$name"); files+=("$file"); states+=("$state")
-		done < <("$PI_RC" ls --here 2>/dev/null)
-		if (( ${#names[@]} == 1 )); then
-			guard_attach "${names[0]}" || return 1
-			return 0
-		fi
-		if (( ${#names[@]} > 1 )); then
-			local -a known=()
-			for file in "${files[@]}"; do
-				[[ $file != "-" ]] && known+=("$file")
-			done
-			if (( ${#known[@]} == ${#names[@]} )) \
-				&& (( $(printf '%s\n' "${known[@]}" | sort -u | wc -l) == 1 )); then
-				# Several views of one conversation: attach to the first.
-				guard_attach "${names[0]}" || return 1
-				return 0
-			fi
-			# Ambiguous picker target: warn (with state) and degrade open.
-			printf 'pi: %d live hosted sessions in this directory; the resume picker may open a conversation that is already live:\n' "${#names[@]}" >&2
-			local i
-			for i in "${!names[@]}"; do
-				printf '  %s\t%s\t%s\n' "${names[i]}" "${states[i]}" "${files[i]}" >&2
-			done
-		fi
-		return 0
+		# An interactive picker cannot be resolved before pi opens, so
+		# never guess a target: host this call and let pi's own picker
+		# run inside it. 2 tells the caller a selection was requested,
+		# so the daemon-owned auto-attach does not swallow the picker.
+		return 2
 	fi
 	local target
 	target=$(guard_resolve_file "$mode" "${value:-}")
-	[[ -n $target ]] || return 0
+	[[ -n $target ]] || return 2
 	local live
-	live=$("$PI_RC" which "$target" 2>/dev/null) || return 0
-	if [[ -n $live ]]; then
-		guard_attach "$live" || return 1
-	fi
+	live=$("$PI_RC" which "$target" 2>/dev/null) || return 2
+	[[ -n $live ]] || return 2
+	guard_attach "$live" || return 1
 	return 0
 }
 
@@ -271,12 +241,20 @@ if [[ -t 0 && -z "${PI_HOSTED:-}" && -x "$PI_RC" ]]; then
 	done
 	if [[ $direct -eq 0 ]]; then
 		ensure_daemon
-		if ! guard_check "${args[@]}"; then
-			# Guard attach failed (session died between check and attach):
-			# degrade open with the original args so the call still works.
-			exec "$REAL_PI" "${args[@]}"
+		selection_requested=0
+		if guard_check "${args[@]}"; then
+			:
+		else
+			guard_status=$?
+			if (( guard_status == 2 )); then
+				selection_requested=1
+			else
+				# Guard attach failed (session died between check and
+				# attach): degrade open with the original args.
+				exec "$REAL_PI" "${args[@]}"
+			fi
 		fi
-		if [[ $force_new -eq 0 ]]; then
+		if [[ $force_new -eq 0 && $selection_requested -eq 0 ]]; then
 			owned=$(owned_session)
 			if [[ -n $owned ]]; then
 				printf 'pi: attaching to the daemon-owned session %s (pi --new starts a fresh conversation)\n' "$owned" >&2

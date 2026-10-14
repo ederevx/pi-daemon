@@ -794,54 +794,96 @@ def test_reload_same_file_announce_no_spawn():
         DAEMON.table.remove_if(sess)
 
 
-def test_stop_and_reap_discard_conversation_file():
-    """A session the daemon ends itself (stop, or the idle-reap of a
-    stale detached phantom) drops its conversation file too, so it stops
-    showing up in pi's /resume picker. A clean user quit (stopping is
-    False) keeps the file, and an absorbed duplicate whose conversation
-    still has a live holder keeps it as well (the file passes to its
-    survivor)."""
+def test_reap_keeps_conversation_and_purge_discards():
+    """A clean quit, an explicit stop, and a GC reap all keep the
+    conversation resumable and record its file for a later attach; only
+    the operator's purge discards it. A conversation a live holder still
+    backs is never unlinked."""
 
-    def mk(name, file_, stopping):
+    def mk(name, file_):
         sess = daemon.Session(name, SCRATCH, ["pi"], pid=1, master_fd=-1)
         sess.file = file_
-        sess.stopping = stopping
         assert_true(DAEMON.table.put(sess))
+        DAEMON.files.record(name, file_)
         return sess
 
-    # stop/reap of the sole holder discards the file (/resume cleaned)
-    sole_file = os.path.join(SCRATCH, "discard-sole.jsonl")
-    open(sole_file, "w").close()
-    sole = mk("pi-discard-sole", sole_file, True)
-    DAEMON.drop(sole, 0)
-    assert_true(not os.path.exists(sole_file),
-                "daemon-ended session file removed from /resume")
-    assert_true(DAEMON.table.get("pi-discard-sole") is None)
+    # a GC reap keeps the conversation and its name -> file mapping
+    reap_file = os.path.join(SCRATCH, "reap-kept.jsonl")
+    open(reap_file, "w").close()
+    reap = mk("pi-reap-kept", reap_file)
+    reap.begin_gc_reap()
+    assert_true(reap.stopping)
+    assert_true(not reap.discard_conversation)
+    DAEMON.drop(reap, 0)
+    assert_true(os.path.exists(reap_file),
+                "a GC reap keeps the conversation resumable")
+    assert_eq(DAEMON.files.get("pi-reap-kept"), reap_file,
+              "the name still resolves to its conversation")
+    assert_true(DAEMON.table.get("pi-reap-kept") is None)
 
-    # a clean user quit keeps the conversation resumable
-    quit_file = os.path.join(SCRATCH, "quit.jsonl")
+    # an explicit stop keeps it too
+    stop_file = os.path.join(SCRATCH, "stop-kept.jsonl")
+    open(stop_file, "w").close()
+    stop = mk("pi-stop-kept", stop_file)
+    stop.stopping = True
+    DAEMON.drop(stop, 0)
+    assert_true(os.path.exists(stop_file), "an explicit stop keeps it")
+
+    # a clean user quit keeps it
+    quit_file = os.path.join(SCRATCH, "quit-kept.jsonl")
     open(quit_file, "w").close()
-    quit_sess = mk("pi-quit", quit_file, False)
+    quit_sess = mk("pi-quit-kept", quit_file)
     DAEMON.drop(quit_sess, 0)
-    assert_true(os.path.exists(quit_file),
-                "clean quit keeps the conversation file")
+    assert_true(os.path.exists(quit_file), "a clean quit keeps it")
 
-    # an absorbed duplicate shares its file with a live holder: dropping
-    # it must NOT unlink the conversation the survivor still hosts
-    shared = os.path.join(SCRATCH, "shared.jsonl")
+    # a shared conversation with a live holder is never unlinked, and an
+    # ordinary stop of its survivor still keeps it
+    shared = os.path.join(SCRATCH, "shared-kept.jsonl")
     open(shared, "w").close()
-    live = mk("pi-live", shared, False)
-    dup = mk("pi-dup", shared, True)   # absorbed holder is marked stopping
+    live = mk("pi-live-kept", shared)
+    dup = mk("pi-dup-kept", shared)
+    dup.stopping = True
     DAEMON.drop(dup, 0)
     assert_true(os.path.exists(shared),
-                "absorbed duplicate's shared conversation is not deleted")
-    assert_true(DAEMON.table.get("pi-live") is not None)
-    # when the surviving holder is itself later ended by the daemon, the
-    # now-orphaned conversation is finally discarded
+                "a shared conversation survives a holder drop")
+    assert_true(DAEMON.table.get("pi-live-kept") is not None)
     live.stopping = True
     DAEMON.drop(live, 0)
-    assert_true(not os.path.exists(shared),
-                "last holder drop discards the conversation")
+    assert_true(os.path.exists(shared),
+                "an ordinary stop of the survivor still keeps it")
+
+    # only the operator purge discards the conversation and its mapping
+    purge_file = os.path.join(SCRATCH, "purge.jsonl")
+    open(purge_file, "w").close()
+    purge = mk("pi-purge", purge_file)
+    purge.begin_gc_reap(discard_conversation=True)
+    assert_true(purge.discard_conversation)
+    DAEMON.drop(purge, 0)
+    assert_true(not os.path.exists(purge_file),
+                "the operator purge discards the conversation")
+    assert_true(DAEMON.files.get("pi-purge") is None,
+                "the discarded conversation's mapping is dropped")
+
+
+def test_attach_reports_recorded_conversation_file():
+    """A missing session whose name still backs a preserved conversation
+    answers attach with that file, so the client resumes it instead of
+    the directory's latest."""
+    name = "pi-attach-recorded"
+    file_ = os.path.join(SCRATCH, "attach-recorded.jsonl")
+    open(file_, "w").close()
+    DAEMON.files.record(name, file_)
+    resp, bridge = DAEMON.control.attach(
+        {"name": name, "cols": 80, "rows": 24}, None)
+    assert_true(resp is not None and not resp.get("ok"))
+    assert_eq(resp.get("error"), "no-session")
+    assert_eq(resp.get("file"), file_,
+              "attach hands back the recorded conversation file")
+    assert_true(not bridge)
+    unknown, _ = DAEMON.control.attach(
+        {"name": "pi-attach-unknown", "cols": 80, "rows": 24}, None)
+    assert_true("file" not in unknown,
+                "an unknown name carries no conversation file")
 
 
 def _spawn_session(name):
@@ -871,7 +913,7 @@ def test_transcript_index_wiring():
     sess = daemon.Session("pi-transcript-wired", SCRATCH, ["pi"],
                           pid=1, master_fd=-1)
     sess.file = file_
-    sess.stopping = True
+    sess.discard_conversation = True
     assert_true(DAEMON.table.put(sess))
     DAEMON.drop(sess, 0)
     assert_true(not os.path.exists(file_), "conversation not discarded")
@@ -1344,15 +1386,20 @@ def test_startup_purges_stale_gc_reap_requests():
     assert_true(not os.path.exists(stale), "stale request not purged")
 
 
-def test_gc_reap_ack_discards_and_never_revives():
+def test_gc_reap_ack_keeps_conversation_and_never_revives():
     """The tool's acknowledgement is the consented reap: the daemon clears
     the request, drops the registry entry, and marks the exit a stop so
-    the stale conversation is discarded and never revived."""
+    it is never revived. The conversation is kept (only the operator
+    purge discards it) and its name still resolves to it."""
     name = "pi-gc-ack"
+    file_ = os.path.join(SCRATCH, "gc-ack-kept.jsonl")
+    open(file_, "w").close()
     sess = daemon.Session(name, SCRATCH, ["pi"], pid=1, master_fd=-1,
                           child=_FinishChild())
+    sess.file = file_
     DAEMON.table.put(sess)
-    DAEMON.registry.add(name, SCRATCH, ["pi", "--session", "conv.jsonl"])
+    DAEMON.registry.add(name, SCRATCH, ["pi", "--session", file_])
+    DAEMON.files.record(name, file_)
     sig = DAEMON.gc_reaper.path(name)
     try:
         sess.last_activity = time.time() - daemon.GC_IDLE - 1.0
@@ -1361,6 +1408,8 @@ def test_gc_reap_ack_discards_and_never_revives():
         assert_true(DAEMON.gc_reaper.requested(name), "request not recorded")
         assert_true(DAEMON.control.gc_reap_ack({"name": name}).get("ok"))
         assert_true(sess.stopping, "acknowledged session not marked stopping")
+        assert_true(not sess.discard_conversation,
+                    "an ordinary reap must not discard the conversation")
         assert_true(not os.path.exists(sig), "ack did not clear the request")
         assert_true(not DAEMON.gc_reaper.requested(name),
                     "ack did not drop the request record")
@@ -1372,9 +1421,16 @@ def test_gc_reap_ack_discards_and_never_revives():
         DAEMON.revive(sess, 1)
         assert_true(DAEMON.table.get(name) is sess,
                     "consented reap was revived")
+        # The conversation is preserved and stays retrievable by name.
+        DAEMON.drop(sess, 0)
+        assert_true(os.path.exists(file_),
+                    "an ordinary reap keeps the conversation")
+        assert_eq(DAEMON.files.get(name), file_,
+                  "the reaped name still resolves to its conversation")
     finally:
         DAEMON.gc_reaper.clear(name)
         DAEMON.registry.drop(name)
+        DAEMON.files.drop(name)
         DAEMON.table.remove_if(sess)
 
 
@@ -1404,6 +1460,10 @@ def test_daemon_purge_stops_due_sessions():
     assert_true(busy not in resp.get("purged"),
                 "busy session was purged")
     assert_true(due_sess.stopping, "purged session not marked stopping")
+    assert_true(due_sess.discard_conversation,
+                "purge must discard the conversation")
+    assert_true(not busy_sess.discard_conversation,
+                "busy session marked for discard")
     assert_true(not busy_sess.stopping, "busy session marked stopping")
     assert_true(not DAEMON.gc_reaper.requested(due),
                 "purged session left a reap request")
@@ -2176,8 +2236,10 @@ def _main():
        posix_only=True)
     ok("reload same-file re-announce keeps no-spawn guard",
        test_reload_same_file_announce_no_spawn)
-    ok("stop/reap discards the conversation file (/resume)",
-       test_stop_and_reap_discard_conversation_file)
+    ok("reap/stop keep the conversation, purge discards it",
+       test_reap_keeps_conversation_and_purge_discards)
+    ok("attach reports the recorded conversation file",
+       test_attach_reports_recorded_conversation_file)
     ok("conversation index sidecar is paired with its file",
        test_transcript_index_wiring)
     ok("transcript wire commands serve the index",
@@ -2202,8 +2264,8 @@ def _main():
        test_state_dir_gc_daemon_log)
     ok("session store gc prunes aged unheld conversations",
        test_session_store_gc_prunes_aged_unheld)
-    ok("gc reap ack discards and never revives",
-       test_gc_reap_ack_discards_and_never_revives)
+    ok("gc reap ack keeps the conversation and never revives",
+       test_gc_reap_ack_keeps_conversation_and_never_revives)
     ok("daemon purge force-stops due sessions, spares busy",
        test_daemon_purge_stops_due_sessions)
     ok("registry dedupe (one entry per conversation)", test_registry_dedupe)

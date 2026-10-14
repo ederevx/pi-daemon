@@ -309,7 +309,7 @@ test("daemon: factory wires the command and events", () => {
   assertEq(pi.onCalls.get("before_agent_start") ?? 0, 1);
   assertEq(pi.onCalls.get("agent_end") ?? 0, 1);
   assertEq(pi.onCalls.get("agent_settled") ?? 0, 1);
-  assertEq(pi.onCalls.get("session_before_switch") ?? 0, 2);
+  assertEq(pi.onCalls.get("session_before_switch") ?? 0, 1);
 });
 
 class MockPi {
@@ -318,6 +318,8 @@ class MockPi {
   readonly onCalls = new Map<string, number>();
   readonly sessionStarters: Array<(event: any) => Promise<void>> = [];
   readonly shutdownHandlers: Array<(event: any) => Promise<void>> = [];
+  readonly beforeSwitchHandlers:
+    Array<(event: any, ctx: any) => Promise<any>> = [];
   readonly messages: string[] = [];
   readonly messageOptions: Array<Record<string, unknown>> = [];
   readonly execCalls: Array<{ file: string; args: string[] }> = [];
@@ -325,6 +327,9 @@ class MockPi {
     this.onCalls.set(name, (this.onCalls.get(name) ?? 0) + 1);
     if (name === "session_start") this.sessionStarters.push(handler);
     if (name === "session_shutdown") this.shutdownHandlers.push(handler);
+    if (name === "session_before_switch") {
+      this.beforeSwitchHandlers.push(handler);
+    }
   }
   registerCommand(name: string, def: unknown): void {
     this.commands.set(name, def);
@@ -545,6 +550,35 @@ test("daemon: gc reap request steers the agent once per request", async () => {
       writeFileSync(sig, JSON.stringify({ id: "pi-gcq", ts: 3 }));
       await new Promise((resolve) => setTimeout(resolve, 150));
       assertEq(pi.messages.length, 2, "no watcher left after shutdown");
+    });
+  });
+});
+
+test("daemon: a canceled hosted switch keeps the gc reap watcher", async () => {
+  const state = join(scratchDir(), "gc-reap-switch");
+  await hosted("pi-gcsw", async () => {
+    await withEnv({ XDG_STATE_HOME: state }, async () => {
+      const pi = new MockPi();
+      factory(pi as never);
+      // session_start listeners: [reload watcher, gc reap watcher]
+      await pi.sessionStarters[1]({ reason: "startup" });
+      const dir = join(state, "pi-pty-host", "gc-reap");
+      mkdirSync(dir, { recursive: true });
+      const sig = join(dir, "pi-gcsw.json");
+      writeFileSync(sig, JSON.stringify({ id: "pi-gcsw", ts: 1 }));
+      await waitFor(() => pi.messages.length === 1, "request surfaced");
+      // A hosted /resume (or /new) is canceled, not performed: canceling
+      // it must not tear the reap watcher down, or a session that stays
+      // alive headless is never re-asked.
+      assert(pi.beforeSwitchHandlers.length > 0,
+        "a switch handler is registered");
+      for (const handler of pi.beforeSwitchHandlers) {
+        const result = await handler({ reason: "resume" }, undefined);
+        assertEq(result?.cancel, true, "hosted switch canceled");
+      }
+      writeFileSync(sig, JSON.stringify({ id: "pi-gcsw", ts: 2 }));
+      await waitFor(() => pi.messages.length === 2,
+        "watcher still steers after a canceled switch");
     });
   });
 });
