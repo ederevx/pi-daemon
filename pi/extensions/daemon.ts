@@ -1168,9 +1168,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		gcReapWatcher.stop();
 	});
-	pi.on("session_before_switch", async () => {
-		gcReapWatcher.stop();
-	});
 
 	// The one GC reaper tool: calling it is the voluntary reap. It
 	// acknowledges the daemon's request (so the daemon clears the

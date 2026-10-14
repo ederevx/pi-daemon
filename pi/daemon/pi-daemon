@@ -29,10 +29,13 @@
 # simply stays until the session's connection dies and the normal
 # child-exit cleanup drops it. The automatic reaper only ever asks; the
 # operator can force the issue with `daemon-purge`, which stops every
-# detached, model-idle session past the same window immediately with the
-# consented-stop semantics of the tool. Independently, the session store
-# GC unlinks aged conversations in pi's session store that no live
-# session backs, so they stop surfacing in pi's /resume picker.
+# detached, model-idle session past the same window immediately and is
+# the only stop that discards the conversation. An ordinary reap or
+# `stop` keeps the conversation, and the daemon remembers which file a
+# name backed so a later `pi-rc attach NAME` resumes that conversation.
+# Independently, the session store GC unlinks aged conversations in pi's
+# session store that no live session backs, so pi-daemon stays the owner
+# that eventually reclaims them.
 #
 # The daemon holds no terminal history: a detached session keeps running
 # headless and an attach re-wires the bridge, sizing the PTY for the new
@@ -57,10 +60,8 @@
 #                                         the wrapper's resume guard
 #   stop {name}                           TERM the process group, KILL
 #                                         after a 2s grace, drop entry;
-#                                         when it was the last live holder
-#                                         of its conversation the session
-#                                         file is discarded so it stops
-#                                         showing in pi's /resume picker
+#                                         the conversation is kept so the
+#                                         name can be attached again
 #   gc-reap-ack {name}                    the daemon_gc_reap tool's
 #                                         acknowledgement of the GC reap
 #                                         request: clear the request and
@@ -88,8 +89,10 @@
 #                                         running headless
 #   announce {name,file[,takeover]}       record the pi session file that
 #                                         backs a hosted session (drives
-#                                         crash revival and the registry
-#                                         resume argv); with takeover, a
+#                                         crash revival, the registry
+#                                         resume argv, and the durable
+#                                         name->file index an attach
+#                                         resumes); with takeover, a
 #                                         duplicate holder of a live
 #                                         conversation yields to a busy
 #                                         holder or absorbs idle holders
@@ -684,6 +687,55 @@ class Registry:
 			if drop:
 				self._store(data)
 		return keep, drop
+
+
+class SessionFileIndex:
+	"""Durable session-name -> conversation-file map.
+
+	A session the daemon no longer hosts (a clean quit, a stop, or a GC
+	reap) leaves the respawn registry so it stays ended, yet its
+	conversation must remain retrievable by name: `pi-rc attach NAME`
+	resumes this file instead of guessing the directory's latest. The
+	index is daemon-owned state kept out of the respawn registry so a
+	reaped session is never respawned at daemon startup; entries whose
+	file is gone are pruned, so the map cannot outgrow the store."""
+
+	def __init__(self, path):
+		self.path = path
+		self._file = pi_platform.AtomicStateFile(path)
+		self._lock = threading.Lock()
+
+	def get(self, name):
+		with self._lock:
+			return self._file.read_dict().get(name)
+
+	def record(self, name, file):
+		# One load-modify-write under the lock, like the registry.
+		if not name or not file:
+			return
+		with self._lock:
+			data = self._file.read_dict()
+			if data.get(name) == file:
+				return
+			data[name] = file
+			self._file.write(data)
+
+	def drop(self, name):
+		with self._lock:
+			data = self._file.read_dict()
+			if name in data:
+				del data[name]
+				self._file.write(data)
+
+	def prune(self):
+		# Drop entries whose conversation is gone; the store GC owns the
+		# file, so the map only ever points at a file that still exists.
+		with self._lock:
+			data = self._file.read_dict()
+			kept = {n: f for n, f in data.items()
+					if isinstance(f, str) and os.path.isfile(f)}
+			if kept != data:
+				self._file.write(kept)
 
 
 class DaemonRoster:
@@ -1912,6 +1964,9 @@ class Session:
 		self.state = "idle"    # model run state, published by the extension
 		self.last_activity = time.time()
 		self.stopping = False  # set by an explicit stop: never revive
+		# Only an explicit operator purge also discards the conversation;
+		# an ordinary stop or GC reap keeps it resumable.
+		self.discard_conversation = False
 		# An in-place /reload was typed into this session: an abnormal
 		# death right after must not be revived into a fresh spawn (a
 		# broken extension update could otherwise respawn every session
@@ -1937,10 +1992,15 @@ class Session:
 		# Any viewer or model-state activity keeps the session alive.
 		self.last_activity = time.time()
 
-	def begin_gc_reap(self):
+	def begin_gc_reap(self, discard_conversation=False):
 		# The agent answered the daemon's GC reap request by calling the
-		# daemon_gc_reap tool: this is a consented stop, so the exit
-		# path discards the stale conversation and never revives it.
+		# daemon_gc_reap tool, or the operator purged it: this is a
+		# consented stop, so the exit path never revives it. Only the
+		# operator's explicit purge also discards the conversation; an
+		# ordinary reap keeps it resumable and lets the daemon's own
+		# session-store GC reclaim it once it ages out.
+		self.discard_conversation = (
+			self.discard_conversation or discard_conversation)
 		self.stopping = True
 
 	def install_client(self, client, initial=b""):
@@ -2261,6 +2321,8 @@ class Daemon:
 		self.table = SessionTable()
 		self.ledger = HandoffLedger()
 		self.gc_reaper = GcReaper(GC_REAP_REQUEST_DIR, GC_IDLE)
+		self.files = SessionFileIndex(
+			os.path.join(REG_DIR, "session-files.json"))
 		self.services = pi_services.ServiceDirectory()
 		self.shutdown_event = threading.Event()
 		self.spawner = SessionSpawner(self.table, registry, owner=self)
@@ -2332,6 +2394,7 @@ class Daemon:
 			# the daemon serving, just unadvertised.
 			log("service descriptor not published: %s" % exc)
 		self.services.start(self.shutdown_event, STATE_GC_TICK)
+		self.files.prune()
 		self.respawn_from_registry()
 		self.tickets.start()
 		self.state_gc.sweep()
@@ -2552,14 +2615,14 @@ class Daemon:
 		log("child-exit '%s' pid %d status %s" % (sess.name, sess.pid, code))
 
 	def _discard_session_file(self, sess):
-		# A session the daemon ended itself (an explicit `stop`, or the
-		# idle-reap of a stale detached phantom) is a discard: drop its
-		# conversation file too so it stops surfacing in pi's /resume
-		# picker. Never on a clean user quit (stopping is False - that
-		# stays resumable), and never when another live session still
-		# hosts the same conversation (takeover/absorption of a duplicate
-		# passes the file to its survivor, so it must not be unlinked).
-		if not (sess.stopping and sess.file):
+		# Only an explicit operator purge discards the conversation (a
+		# clean quit, an explicit `stop`, and the GC reap all keep it
+		# resumable). The daemon's own session-store GC still reclaims any
+		# conversation no live session backs once it ages past the GC
+		# window. Never when another live session still hosts the same
+		# conversation (takeover/absorption of a duplicate passes the
+		# file to its survivor, so it must not be unlinked).
+		if not (sess.discard_conversation and sess.file):
 			return
 		with self.table.lock:
 			remaining = self.table.holders_of(sess.file)
@@ -2570,6 +2633,7 @@ class Daemon:
 				os.unlink(sess.file)
 				self.transcript_index.forget(sess.file)
 				self.transcript_handles.forget(sess.file)
+				self.files.drop(sess.name)
 				log("discard '%s' conversation %s" % (sess.name, sess.file))
 		except OSError as exc:
 			log("discard '%s' conversation failed: %s" % (sess.name, exc))
@@ -2894,7 +2958,14 @@ class Control:
 			follow = self.daemon.ledger.follow(name, table)
 		if sess is None:
 			if follow is None:
-				return err("no-session"), False
+				resp = err("no-session")
+				# The name may still back a preserved conversation: hand
+				# its file to the client so a re-attach resumes that
+				# conversation instead of the directory's latest.
+				file_ = self.daemon.files.get(name)
+				if file_:
+					resp["file"] = file_
+				return resp, False
 			# The duplicate already shut down, but its handoff survives: a
 			# late viewer follows it instead of recreating the duplicate.
 			send_json(conn, {"ok": True, "name": name, "state": follow["state"],
@@ -3140,8 +3211,9 @@ class Control:
 		# answered the GC reap request and is shutting itself down.
 		# Clear the request and the registry entry so the reaper's
 		# state is clean before the process exits, and mark the exit a
-		# consented stop so the stale conversation is discarded and
-		# never revived.
+		# consented stop so it is never revived. The conversation is
+		# kept: the daemon's own session-store GC reclaims it once it
+		# ages out.
 		name = req.get("name")
 		if not (isinstance(name, str) and name):
 			return bad_request()
@@ -3157,17 +3229,17 @@ class Control:
 
 	def daemon_purge(self, _req):
 		# The operator's manual force purge: stop every detached,
-		# model-idle session past the one GC window immediately, with the
-		# consented-stop semantics of the daemon_gc_reap tool (its
-		# conversation is discarded and it is never revived). Attached and
-		# busy sessions are spared, and the automatic reaper stays
-		# ask-only. Stopping is marked synchronously so a purge response
-		# already reflects a session the relay thread no longer asks.
+		# model-idle session past the one GC window immediately and
+		# discard its conversation (the one destructive stop). It is never
+		# revived. Attached and busy sessions are spared, and the automatic
+		# reaper stays ask-only. Stopping is marked synchronously so a
+		# purge response already reflects a session the relay thread no
+		# longer asks.
 		purged = []
 		for sess in self.daemon.table.snapshot():
 			if not self.daemon.gc_reaper.due(sess):
 				continue
-			sess.begin_gc_reap()
+			sess.begin_gc_reap(discard_conversation=True)
 			self.daemon.gc_reaper.clear(sess.name)
 			threading.Thread(target=sess.terminate, daemon=True).start()
 			purged.append(sess.name)
@@ -3354,6 +3426,9 @@ class Control:
 				sess.reload_injected = False
 				sess.reload_injected_at = 0.0
 			sess.file = file
+			# Remember the name -> conversation mapping so a later attach
+			# can resume this conversation after the session is gone.
+			self.daemon.files.record(name, file)
 			# Surface other live holders of the same conversation so the
 			# extension can warn about a picker-opened duplicate
 			# immediately.
