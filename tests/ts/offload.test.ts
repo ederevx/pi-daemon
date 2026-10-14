@@ -7,6 +7,9 @@
  * escape hatch. No module-global mutable state anywhere in the wiring.
  */
 
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { test, assert, assertEq, assertMatches, scratchDir, waitFor, withEnv } from "./harness.ts";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { sessionKeyOf, TicketClient, default as factory } from "../../pi/extensions/offload.ts";
@@ -515,6 +518,34 @@ test("offload: bash tool falls back to local execution when the daemon is down",
     assert(/(^|[\\/])pi-rc$/.test(pi.execCalls[0].file),
       `POSIX must exec pi-rc directly, got ${pi.execCalls[0].file}`);
   }
+});
+
+test("offload: the stored setting disables offloading like PI_OFFLOAD=off", async () => {
+  const dir = join(scratchDir(), `offload-setting-${Date.now()}`);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "settings.json"),
+    JSON.stringify({ piDaemon: { offload: { enabled: false } } }),
+  );
+  await withEnv({ PI_OFFLOAD: undefined, PI_CODING_AGENT_DIR: dir }, async () => {
+    const pi = mount(new FakePi());
+    const bashTool = pi.tools.get("bash") as { execute: unknown };
+    const execute = bashTool.execute as (
+      _id: string,
+      p: { command: string; cwd?: string },
+      _s: unknown,
+      _o: unknown,
+      _c: unknown,
+    ) => Promise<{ content: Array<{ type: string; text: string }> }>;
+    const out = await execute("c1", { command: "printf setting-disabled-ok", cwd: scratchDir() }, undefined, undefined, {
+      sessionManager: { getSessionId: () => "test-session", getSessionFile: () => "/x/abc.jsonl" },
+      cwd: scratchDir(),
+      mode: "cli",
+    });
+    const text = out.content.map((b) => (b as { text: string }).text).join("\n");
+    assertMatches(text, /setting-disabled-ok/);
+    assertEq(pi.execCalls.length, 0, "no daemon traffic when the setting disables offloading");
+  });
 });
 
 test("offload: PI_OFFLOAD=off runs bash locally without any daemon traffic", async () => {
