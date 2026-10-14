@@ -9,9 +9,12 @@
  *
  * It is also the gate: until `pre_daemon` has been called in a session,
  * every tool this extension registers is blocked with a reason pointing
- * here. Non-extension tools are never touched. The gate resets on each
- * session start. Tool rows use pi's native collapsed rendering, so the
- * extension blends in; Ctrl+O expands.
+ * here. That includes `bash`, which the offload extension only offloads -
+ * and therefore only gates - while command offloading is enabled, so a
+ * session with offloading disabled keeps its plain local shell. Other
+ * extensions' and pi's own tools are never touched. The gate resets on
+ * each session start. Tool rows use pi's native collapsed rendering, so
+ * the extension blends in; Ctrl+O expands.
  */
 
 import type {
@@ -21,6 +24,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+import { OffloadPolicy } from "./settings/offload-policy.ts";
+
 /** The name of this extension's onboarding tool. */
 const TOOL_NAME = "pre_daemon";
 
@@ -29,15 +34,21 @@ const TOOL_NAME = "pre_daemon";
 export class PreDaemonTool {
 	private acknowledged = false;
 
-	/** The daemon tools this extension registers and therefore gates.
-	 *  `bash` is excluded: the offload override is transparent, so it
-	 *  must keep behaving like the built-in shell. `pre_daemon` is the
-	 *  way in and is never gated. */
+	/** The tools this extension gates. `bash` is the offload extension's
+	 *  override: it is gated only while offloading is enabled, because a
+	 *  disabled offload leaves the plain local shell in place. `pre_daemon`
+	 *  is the way in and is never gated. */
 	private readonly owned = new Set([
+		"bash",
 		"daemon_tasks",
 		"daemon_gc_reap",
 		"transcript_read",
 	]);
+
+	/** The offload policy, asked per decision and never cached. */
+	constructor(
+		private readonly policy: Pick<OffloadPolicy, "enabled"> = new OffloadPolicy(),
+	) {}
 
 	/** Register the tool, the per-session reset, and the gate. */
 	register(pi: ExtensionAPI): void {
@@ -71,13 +82,13 @@ export class PreDaemonTool {
 			"",
 			"Tools:",
 			"- pre_daemon: this catalog; call once before any daemon/offload tool.",
-			"- bash: every shell command is handed to the daemon immediately as a ticket; the claim succeeds at once and the result is delivered when it finishes.",
+			"- bash: with offloading enabled, every shell command is handed to the daemon immediately as a ticket; the claim succeeds at once and the result is delivered when it finishes.",
 			"- daemon_tasks: submit/status/result/watch/cancel/remove/list tickets.",
 			"- daemon_gc_reap: reap this hosted session when the daemon requests it.",
 			"- transcript_read: read this conversation from the daemon index (stat/path/entries/tree/range) instead of loading the whole session file.",
 			"",
 			"Conventions:",
-			"- Call pre_daemon once per session before using daemon_tasks, daemon_gc_reap, or transcript_read; bash stays transparent and is handed off automatically.",
+			"- Call pre_daemon once per session before daemon_tasks, daemon_gc_reap, or transcript_read, and before bash when offloading is enabled. When offloading is disabled, bash runs locally without this prerequisite.",
 			"- Every bash call is already daemon-owned and non-blocking; pass the bash timeout to bound it daemon-side, and use daemon_tasks result <id> wait=<seconds> only to block for a result deliberately.",
 			"- A blocking result wait is interruptible and steerable: Escape or a queued message releases it; the ticket keeps running and still delivers on completion.",
 			"- Call daemon_gc_reap only when pi-daemon asks this idle detached session to reap, or when you are deliberately done.",
@@ -87,7 +98,7 @@ export class PreDaemonTool {
 			"- Offloaded commands become daemon-owned tickets that outlive the submitting session and persist in tickets.json.",
 			"- Remote-control helpers: pi-rc attach/ls/state, /daemon-reload, /daemon-settings, /daemon-purge.",
 			"- transcript_read serves the daemon's positional index, so long conversations can be paged instead of re-read in full.",
-			"- If the daemon is unreachable, bash falls back to the local shell transparently.",
+			"- If the daemon is unreachable, bash falls back to the local shell transparently (after the acknowledgement, while offloading is enabled).",
 		].join("\n");
 	}
 
@@ -109,15 +120,19 @@ export class PreDaemonTool {
 			this.acknowledged = true;
 			return undefined;
 		}
-		if (!this.acknowledged && this.owns(name)) {
-			return {
-				block: true,
-				reason:
-					"Call pre_daemon first: it returns the pi-daemon " +
-					"tool catalog and conventions. Then retry this call.",
-			};
-		}
-		return undefined;
+		if (this.acknowledged || !this.owns(name)) return undefined;
+		// A disabled offload leaves the plain local shell, which owes nothing
+		// to the daemon: it stays ungated and unacknowledged.
+		if (name === "bash" && !this.policy.enabled()) return undefined;
+		return {
+			block: true,
+			reason:
+				"Call pre_daemon first: it returns the pi-daemon " +
+				"tool catalog and conventions. Then retry this call." +
+				(name === "bash"
+					? " This command was not run locally or submitted to the daemon."
+					: ""),
+		};
 	}
 }
 

@@ -13,6 +13,7 @@ import { registry, cleanupScratch } from "./harness.ts";
 
 import "./daemon.test.ts";
 import "./offload.test.ts";
+import "./offload-policy.test.ts";
 import "./pre-daemon.test.ts";
 import "./settings.test.ts";
 import "./transcript.test.ts";

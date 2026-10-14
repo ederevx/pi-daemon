@@ -97,9 +97,12 @@ them, and can uninstall exactly what it installed.
   session that dies while processing the reload stays dead
   instead of being respawned, so a broken update cannot cascade into a
   spawn storm.
-- **Command offloading** (`offload` pi extension): every `bash` call is
-  handed to the daemon as a **ticket** immediately — a daemon-owned shell
-  command that outlives the submitting agent — and the tool returns a
+- **Command offloading** (`offload` pi extension): while command
+  offloading is enabled, a `bash` call first requires the session's
+  `pre_daemon` acknowledgement — it is blocked, and neither run locally
+  nor submitted, until the catalog has been read — and is then handed to
+  the daemon as a **ticket** immediately: a daemon-owned shell command
+  that outlives the submitting agent. The tool returns a
   successful claim at once, so no task holds the agent and the call never
   surfaces the stock tool's null-exit error; the claim names the ticket
   and advertises both continuations - keep calling tools, or block
@@ -125,8 +128,9 @@ them, and can uninstall exactly what it installed.
   message is queued), `watch` (live output via partial updates), and
   `status`, `list`, `cancel`, and `remove`. When the daemon is
   unreachable the bash tool falls back to pi's local execution
-  transparently, and `piDaemon.offload.enabled=false` (or
-  `PI_OFFLOAD=off`) disables offloading entirely. Tickets are garbage
+  transparently, once the session is acknowledged. `piDaemon.offload.enabled=false`
+  (or `PI_OFFLOAD=off`) disables offloading entirely, and `bash` is then
+  the plain local shell: ungated, and requiring no `pre_daemon` call. Tickets are garbage
   collected by the daemon: finished tickets expire after
   `PI_PTYD_TICKET_TTL_HOURS` hours (default 72h) with the finished set
   capped at 200 (oldest evicted), and each sweep unlinks the expired
