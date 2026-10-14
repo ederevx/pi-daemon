@@ -21,7 +21,9 @@
 #                                       (default name: dir basename; default
 #                                       command resumes the latest pi session,
 #                                       --fresh starts an empty one)
-#   pi-rc attach [name] [dir]           attach, recreating + resuming if gone
+#   pi-rc attach [name] [dir]           attach, recreating if gone (resuming
+#                                       that name's recorded conversation,
+#                                       else the directory's latest pi session)
 #   pi-rc attach --new [-- <pi args...>]  start a NEW hosted pi session (unique
 #                                       name; fresh conversation unless the
 #                                       pi args explicitly resume one) and
@@ -598,19 +600,24 @@ class AttachFlow:
 
 	def handshake(self, sock):
 		# Attach the current connection to self.session; recreates the
-		# session (resuming the latest conversation) when it is gone.
+		# session (resuming the conversation the daemon recorded for its
+		# name, else the latest) when it is gone.
 		send_json(sock, {"cmd": "attach", "name": self.session,
 						 "cols": self.cols, "rows": self.rows})
 		resp, rest = read_json_line(sock)
 		if resp is None or not resp.get("ok"):
 			error = (resp or {}).get("error") if resp else "no response"
 			if error == "no-session" and not self.fresh_new:
-				return self._recreate(sock)
+				# The daemon hands back the conversation file this name
+				# last backed, so a re-attach resumes that conversation
+				# instead of guessing the directory's latest.
+				return self._recreate(sock, (resp or {}).get("file"))
 			die("attach failed: %s" % error)
 		return resp, rest
 
-	def _recreate(self, sock):
-		argv = PROCESS.resume_command()
+	def _recreate(self, sock, file_=None):
+		argv = (PROCESS.pi_argv(["--session", file_]) if file_
+				else PROCESS.resume_command())
 		send_json(sock, {"cmd": "start", "name": self.session,
 						 "dir": self.dir_, "argv": argv,
 						 "cols": self.cols, "rows": self.rows})
@@ -618,8 +625,9 @@ class AttachFlow:
 		if start_resp is None or not start_resp.get("ok"):
 			die("attach failed: start failed: %s"
 				% (start_resp or {}).get("error", "no response"))
-		print("pi-rc: recreated '%s' in %s (resuming latest session)"
-			  % (self.session, self.dir_))
+		print("pi-rc: recreated '%s' in %s (resuming %s)"
+			  % (self.session, self.dir_,
+				 "its recorded conversation" if file_ else "latest session"))
 		send_json(sock, {"cmd": "attach", "name": self.session,
 						 "cols": self.cols, "rows": self.rows})
 		resp, rest = read_json_line(sock)
@@ -864,7 +872,7 @@ def cmd_ls(args, client):
 		sessions = [s for s in sessions
 					if same_dir(s.get("dir", ""), cwd)]
 	if not sessions:
-		print("pi-rc: no hosted sessions")
+		print("pi-rc: no hosted sessions", file=sys.stderr)
 		return
 	for s in sessions:
 		marker = "attached" if s.get("attached") else "detached"

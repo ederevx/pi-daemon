@@ -148,8 +148,12 @@ them, and can uninstall exactly what it installed.
   processes, except aged conversations the session store GC has
   discarded. When a hosted pi is gone (reboot, daemon restart), the
   daemon respawns it from its registry, and `pi-rc attach` or
-  `pi-rc start` resumes the latest session for that directory (`pi -c`),
-  falling back to a fresh pi; pass `--fresh` to force an empty session.
+  `pi-rc start` resumes its recorded conversation (else the directory's
+  latest session, `pi -c`), falling back to a fresh pi; pass `--fresh`
+  to force an empty session. A conversation the daemon ended (a clean
+  quit, an explicit `stop`, or a GC reap) stays resumable, and
+  `pi-rc attach <name>` resumes the file that name last backed; only
+  `/daemon-purge` discards it.
 - **Transcript retrieval** (`transcript` pi extension): the daemon keeps a
   positional `.jsonl.idx` sidecar beside every cold conversation and serves
   it over the control socket, so a session can read its own history without
@@ -226,7 +230,7 @@ with the built-in default as the fallback.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `gcIdleHours` | `24` | Detached model-idle sessions are asked to reap themselves through the `daemon_gc_reap` tool after this many hours, and aged conversations in pi's session store that no live session backs are discarded. `0` disables. |
+| `gcIdleHours` | `24` | Detached model-idle sessions are asked to reap themselves through the `daemon_gc_reap` tool after this many hours (the reap keeps the conversation resumable), and the session-store GC discards conversations untouched this long that no live session backs. `0` disables both. |
 | `daemonIdleTimeoutHours` | `1` | Self-shutdown after this many hours with nothing attached, all sessions idle, and no tickets. `0` disables. |
 | `minReviveLifeSeconds` | `30` | A hosted pi that lived shorter than this is never revived. |
 | `reloadGuardGraceSeconds` | `60` | No-spawn guard after an in-place reload. |
@@ -271,16 +275,18 @@ negative number is rejected and the next source applies, so a
 hand-written `Infinity` or `nan` cannot make a session un-reapable.
 `0` disables the corresponding reaper. The session reaper never
 force-kills: it writes a per-session reap request the extension
-surfaces, and the session reaps itself by calling `daemon_gc_reap`.
-Alongside it, the session store GC sweeps pi's conversation store and
-discards `.jsonl` conversations untouched past `gcIdleHours` that no
-live hosted session backs, so a leftover conversation stops surfacing
-in pi's /resume picker; a conversation a live session holds is left to
-the ask-only reaper.
+surfaces, and the session reaps itself by calling `daemon_gc_reap`. A
+reap, a clean quit, and an explicit `pi-rc stop` all keep the
+conversation resumable, and the daemon remembers which file a session
+name backed so a later `pi-rc attach <name>` resumes that conversation
+rather than the directory's latest. The session store GC is what
+eventually reclaims conversations: it sweeps pi's conversation store
+and discards `.jsonl` files untouched past `gcIdleHours` that no live
+hosted session backs, so pi-daemon remains the owner of cleanup; a
+conversation a live session holds is left to the ask-only reaper.
 `/daemon-purge` (and `pi-rc daemon-purge`) is the operator's manual
 force purge: it stops every detached, model-idle session past the
-`gcIdleHours` window immediately, with the same consented-stop
-semantics as `daemon_gc_reap` (the conversation is discarded), while
+`gcIdleHours` window immediately and discards its conversation, while
 attached and busy sessions are never purged.
 
 ## Maintenance conventions
