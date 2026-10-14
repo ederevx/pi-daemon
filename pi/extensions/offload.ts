@@ -1,9 +1,8 @@
 /**
- * Command offloading for Pi — every shell command becomes a daemon-owned
- * ticket.
+ * Command offloading for Pi — shell commands become daemon-owned tickets.
  *
  * The extension overrides the built-in `bash` tool with a variant whose
- * execution backend submits every command to pi-daemon as a ticket and
+ * execution backend submits the command to pi-daemon as a ticket and
  * returns a successful claim at once: the daemon always owns execution,
  * no task holds the agent, and the call never returns the stock tool's
  * null-exit hand-off error. The submit-armed delivery watcher waits on
@@ -20,7 +19,15 @@
  *   deferred result arrives.
  * - If the daemon is unreachable, execution falls back to pi's local
  *   shell backend transparently — the agent only ever sees normal bash
- *   behavior. PI_OFFLOAD=off disables offloading entirely.
+ *   behavior. PI_OFFLOAD=off (or `piDaemon.offload.enabled=false`)
+ *   disables offloading entirely, and the shell then runs locally with no
+ *   onboarding prerequisite.
+ *
+ * With offloading enabled the extension's bash tool is gated exactly like
+ * the daemon tools: until `pre_daemon` has been called in the session, the
+ * call is blocked instead of being submitted to the daemon or run locally.
+ * That gate belongs to the pre-daemon extension, which asks this module's
+ * OffloadPolicy whether offloading is on.
  *
  * Tickets survive everything else: they outlive the submitting session
  * (daemon-owned execution), are persisted in the daemon's tickets.json,
@@ -59,9 +66,7 @@ import {
 	type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
 import { ProcessRunner, resolvePiRc } from "./daemon.ts";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { OffloadPolicy } from "./settings/offload-policy.ts";
 
 /** pi-rc exit codes: 4 = unreachable before any request landed (safe to
  *  run the task locally); 7 = the request was sent but the outcome is
@@ -69,51 +74,6 @@ import { join } from "node:path";
  *  matching ticket instead of re-running. */
 const EXIT_NO_DAEMON = 4;
 const EXIT_AMBIGUOUS = 7;
-
-/** The pi settings file's "piDaemon.offload" section, read once at first
- *  use. Environment variables still take precedence per call, so tests
- *  and one-off runs can override without editing the settings file. */
-class OffloadSettings {
-	private section: Record<string, unknown> | null = null;
-
-	/** Whether offloading is enabled: PI_OFFLOAD=off wins, then the
-	 *  offload.enabled setting, then enabled. */
-	enabled(): boolean {
-		const env = process.env.PI_OFFLOAD;
-		if (env !== undefined && env !== "") return env !== "off";
-		const value = this.offload().enabled;
-		return typeof value === "boolean" ? value : true;
-	}
-
-	/** The same policy in the negative, owned once for both call sites. */
-	disabled(): boolean {
-		return !this.enabled();
-	}
-
-	private offload(): Record<string, unknown> {
-		const section = this.load().offload;
-		return section && typeof section === "object"
-			? section as Record<string, unknown> : {};
-	}
-
-	private load(): Record<string, unknown> {
-		if (this.section !== null) return this.section;
-		const dir = process.env.PI_CODING_AGENT_DIR
-			|| join(homedir(), ".pi", "agent");
-		try {
-			const raw = JSON.parse(
-				readFileSync(join(dir, "settings.json"), "utf8"));
-			const section = raw?.piDaemon;
-			this.section = section && typeof section === "object"
-				? section as Record<string, unknown> : {};
-		} catch {
-			this.section = {};
-		}
-		return this.section;
-	}
-}
-
-const OFFLOAD_SETTINGS = new OffloadSettings();
 
 /** Longest single ticket-wait round trip, in seconds. */
 const WAIT_CHUNK_SECONDS = 300;
@@ -1064,10 +1024,11 @@ class OffloadedBash implements BashOperations {
 	constructor(
 		private readonly localBash: BashOperations,
 		private readonly tasks: DaemonTasks,
+		private readonly policy: Pick<OffloadPolicy, "enabled">,
 	) {}
 
 	private offloadDisabled(): boolean {
-		return OFFLOAD_SETTINGS.disabled();
+		return !this.policy.enabled();
 	}
 
 	exec: BashOperations["exec"] = async (command, cwd, { onData, signal, timeout, env }) => {
@@ -1145,13 +1106,15 @@ export default function (pi: ExtensionAPI) {
 			.component(expanded, outputPad);
 	});
 	const localBash: BashOperations = createLocalBashOperations();
+	const policy = new OffloadPolicy();
 
-	const disabled = () => OFFLOAD_SETTINGS.disabled();
+	const disabled = () => !policy.enabled();
 
-	// -- transparent bash offloading -------------------------------------
+	// -- bash offloading -------------------------------------------------
 	// The offload backend lives in the OffloadedBash class (module level);
-	// this bootstrap composes it with the local fallback and the daemon.
-	const backend = new OffloadedBash(localBash, tasks);
+	// this bootstrap composes it with the local fallback, the daemon, and
+	// the same offload policy the onboarding gate consults.
+	const backend = new OffloadedBash(localBash, tasks, policy);
 
 
 	// bash tool override: same schema, renderers, prompt snippet, and
@@ -1161,10 +1124,13 @@ export default function (pi: ExtensionAPI) {
 	Object.assign(bashTool, {
 		promptGuidelines: [
 			"You can inspect PI_* environment variables for current model and session details.",
-			"Every bash call is handed to pi-daemon as a ticket whose result is " +
-				"steered in automatically, so keep calling tools instead of sleeping " +
-				"or polling - a `sleep` call is refused; to block for a ticket " +
-				"before the next step, call daemon_tasks result <id> wait=<seconds>.",
+			"When offloading is enabled, call pre_daemon once per session before " +
+				"using bash.",
+			"When offloading is enabled, every bash call is handed to pi-daemon as a " +
+				"ticket whose result is steered in automatically, so keep calling tools " +
+				"instead of sleeping or polling - a `sleep` call is refused; to block for " +
+				"a ticket before the next step, call daemon_tasks result <id> " +
+				"wait=<seconds>.",
 		],
 	});
 	pi.registerTool(bashTool);
