@@ -21,4 +21,6 @@ import "./transcript.test.ts";
 
 await registry.runAll();
 cleanupScratch();
-if (registry.failed > 0) process.exit(1);
+// Exit deterministically: a runner must not depend on an empty event
+// loop, and any stray handle is a defect the suite already reports.
+process.exit(registry.failed > 0 ? 1 : 0);
