@@ -22,6 +22,8 @@ class StubControlServer {
 	private readonly replies: Array<Record<string, unknown>>;
 	private port = 0;
 	private cursor = 0;
+	/** Open connections, so stop() can close the server at once. */
+	private readonly sockets = new Set<Socket>();
 	readonly commands: Array<Record<string, unknown>> = [];
 	rejectHello = false;
 	closeWithoutReply = false;
@@ -47,11 +49,17 @@ class StubControlServer {
 	}
 
 	async stop(): Promise<void> {
+		for (const socket of this.sockets) socket.destroy();
+		this.sockets.clear();
 		await new Promise<void>((resolve) => this.server.close(() => resolve()));
+		// Never let a closing stub hold the test run's event loop.
+		this.server.unref();
 	}
 
 	/** Serve one connection: hello, then exactly one command. */
 	private handle(socket: Socket): void {
+		this.sockets.add(socket);
+		socket.on("close", () => this.sockets.delete(socket));
 		let buffer = "";
 		let greeted = false;
 		socket.on("data", (chunk: Buffer) => {

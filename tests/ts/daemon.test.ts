@@ -579,6 +579,8 @@ test("daemon: a canceled hosted switch keeps the gc reap watcher", async () => {
       writeFileSync(sig, JSON.stringify({ id: "pi-gcsw", ts: 2 }));
       await waitFor(() => pi.messages.length === 2,
         "watcher still steers after a canceled switch");
+      // release the watcher so the test run's event loop can exit
+      await pi.shutdownHandlers[1]({ reason: "quit" });
     });
   });
 });
