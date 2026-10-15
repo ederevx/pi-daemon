@@ -12,7 +12,12 @@ import { join } from "node:path";
 
 import { test, assert, assertEq, assertMatches, scratchDir, waitFor, withEnv } from "./harness.ts";
 import { initTheme } from "@earendil-works/pi-coding-agent";
-import { sessionKeyOf, TicketClient, default as factory } from "../../pi/extensions/offload.ts";
+import {
+  formatResult,
+  sessionKeyOf,
+  TicketClient,
+  default as factory,
+} from "../../pi/extensions/offload.ts";
 import { ProcessRunner } from "../../pi/extensions/daemon.ts";
 
 interface ExeResult {
@@ -26,35 +31,102 @@ function ok(stdout: string): ExeResult {
   return { code: 0, stdout, stderr: "", killed: false };
 }
 
-function ticketRecord(status: string, id = "t-1"): string {
+function ticketRecord(
+  status: string,
+  id = "t-1",
+  command = "echo hi",
+  exit: number | null = status === "running" ? null : 0,
+): string {
   return JSON.stringify({
     id,
     session: "abc",
     cwd: "/x",
-    command: "echo hi",
+    command,
     kind: "shell",
     status,
     created: 1,
     started: 1,
     finished: status === "running" ? null : 2,
-    exit: status === "running" ? null : 0,
+    exit,
     term: null,
     truncated: false,
     error: null,
   });
 }
 
+function fail(stderr: string): ExeResult {
+  return { code: 1, stdout: "", stderr, killed: false };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 class FakePi {
   readonly sent: Array<{ message: unknown; options: unknown }> = [];
   readonly messageRenderers = new Map<string, unknown>();
-  readonly tools = new Map<string, { name: string; execute?: unknown }>();
+  readonly tools = new Map<string, { name: string; execute?: unknown; renderResult?: unknown }>();
   readonly commands = new Map<string, unknown>();
   readonly execCalls: Array<{ file: string; args: string[] }> = [];
-  /** Incremental ticket logs keyed by id, for offset reads. */
-  readonly logs = new Map<string, string>();
-  private readonly wait300 = new Map<string, number>();
+  /** id -> status steps; `ticket-list` and `ticket-wait` each advance
+   *  their own cursor, so a watcher and the wait loop never race for an
+   *  entry. The last step sticks. */
+  readonly script = new Map<string, string[]>();
+  private readonly cursors = new Map<string, { list: number; wait: number }>();
+  /** Byte-accurate ticket logs, so offsets are true byte offsets. */
+  readonly logs = new Map<string, Buffer>();
+  /** Ids a watcher must not settle on until released. */
+  readonly holdWait = new Set<string>();
+  /** Ids whose next offset read fails once. */
+  readonly failOutputOnce = new Set<string>();
+  /** Queued ticket ids for submit, in order. */
+  submitIds: string[] = [];
+  /** Maximum bytes one offset read returns (the daemon's chunk cap). */
+  chunkBytes = Infinity;
+  /** Runs at the start of every ticket-list, for mid-wait log growth. */
+  onList?: (n: number) => void;
+  private listCalls = 0;
+  private readonly holdMs = 40;
 
   constructor(private readonly daemonDown = false) {}
+
+  /** The steps for one id, defaulting to a ticket that finishes after
+   *  one observation. */
+  private steps(id: string): string[] {
+    let steps = this.script.get(id);
+    if (!steps) {
+      steps = ["running", "done"];
+      this.script.set(id, steps);
+    }
+    return steps;
+  }
+
+  /** Name `id` so a list includes it. */
+  track(id: string, steps: string[] = ["running", "done"]): void {
+    this.script.set(id, steps);
+  }
+
+  /** Append to a byte-accurate ticket log. */
+  append(id: string, text: string): void {
+    this.logs.set(id, Buffer.concat([
+      this.logs.get(id) ?? Buffer.alloc(0),
+      Buffer.from(text, "utf8"),
+    ]));
+  }
+
+  private statusFor(id: string, kind: "list" | "wait"): string {
+    const steps = this.steps(id);
+    const cursor = this.cursors.get(id) ?? { list: 0, wait: 0 };
+    const index = Math.min(cursor[kind], steps.length - 1);
+    cursor[kind] = index + 1;
+    this.cursors.set(id, cursor);
+    return steps[index];
+  }
+
+  private knownIds(): string[] {
+    return ["t-1", ...this.script.keys()].filter(
+      (id, index, all) => all.indexOf(id) === index);
+  }
 
   async exec(file: string, args: string[]): Promise<ExeResult> {
     // The Windows launch shape runs pi-rc through the Python
@@ -68,35 +140,44 @@ class FakePi {
     // arguments) so assertions can name the verb and its flags alike.
     this.execCalls.push({ file: python ? args[0] : file, args: [cmd, ...rest] });
     if (this.daemonDown) return { code: 4, stdout: "", stderr: "down", killed: false };
-    if (cmd === "ticket-submit") return ok("ticket t-1\n");
+    if (cmd === "ticket-submit") {
+      return ok(`ticket ${this.submitIds.shift() ?? "t-1"}\n`);
+    }
     if (cmd === "ticket-wait") {
       const id = rest[0];
       const timeout = Number(rest[1] ?? 0);
-      if (timeout > 0) {
-        const n = (this.wait300.get(id) ?? 0) + 1;
-        this.wait300.set(id, n);
-        return ok(ticketRecord(n >= 2 ? "done" : "running") + "\n");
+      if (timeout > 0 && this.holdWait.has(id)) {
+        await delay(this.holdMs);
+        return ok(ticketRecord("running", id) + "\n");
       }
-      const settled = (this.wait300.get(id) ?? 0) >= 2;
-      return ok(ticketRecord(settled ? "done" : "running") + "\n");
+      return ok(ticketRecord(this.statusFor(id, "wait"), id) + "\n");
     }
     if (cmd === "ticket-output") {
+      const id = rest[0];
       if (args.includes("--json")) {
-        return ok(JSON.stringify({ ok: true, id: rest[0], status: "done", exit: 0, output: "out-json" }));
+        return ok(JSON.stringify({
+          ok: true, id, status: "done", exit: 0,
+          output: (this.logs.get(id) ?? Buffer.alloc(0)).toString("utf8"),
+        }));
       }
       // Offset mode mirrors pi-rc's byte-faithful wire format: the
       // base64 payload from the offset, empty when the log has no
-      // new bytes.
+      // new bytes. The daemon caps one reply at TICKET_CHUNK bytes.
       const offset = Number(rest[1]);
       if (rest[1] !== undefined && !Number.isNaN(offset)) {
-        const log = this.logs.get(rest[0]) ?? "";
-        return ok(offset < log.length
-          ? Buffer.from(log.slice(offset), "utf8").toString("base64")
-          : "");
+        if (this.failOutputOnce.delete(id)) return fail("boom");
+        const log = this.logs.get(id) ?? Buffer.alloc(0);
+        const end = Math.min(log.length, offset + this.chunkBytes);
+        return ok(log.subarray(offset, end).toString("base64"));
       }
       return ok("");
     }
-    if (cmd === "ticket-list") return ok(ticketRecord("done") + "\n");
+    if (cmd === "ticket-list") {
+      this.onList?.(++this.listCalls);
+      const rows = this.knownIds()
+        .map((id) => ticketRecord(this.statusFor(id, "list"), id));
+      return ok(rows.length ? rows.join("\n") + "\n" : "");
+    }
     if (cmd === "ticket-cancel") return ok("");
     if (cmd === "ticket-remove") return ok("");
     if (cmd === "tickets-reset") return ok("pi-rc: reset: cancelled 0, removed 0\n");
@@ -107,7 +188,7 @@ class FakePi {
     this.sent.push({ message, options });
     return Promise.resolve();
   }
-  registerTool(tool: { name: string; execute?: unknown }): void {
+  registerTool(tool: { name: string; execute?: unknown; renderResult?: unknown }): void {
     this.tools.set(tool.name, tool);
   }
   registerCommand(name: string, def: unknown): void {
@@ -320,7 +401,7 @@ test("offload: a queued user message yields the result wait", async () => {
 
 test("offload: watch streams incremental output and abort releases the wait", async () => {
   const pi = mount(new FakePi());
-  pi.logs.set("t-1", "chunk-one-chunk-two");
+  pi.append("t-1", "chunk-one-chunk-two");
   const tools = pi.tools.get("daemon_tasks");
   const updates: string[] = [];
   const result = await runToolIO<{ content: Array<{ text: string }> }>(
@@ -351,7 +432,7 @@ test("offload: watch abort releases the wait with the ticket still running", asy
 
 test("offload: bash defers with a success claim and the watcher steers the result", async () => {
   const pi = mount(new FakePi());
-  pi.logs.set("t-1", "deferred-output");
+  pi.append("t-1", "deferred-output");
   const bashTool = pi.tools.get("bash") as { execute: unknown };
   const execute = bashTool.execute as (
     _id: string,
@@ -395,7 +476,7 @@ test("offload: bash defers with a success claim and the watcher steers the resul
 
 test("offload: an abort leaves the daemon-owned ticket and its watcher running", async () => {
   const pi = mount(new FakePi());
-  pi.logs.set("t-1", "late-output");
+  pi.append("t-1", "late-output");
   const bashTool = pi.tools.get("bash") as { execute: unknown };
   const execute = bashTool.execute as (
     _id: string,
@@ -628,6 +709,261 @@ test("offload: /daemon-tasks scopes to the command context's session file", asyn
     assert(dock !== undefined, "dock mounted");
     assertEq(dock!.sessionKey, "abc");
   });
+});
+
+test("offload: watch streams two tickets and freezes the earlier finisher", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  pi.track("t-1", ["running", "done"]);
+  pi.track("t-2", ["running", "running", "done"]);
+  const updates: Array<{
+    content?: Array<{ text?: string }>;
+    details?: { streams?: Array<{ id: string; state: string }> };
+  }> = [];
+  const result = await runToolIO<{ content: Array<{ text: string }> }>(
+    tools,
+    { action: "watch", ids: ["t-1", "t-2"] },
+    { onUpdate: (u) => updates.push(u as (typeof updates)[number]) },
+  );
+  const both = updates.find((u) =>
+    (u.content?.[0]?.text ?? "").includes("waiting for ticket t-1") &&
+    (u.content?.[0]?.text ?? "").includes("waiting for ticket t-2"));
+  assert(both !== undefined, "both sections stream while both run");
+  const frozen = updates.find((u) =>
+    u.details?.streams?.some((s) => s.id === "t-1" && s.state === "done") &&
+    u.details?.streams?.some((s) => s.id === "t-2" && s.state === "running"));
+  assert(frozen !== undefined, "the earlier finisher freezes at done");
+  assertMatches(result.content[0].text, /ticket t-1 done/);
+  assertMatches(result.content[0].text, /ticket t-2 done/);
+});
+
+test("offload: result ids returns on the first completion and cards the late ticket", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  pi.submitIds = ["t-1", "t-2"];
+  pi.track("t-1", ["done"]);
+  pi.track("t-2", ["running", "done"]);
+  pi.holdWait.add("t-1");
+  pi.holdWait.add("t-2");
+  await runTool(tools, { action: "submit", command: "echo one" });
+  await runTool(tools, { action: "submit", command: "echo two" });
+  const result = await runTool<{ content: Array<{ text: string }> }>(
+    tools, { action: "result", ids: ["t-1", "t-2"], wait: 5 },
+  );
+  pi.holdWait.delete("t-1");
+  pi.holdWait.delete("t-2");
+  assertMatches(result.content[0].text, /ticket t-1 done/);
+  assertMatches(result.content[0].text, /Still running: t-2/);
+  await waitFor(() =>
+    pi.sent.some((s) => /t-2/.test(JSON.stringify(s.message))),
+    "the late ticket is carded");
+  const cards = pi.sent.filter((s) =>
+    /Background task finished/.test(JSON.stringify(s.message)));
+  assertEq(cards.length, 1, "only the late ticket is carded");
+  assert(!/t-1/.test(JSON.stringify(cards[0].message)),
+    "the finished ticket is not carded again");
+});
+
+test("offload: a pre-aborted multi-id result does no blocking round", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  pi.track("t-1", ["running"]);
+  pi.track("t-2", ["running"]);
+  const controller = new AbortController();
+  controller.abort();
+  const result = await runToolIO<{ content: Array<{ text: string }> }>(
+    tools, { action: "result", ids: ["t-1", "t-2"], wait: 30 },
+    { signal: controller.signal },
+  );
+  assertMatches(result.content[0].text, /still running/i);
+  assertEq(pi.execCalls.filter((c) => c.args[0] === "ticket-list").length, 1,
+    "one ticket-list");
+  assertEq(pi.execCalls.filter((c) => c.args[0] === "ticket-wait").length, 0,
+    "no ticket-wait");
+});
+
+test("offload: a queued message yields a multi-id result without blocking rounds", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  pi.track("t-1", ["running"]);
+  pi.track("t-2", ["running"]);
+  const result = await runToolIO<{ content: Array<{ text: string }> }>(
+    tools, { action: "result", ids: ["t-1", "t-2"], wait: 30 },
+    { ctx: { hasPendingMessages: () => true } },
+  );
+  assertMatches(result.content[0].text, /still running/i);
+  assertEq(pi.execCalls.filter((c) => c.args[0] === "ticket-list").length, 1,
+    "one ticket-list");
+  assertEq(pi.execCalls.filter((c) => c.args[0] === "ticket-wait").length, 0,
+    "no ticket-wait");
+});
+
+test("offload: a released single result wait keeps the legacy text", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  pi.track("t-1", ["running"]);
+  const controller = new AbortController();
+  controller.abort();
+  const result = await runToolIO<{ content: Array<{ text: string }> }>(
+    tools, { action: "result", id: "t-1", wait: 30 }, { signal: controller.signal },
+  );
+  assertEq(result.content[0].text,
+    "ticket t-1 still running: echo hi\n" +
+    "The result will still be delivered automatically when it finishes, or " +
+    "re-call daemon_tasks result t-1 with wait to block again " +
+    "(the wait is interruptible and yields early when a message is queued).");
+});
+
+test("offload: a huge log stays within the per-tick read and snapshot bounds", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  pi.chunkBytes = 256 << 10;
+  pi.track("t-1", ["running"]);
+  pi.logs.set("t-1", Buffer.from(("0123456789".repeat(10) + "\n").repeat(52000)));
+  const updates: string[] = [];
+  const result = await runToolIO<{ content: Array<{ text: string }> }>(
+    tools, { action: "result", id: "t-1", wait: 1 },
+    { onUpdate: (u) => updates.push((u as { content: Array<{ text: string }> }).content[0].text) },
+  );
+  assertMatches(result.content[0].text, /still running/);
+  // The stream is pulled at most once per tick; the final fetch never ran.
+  const reads = pi.execCalls.filter(
+    (c) => c.args[0] === "ticket-output" && c.args.length === 3);
+  assert(reads.length <= 16, `one tick reads at most 16 chunks, got ${reads.length}`);
+  assert(updates.length > 0, "a partial was delivered");
+  for (const text of updates) {
+    assert(Buffer.byteLength(text, "utf8") <= 16384,
+      `the snapshot stays under 16 KiB, got ${Buffer.byteLength(text, "utf8")}`);
+  }
+});
+
+test("offload: the watch final text equals formatResult over the full output", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  pi.chunkBytes = 256 << 10;
+  pi.track("t-1", ["running", "done"]);
+  const body = ("0123456789".repeat(10) + "\n").repeat(52000);
+  pi.logs.set("t-1", Buffer.from(body));
+  const result = await runToolIO<{ content: Array<{ text: string }> }>(
+    tools, { action: "watch", id: "t-1" },
+  );
+  const ticket = JSON.parse(ticketRecord("done", "t-1")) as never;
+  assertEq(result.content[0].text, formatResult(ticket, body));
+});
+
+test("offload: a UTF-8 character split across chunks renders intact", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  pi.chunkBytes = 1;
+  pi.track("t-1", ["running", "done"]);
+  pi.logs.set("t-1", Buffer.from("caf\u00e9\n", "utf8"));
+  const updates: string[] = [];
+  await runToolIO(tools, { action: "result", id: "t-1", wait: 5 }, {
+    onUpdate: (u) =>
+      updates.push((u as { content: Array<{ text: string }> }).content[0].text),
+  });
+  const shown = updates.find((text) => text.includes("caf"));
+  assert(shown !== undefined, "the partial showed the decoded text");
+  assert(shown!.includes("caf\u00e9"), "the split character rendered intact");
+});
+
+test("offload: TicketStream joins a split character and reads in order", async () => {
+  const { TicketStream } = await import(
+    "../../pi/extensions/tickets/ticket-stream.ts");
+  const chunks = [Buffer.from([0xc3]), Buffer.from([0xa9, 0x0a])];
+  let calls = 0;
+  const offsets: number[] = [];
+  const source = {
+    outputFrom: async (_id: string, offset: number) => {
+      offsets.push(offset);
+      const data = chunks[calls] ?? Buffer.alloc(0);
+      calls++;
+      return { data, next: offset + data.length };
+    },
+  };
+  const stream = new TicketStream("t-1");
+  await stream.pull(source, 16);
+  assertEq(stream.tail(), "\u00e9\n", "the split character decoded whole");
+  assertEq(stream.behind, false, "an empty read clears behind");
+  assertEq(offsets.join(","), "0,1,3", "reads resume at the byte cursor");
+});
+
+test("offload: a failed final fetch re-arms delivery via unconsume", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  pi.track("t-1", ["done"]);
+  pi.append("t-1", "late-output");
+  pi.failOutputOnce.add("t-1");
+  await assertReject(
+    () => runTool(tools, { action: "result", id: "t-1", wait: 5 }),
+    "a failed output fetch rejects the single-ticket result",
+  );
+  await waitFor(
+    () => pi.sent.some((s) => /late-output/.test(JSON.stringify(s.message))),
+    "unconsume re-armed delivery",
+  );
+});
+
+test("offload: ids wins over id, dedupes, and caps the fan-out", async () => {
+  const pi = mount(new FakePi());
+  const tools = pi.tools.get("daemon_tasks");
+  pi.track("t-1", ["done"]);
+  pi.track("t-2", ["done"]);
+  const result = await runTool<{ content: Array<{ text: string }> }>(
+    tools, { action: "result", id: "t-9", ids: ["t-1", "t-1", "t-2"], wait: 5 },
+  );
+  assertMatches(result.content[0].text, /ticket t-1 done/);
+  assertMatches(result.content[0].text, /ticket t-2 done/);
+  assert(!result.content[0].text.includes("t-9"), "ids wins over id");
+  await assertReject(
+    () => runTool(tools, { action: "result", ids: ["t-1", "t-2", "t-3", "t-4", "t-5", "t-6", "t-7", "t-8", "t-9"], wait: 1 }),
+    "more than eight ids is refused",
+  );
+  await assertReject(
+    () => runTool(tools, { action: "result" }),
+    "a result with no id is refused",
+  );
+});
+
+test("offload: the live view shares lines across streams and reproduces the preview", () => {
+  initTheme("dark");
+  const pi = mount(new FakePi());
+  const tool = pi.tools.get("daemon_tasks") as {
+    renderResult?: (
+      result: unknown, options: unknown, theme: unknown, context: unknown,
+    ) => { render(width: number): string[] };
+  };
+  assert(typeof tool.renderResult === "function", "renderResult registered");
+  const theme = {
+    fg: (_role: string, text: string) => text,
+    bg: (_role: string, text: string) => text,
+    bold: (text: string) => text,
+  };
+  const streams = [
+    { id: "t-1", command: "one", state: "running", exit: null, runtimeSeconds: 12, tail: "a1\na2\na3", behind: false },
+    { id: "t-2", command: "two", state: "done", exit: 0, runtimeSeconds: 3, tail: "b1", behind: false },
+  ];
+  const partial = tool.renderResult!(
+    { content: [{ type: "text", text: "snap" }], details: { streams } },
+    { expanded: false, isPartial: true }, theme, {},
+  ).render(80).join("\n");
+  assertMatches(partial, /t-1/);
+  assertMatches(partial, /running 12s/);
+  assertMatches(partial, /done exit 0/);
+  assertMatches(partial, /a3/);
+  const body = Array.from({ length: 25 }, (_, i) => `line${i}`).join("\n");
+  const collapsed = tool.renderResult!(
+    { content: [{ type: "text", text: body }], details: {} },
+    { expanded: false, isPartial: false }, theme, {},
+  ).render(80).join("\n");
+  assertMatches(collapsed, /line0/);
+  assert(!collapsed.includes("line10"), "only the first ten lines are collapsed");
+  assertMatches(collapsed, /\.\.\. \(15 more lines,/);
+  const expanded = tool.renderResult!(
+    { content: [{ type: "text", text: body }], details: {} },
+    { expanded: true, isPartial: false }, theme, {},
+  ).render(80).join("\n");
+  assertMatches(expanded, /line24/);
 });
 
 /** runTool variant that expects rejection. */
