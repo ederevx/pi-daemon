@@ -77,6 +77,19 @@ class InstallScriptTests(unittest.TestCase):
         self.scratch = ScratchHome()
         self.addCleanup(self.scratch.cleanup)
 
+    def renamed_checkout(self):
+        """A differently named path that resolves to this checkout, so the
+        guard must match it by realpath, not by the final component."""
+        alias = self.scratch.root / "renamed-checkout"
+        try:
+            os.symlink(str(ROOT), str(alias), target_is_directory=True)
+            return str(alias)
+        except (OSError, NotImplementedError):
+            # No symlink privilege: the installer runs from the checkout,
+            # so a relative entry still resolves to it without the name
+            # "pi-daemon".
+            return "."
+
     def test_manual_install_writes_extensions(self):
         result = self.scratch.run()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -159,6 +172,28 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("installed as a pi package", result.stderr)
         self.assertFalse(
             self.scratch.path(".pi/agent/extensions/daemon.ts").exists())
+
+    def test_manual_install_refuses_differently_named_checkout(self):
+        # A worktree or renamed clone is not literally "pi-daemon": the
+        # guard must still catch a local entry pointing at this checkout.
+        settings = self.scratch.path(".pi/agent/settings.json")
+        settings.write_text(json.dumps({"packages": [
+            self.renamed_checkout()]}))
+        result = self.scratch.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installed as a pi package", result.stderr)
+        self.assertFalse(
+            self.scratch.path(".pi/agent/extensions/daemon.ts").exists())
+
+    def test_manual_install_allows_unrelated_local_path(self):
+        other = self.scratch.root / "unrelated-package"
+        other.mkdir()
+        settings = self.scratch.path(".pi/agent/settings.json")
+        settings.write_text(json.dumps({"packages": [str(other)]}))
+        result = self.scratch.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(
+            self.scratch.path(".pi/agent/extensions/daemon.ts").is_file())
 
     def test_manual_install_allowed_without_pin(self):
         settings = self.scratch.path(".pi/agent/settings.json")

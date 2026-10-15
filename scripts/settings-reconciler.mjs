@@ -15,6 +15,7 @@
 import {
 	chmodSync,
 	existsSync,
+	realpathSync,
 	readFileSync,
 	renameSync,
 	statSync,
@@ -29,11 +30,14 @@ import { homedir } from "node:os";
 export class SettingsReconciler {
 	/** @param settingsPath path of the pi settings.json to reconcile
 	 *  @param version the version being installed (prefers its pin)
-	 *  @param packageName directory name the package installs under */
-	constructor(settingsPath, version, packageName) {
+	 *  @param packageName directory name the package installs under
+	 *  @param checkoutRoot this checkout, so a local entry pointing at
+	 *  it is recognized whatever the directory is named */
+	constructor(settingsPath, version, packageName, checkoutRoot) {
 		this.settingsPath = settingsPath;
 		this.version = version;
 		this.packageName = packageName;
+		this.checkoutRoot = checkoutRoot;
 	}
 
 	/** Default settings location, honoring pi's config-dir override. */
@@ -54,13 +58,26 @@ export class SettingsReconciler {
 		}
 	}
 
-	/** Whether a packages entry installs this package: a git pin or a
-	 *  path whose final component is the package directory. */
+	/** Whether a packages entry installs this package: a git pin, a path
+	 *  whose final component is the package directory, or a local path
+	 *  that resolves to this checkout. */
 	installsPackage(entry) {
 		if (typeof entry !== "string") return false;
 		if (entry.startsWith("git:")) return entry.includes(this.packageName);
 		const last = entry.split(/[\\/]/).filter(Boolean).pop();
-		return last === this.packageName;
+		return last === this.packageName || this.isThisCheckout(entry);
+	}
+
+	/** Whether a local entry resolves to this checkout whatever the
+	 *  directory is named. */
+	isThisCheckout(entry) {
+		if (!this.checkoutRoot) return false;
+		try {
+			return realpathSync(entry) === realpathSync(this.checkoutRoot);
+		} catch {
+			// Missing or unreadable path: not this checkout.
+			return false;
+		}
 	}
 
 	/** Drops every pi-daemon entry but one. Returns the dropped entries,
