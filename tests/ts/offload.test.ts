@@ -951,6 +951,11 @@ test("offload: the live view shares lines across streams and reproduces the prev
   assertMatches(partial, /running 12s/);
   assertMatches(partial, /done exit 0/);
   assertMatches(partial, /a3/);
+  // The marker is a band, and every output line sits indented under it,
+  // so a line of a ticket's output cannot be read as a marker.
+  assertMatches(partial, /▌ t-1 running 12s one/);
+  assertMatches(partial, /^ {2}a3/m);
+  assertMatches(partial, /^ {2}b1/m);
   const body = Array.from({ length: 25 }, (_, i) => `line${i}`).join("\n");
   const collapsed = tool.renderResult!(
     { content: [{ type: "text", text: body }], details: {} },
