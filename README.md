@@ -126,7 +126,11 @@ them, and can uninstall exactly what it installed.
   (one-go fetch, or an active interruptible wait with `wait` that
   returns as soon as the ticket finishes and yields early when a user
   message is queued), `watch` (live output via partial updates), and
-  `status`, `list`, `cancel`, and `remove`. When the daemon is
+  `status`, `list`, `cancel`, and `remove`. `result` and `watch` take
+  up to eight ticket ids (`ids`, or a single `id`), and the tool window
+  streams every ticket's state and output tail at once. `result`
+  returns as soon as the first ticket finishes and names the rest as
+  still running; `watch` returns when all have finished. When the daemon is
   unreachable the bash tool falls back to pi's local execution
   transparently, once the session is acknowledged. `piDaemon.offload.enabled=false`
   (or `PI_OFFLOAD=off`) disables offloading entirely, and `bash` is then
@@ -203,6 +207,7 @@ pi/
   extensions/daemon.ts   # /bg: detach/handover, /daemon-purge, reload relay
                          # + the daemon_gc_reap tool
   extensions/offload.ts  # ticket offloading + daemon_tasks tool
+  extensions/tickets/    # multi-ticket stream cursor, feed, wait loop, view
   extensions/pre-daemon.ts # pre_daemon onboarding: catalog + first-call gate
   extensions/transcript.ts # transcript_read: index-backed conversation reads
   extensions/transcript/ # control client + transcript_read implementation
