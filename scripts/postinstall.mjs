@@ -59,10 +59,11 @@ class PackageProvisioner {
 /** Fails soft like the provisioner: a reconciliation problem is a
  *  warning, never an install failure. */
 class SettingsGuard {
-	constructor(version) {
+	constructor(version, checkoutRoot) {
 		this.version = version;
 		this.reconciler = new SettingsReconciler(
-			SettingsReconciler.defaultPath(), version, "pi-daemon");
+			SettingsReconciler.defaultPath(), version, "pi-daemon",
+			checkoutRoot);
 	}
 
 	run() {
@@ -90,6 +91,7 @@ const provisioner = new PackageProvisioner(repoRoot);
 const status = provisioner.run();
 new SettingsGuard(
 	JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).version,
+	repoRoot,
 ).run();
 process.exit(status);
 process.exit(new PackageProvisioner(repoRoot).run());

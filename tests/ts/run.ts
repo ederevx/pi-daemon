@@ -16,8 +16,11 @@ import "./offload.test.ts";
 import "./offload-policy.test.ts";
 import "./pre-daemon.test.ts";
 import "./settings.test.ts";
+import "./settings-reconciler.test.ts";
 import "./transcript.test.ts";
 
 await registry.runAll();
 cleanupScratch();
-if (registry.failed > 0) process.exit(1);
+// Exit deterministically: a runner must not depend on an empty event
+// loop, and any stray handle is a defect the suite already reports.
+process.exit(registry.failed > 0 ? 1 : 0);
