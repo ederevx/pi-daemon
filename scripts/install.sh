@@ -62,23 +62,31 @@ mkdir -p "$pi_home/extensions" "$local_bin" "$systemd_dir" "$state_dir"
 # aborts every new pi session with tool-conflict errors ("Tool "bash"
 # conflicts ... offload.ts"). The bare manual invocation therefore
 # refuses outright whenever a packages entry installs pi-daemon — a git
-# pin or a local path whose final component is this package. --package
-# mode is exempt: it is the package's own postinstall and exists to
-# remove such copies. Uninstall the manual copy or drop the pin first;
-# nothing on disk has been touched by the refusal.
+# pin, a local path whose final component is this package, or a local
+# path that resolves to this very checkout (a worktree or renamed clone
+# is not literally named pi-daemon). --package mode is exempt: it is the
+# package's own postinstall and exists to remove such copies. Uninstall
+# the manual copy or drop the pin first; nothing on disk has been touched
+# by the refusal.
 if [[ $package_mode -eq 0 ]]; then
-  pinned="$(python3 - "$pi_home/settings.json" <<'PYGUARD'
-import json, sys
+  pinned="$(python3 - "$pi_home/settings.json" "$repo_root" <<'PYGUARD'
+import json, os, sys
 try:
     packages = json.load(open(sys.argv[1], encoding="utf-8")).get("packages", [])
 except Exception:
     packages = []
+checkout = os.path.realpath(sys.argv[2])
 for entry in packages:
     if not isinstance(entry, str):
         continue
     normalized = entry.replace("\\", "/").rstrip("/")
-    if (normalized.startswith("git:") and "pi-daemon" in normalized) \
-            or normalized.rsplit("/", 1)[-1] == "pi-daemon":
+    if normalized.startswith("git:") and "pi-daemon" in normalized:
+        print(entry)
+        break
+    if not normalized:
+        continue
+    if normalized.rsplit("/", 1)[-1] == "pi-daemon" \
+            or os.path.realpath(normalized) == checkout:
         print(entry)
         break
 PYGUARD

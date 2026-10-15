@@ -16,6 +16,7 @@ import "./offload.test.ts";
 import "./offload-policy.test.ts";
 import "./pre-daemon.test.ts";
 import "./settings.test.ts";
+import "./settings-reconciler.test.ts";
 import "./transcript.test.ts";
 
 await registry.runAll();
