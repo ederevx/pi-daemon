@@ -934,8 +934,9 @@ test("offload: the live view shares lines across streams and reproduces the prev
     ) => { render(width: number): string[] };
   };
   assert(typeof tool.renderResult === "function", "renderResult registered");
+  const tones: Array<[string, string]> = [];
   const theme = {
-    fg: (_role: string, text: string) => text,
+    fg: (role: string, text: string) => { tones.push([role, text]); return text; },
     bg: (_role: string, text: string) => text,
     bold: (text: string) => text,
   };
@@ -951,11 +952,15 @@ test("offload: the live view shares lines across streams and reproduces the prev
   assertMatches(partial, /running 12s/);
   assertMatches(partial, /done exit 0/);
   assertMatches(partial, /a3/);
-  // The marker is a band, and every output line sits indented under it,
-  // so a line of a ticket's output cannot be read as a marker.
+  // The band's outcome-colored glyph sets it apart; output is flush, so
+  // a line of a ticket's output cannot be read as a marker.
   assertMatches(partial, /▌ t-1 running 12s one/);
-  assertMatches(partial, /^ {2}a3/m);
-  assertMatches(partial, /^ {2}b1/m);
+  assertMatches(partial, /^a3/m);
+  assertMatches(partial, /^b1/m);
+  assert(!partial.split("\n").some((line) => line.startsWith(" ")),
+    "no ticket output line is indented");
+  assert(tones.some(([role, text]) => role === "success" && text === "▌"),
+    "a finished ticket's band is drawn in the outcome color");
   const body = Array.from({ length: 25 }, (_, i) => `line${i}`).join("\n");
   const collapsed = tool.renderResult!(
     { content: [{ type: "text", text: body }], details: {} },
