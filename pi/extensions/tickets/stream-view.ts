@@ -1,10 +1,12 @@
 /**
  * pi-daemon — the TUI view of a live `daemon_tasks` result.
  *
- * A partial result draws every stream as a marker band - a `▌` glyph,
- * the ticket id, its state and command - with that ticket's output
- * indented beneath it, a fair share of the tail each, so several tickets
- * stay visible at once and output cannot be mistaken for a marker. A
+ * A partial result draws every stream as a marker band - an
+ * outcome-colored `▌` glyph, the ticket id in the accent color, its
+ * state and command - with that ticket's output flush beneath it, a
+ * fair share of the tail each, so several tickets stay visible at once
+ * and output cannot be mistaken for a marker. Raw command output has no
+ * kinds to color, so the band is what sets output apart. A
  * final result reproduces pi's default tool renderer exactly (the first
  * ten lines, then an expand hint) because a throwing renderer falls back
  * to that and the fallback must not depend on us. Used only by the
@@ -76,7 +78,7 @@ export class TicketStreamView {
 	}
 
 	/** Every stream as a marker band plus its share of the tail, the
-	 *  output indented under its own marker; the hint rides the first
+	 *  output flush under its own marker; the hint rides the first
 	 *  header so it never costs a section its line. */
 	private partial(
 		streams: readonly StreamDetail[],
@@ -91,7 +93,7 @@ export class TicketStreamView {
 		let hidden = streams.length > MAX_STREAMS;
 		for (const stream of rendered) {
 			out.push([
-				theme.fg("dim", "▌"),
+				theme.fg(outcomeColor(stream.state, stream.exit), "▌"),
 				theme.fg("accent", theme.bold(stream.id)),
 				theme.fg(outcomeColor(stream.state, stream.exit), this.stateLabel(stream)),
 				theme.fg("dim", stream.command.slice(0, COMMAND_CHARS)),
@@ -99,7 +101,7 @@ export class TicketStreamView {
 			const lines = liveLines(stream.tail);
 			const shown = per === Infinity ? lines : lines.slice(-per);
 			if (shown.length < lines.length || stream.behind) hidden = true;
-			for (const line of shown) out.push(`  ${theme.fg("toolOutput", line)}`);
+			for (const line of shown) out.push(theme.fg("toolOutput", line));
 		}
 		if (streams.length > MAX_STREAMS) {
 			const extra = streams.slice(MAX_STREAMS)

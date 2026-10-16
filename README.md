@@ -128,8 +128,9 @@ them, and can uninstall exactly what it installed.
   message is queued), `watch` (live output via partial updates), and
   `status`, `list`, `cancel`, and `remove`. `result` and `watch` take
   up to eight ticket ids (`ids`, or a single `id`), and the tool window
-  streams every ticket at once as a marker band (a `▌`, its id, state
-  and command) with that ticket's output tail indented beneath it. `result`
+  streams every ticket at once as a marker band (an outcome-colored
+  `▌`, its id, state and command) with that ticket's output tail flush
+  beneath it. `result`
   returns as soon as the first ticket finishes and names the rest as
   still running; `watch` returns when all have finished. When the daemon is
   unreachable the bash tool falls back to pi's local execution
