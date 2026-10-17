@@ -1,14 +1,14 @@
 # pi-daemon
 
-Persistent backgrounding for the Pi coding agent, maintained like
-the sibling pi extension packages: a private repo whose
-installer copies manifest-owned resources into the Pi agent home, records
-them, and can uninstall exactly what it installed.
+Keeps Pi sessions running when terminals disconnect, with automatic
+reattachment, background command tickets, and transcript retrieval.
 
 ## What it provides
 
-- **PTY host daemon** (`pi-daemon`): a stdlib-only Python daemon, run by the
-  systemd user service, that owns one PTY per hosted pi TUI session.
+- **PTY host daemon** (`pi-daemon`): a stdlib-only Python daemon that
+  owns one PTY per hosted pi TUI session; a systemd user service
+  supervises it where available, and startup is detached or on demand
+  otherwise.
   Sessions survive client disconnect and a daemon restart (respawned from
   a state registry); every hosted child gets `PI_HOSTED` and
   `PI_HOSTED_SESSION` in its env. While a session is detached, the daemon
@@ -175,7 +175,7 @@ them, and can uninstall exactly what it installed.
 ### As a pi package
 
 ```bash
-pi install git:github.com/ederevx/pi-daemon@v2.9.9
+pi install git:github.com/ederevx/pi-daemon@v2.9.54
 ```
 
 `npm install` runs `scripts/postinstall.mjs`, which provisions the
@@ -183,18 +183,7 @@ systemd user unit, the `pi-rc` client, the `pi` wrapper, the daemon, and
 the seam modules to the same manual paths, while the extensions load
 from the package clone. Updating the pinned ref re-runs it. Extension
 copies a prior manual install owned are removed so only one loader
-source remains. Restart the service to adopt a new daemon binary:
-`systemctl --user restart pi-daemon`.
-
-### Manually
-
-```bash
-bash scripts/install.sh
-```
-
-Re-run to refresh owned copies in place. Requires `pi` on PATH and
-`python3` (>= 3.8, stdlib-only) for the pi-daemon daemon and uninstall's
-manifest reading.
+source remains. Adopt a new daemon binary with `/daemon-reload`.
 
 ## Uninstall
 
@@ -295,11 +284,5 @@ conversation a live session holds is left to the ask-only reaper.
 force purge: it stops every detached, model-idle session past the
 `gcIdleHours` window immediately and discards its conversation, while
 attached and busy sessions are never purged.
-
-## Maintenance conventions
-
-Same as the sibling protocol repos: work on a feature branch, validate, land
-through a PR, cut the next tag on the merged HEAD, and reinstall the host
-from that tag before relying on the change.
 
 © 2026 Edrick Sinsuan. Licensed under [MIT](LICENSE).
