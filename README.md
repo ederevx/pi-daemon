@@ -151,7 +151,8 @@ attached and busy sessions are never purged.
   `PI_OFFLOAD=off`) makes `bash` the plain local shell. Finished
   tickets expire after `PI_PTYD_TICKET_TTL_HOURS` (default 72h), capped
   at 200.
-- **`/daemon-reload`** - adopt a new daemon binary (restart the unit).
+- **`/daemon-reload`** - adopt a new daemon binary through the systemd unit
+  where available, otherwise through the daemon's successor process.
 - **`transcript_read`** - read the current or a named conversation
   through the daemon's positional index (`stat`, `path`, `entries`,
   `tree`, `range`); read-only, nothing appended.
@@ -166,9 +167,8 @@ stopped, or GC-aged. `/daemon-purge` stops detached model-idle sessions
 past `gcIdleHours` and discards their conversations; attached and busy
 sessions are never purged.
 
-Unique constraints kept from the former detail: the wrapper degrades
-open when the daemon is unreachable; the `PI_HOSTED` guard keeps hosted
-or nested starts out of the way; and the session reaper never
-force-kills - it asks the session to call `daemon_gc_reap`.
+The wrapper degrades open when the daemon is unreachable; the `PI_HOSTED`
+guard keeps hosted or nested starts out of the way; and the session reaper
+never force-kills - it asks the session to call `daemon_gc_reap`.
 
 © 2026 Edrick Sinsuan. Licensed under [MIT](LICENSE).
