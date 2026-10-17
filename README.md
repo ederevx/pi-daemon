@@ -136,171 +136,39 @@ force purge: it stops every detached, model-idle session past the
 `gcIdleHours` window immediately and discards its conversation, while
 attached and busy sessions are never purged.
 
-## Details
+## Usage
 
-- **PTY host daemon** (`pi-daemon`): a stdlib-only Python daemon that
-  owns one PTY per hosted pi TUI session; a systemd user service
-  supervises it where available, and startup is detached or on demand
-  otherwise.
-  Sessions survive client disconnect and a daemon restart (respawned from
-  a state registry); every hosted child gets `PI_HOSTED` and
-  `PI_HOSTED_SESSION` in its env. While a session is detached, the daemon
-  drains the PTY and discards output, so a headless agent can keep
-  working without ever blocking on a full tty buffer. This replaces tmux
-  hosting entirely — there is no tmux anywhere.
-- **Auto-hosting wrapper** (`pi`): a plain interactive `pi` call attaches
-  to the directory's daemon-owned session — the live hosted session
-  backing this directory's latest conversation — so terminals become
-  interchangeable viewports of one daemon-owned session instead of
-  spawning duplicates; the daemon owns the sessions, the terminal just
-  views. `pi --new` (a wrapper flag, consumed before pi sees it) keeps
-  the old behavior: a fresh conversation in its own new hosted session
-  through `pi-rc attach --new`. The owned-session scan only considers
-  sessions with a real conversation file on record, so `--no-session`
-  children (one-shot workers share the directory in the listing) are
-  never attached. Resume flags (--resume / --continue) ride along into
-  the hosted session as pi args. Before attaching, the wrapper resolves
-  the target conversation file of a
-  `--resume` / `--continue` / `--session` call (without spawning pi) and,
-  when a live hosted session already backs it, ATTACHES to that session
-  instead of starting a second pi — entering an active session is not an
-  interruption, and only explicit user actions (the detach key, Ctrl-\)
-  ever touch the running model. The interactive `--resume` picker cannot
-  be resolved before pi opens; when it still opens a conversation a live
-  session already backs, the duplicate yields to a busy holder (its
-  viewers follow the work) or absorbs idle-at-prompt holders (it keeps
-  the conversation, their views follow it), so no two live pis ever
-  run on one file. `/new` inside a hosted session is carried, not
-  terminated: the extension cancels pi's in-process switch (which would
-  abort an in-flight turn), the daemon spawns a fresh hosted session and
-  moves the terminal's bridge onto it, and the old session keeps running
-  headless with its conversation. If the attach itself fails (e.g. the
-  session died between check and attach), the wrapper degrades open with
-  the original args. An unreachable daemon, unresolvable target, or no
-  match degrades open exactly as before, and plain `pi` starts are
-  unaffected. One-shot invocations (`-p`/`--print`, `--no-session`),
-  help/version, and non-tty stdin stay direct. The `PI_HOSTED` guard
-  keeps hosted one-shot/worker sessions and nested starts out of the way:
-  anything already inside the daemon execs the real pi untouched. The
-  wrapper resolves the real binary at install time and is manifest-owned.
-  If the service is down, the wrapper starts it first (the systemd user
-  unit where installed, otherwise a detached spawn) so the very start
-  that brought the daemon up is hosted immediately — no manual `/bg`
-  then reenter. If `pi-rc` is missing or the daemon still cannot come
-  up, the wrapper degrades to the real pi so a start always works.
-- **`daemon` pi extension**: `/bg` runs the moment it is entered,
-  even while the agent is mid-turn (pi executes extension commands
-  immediately). Inside a hosted session it is an instantaneous detach
-  (`pi-rc detach`): the daemon drops the client bridge in milliseconds —
-  zero process churn — and the pi keeps running headless until
-  reattached; no continuation prompt is sent, so a backgrounded session
-  idles once its in-flight work settles. Outside hosting, `/bg` hands
-  the session over to the service (`pi-rc handover`): the daemon waits
-  for the current pi to exit and hosts it as `pi --session <file>`.
-  `/bg` never aborts a running operation: if the agent is mid-turn, pi
-  prints a notice, waits for the work to settle (retries and queued
-  follow-ups included), then shuts down gracefully. Ephemeral
-  (`--no-session`) sessions are refused. (Ctrl+D cannot be rebound:
-  pi refuses extension shortcuts that conflict with its built-in
-  `app.exit` Ctrl+D binding.) The
-  extension also announces each session's file to the daemon so abnormal
-  deaths can be revived from the same conversation.
-- **Extension reload watch**: the daemon polls the extension roots
-  (extensions, skills, prompts, themes, context files); on change it
-  signals a reload to every hosted conversation session so pi re-scans
-  its loaded resources in place, and persists the file-level diff for
-  the in-session daemon extension to relay to the agent once it
-  settles. The signal is direct: the daemon writes a one-shot
-  token-stamped per-session signal file under the daemon state dir and
-  the in-session daemon extension (watching for it) consumes the
-  signal and runs pi's own reload flow programmatically (`ctx.reload()`
-  — the same flow as a typed `/reload`, with no keystrokes entering
-  the TUI); a signal an extension without the watcher does not consume
-  within a short grace is deleted again and the daemon falls back to
-  typing `/reload` into the session's PTY the old way.
-  Sessions that are not idle are skipped for the round instead (busy
-  mid-turn, or parked on a blocking daemon wait `waiting`) since pi
-  would deny a reload in either state; each skipped session stays owed,
-  is retried every poll until it goes idle, and the diff is stamped
-  only once every owed session was reloaded or is gone (never dropped,
-  with newer edits coalescing into the pending diff). A manual
-  `pi-rc extensions-reload` follows the same deferral and the watch
-  finishes its busy sessions. The reload is strictly in-place: it only signals
-  sessions that already exist and never starts or revives one, and a
-  session that dies while processing the reload stays dead
-  instead of being respawned, so a broken update cannot cascade into a
-  spawn storm.
-- **Command offloading** (`offload` pi extension): while command
-  offloading is enabled, a `bash` call first requires the session's
-  `pre_daemon` acknowledgement — it is blocked, and neither run locally
-  nor submitted, until the catalog has been read — and is then handed to
-  the daemon as a **ticket** immediately: a daemon-owned shell command
-  that outlives the submitting agent. The tool returns a
-  successful claim at once, so no task holds the agent and the call never
-  surfaces the stock tool's null-exit error; the claim names the ticket
-  and advertises both continuations - keep calling tools, or block
-  explicitly with `daemon_tasks result <id> wait=<seconds>`. The full
-  output arrives as a steer before the next model call, or later if the
-  command outlives the turn; a `sleep` command (or a polling loop) is
-  refused in both `bash` and `daemon_tasks submit` before it reaches the
-  daemon, since the result is steered in anyway and a deliberate block
-  belongs to `daemon_tasks result`. The bash and daemon_tasks guidelines
-  and the claim itself say so. A `timeout` passed to the
-  bash tool travels with the ticket and is enforced daemon-side (TERM,
-  then KILL), recorded as a failed `timed out` ticket. Every
-  ticket is recorded in the daemon's persisted `tickets.json` and
-  assigned to the owning session (hosted session name, else the
-  conversation file stem), so `daemon_tasks list` shows them and a
-  crashed or restarted session re-arms its pending results on
-  `session_start`. The ticket id carries a short session segment
-  (`t-<seg>-<n>`), so a task names the session it belongs to at a
-  glance without a separate lookup. The `daemon_tasks` tool exposes the machinery
-  explicitly: `submit` (fire-and-forget background command), `result`
-  (one-go fetch, or an active interruptible wait with `wait` that
-  returns as soon as the ticket finishes and yields early when a user
-  message is queued), `watch` (live output via partial updates), and
-  `status`, `list`, `cancel`, and `remove`. `result` and `watch` take
-  up to eight ticket ids (`ids`, or a single `id`), and the tool window
-  streams every ticket at once as a marker band (an outcome-colored
-  `▌`, its id, state and command) with that ticket's output tail flush
-  beneath it. `result`
-  returns as soon as the first ticket finishes and names the rest as
-  still running; `watch` returns when all have finished. When the daemon is
-  unreachable the bash tool falls back to pi's local execution
-  transparently, once the session is acknowledged. `piDaemon.offload.enabled=false`
-  (or `PI_OFFLOAD=off`) disables offloading entirely, and `bash` is then
-  the plain local shell: ungated, and requiring no `pre_daemon` call. Tickets are garbage
-  collected by the daemon: finished tickets expire after
-  `PI_PTYD_TICKET_TTL_HOURS` hours (default 72h) with the finished set
-  capped at 200 (oldest evicted), and each sweep unlinks the expired
-  output logs; a daemon restart or shutdown marks running tickets
-  `lost` instead of ever claiming a live process.
-- **Always backgrounded**: a hosted session never dies silently. When
-  its pi process dies abnormally (crash, SIGKILL, OOM), the daemon
-  revives it headless as `pi --session <file>` under the same name. Only
-  a clean quit (Ctrl+D or the `/quit` command), an explicit `pi-rc stop`, a daemon
-  shutdown, a deleted session file, or the session store GC age-out ends
-  one for good, and a revived
-  pi that dies again within 30 seconds is left dead so a crash loop
-  cannot spin the daemon.
-- **Session survival**: pi sessions live on disk independent of
-  processes, except aged conversations the session store GC has
-  discarded. When a hosted pi is gone (reboot, daemon restart), the
-  daemon respawns it from its registry, and `pi-rc attach` or
-  `pi-rc start` resumes its recorded conversation (else the directory's
-  latest session, `pi -c`), falling back to a fresh pi; pass `--fresh`
-  to force an empty session. A conversation the daemon ended (a clean
-  quit, an explicit `stop`, or a GC reap) stays resumable, and
-  `pi-rc attach <name>` resumes the file that name last backed; only
-  `/daemon-purge` discards it.
-- **Transcript retrieval** (`transcript` pi extension): the daemon keeps a
-  positional `.jsonl.idx` sidecar beside every cold conversation and serves
-  it over the control socket, so a session can read its own history without
-  parsing the whole file. The `transcript_read` tool exposes the read views —
-  `stat`, `path` (leaf-to-root), `entries` (cursor/id paging), `tree`, and
-  `range` (entry-aligned raw bytes) — defaults to the current session, and
-  names only files the daemon validates inside the session store. It is
-  read-only and appends nothing, so it never competes with pi's compaction
-  or cache handling.
+- **`pre_daemon`** - call once before `bash` when offloading is on; it
+  returns the daemon catalogue and gates the offload tool.
+- **`/bg`** - inside a hosted session it detaches instantly
+  (`pi-rc detach`); outside hosting it hands the session over
+  (`pi-rc handover`). It never aborts in-flight work and refuses
+  ephemeral (`--no-session`) sessions. Ctrl+D cannot be rebound.
+- **Tickets** - with offloading on, a `bash` call becomes a daemon-owned
+  ticket at once; `daemon_tasks result` blocks or `watch` streams, and
+  `status`, `list`, `cancel`, and `remove` manage it. A `sleep` or
+  polling loop is refused. `piDaemon.offload.enabled=false` (or
+  `PI_OFFLOAD=off`) makes `bash` the plain local shell. Finished
+  tickets expire after `PI_PTYD_TICKET_TTL_HOURS` (default 72h), capped
+  at 200.
+- **`/daemon-reload`** - adopt a new daemon binary (restart the unit).
+- **`transcript_read`** - read the current or a named conversation
+  through the daemon's positional index (`stat`, `path`, `entries`,
+  `tree`, `range`); read-only, nothing appended.
+- **Reload watch** - the daemon reloads hosted sessions in place when
+  extension roots change; a busy session stays owed and is retried, and
+  a session that dies during a reload is not respawned.
+
+A hosted session survives client disconnect and daemon restart: when its
+pi dies abnormally it is revived headless from the same conversation,
+unless it lived under `minReviveLifeSeconds` (30) or was ended cleanly,
+stopped, or GC-aged. `/daemon-purge` stops detached model-idle sessions
+past `gcIdleHours` and discards their conversations; attached and busy
+sessions are never purged.
+
+Unique constraints kept from the former detail: the wrapper degrades
+open when the daemon is unreachable; the `PI_HOSTED` guard keeps hosted
+or nested starts out of the way; and the session reaper never
+force-kills - it asks the session to call `daemon_gc_reap`.
 
 © 2026 Edrick Sinsuan. Licensed under [MIT](LICENSE).
