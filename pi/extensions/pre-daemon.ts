@@ -92,6 +92,7 @@ export class PreDaemonTool {
 			"- Every bash call is already daemon-owned and non-blocking; pass the bash timeout to bound it daemon-side, and use daemon_tasks result <id> wait=<seconds> only to block for a result deliberately.",
 			"- A blocking result wait is interruptible and steerable: Escape or a queued message releases it; the ticket keeps running and still delivers on completion.",
 			"- Call daemon_gc_reap only when pi-daemon asks this idle detached session to reap, or when you are deliberately done.",
+			"- ssh from this session is for moving files only (scp, sftp, rsync); the remote-work guard refuses a remote shell or remote work.",
 			"",
 			"Features:",
 			"- Hosted sessions run headless in the pi-daemon and survive terminal exit, SSH logout, and reboot; /bg detaches or hands over, pi-rc attach resumes.",
