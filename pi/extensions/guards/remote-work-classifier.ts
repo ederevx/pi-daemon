@@ -168,11 +168,16 @@ export class RemoteWorkClassifier {
 	}
 
 	private sshVerdict(args: string[]): RemoteVerdict {
-		const operands = this.sshOperands(args);
-		if (operands.info) return "ssh-info";
-		if (operands.tunnel) return "ssh-tunnel";
-		if (operands.remoteCommand) return "ssh-exec";
-		const remote = operands.positional.slice(1).join(" ").trim();
+		const before = this.sshOperands(args);
+		const host = before.positional[0];
+		// ssh re-parses options after the host; the first non-option after
+		// it starts the remote command.
+		const after = this.sshOperands(before.positional.slice(1));
+		if (before.info || after.info) return "ssh-info";
+		if (before.remoteCommand || after.remoteCommand) return "ssh-exec";
+		if (host === undefined) return "ssh-shell";
+		if (before.tunnel || after.tunnel) return "ssh-tunnel";
+		const remote = after.positional.join(" ").trim();
 		if (remote === "") return "ssh-shell";
 		return this.remoteIsTransfer(remote) ? "transfer" : "ssh-exec";
 	}
@@ -183,9 +188,11 @@ export class RemoteWorkClassifier {
 		if (scan.nested.length > 0 || scan.segments.length === 0) {
 			return false;
 		}
+		let sawCommand = false;
 		for (const segment of scan.segments) {
 			const words = this.commandWords(this.words(segment));
 			if (words.length === 0) continue;
+			sawCommand = true;
 			const name = this.basename(words[0]);
 			if (!RemoteWorkClassifier.TRANSFER_WORDS.has(name)) {
 				return false;
@@ -194,7 +201,7 @@ export class RemoteWorkClassifier {
 				return false;
 			}
 		}
-		return true;
+		return sawCommand;
 	}
 
 	/** tar options that execute a program instead of writing bytes. */
@@ -257,6 +264,11 @@ export class RemoteWorkClassifier {
 
 	/** A pi management subcommand is not an agent run; anything else is. */
 	private piVerdict(args: string[]): RemoteVerdict | null {
+		// An explicit headless form is an agent run whatever follows it.
+		if (args.some((arg) => arg === "-p" || arg === "--print"
+			|| arg === "--mode" || arg.startsWith("--mode="))) {
+			return "headless-pi";
+		}
 		const plain = args.filter((arg) => !arg.startsWith("-"));
 		if (plain.length === 0) {
 			const metaOnly = args.length > 0 && args.every((arg) =>
@@ -339,6 +351,11 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			if (char === ";" || char === "\n") {
+				push();
+				index += 1;
+				continue;
+			}
+			if (char === "(" || char === ")") {
 				push();
 				index += 1;
 				continue;
