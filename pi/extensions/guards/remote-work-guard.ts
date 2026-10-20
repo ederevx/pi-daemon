@@ -57,7 +57,7 @@ export class RemoteWorkGuard {
 
 	/** The shell text a tool call would run, or undefined. */
 	private commandOf(event: ToolCallEvent): string | undefined {
-		const input = event.input as Record<string, unknown>;
+		const input = (event.input ?? {}) as Record<string, unknown>;
 		if (event.toolName === "bash" || event.toolName === "powershell") {
 			const command = input.command;
 			return typeof command === "string" && command.trim() !== ""

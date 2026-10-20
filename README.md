@@ -103,6 +103,14 @@ Environment overrides: `PI_DAEMON_GC_IDLE_HOURS`,
 `PI_PTYD_TRANSCRIPT_INDEX_INTERVAL`, `PI_PTYD_TRANSCRIPT_INDEX_MAX_MB`,
 `PI_PTYD_TRANSCRIPT_INDEX_MAX_LINE_MB`, and `PI_OFFLOAD`.
 
+The remote-work guard keeps `ssh` for file transfer only: a remote
+shell or remote command is refused in `bash`, `powershell`, and
+`daemon_tasks submit`, while `scp`, `sftp`, `rsync`, and a `cat`/`tar`
+pipe over `ssh` stay allowed. It is on by default; `PI_REMOTE_GUARD=off`
+or `piDaemon.remoteGuard.enabled=false` disables it (environment
+precedence is the usual one). This switch is not a `/daemon-settings`
+row.
+
 `/daemon-settings` opens the same tunables in pi's two-column settings
 dock: flag rows toggle in place, number and roots rows open an editor
 seeded with the current value, and every accepted change is written

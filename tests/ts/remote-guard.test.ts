@@ -60,6 +60,9 @@ test("remote guard: refuses a remote shell and remote work", () => {
 		"sudo env A=1 timeout 5 ssh host ls",
 		"echo $(ssh host hostname)",
 		"ssh -o RemoteCommand=ls host",
+		"ssh host -T",
+		"ssh host -o RemoteCommand=make",
+		"(cd x && ssh host make)",
 	]) {
 		const result = gate(bash(command));
 		assertEq(result?.block, true, `must block: ${command}`);
@@ -80,6 +83,7 @@ test("remote guard: allows transfers, ssh queries, and tunnels", () => {
 		"ssh -V",
 		"ssh -G host",
 		"ssh -N -L 1:h:2 host",
+		"ssh host -- cat f",
 		"pi -p x",
 		"grep -rn ssh README.md",
 	]) {
