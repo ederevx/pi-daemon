@@ -23,6 +23,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { test, assert, assertEq, scratchDir, withEnv } from "./harness.ts";
+import { repoRoot as extensionRoot } from "../../pi/extensions/provision.ts";
 import {
   PackageProvisioner,
   ProvisioningGuard,
@@ -87,6 +88,12 @@ class ScratchPackage {
   }
 }
 
+test("extension: resolves the clone that holds the installer", () => {
+  assertEq(extensionRoot, REPO, "the extension finds the package clone");
+  assert(existsSync(join(extensionRoot, "scripts", "install.sh")),
+    "the clone holds the installer the guard runs");
+});
+
 test("stamp: a package install of this clone is current", () => {
   const scratch = new ScratchPackage("current");
   scratch.install();
@@ -133,6 +140,19 @@ test("guard: a manual layout without an installer is a no-op", () => {
   assertEq(guard.run(() => {
     throw new Error("a missing installer must not report");
   }), null, "nothing is spawned");
+});
+
+test("guard: a missing state directory is created for the log", async () => {
+  const scratch = new ScratchPackage("missing-state");
+  const guard = new ProvisioningGuard(
+    new ProvisionStamp(scratch.clone, join(scratch.root, "state", "manifest.json")),
+    new PackageProvisioner(scratch.clone));
+  await withEnv({ HOME: scratch.home, PATH: scratch.path() }, async () => {
+    const spawned = guard.run(() => undefined);
+    assert(spawned, "a missing manifest provisions");
+    await new Promise<void>((resolve) => spawned.on("exit", () => resolve()));
+  });
+  assert(existsSync(guard.logPath), "the log directory is created");
 });
 
 test("guard: a stale clone re-provisions the installed copies", async () => {

@@ -13,7 +13,13 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, openSync, readFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	openSync,
+	closeSync,
+	readFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -127,6 +133,7 @@ export class ProvisioningGuard {
 			if (!existsSync(this.provisioner.installer) || this.stamp.isCurrent()) {
 				return null;
 			}
+			mkdirSync(dirname(this.logPath), { recursive: true });
 			const log = openSync(this.logPath, "w");
 			const [shell, args] = this.provisioner.command();
 			const child = spawn(shell, args, {
@@ -134,6 +141,8 @@ export class ProvisioningGuard {
 				stdio: ["ignore", log, log],
 				windowsHide: true,
 			});
+			// The child holds its own copies of the descriptors.
+			closeSync(log);
 			child.on("error", (err) => onDone(err.message));
 			child.on("exit", (code) => onDone(
 				code === 0 ? null : code === 75 ? undefined : `install.sh exited ${code}`));

@@ -13,6 +13,8 @@
  * extension copy, which has no `scripts/` beside it.
  */
 
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -21,7 +23,8 @@ import {
 	ProvisionStamp,
 } from "../../scripts/package-provisioner.mjs";
 
-const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+/** The package clone: this module lives at `<clone>/pi/extensions/`. */
+export const repoRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
