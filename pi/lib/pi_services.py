@@ -15,7 +15,9 @@ Layout: <services_root>/<service>/<provider>.json with
 
 A descriptor is stale when its JSON is malformed, its pid is not alive,
 or its endpoint file is missing/unreachable; the sweep removes only
-those. Nothing here is module-level mutable state.
+those. Nothing here is module-level mutable state. The contract this
+implements, and the `pi-rpc/1` service standard built on it, is
+`docs/pi-services.md`.
 """
 
 import os
