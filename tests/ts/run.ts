@@ -17,6 +17,7 @@ import "./offload-policy.test.ts";
 import "./pre-daemon.test.ts";
 import "./remote-guard.test.ts";
 import "./settings.test.ts";
+import "./provisioning.test.ts";
 import "./settings-reconciler.test.ts";
 import "./transcript.test.ts";
 

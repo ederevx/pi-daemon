@@ -57,6 +57,18 @@ dest_wrapper_cmd="$local_bin/pi.cmd"
 
 mkdir -p "$pi_home/extensions" "$local_bin" "$systemd_dir" "$state_dir"
 
+# One installer at a time: every session start reconciles provisioning, and
+# hosted sessions respawn together after a reload, so concurrent runs must
+# not interleave the manifest or the systemctl calls. A lock older than ten
+# minutes is a crashed run's leftover.
+lock="$state_dir/install.lock"
+find "$lock" -maxdepth 0 -mmin +10 -exec rmdir {} \; 2>/dev/null || true
+mkdir "$lock" 2>/dev/null || {
+  echo "install: another install is running ($lock)" >&2
+  exit 75
+}
+trap 'rmdir "$lock" 2>/dev/null' EXIT
+
 # The one-loader guard: a pinned pi package already loads this repo's
 # extensions from its own clone, and a manual extension copy beside it
 # aborts every new pi session with tool-conflict errors ("Tool "bash"
@@ -102,6 +114,7 @@ PYGUARD
   fi
 fi
 
+sources=()
 install_to() {
 	# Atomic replacement, per shared convention: never truncate a file
 	# that running software may read or execute — land the complete new
@@ -109,6 +122,7 @@ install_to() {
 	local mode="$1" src="$2" dest="$3" tmp="$3.tmp.$$"
 	install -m "$mode" "$src" "$tmp"
 	mv -f "$tmp" "$dest"
+	sources+=("$src")
 }
 
 # In package mode the extensions are the package's, not this install's:
@@ -179,6 +193,9 @@ chmod 755 "$dest_wrapper"
 # Windows resolves a bare `pi` through pi.cmd; it delegates to the same bash
 # wrapper, so the guarding logic is not duplicated per platform.
 install_to 755 "$repo_root/pi/bin/pi-wrapper.cmd" "$dest_wrapper_cmd"
+# The unit and the wrapper are rendered from templates, so the manifest
+# records those templates as the sources their destinations came from.
+sources+=("$repo_root/pi/systemd/pi-daemon.service" "$repo_root/pi/bin/pi-wrapper")
 
 owned=("$dest_daemon" "$dest_helper" "$dest_helper_cmd" "$dest_wrapper" "$dest_wrapper_cmd" "$dest_unit" "$dest_platform" "$dest_conpty" "$dest_settings" "$dest_transcript" "$dest_services")
 if [[ $package_mode -eq 0 ]]; then
@@ -188,6 +205,7 @@ fi
   printf '{\n'
   printf '  "version": 1,\n'
   printf '  "repo": "%s",\n' "$repo_root"
+  printf '  "mode": "%s",\n' "$([[ $package_mode -eq 1 ]] && echo package || echo manual)"
   printf '  "owned": [\n'
   for i in "${!owned[@]}"; do
     printf '    "%s"%s\n' "${owned[$i]}" "$([[ $i -lt $((${#owned[@]} - 1)) ]] && printf ,)"
@@ -197,6 +215,13 @@ fi
   for i in "${!owned[@]}"; do
     printf '    "%s": "%s"%s\n' "${owned[$i]}" "$(sha256sum "${owned[$i]}" | cut -d' ' -f1)" \
       "$([[ $i -lt $((${#owned[@]} - 1)) ]] && printf ,)"
+  done
+  printf '  },\n'
+  printf '  "sources": {\n'
+  for i in "${!sources[@]}"; do
+    printf '    "%s": "%s"%s\n' "${sources[$i]#"$repo_root"/}" \
+      "$(sha256sum "${sources[$i]}" | cut -d' ' -f1)" \
+      "$([[ $i -lt $((${#sources[@]} - 1)) ]] && printf ,)"
   done
   printf '  }\n}\n'
 } > "$manifest.tmp"
