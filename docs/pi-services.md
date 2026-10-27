@@ -203,6 +203,12 @@ kills, or deletes a provider: only an explicit terminate or the owner's
 idle policy ends a provider or session. A client drops only its own
 bindings, and a provider keeps no consumer state across restarts.
 
+A provider marks every child it hosts with `PI_HOSTED=1` and
+`PI_HOSTED_SESSION=<name>`, so a consumer can tell a hosted session from
+one it runs itself. A consumer defers lifetime decisions on a marked
+session only while a non-stale `session-host` descriptor (§2) is
+present, and makes them itself otherwise.
+
 ## 8 Adoption
 
 - **Adopted:** `session-host` discovery (`pi_services.py`, pi-teams
@@ -210,7 +216,11 @@ bindings, and a provider keeps no consumer state across restarts.
   its control protocol kept at `pi-pty-host/1`.
 - **Exempt, pi-teams broker `op` frames:** one broker serving its own
   clients and peers, not an extension-to-extension service. A package
-  that needs team data gets a `pi-rpc/1` service published for it.
+  that needs team data gets a `pi-rpc/1` service published for it. A
+  peer-host spawn is a `peer-control` frame on the peer link, never a
+  `pi-rpc/1` call; the remote broker hosts the teammate through its own
+  `session-host` discovery, binding a provider only while a live,
+  non-stale descriptor is present and self-provisioning otherwise.
 - **Exempt, pi-consult bridge:** a consultant's MCP bridge talking to one
   extension with a per-invocation token.
 - **Exempt, agent-mem-struct hook calls:** a subprocess hook, not
