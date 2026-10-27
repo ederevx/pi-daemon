@@ -35,13 +35,19 @@ export default function (pi: ExtensionAPI) {
 		guard.run((failure) => {
 			// Another session holds the installer lock and is provisioning.
 			if (failure === undefined) return;
-			ctx.ui.notify(
-				failure === null
-					? "pi-daemon: provisioned the daemon and helpers from this " +
-						"package; /daemon-reload adopts a new daemon."
-					: `pi-daemon: provisioning failed (${failure}); see ` +
-						`${guard.logPath}.`,
-				failure === null ? "info" : "warning");
+			// Reported after session_start returned, so a headless or ended
+			// session loses the message and never the process.
+			try {
+				ctx.ui?.notify?.(
+					failure === null
+						? "pi-daemon: provisioned the daemon and helpers from this " +
+							"package; /daemon-reload adopts a new daemon."
+						: `pi-daemon: provisioning failed (${failure}); see ` +
+							`${guard.logPath}.`,
+					failure === null ? "info" : "warning");
+			} catch {
+				// The log at guard.logPath still records the outcome.
+			}
 		});
 	});
 }
