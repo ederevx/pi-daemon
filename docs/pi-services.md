@@ -25,9 +25,7 @@ one deviation: batches are not supported. A JSON array is rejected with
   `error`.
 - A notification carries `method` and optional `params`, never `id`, and
   is never answered.
-- Methods beginning `rpc.` belong to this profile. Service methods use
-  `<service>.<method>`, so `session-host.list` cannot collide with
-  another package's vocabulary.
+- Methods beginning `rpc.` belong to this profile.
 
 On a socket, each message is one compact JSON object on one
 `\n`-terminated UTF-8 line. A line longer than 64 KiB closes the
