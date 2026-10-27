@@ -6,6 +6,7 @@ fake systemd tools on PATH, then inspects the files it wrote. Scratch
 lives under ~/tmp, never the system /tmp. The suite skips without bash.
 """
 
+import hashlib
 import json
 import os
 import pathlib
@@ -203,6 +204,45 @@ class InstallScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(
             self.scratch.path(".pi/agent/extensions/daemon.ts").is_file())
+
+    def test_package_install_records_sources(self):
+        result = self.scratch.run("--package")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.scratch.manifest()
+        self.assertEqual(manifest["mode"], "package")
+        sources = manifest["sources"]
+        for rendered in ("pi/systemd/pi-daemon.service", "pi/bin/pi-wrapper"):
+            self.assertIn(rendered, sources)
+        for rel, digest in sources.items():
+            expected = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
+            self.assertEqual(digest, expected, rel)
+
+    def test_manual_install_records_manual_mode(self):
+        result = self.scratch.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.scratch.manifest()
+        self.assertEqual(manifest["mode"], "manual")
+        self.assertIn("pi/extensions/daemon.ts", manifest["sources"])
+
+    def test_install_refuses_while_locked(self):
+        lock = self.scratch.path(".pi/agent/.pi-daemon/install.lock")
+        lock.mkdir(parents=True)
+        result = self.scratch.run("--package")
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertFalse(self.scratch.path(".local/bin/pi-daemon").exists())
+        self.assertTrue(lock.is_dir())
+
+    def test_install_clears_stale_lock(self):
+        lock = self.scratch.path(".pi/agent/.pi-daemon/install.lock")
+        lock.mkdir(parents=True)
+        stale = 3600
+        os.utime(lock, (lock.stat().st_mtime - stale,
+                        lock.stat().st_mtime - stale))
+        result = self.scratch.run("--package")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(
+            self.scratch.path(".local/bin/pi-daemon").is_file())
+        self.assertFalse(lock.exists())
 
 
 if __name__ == "__main__":

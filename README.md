@@ -32,12 +32,19 @@ reattachment, background command tickets, and transcript retrieval.
 pi install git:github.com/ederevx/pi-daemon@v2.9.54
 ```
 
-`npm install` runs `scripts/postinstall.mjs`, which provisions the
-systemd user unit, the `pi-rc` client, the `pi` wrapper, the daemon, and
-the seam modules to the same manual paths, while the extensions load
-from the package clone. Updating the pinned ref re-runs it. Extension
-copies a prior manual install owned are removed so only one loader
-source remains. Adopt a new daemon binary with `/daemon-reload`.
+`npm install` runs `scripts/postinstall.mjs` on a fresh install, and the
+package's `provision` extension reconciles on every session start: when
+the clone's sources differ from what the install manifest recorded, it
+re-runs `scripts/install.sh --package` in the background. Together they
+provision the systemd user unit, the `pi-rc` client, the `pi` wrapper, the
+daemon, and the seam modules to the same manual paths, while the
+extensions load from the package clone. pi skips `npm install` when an
+updated pin resolves to the commit already checked out, so the
+session-start reconciliation is what applies such an update. Provisioning
+removes extension copies a prior manual install owned so only one loader
+source remains; if a leftover copy aborts sessions with tool-conflict
+errors before that can happen, run `bash scripts/install.sh --package`.
+Adopt a new daemon binary with `/daemon-reload`.
 
 ## Uninstall
 
@@ -54,6 +61,7 @@ pi/
   extensions/offload.ts  # ticket offloading + daemon_tasks tool
   extensions/tickets/    # multi-ticket stream cursor, feed, wait loop, view
   extensions/pre-daemon.ts # pre_daemon onboarding: catalog + first-call gate
+  extensions/provision.ts # session-start provisioning reconciliation
   extensions/transcript.ts # transcript_read: index-backed conversation reads
   extensions/transcript/ # control client + transcript_read implementation
   bin/pi-rc              # client: tickets, bridge, input, reload,
