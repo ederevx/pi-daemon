@@ -29,7 +29,7 @@ reattachment, background command tickets, and transcript retrieval.
 ### As a pi package
 
 ```bash
-pi install git:github.com/ederevx/pi-daemon@v2.9.54
+pi install git:github.com/ederevx/pi-daemon@v2.9.58
 ```
 
 `npm install` runs `scripts/postinstall.mjs` on a fresh install, and the
