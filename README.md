@@ -20,6 +20,9 @@ reattachment, background command tickets, and transcript retrieval.
   `daemon_tasks` for result, watch, status, cancel, and remove.
 - **Transcript retrieval** - `transcript_read` serves indexed
   conversation reads without parsing the whole file.
+- **Extension service contract** - `docs/pi-services.md` defines
+  `pi-rpc/1`, the shared contract for one extension to call another or
+  subscribe to its signals.
 
 ## Install
 
