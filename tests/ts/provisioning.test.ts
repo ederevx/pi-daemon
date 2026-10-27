@@ -17,13 +17,23 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { test, assert, assertEq, scratchDir, withEnv } from "./harness.ts";
-import { repoRoot as extensionRoot } from "../../pi/extensions/provision.ts";
+import {
+  test,
+  assert,
+  assertEq,
+  scratchDir,
+  waitFor,
+  withEnv,
+} from "./harness.ts";
+import provisionExtension, {
+  repoRoot as extensionRoot,
+} from "../../pi/extensions/provision.ts";
 import {
   PackageProvisioner,
   ProvisioningGuard,
@@ -93,6 +103,21 @@ test("extension: resolves the clone that holds the installer", () => {
   assert(existsSync(join(extensionRoot, "scripts", "install.sh")),
     "the clone holds the installer the guard runs");
 });
+
+/** Registers the extension against a stand-in pi and returns the one
+ *  session_start handler it captured. */
+function sessionStartHandler(): (ctx: unknown) => Promise<void> {
+  let handler: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  const pi = {
+    on(name: string, fn: (event: unknown, ctx: unknown) => Promise<void>) {
+      if (name === "session_start") handler = fn;
+    },
+  };
+  provisionExtension(pi as never);
+  assert(handler, "the extension registers session_start");
+  const captured = handler;
+  return (ctx: unknown) => captured({}, ctx);
+}
 
 test("stamp: a package install of this clone is current", () => {
   const scratch = new ScratchPackage("current");
@@ -177,4 +202,38 @@ test("guard: a stale clone re-provisions the installed copies", async () => {
     createHash("sha256").update(readFileSync(path)).digest("hex");
   assertEq(digest(installed), digest(source), "the installed copy followed");
   assert(scratch.stamp().isCurrent(), "the manifest now matches the clone");
+});
+
+test("extension: a headless session start provisions without a UI", async () => {
+  const scratch = new ScratchPackage("extension-headless");
+  scratch.install();
+  unlinkSync(scratch.manifest);
+
+  const start = sessionStartHandler();
+  await withEnv({ HOME: scratch.home, PATH: scratch.path() }, async () => {
+    await start({ ui: undefined });
+    await waitFor(() => scratch.stamp().isCurrent(),
+      "the session start provisions a stale clone");
+  });
+  assert(existsSync(join(scratch.home, ".local", "bin", "pi-daemon")),
+    "the installed daemon came from the session start");
+});
+
+test("extension: a failing notice never escapes the session start", async () => {
+  const scratch = new ScratchPackage("extension-broken-ui");
+  scratch.install();
+  unlinkSync(scratch.manifest);
+
+  const start = sessionStartHandler();
+  await withEnv({ HOME: scratch.home, PATH: scratch.path() }, async () => {
+    await start({
+      ui: {
+        notify: () => {
+          throw new Error("ui gone");
+        },
+      },
+    });
+    await waitFor(() => scratch.stamp().isCurrent(),
+      "provisioning finished despite the throwing notice");
+  });
 });
