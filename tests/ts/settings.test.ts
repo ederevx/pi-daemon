@@ -174,27 +174,26 @@ test("settings: TUI present renders the rows through ui.custom", async () => {
 	});
 });
 
-test("settings: a failing custom UI falls back to the listing", async () => {
+test("settings: a failing custom UI reports why above the listing", async () => {
 	const dir = join(scratchDir(), "view-fail-agent");
-	const lines: string[] = [];
-	const real = console.error;
-	console.error = (message?: unknown) => {
-		lines.push(String(message));
-	};
+	const notices: Array<{ message: string; kind: string }> = [];
 	try {
 		await withEnv({ ...ALL_ENV, PI_CODING_AGENT_DIR: dir }, async () => {
 			const ui = {
 				custom: async () => {
 					throw new Error("boom");
 				},
-				notify: () => {},
+				notify: (message: string, kind: string) => notices.push({ message, kind }),
 			};
 			await new DaemonSettingsPresenter().present(ui as never, "tui", () => {});
 		});
 	} finally {
-		console.error = real;
+		/* nothing to restore */
 	}
-	assertMatches(lines.join("\n"), /pi-daemon-settings:/);
+	assertEq(notices.length, 1, "one notice, not a silent fallback");
+	assertEq(notices[0].kind, "error");
+	assertMatches(notices[0].message, /boom/);
+	assertMatches(notices[0].message, /pi-daemon-settings:/);
 });
 
 test("settings: store writes atomically and preserves keys and mode", async () => {
@@ -394,4 +393,31 @@ test("settings: the command persists a change and reports the save", async () =>
 		"changes; daemon-owned values apply on the next daemon restart.");
 	const written = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
 	assertEq(written.piDaemon.extWatch, false, "change persisted");
+});
+test("settings: a row that throws on input is reported, not thrown", async () => {
+	const dir = join(scratchDir(), "row-throw-agent");
+	const notices: Array<{ message: string; kind?: string }> = [];
+	await withEnv({ ...ALL_ENV, PI_CODING_AGENT_DIR: dir }, async () => {
+		let view: DaemonSettingsView | undefined;
+		const ui = {
+			custom: async (render: any) => {
+				view = render({ requestRender() {} }, theme(), {}, () => {});
+				return undefined;
+			},
+			notify: (message: string, kind?: string) => notices.push({ message, kind }),
+		};
+		const presenter = new DaemonSettingsPresenter();
+		const rows = presenter.rows();
+		rows[0].submenu = () => {
+			throw new Error("Theme not initialized. Call initTheme() first.");
+		};
+		presenter.rows = () => rows;
+		await presenter.present(ui as never, "tui", () => {});
+		assert(view !== undefined, "the dock mounted");
+		view!.selectItem(rows[0].id);
+		view!.handleInput("\r");
+	});
+	assertEq(notices.length, 1, "the build failure is reported once");
+	assertEq(notices[0].kind, "error");
+	assertMatches(notices[0].message, /Theme not initialized/);
 });
