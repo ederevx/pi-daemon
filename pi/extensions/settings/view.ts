@@ -16,18 +16,21 @@ import {
 	type SettingsListTheme,
 } from "@earendil-works/pi-tui";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
-import type { SettingRow, SettingsChange, ViewTheme } from "./presenter.ts";
+import type { Notify, SettingRow, SettingsChange, ViewTheme } from "./presenter.ts";
 
 export class DaemonSettingsView extends Container {
 	private readonly list: SettingsList;
+	private readonly onFailure: Notify;
 
 	constructor(
 		rows: readonly SettingRow[],
 		theme: ViewTheme,
 		onChange: SettingsChange,
 		onCancel: () => void,
+		onFailure: Notify = () => {},
 	) {
 		super();
+		this.onFailure = onFailure;
 		const border = (text: string): string => theme.fg("border", text);
 		this.list = new SettingsList(
 			rows.map((row) => DaemonSettingsView.toItem(row)),
@@ -43,7 +46,11 @@ export class DaemonSettingsView extends Container {
 
 	/** Forward focus input to the list; the Container base has none. */
 	handleInput(data: string): void {
-		this.list.handleInput(data);
+		try {
+			this.list.handleInput(data);
+		} catch (err) {
+			this.onFailure(err instanceof Error ? err.message : String(err), "error");
+		}
 	}
 
 	/** Move the selection to a row id (programmatic navigation). */
