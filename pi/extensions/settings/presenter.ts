@@ -187,6 +187,10 @@ export class DaemonSettingsPresenter {
 	/** Present the rows in pi's settings view when a TUI is available,
 	 *  otherwise list them on stderr. A render failure falls back to the
 	 *  listing so the command never breaks a session. */
+	/** Present the rows in pi's settings view when a TUI is available,
+	 *  otherwise list them on stderr. A failed presentation reports why above
+	 *  the listing, because a silent fallback reads as the command doing
+	 *  nothing. */
 	async present(
 		ui: ExtensionUIContext | undefined,
 		mode: string | undefined,
@@ -200,10 +204,12 @@ export class DaemonSettingsPresenter {
 			try {
 				await ui.custom((_tui, theme, _keybindings, done) =>
 					new DaemonSettingsView(rows, theme, onChange,
-						() => done(undefined)));
+						() => done(undefined), notify));
 				return;
-			} catch {
-				// fall through to the stderr listing
+			} catch (err) {
+				const reason = err instanceof Error ? err.message : String(err);
+				notify(`pi-daemon: settings presentation failed: ${reason}\n\n${this.listing(rows)}`, "error");
+				return;
 			}
 		}
 		this.printRows(rows);
@@ -323,9 +329,14 @@ export class DaemonSettingsPresenter {
 
 	/** Print the rows to stderr for non-UI modes. */
 	private printRows(rows: SettingRow[]): void {
-		console.error("pi-daemon-settings:\n  "
+		console.error(this.listing(rows));
+	}
+
+	/** The rows as a plain listing, shared by stderr and the failure notice. */
+	private listing(rows: SettingRow[]): string {
+		return "pi-daemon-settings:\n  "
 			+ rows.map((row) => DaemonSettingsPresenter.formatRow(row))
-				.join("\n  "));
+				.join("\n  ");
 	}
 
 	/** A spec for a numeric row (the common case). */
