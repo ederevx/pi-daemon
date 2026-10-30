@@ -54,16 +54,20 @@ export class TicketGroupWait {
 	) {}
 
 	async run(options: GroupWaitOptions): Promise<GroupOutcome> {
-		const started = Date.now();
-		const elapsed = (): number => (Date.now() - started) / 1000;
+		const started = performance.now();
+		const elapsed = (): number => (performance.now() - started) / 1000;
 		// The bound governs the whole loop, not just the check: the
-		// sleep never outlives the remaining time, and a pull that
-		// crossed the bound ends the wait on the records in hand
-		// instead of streaming another frame past it.
+		// sleep never outlives the remaining time, and in-flight work
+		// ends on the records in hand instead of streaming another
+		// frame past it.
 		const remaining = (): number =>
-			options.bound * 1000 - (Date.now() - started);
+			options.bound * 1000 - (performance.now() - started);
 		const expired = (): boolean =>
 			options.bound !== Infinity && remaining() <= 0;
+		const stopped = (): boolean =>
+			expired()
+			|| (options.signal?.aborted ?? false)
+			|| (options.shouldYield?.() ?? false);
 		for (;;) {
 			const records = await this.observe(options.ids);
 			for (const id of options.ids) {
@@ -77,16 +81,14 @@ export class TicketGroupWait {
 			const satisfied = options.mode === "first"
 				? completed.length > 0
 				: running.length === 0;
-			if (satisfied
-				|| expired()
-				|| (options.signal?.aborted ?? false)
-				|| (options.shouldYield?.() ?? false)) {
+			if (satisfied || stopped()) {
 				return { records, completed, running, streams: this.streams };
 			}
 			if (options.feed) {
 				await Promise.allSettled(running.map((id) =>
-					this.stream(id).pull(this.client, TicketGroupWait.PULL_CHUNKS)));
-				if (expired()) {
+					this.stream(id).pull(this.client, TicketGroupWait.PULL_CHUNKS,
+						stopped)));
+				if (stopped()) {
 					return { records, completed, running, streams: this.streams };
 				}
 				options.feed.update(
@@ -99,6 +101,11 @@ export class TicketGroupWait {
 			await this.sleep(
 				Math.max(0, Math.min(this.pollMs, remaining())),
 				options.signal);
+			// The expired sleep must not buy another status round: the
+			// bound ends the wait on the records in hand.
+			if (satisfied || stopped()) {
+				return { records, completed, running, streams: this.streams };
+			}
 		}
 	}
 
