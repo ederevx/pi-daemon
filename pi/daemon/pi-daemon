@@ -1211,13 +1211,14 @@ class TicketRunner:
 		return None
 
 	def wait(self, tid, timeout):
-		deadline = time.time() + max(0.0, min(float(timeout or 0), TICKET_MAX_WAIT))
+		# Monotonic: a wall-clock step must not stretch or cut the wait.
+		deadline = time.monotonic() + max(0.0, min(float(timeout or 0), TICKET_MAX_WAIT))
 		with self.store.cond:
 			rec = self.store.get_locked(tid)
 			if rec is None:
 				return None
-			while rec["status"] == "running" and time.time() < deadline:
-				self.store.cond.wait(deadline - time.time())
+			while rec["status"] == "running" and time.monotonic() < deadline:
+				self.store.cond.wait(deadline - time.monotonic())
 				rec = self.store.get_locked(tid)
 				if rec is None:
 					return None
@@ -1228,8 +1229,8 @@ class TicketRunner:
 				with self._lock:
 					proc = self._procs.get(tid)
 				if proc is not None and proc.poll() is not None:
-					settle_deadline = time.time() + 0.5
-					while rec["status"] == "running" and time.time() < settle_deadline:
+					settle_deadline = time.monotonic() + 0.5
+					while rec["status"] == "running" and time.monotonic() < settle_deadline:
 						self.store.cond.wait(0.05)
 						rec = self.store.get_locked(tid)
 						if rec is None:
