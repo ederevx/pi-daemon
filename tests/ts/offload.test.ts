@@ -712,6 +712,33 @@ test("offload: /daemon-tasks scopes to the command context's session file", asyn
   });
 });
 
+test("offload: /daemon-tasks reports a failed presentation", async () => {
+  // A rejected mount used to be swallowed by a catch for "dock
+  // unavailable or canceled", so the command looked inert; Escape
+  // resolves through done(), so a rejection can only be a failure.
+  const pi = mount(new FakePi());
+  const def = pi.commands.get("daemon-tasks") as {
+    handler: (args: string, ctx: unknown) => Promise<void>;
+  };
+  initTheme("dark");
+  const notices: Array<{ message: string; kind?: string }> = [];
+  const ui = {
+    custom: async () => {
+      throw new Error("mount failed");
+    },
+    notify: (message: string, kind?: string) => notices.push({ message, kind }),
+  };
+  await def.handler("", {
+    mode: "tui",
+    ui,
+    sessionManager: { getSessionFile: () => "/x/abc.jsonl" },
+  });
+  assertEq(notices.length, 1, "one presentation failure notice");
+  assertEq(notices[0].kind, "error");
+  assertEq(notices[0].message,
+    "pi-daemon: daemon tasks presentation failed: mount failed");
+});
+
 test("offload: watch streams two tickets and freezes the earlier finisher", async () => {
   const pi = mount(new FakePi());
   const tools = pi.tools.get("daemon_tasks");
