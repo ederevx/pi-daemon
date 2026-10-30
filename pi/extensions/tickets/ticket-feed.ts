@@ -33,6 +33,7 @@ export interface StreamDetail {
 	state: TicketState;
 	exit: number | null;
 	runtimeSeconds: number;
+	waitSeconds: number;
 	tail: string;
 	behind: boolean;
 }
@@ -161,6 +162,7 @@ export class TicketFeed {
 				runtimeSeconds: ticket
 					? Math.max(0, now - ticket.started)
 					: this.waitSeconds,
+				waitSeconds: this.waitSeconds,
 				tail: stream?.tail() ?? "",
 				behind: stream?.behind ?? false,
 			};

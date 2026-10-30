@@ -118,7 +118,10 @@ export class TicketStreamView {
 	private stateLabel(stream: StreamDetail): string {
 		switch (stream.state) {
 			case "running": {
-				const base = `running ${Math.round(stream.runtimeSeconds)}s`;
+				// Task age, not wait age: a long-running ticket under a
+				// fresh wait must not read as the wait overrunning.
+				const base = `running ${Math.round(stream.runtimeSeconds)}s` +
+					` (waited ${Math.round(stream.waitSeconds)}s)`;
 				return stream.behind ? `${base} ... catching up` : base;
 			}
 			case "done":
