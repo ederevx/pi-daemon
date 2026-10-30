@@ -31,10 +31,19 @@ export class TicketStream {
 	) {}
 
 	/** Reads up to maxChunks chunks of new output; returns whether any
-	 *  bytes arrived. Callers bound the per-tick work with maxChunks. */
-	async pull(source: OutputSource, maxChunks: number): Promise<boolean> {
+	 *  bytes arrived. Callers bound the per-tick work with maxChunks;
+	 *  shouldStop ends the pull early, leaving it marked behind. */
+	async pull(
+		source: OutputSource,
+		maxChunks: number,
+		shouldStop?: () => boolean,
+	): Promise<boolean> {
 		let pulled = false;
 		for (let i = 0; i < maxChunks; i++) {
+			if (shouldStop?.()) {
+				this.behind = true;
+				return pulled;
+			}
 			const { data, next } = await source.outputFrom(this.id, this.offset);
 			if (data.length === 0) {
 				this.behind = false;
