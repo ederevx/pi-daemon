@@ -882,8 +882,9 @@ class DaemonTasksDock {
 				}
 				return this as unknown as Component;
 			});
-		} catch {
-			/* dock unavailable or canceled */
+		} catch (err) {
+			const reason = err instanceof Error ? err.message : String(err);
+			ui.notify?.(`pi-daemon: daemon tasks presentation failed: ${reason}`, "error");
 		} finally {
 			this.stop();
 		}
