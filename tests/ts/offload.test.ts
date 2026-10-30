@@ -853,18 +853,6 @@ test("offload: a deadline cancels a pending status request without a replacement
     }
     return baseExec(file, args, options);
   };
-  (pi as { exec: unknown }).exec = (
-    file: string, args: string[], options?: { signal?: AbortSignal },
-  ): Promise<ExeResult> => {
-    if (args[0] === "ticket-list" && options?.signal) {
-      pi.execCalls.push({ file, args });
-      return new Promise<ExeResult>((resolve) => {
-        options.signal!.addEventListener("abort", () => resolve(ok("")),
-          { once: true });
-      });
-    }
-    return baseExec(file, args, options);
-  };
   const tools = pi.tools.get("daemon_tasks");
   const result = await runToolIO<{
     content: Array<{ text: string }>;
