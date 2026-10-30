@@ -1383,7 +1383,7 @@ export default function (pi: ExtensionAPI) {
 								yieldNow: () =>
 									Boolean(ctx?.hasPendingMessages?.()),
 								feed: streamFeed(ids, onUpdate),
-								});
+							});
 							return await watchRelease(tasks, ids, outcome);
 						} catch (error) {
 							// A stop before any status was observed owes the
