@@ -256,15 +256,14 @@ async function runBlockingWait(
 			shouldYield: options.yieldNow,
 			feed: options.feed,
 			onObserved: (ticket) => tasks.consume(ticket.id),
-			});
+		});
 	} finally {
 		options.feed.close();
 	}
 }
 
-/** The `result` wait=0 path and a cancelled wait's fallback: one
- *  list for every status, a non-blocking probe only for an id the
- *  list no longer carries, no feed, no blocking. */
+/** The `result` wait=0 path: one status list, with individual probes
+ *  for missing ids. Does not wait for ticket completion. */
 async function probeAll(
 	tasks: DaemonTasks,
 	ids: readonly string[],
