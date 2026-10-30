@@ -379,11 +379,11 @@ test("offload: a pre-aborted signal releases the result wait without blocking ro
     { action: "result", id: "t-1", wait: 30 },
     { signal: controller.signal },
   );
-  assertMatches(result.content[0].text, /still running/);
-  // The wait must not hold a blocking pi-rc round trip open: only the
-  // immediate status probe (two args) is allowed.
-  assert(!pi.execCalls.some((c) => c.args[0] === "ticket-wait" && c.args.length > 2),
-    "no blocking ticket-wait round trips after abort");
+  assertMatches(result.content[0].text, /ended before ticket status/);
+  // A stopped wait never starts status traffic: cancellation, not a
+  // restarted request.
+  assertEq(pi.execCalls.filter((c) => c.args[0].startsWith("ticket-")).length, 0,
+    "no ticket requests after a pre-aborted wait");
 });
 
 test("offload: a queued user message yields the result wait", async () => {
@@ -394,9 +394,10 @@ test("offload: a queued user message yields the result wait", async () => {
     { action: "result", id: "t-1", wait: 30 },
     { ctx: { hasPendingMessages: () => true } },
   );
-  assertMatches(result.content[0].text, /still running/);
-  assert(!pi.execCalls.some((c) => c.args[0] === "ticket-wait" && c.args.length > 2),
-    "no blocking round trips while a message is queued");
+  assertMatches(result.content[0].text, /ended before ticket status/);
+  // A yielded wait never starts status traffic.
+  assertEq(pi.execCalls.filter((c) => c.args[0].startsWith("ticket-")).length, 0,
+    "no ticket requests after a yielded wait");
 });
 
 test("offload: watch streams incremental output and abort releases the wait", async () => {
@@ -425,9 +426,9 @@ test("offload: watch abort releases the wait with the ticket still running", asy
     { action: "watch", id: "t-1" },
     { signal: controller.signal },
   );
-  assertMatches(result.content[0].text, /released early/);
-  assert(!pi.execCalls.some((c) => c.args[0] === "ticket-wait" && c.args.length > 2),
-    "no blocking round trips after abort");
+  assertMatches(result.content[0].text, /ended before ticket status/);
+  assertEq(pi.execCalls.filter((c) => c.args[0].startsWith("ticket-")).length, 0,
+    "no ticket requests after a pre-aborted watch");
 });
 
 test("offload: bash defers with a success claim and the watcher steers the result", async () => {
@@ -775,11 +776,9 @@ test("offload: a pre-aborted multi-id result does no blocking round", async () =
     tools, { action: "result", ids: ["t-1", "t-2"], wait: 30 },
     { signal: controller.signal },
   );
-  assertMatches(result.content[0].text, /still running/i);
-  assertEq(pi.execCalls.filter((c) => c.args[0] === "ticket-list").length, 1,
-    "one ticket-list");
-  assertEq(pi.execCalls.filter((c) => c.args[0] === "ticket-wait").length, 0,
-    "no ticket-wait");
+  assertMatches(result.content[0].text, /ended before ticket status/i);
+  assertEq(pi.execCalls.filter((c) => c.args[0].startsWith("ticket-")).length, 0,
+    "no ticket requests after a pre-aborted multi-id wait");
 });
 
 test("offload: a queued message yields a multi-id result without blocking rounds", async () => {
@@ -791,14 +790,14 @@ test("offload: a queued message yields a multi-id result without blocking rounds
     tools, { action: "result", ids: ["t-1", "t-2"], wait: 30 },
     { ctx: { hasPendingMessages: () => true } },
   );
-  assertMatches(result.content[0].text, /still running/i);
-  assertEq(pi.execCalls.filter((c) => c.args[0] === "ticket-list").length, 1,
-    "one ticket-list");
+  assertMatches(result.content[0].text, /ended before ticket status/i);
+  assertEq(pi.execCalls.filter((c) => c.args[0].startsWith("ticket-")).length, 0,
+    "no ticket requests after a yielded multi-id wait");
   assertEq(pi.execCalls.filter((c) => c.args[0] === "ticket-wait").length, 0,
     "no ticket-wait");
 });
 
-test("offload: a released single result wait keeps the legacy text", async () => {
+test("offload: a cancelled single result wait reports status unavailable", async () => {
   const pi = mount(new FakePi());
   const tools = pi.tools.get("daemon_tasks");
   pi.track("t-1", ["running"]);
@@ -808,10 +807,10 @@ test("offload: a released single result wait keeps the legacy text", async () =>
     tools, { action: "result", id: "t-1", wait: 30 }, { signal: controller.signal },
   );
   assertEq(result.content[0].text,
-    "ticket t-1 still running: echo hi\n" +
-    "The result will still be delivered automatically when it finishes, or " +
-    "re-call daemon_tasks result t-1 with wait to block again " +
-    "(the wait is interruptible and yields early when a message is queued).");
+    "pi-daemon: the wait for t-1 ended before ticket status was available; " +
+    "re-call daemon_tasks result when calm.");
+  assertEq(pi.execCalls.filter((c) => c.args[0].startsWith("ticket-")).length, 0,
+    "no ticket requests after a pre-aborted wait");
 });
 
 test("offload: a huge log stays within the per-tick read and snapshot bounds", async () => {
