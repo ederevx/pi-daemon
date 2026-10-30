@@ -15,7 +15,11 @@ import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
  *  byte offset. Deliberately not TicketClient, so streams never import
  *  offload.ts. */
 export interface OutputSource {
-	outputFrom(id: string, offset: number): Promise<{ data: Buffer; next: number }>;
+	outputFrom(
+		id: string,
+		offset: number,
+		signal?: AbortSignal,
+	): Promise<{ data: Buffer; next: number }>;
 }
 
 export class TicketStream {
@@ -37,6 +41,7 @@ export class TicketStream {
 		source: OutputSource,
 		maxChunks: number,
 		shouldStop?: () => boolean,
+		signal?: AbortSignal,
 	): Promise<boolean> {
 		let pulled = false;
 		for (let i = 0; i < maxChunks; i++) {
@@ -44,7 +49,8 @@ export class TicketStream {
 				this.behind = true;
 				return pulled;
 			}
-			const { data, next } = await source.outputFrom(this.id, this.offset);
+			const { data, next } = await source.outputFrom(
+				this.id, this.offset, signal);
 			if (data.length === 0) {
 				this.behind = false;
 				return pulled;
