@@ -256,13 +256,7 @@ async function runBlockingWait(
 			shouldYield: options.yieldNow,
 			feed: options.feed,
 			onObserved: (ticket) => tasks.consume(ticket.id),
-		});
-	} catch (error) {
-		// A stop before any status was observed still owes the caller a
-		// status line: one fresh uncanceled probe round, never a
-		// blocking one.
-		if (!(error instanceof WaitCancelled)) throw error;
-		return await probeAll(tasks, ids);
+			});
 	} finally {
 		options.feed.close();
 	}
@@ -1348,17 +1342,32 @@ export default function (pi: ExtensionAPI) {
 					const blocking = (params.wait ?? 0) > 0;
 					if (blocking) tasks.setSessionState("waiting");
 					try {
-						const outcome = blocking
-							? await runBlockingWait(tasks, ids, {
-								mode: "first",
-								bound: params.wait ?? 0,
-								signal,
-								yieldNow: () =>
-									Boolean(ctx?.hasPendingMessages?.()),
-								feed: streamFeed(ids, onUpdate),
-							})
-							: await probeAll(tasks, ids);
-						return await resultRelease(tasks, ids, outcome);
+						// A stop before any status was observed owes the
+						// caller a plain answer, never a restarted request.
+						try {
+							const outcome = blocking
+								? await runBlockingWait(tasks, ids, {
+									mode: "first",
+									bound: params.wait ?? 0,
+									signal,
+									yieldNow: () =>
+										Boolean(ctx?.hasPendingMessages?.()),
+									feed: streamFeed(ids, onUpdate),
+								})
+								: await probeAll(tasks, ids);
+							return await resultRelease(tasks, ids, outcome);
+						} catch (error) {
+							if (!(error instanceof WaitCancelled)) throw error;
+							return {
+								content: [{
+									type: "text",
+									text: `pi-daemon: the wait for ${ids.join(", ")} ` +
+										`ended before ticket status was available; ` +
+										`re-call daemon_tasks result when calm.`,
+								}],
+								details: { ids, statusUnavailable: true },
+							};
+						}
 					} finally {
 						if (blocking) tasks.setSessionState("busy");
 					}
@@ -1367,15 +1376,30 @@ export default function (pi: ExtensionAPI) {
 					const ids = resolveTicketIds(params);
 					tasks.setSessionState("waiting");
 					try {
-						const outcome = await runBlockingWait(tasks, ids, {
-							mode: "all",
-							bound: Infinity,
-							signal,
-							yieldNow: () =>
-								Boolean(ctx?.hasPendingMessages?.()),
-							feed: streamFeed(ids, onUpdate),
-						});
-						return await watchRelease(tasks, ids, outcome);
+						try {
+							const outcome = await runBlockingWait(tasks, ids, {
+								mode: "all",
+								bound: Infinity,
+								signal,
+								yieldNow: () =>
+									Boolean(ctx?.hasPendingMessages?.()),
+								feed: streamFeed(ids, onUpdate),
+								});
+							return await watchRelease(tasks, ids, outcome);
+						} catch (error) {
+							// A stop before any status was observed owes the
+							// caller a plain answer, never a restarted request.
+							if (!(error instanceof WaitCancelled)) throw error;
+							return {
+								content: [{
+									type: "text",
+									text: `pi-daemon: the watch for ${ids.join(", ")} ` +
+										`ended before ticket status was available; ` +
+										`re-call daemon_tasks result when calm.`,
+								}],
+								details: { ids, statusUnavailable: true },
+							};
+						}
 					} finally {
 						tasks.setSessionState("busy");
 					}
