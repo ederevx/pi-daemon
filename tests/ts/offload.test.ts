@@ -941,8 +941,8 @@ test("offload: the live view shares lines across streams and reproduces the prev
     bold: (text: string) => text,
   };
   const streams = [
-    { id: "t-1", command: "one", state: "running", exit: null, runtimeSeconds: 12, tail: "a1\na2\na3", behind: false },
-    { id: "t-2", command: "two", state: "done", exit: 0, runtimeSeconds: 3, tail: "b1", behind: false },
+    { id: "t-1", command: "one", state: "running", exit: null, runtimeSeconds: 12, waitSeconds: 4, tail: "a1\na2\na3", behind: false },
+    { id: "t-2", command: "two", state: "done", exit: 0, runtimeSeconds: 3, waitSeconds: 4, tail: "b1", behind: false },
   ];
   const partial = tool.renderResult!(
     { content: [{ type: "text", text: "snap" }], details: { streams } },
@@ -954,7 +954,7 @@ test("offload: the live view shares lines across streams and reproduces the prev
   assertMatches(partial, /a3/);
   // The band's outcome-colored glyph sets it apart; output is flush, so
   // a line of a ticket's output cannot be read as a marker.
-  assertMatches(partial, /▌ t-1 running 12s one/);
+  assertMatches(partial, /▌ t-1 running 12s \(waited 4s\) one/);
   assertMatches(partial, /^a3/m);
   assertMatches(partial, /^b1/m);
   assert(!partial.split("\n").some((line) => line.startsWith(" ")),

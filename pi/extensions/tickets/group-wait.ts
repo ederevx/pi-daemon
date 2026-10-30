@@ -56,6 +56,14 @@ export class TicketGroupWait {
 	async run(options: GroupWaitOptions): Promise<GroupOutcome> {
 		const started = Date.now();
 		const elapsed = (): number => (Date.now() - started) / 1000;
+		// The bound governs the whole loop, not just the check: the
+		// sleep never outlives the remaining time, and a pull that
+		// crossed the bound ends the wait on the records in hand
+		// instead of streaming another frame past it.
+		const remaining = (): number =>
+			options.bound * 1000 - (Date.now() - started);
+		const expired = (): boolean =>
+			options.bound !== Infinity && remaining() <= 0;
 		for (;;) {
 			const records = await this.observe(options.ids);
 			for (const id of options.ids) {
@@ -70,7 +78,7 @@ export class TicketGroupWait {
 				? completed.length > 0
 				: running.length === 0;
 			if (satisfied
-				|| elapsed() >= options.bound
+				|| expired()
 				|| (options.signal?.aborted ?? false)
 				|| (options.shouldYield?.() ?? false)) {
 				return { records, completed, running, streams: this.streams };
@@ -78,6 +86,9 @@ export class TicketGroupWait {
 			if (options.feed) {
 				await Promise.allSettled(running.map((id) =>
 					this.stream(id).pull(this.client, TicketGroupWait.PULL_CHUNKS)));
+				if (expired()) {
+					return { records, completed, running, streams: this.streams };
+				}
 				options.feed.update(
 					options.ids.map((id) => records.get(id)!),
 					this.streams,
@@ -85,7 +96,9 @@ export class TicketGroupWait {
 				);
 				options.feed.deliverIfChanged();
 			}
-			await this.sleep(this.pollMs, options.signal);
+			await this.sleep(
+				Math.max(0, Math.min(this.pollMs, remaining())),
+				options.signal);
 		}
 	}
 
