@@ -836,6 +836,49 @@ test("offload: a huge log stays within the per-tick read and snapshot bounds", a
   }
 });
 
+test("offload: a deadline cancels a pending status request without a replacement", async () => {
+  const pi = mount(new FakePi());
+  // The first ticket-list hangs until its own signal aborts, so the
+  // wait's bound must be the thing that ends it.
+  const baseExec = pi.exec.bind(pi);
+  (pi as { exec: unknown }).exec = (
+    file: string, args: string[], options?: { signal?: AbortSignal },
+  ): Promise<ExeResult> => {
+    if (args[0] === "ticket-list" && options?.signal) {
+      pi.execCalls.push({ file, args });
+      return new Promise<ExeResult>((resolve) => {
+        options.signal!.addEventListener("abort", () => resolve(ok("")),
+          { once: true });
+      });
+    }
+    return baseExec(file, args, options);
+  };
+  (pi as { exec: unknown }).exec = (
+    file: string, args: string[], options?: { signal?: AbortSignal },
+  ): Promise<ExeResult> => {
+    if (args[0] === "ticket-list" && options?.signal) {
+      pi.execCalls.push({ file, args });
+      return new Promise<ExeResult>((resolve) => {
+        options.signal!.addEventListener("abort", () => resolve(ok("")),
+          { once: true });
+      });
+    }
+    return baseExec(file, args, options);
+  };
+  const tools = pi.tools.get("daemon_tasks");
+  const result = await runToolIO<{
+    content: Array<{ text: string }>;
+    details: { statusUnavailable?: boolean };
+  }>(tools, { action: "result", id: "t-1", wait: 0.2 }, {});
+  assertEq(result.details.statusUnavailable, true,
+    "the deadline reports status unavailable");
+  const lists = pi.execCalls.filter((c) => c.args[0] === "ticket-list");
+  assertEq(lists.length, 1, "exactly one ticket-list request");
+  assertEq(
+    pi.execCalls.filter((c) => c.args[0].startsWith("ticket-")).length, 1,
+    "no replacement ticket requests");
+});
+
 test("offload: the watch final text equals formatResult over the full output", async () => {
   const pi = mount(new FakePi());
   const tools = pi.tools.get("daemon_tasks");
