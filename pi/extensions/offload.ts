@@ -257,18 +257,30 @@ async function runBlockingWait(
 			feed: options.feed,
 			onObserved: (ticket) => tasks.consume(ticket.id),
 		});
+	} catch (error) {
+		// A stop before any status was observed still owes the caller a
+		// status line: one fresh uncanceled probe round, never a
+		// blocking one.
+		if (!(error instanceof WaitCancelled)) throw error;
+		return await probeAll(tasks, ids);
 	} finally {
 		options.feed.close();
 	}
 }
 
-/** The `result` wait=0 path: one probe per id, no feed, no blocking. */
+/** The `result` wait=0 path and a cancelled wait's fallback: one
+ *  list for every status, a non-blocking probe only for an id the
+ *  list no longer carries, no feed, no blocking. */
 async function probeAll(
 	tasks: DaemonTasks,
 	ids: readonly string[],
 ): Promise<GroupOutcome> {
+	const listed = new Map<string, Ticket>();
+	for (const ticket of await tasks.client.list()) listed.set(ticket.id, ticket);
 	const records = new Map<string, Ticket>();
-	for (const id of ids) records.set(id, await tasks.probe(id));
+	for (const id of ids) {
+		records.set(id, listed.get(id) ?? await tasks.probe(id));
+	}
 	return {
 		records,
 		completed: ids.filter((id) => records.get(id)!.status !== "running"),
