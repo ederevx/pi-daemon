@@ -91,7 +91,10 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExecOptions,
+	ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { DaemonSettingsPresenter } from "./settings/presenter.ts";
 
@@ -239,17 +242,21 @@ function resolveWindowlessPython(): string {
  *  argument. One seam so every extension launches scripts identically. */
 export class ProcessRunner {
 	constructor(
-		private readonly exec: (file: string, args: string[]) => Promise<any>,
+		private readonly exec: (
+			file: string,
+			args: string[],
+			options?: ExecOptions,
+		) => Promise<any>,
 		private readonly platform: string = process.platform,
 		private readonly interpreter: () => string = resolveWindowlessPython,
 	) {}
 
 	/** Run `file` with `args` under this platform's launcher. */
-	run(file: string, args: string[]): Promise<any> {
+	run(file: string, args: string[], options?: ExecOptions): Promise<any> {
 		if (this.platform === "win32") {
-			return this.exec(this.interpreter(), [file, ...args]);
+			return this.exec(this.interpreter(), [file, ...args], options);
 		}
-		return this.exec(file, args);
+		return this.exec(file, args, options);
 	}
 }
 
@@ -703,7 +710,7 @@ export class RcBackground {
 	private readonly runner: ProcessRunner;
 
 	constructor(
-		exec: (file: string, args: string[]) => Promise<any>,
+		exec: (file: string, args: string[], options?: ExecOptions) => Promise<any>,
 		hold: HandoverHold = new HandoverHold(),
 		supervisor: DaemonSupervisor | null = null,
 		platform: string = process.platform,

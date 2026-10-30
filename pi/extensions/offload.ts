@@ -43,6 +43,7 @@
 import type {
 	AgentToolUpdateCallback,
 	ExtensionAPI,
+	ExecOptions,
 } from "@earendil-works/pi-coding-agent";
 import {
 	createBashTool,
@@ -71,7 +72,7 @@ import {
 import { ProcessRunner, resolvePiRc } from "./daemon.ts";
 import { OffloadPolicy } from "./settings/offload-policy.ts";
 import { TicketFeed, type StreamDetail } from "./tickets/ticket-feed.ts";
-import { TicketGroupWait, type GroupOutcome } from "./tickets/group-wait.ts";
+import { TicketGroupWait, type GroupOutcome, WaitCancelled } from "./tickets/group-wait.ts";
 import { outcomeColor, TicketStreamView } from "./tickets/stream-view.ts";
 
 /** pi-rc exit codes: 4 = unreachable before any request landed (safe to
@@ -422,13 +423,18 @@ export class TicketClient {
 	 *  unreachable daemon (exit 4) or a failed spawn. The daemon caps a
 	 *  ticket-wait round trip itself (TICKET_MAX_WAIT), so no
 	 *  client-side timeout is layered on top. */
-	private async run(args: string[]): Promise<string> {
+	private async run(args: string[], options?: ExecOptions): Promise<string> {
 		let result: Awaited<ReturnType<ProcessRunner["run"]>>;
 		try {
-			result = await this.runner.run(this.piRc, args);
+			result = await this.runner.run(this.piRc, args, options);
 		} catch (exc) {
+			// The caller's own cancellation is not a daemon failure: the
+			// bound or the abort ended the request, so it surfaces as a
+			// cancellation the wait loop understands.
+			if (options?.signal?.aborted) throw new WaitCancelled();
 			throw new DaemonUnavailable(`pi-rc failed: ${String(exc)}`);
 		}
+		if (options?.signal?.aborted) throw new WaitCancelled();
 		if (result.code === EXIT_NO_DAEMON) {
 			throw new DaemonUnavailable("background service is not running");
 		}
@@ -485,10 +491,14 @@ export class TicketClient {
 	}
 
 	/** Blocks at most timeoutSeconds; timeout 0 is a status probe. */
-	async wait(id: string, timeoutSeconds: number): Promise<Ticket> {
+	async wait(
+		id: string,
+		timeoutSeconds: number,
+		signal?: AbortSignal,
+	): Promise<Ticket> {
 		const args = ["ticket-wait", id];
 		if (timeoutSeconds > 0) args.push(String(timeoutSeconds));
-		const out = await this.run(args);
+		const out = await this.run(args, signal ? { signal } : undefined);
 		const line = out.trim().split("\n")[0] || "";
 		const ticket = JSON.parse(line) as Ticket;
 		if (!ticket || typeof ticket.id !== "string") {
@@ -524,18 +534,21 @@ export class TicketClient {
 	async outputFrom(
 		id: string,
 		offset: number,
+		signal?: AbortSignal,
 	): Promise<{ data: Buffer; next: number }> {
-		const out = await this.run(["ticket-output", id, String(offset)]);
+		const out = await this.run(
+			["ticket-output", id, String(offset)],
+			signal ? { signal } : undefined);
 		const data = Buffer.from(out.trim(), "base64");
 		return { data, next: offset + data.length };
 	}
 
 	/** Reads the whole output log in bounded chunks. */
-	async outputAll(id: string): Promise<string> {
+	async outputAll(id: string, signal?: AbortSignal): Promise<string> {
 		const parts: Buffer[] = [];
 		let offset = 0;
 		for (let i = 0; i < 256; i++) {
-			const { data, next } = await this.outputFrom(id, offset);
+			const { data, next } = await this.outputFrom(id, offset, signal);
 			if (data.length === 0) break;
 			parts.push(data);
 			offset = next;
@@ -549,10 +562,10 @@ export class TicketClient {
 		return id;
 	}
 
-	async list(session?: string): Promise<Ticket[]> {
+	async list(session?: string, signal?: AbortSignal): Promise<Ticket[]> {
 		const args = ["ticket-list"];
 		if (session) args.push(session);
-		const out = await this.run(args);
+		const out = await this.run(args, signal ? { signal } : undefined);
 		return out
 			.trim()
 			.split("\n")
@@ -1193,7 +1206,11 @@ class OffloadedBash implements BashOperations {
 	};
 }
 export default function (pi: ExtensionAPI) {
-	const exec = (file: string, args: string[]) => pi.exec(file, args);
+	const exec = (
+		file: string,
+		args: string[],
+		options?: ExecOptions,
+	) => pi.exec(file, args, options);
 	const tasks = new DaemonTasks(new ProcessRunner(exec), (message, options) => {
 		void pi.sendMessage(message, options);
 	});
