@@ -70,6 +70,10 @@ import {
 	type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
 import { ProcessRunner, resolvePiRc } from "./daemon.ts";
+import { ToolCompletionCalls } from "./completion/calls.ts";
+import { COMPLETION_VERSION } from "./completion/protocol.ts";
+import { ToolCompletionService } from "./completion/service.ts";
+import { ToolCompletionTool } from "./completion/tool.ts";
 import { OffloadPolicy } from "./settings/offload-policy.ts";
 import { TicketFeed, type StreamDetail } from "./tickets/ticket-feed.ts";
 import { TicketGroupWait, type GroupOutcome, WaitCancelled } from "./tickets/group-wait.ts";
@@ -1145,6 +1149,7 @@ class OffloadedBash implements BashOperations {
 		private readonly localBash: BashOperations,
 		private readonly tasks: DaemonTasks,
 		private readonly policy: Pick<OffloadPolicy, "enabled">,
+		private readonly completions: ToolCompletionCalls,
 	) {}
 
 	private offloadDisabled(): boolean {
@@ -1203,6 +1208,11 @@ class OffloadedBash implements BashOperations {
 		// and its two continuations, so an agent that reaches for a sleep
 		// instead learns it may simply keep calling tools (the result is
 		// steered in) or block explicitly with daemon_tasks result.
+		// Handed off: this call's result is an acknowledgment, so it is marked
+		// pending on the operation it started and a caller that needs the
+		// output can resolve it instead of forwarding the claim. The local
+		// fallback above stays unmarked, which means final.
+		this.completions.pending({ ticket: id });
 		onData(Buffer.from(
 			`[pi-daemon] ticket ${id} taken by the daemon; the result is ` +
 			`steered in automatically.\n` +
@@ -1238,8 +1248,11 @@ export default function (pi: ExtensionAPI) {
 	// -- bash offloading -------------------------------------------------
 	// The offload backend lives in the OffloadedBash class (module level);
 	// this bootstrap composes it with the local fallback, the daemon, and
-	// the same offload policy the onboarding gate consults.
-	const backend = new OffloadedBash(localBash, tasks, policy);
+	// the same offload policy the onboarding gate consults. The completion
+	// calls own the per-call mark that tells a caller the result it got is
+	// an acknowledgment.
+	const completions = new ToolCompletionCalls();
+	const backend = new OffloadedBash(localBash, tasks, policy, completions);
 
 
 	// bash tool override: same schema, renderers, prompt snippet, and
@@ -1258,7 +1271,25 @@ export default function (pi: ExtensionAPI) {
 				"wait=<seconds>.",
 		],
 	});
+	completions.attach(bashTool);
 	pi.registerTool(bashTool);
+
+	// -- deferred results ------------------------------------------------
+	// A caller that receives bash's acknowledgment learns from
+	// `details.toolCompletion` that the output is still coming, and asks the
+	// advertised resolver for it. The capability names the resolver by its
+	// registered name, so no consumer hardcodes this package, the bash tool,
+	// or the ticket syntax.
+	const completionTool = new ToolCompletionTool(tasks, WAIT_CHUNK_SECONDS);
+	completionTool.register(pi);
+	const completionService = new ToolCompletionService(pi.events, [
+		{
+			tool: bashTool.name,
+			versions: [COMPLETION_VERSION],
+			resolver: { name: ToolCompletionTool.NAME },
+		},
+	]);
+	const stopCompletionService = completionService.start();
 
 	// -- explicit task management tool -----------------------------------
 
@@ -1450,6 +1481,7 @@ export default function (pi: ExtensionAPI) {
 		await tasks.rearm(ctx?.sessionManager?.getSessionFile?.() ?? null);
 	});
 	pi.on("session_shutdown", async () => {
+		stopCompletionService();
 		tasks.stopWatching();
 	});
 

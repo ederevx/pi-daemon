@@ -11,7 +11,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { test, assert, assertEq, assertMatches, scratchDir, waitFor, withEnv } from "./harness.ts";
-import { initTheme } from "@earendil-works/pi-coding-agent";
+import { initTheme, createEventBus } from "@earendil-works/pi-coding-agent";
 import {
   formatResult,
   sessionKeyOf,
@@ -63,6 +63,8 @@ function delay(ms: number): Promise<void> {
 }
 
 class FakePi {
+  /** The session event bus: the tool-completion capability is served on it. */
+  readonly events = createEventBus();
   readonly sent: Array<{ message: unknown; options: unknown }> = [];
   readonly messageRenderers = new Map<string, unknown>();
   readonly tools = new Map<string, { name: string; execute?: unknown; renderResult?: unknown }>();
@@ -454,6 +456,11 @@ test("offload: bash defers with a success claim and the watcher steers the resul
   // The claim is a success, never the stock tool's null-exit hand-off
   // error: the daemon owns the ticket and the agent is not held.
   assertEq(out.structuredContent?.exit_code, 0, "claim returns success");
+  // The result is an acknowledgment, and says so in its own details, so a
+  // caller that needs the output can resolve it instead of forwarding it.
+  const completion = (out as unknown as { details?: { toolCompletion?: { state?: string; payload?: { ticket?: string } } } }).details?.toolCompletion;
+  assertEq(completion?.state, "pending", "a deferred bash result is marked pending");
+  assertEq(completion?.payload?.ticket, "t-1", "the mark names the operation it started");
   assertEq(out.isError, undefined, "not an error result");
   // The claim advertises the ticket and both continuations - keep
   // calling tools, or block explicitly - so an agent that would sleep
@@ -591,6 +598,8 @@ test("offload: bash tool falls back to local execution when the daemon is down",
   });
   const text = out.content.map((b) => (b as { text: string }).text).join("\n");
   assertMatches(text, /fallback-works/);
+  const completion = (out as unknown as { details?: { toolCompletion?: { state?: string } } }).details?.toolCompletion;
+  assertEq(completion?.state, "final", "a locally executed command is final, not pending");
   assert(pi.execCalls.length > 0, "pi-rc was attempted first");
   // The file argument is the seam that broke Windows: on POSIX it is the
   // shebang'd pi-rc, on Windows it must be the Python interpreter (the
