@@ -53,6 +53,7 @@ export class ToolCompletionService {
 				service: COMPLETION_SERVICE,
 				version: COMPLETION_VERSION,
 				methods: ["rpc.hello", COMPLETION_DESCRIBE],
+				topics: [],
 			});
 			return;
 		}

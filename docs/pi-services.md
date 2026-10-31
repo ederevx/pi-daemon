@@ -214,6 +214,15 @@ present, and makes them itself otherwise.
 - **Adopted:** `session-host` discovery (`pi_services.py`, pi-teams
   `service_registry.py`) publishes and reads the descriptor above, with
   its control protocol kept at `pi-pty-host/1`.
+- **Adopted:** `tool-completion`, in-process only, published by
+  pi-daemon's `bash` backend (which attaches `details.toolCompletion` to
+  every result) and consumed by pi-consult before it answers a bridged
+  tool call. A consumer asks `completion.describe` at the point of use
+  and gets back the registered resolver tool for each producer tool; the
+  resolver itself is called through the consumer's own tool path, so the
+  payload stays opaque and no consumer knows the ticket syntax. A
+  deferred operation is resolved, never re-run, and a consumer with no
+  provider keeps its previous behaviour.
 - **Exempt, pi-teams broker `op` frames:** one broker serving its own
   clients and peers, not an extension-to-extension service. A package
   that needs team data gets a `pi-rpc/1` service published for it. A
