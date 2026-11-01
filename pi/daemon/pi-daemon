@@ -226,6 +226,15 @@ _default_watch_roots = [
 	os.path.join(_agent_home, "git"),
 	os.path.join(_agent_home, "settings.json"),
 ]
+# The settings.json watch root is fingerprinted by only the keys that
+# decide which extensions, skills, prompts, themes and packages pi
+# loads (see pi's SettingsSchema). Editing other settings (provider,
+# theme, compaction, piConsult, ...) must NOT trigger a reload round:
+# those take effect on the next manual /reload, and treating every
+# settings.json write as an extension change reloads every hosted
+# session the moment the user saves an extension setting — the reload
+# lands while the settings dock is still open.
+EXT_SETTINGS_KEYS = ("packages", "extensions", "skills", "prompts", "themes")
 EXT_WATCH_ENABLED = SETTINGS.resolve("PI_PTYD_EXT_WATCH", "extWatch", True,
 									 kind="flag")
 EXT_WATCH_INTERVAL = SETTINGS.resolve("PI_PTYD_EXT_WATCH_INTERVAL",
@@ -447,18 +456,52 @@ def err(error):
 	return {"ok": False, "error": error}
 
 
+def _settings_fingerprint(path):
+	"""Content fingerprint of a settings.json file restricted to the
+	keys that decide which extensions/resources pi loads
+	(EXT_SETTINGS_KEYS). A mtime/size fingerprint would fire a reload
+	round on every settings write — including edits to provider, theme
+	or extension-specific config that the docks already say take effect
+	on the next /reload — so only the loading keys count. Returns a
+	(sha256-hex, length) tuple; on a read or parse error it falls back
+	to the stat fingerprint so a broken or freshly created settings.json
+	is still detected (and a reload can repair it). OSError from the
+	initial stat propagates so the caller skips the root, matching the
+	missing-directory behavior."""
+	st = os.stat(path)
+	try:
+		with open(path, "rb") as f:
+			data = json.loads(f.read().decode("utf-8"))
+	except (OSError, ValueError):
+		return (st.st_mtime_ns, st.st_size)
+	if not isinstance(data, dict):
+		return (st.st_mtime_ns, st.st_size)
+	selector = {k: data.get(k) for k in EXT_SETTINGS_KEYS}
+	payload = json.dumps(selector, sort_keys=True,
+						 separators=(",", ":")).encode("utf-8")
+	return (hashlib.sha256(payload).hexdigest(), len(payload))
+
+
 def ext_root_fingerprint(roots):
-	"""{(abs_path): (mtime_ns, size)} for every file under roots; missing
+	"""{(abs_path): two-element tuple} for every file under roots; missing
 	paths are skipped and directories are walked. Cheap per-poll change
-	detection for the extension-reload watcher. Values are int tuples so
-	the on-disk snapshot round-trips exactly (JSON arrays become tuples
-	again on read)."""
+	detection for the extension-reload watcher. The value is the stat
+	(mtime_ns, size) for an ordinary file root, or a (sha256-hex, length)
+	content hash of the extension-loading keys for a settings.json root
+	(see _settings_fingerprint), so saving a non-loading setting does not
+	retrigger a reload round. Values are tuples so the on-disk snapshot
+	round-trips exactly (JSON arrays become tuples again on read)."""
 	fp = {}
 	for root in roots:
 		try:
 			if os.path.isfile(root):
-				st = os.stat(root)
-				fp[os.path.abspath(root)] = (st.st_mtime_ns, st.st_size)
+				abs_path = os.path.abspath(root)
+				if os.path.basename(abs_path) == "settings.json":
+					val = _settings_fingerprint(abs_path)
+				else:
+					st = os.stat(abs_path)
+					val = (st.st_mtime_ns, st.st_size)
+				fp[abs_path] = val
 			elif os.path.isdir(root):
 				for dirpath, _dirs, files in os.walk(root):
 					for fn in files:
