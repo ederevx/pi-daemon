@@ -288,6 +288,61 @@ def test_ext_fingerprint():
     assert_eq(daemon.ext_root_fingerprint([os.path.join(root, "nope")]), {})
 
 
+def test_ext_fingerprint_settings_json():
+	"""A settings.json watch root is fingerprinted by only the keys that
+	decide which extensions/resources pi loads (packages, extensions,
+	skills, prompts, themes). Editing other settings (provider, theme,
+	piConsult, ...) must NOT change the fingerprint: those take effect on
+	the next manual /reload, and treating every settings.json write as an
+	extension change reloads every hosted session the moment the user
+	saves an extension setting — the reload lands while the settings dock
+	is still open."""
+	d = os.path.join(SCRATCH, "settings-root")
+	os.makedirs(d, exist_ok=True)
+	sp = os.path.join(d, "settings.json")
+
+	def write(obj):
+		with open(sp, "w") as f:
+			json.dump(obj, f)
+		# Force an mtime change so a stat fingerprint would definitely
+		# differ: only the content selector may keep the fingerprint stable.
+		os.utime(sp, (time.time() + 10, time.time() + 10))
+
+	write({"packages": ["git:github.com/x/y@v1"],
+		   "piConsult": {"enabled": True}, "theme": "light"})
+	fp1 = daemon.ext_root_fingerprint([sp])
+	assert_true(sp in fp1, fp1)
+	# Edit a non-loading key: fingerprint must be unchanged even though
+	# the file's mtime/size both moved.
+	time.sleep(0.01)
+	write({"packages": ["git:github.com/x/y@v1"],
+		   "piConsult": {"enabled": False}, "theme": "dark"})
+	fp2 = daemon.ext_root_fingerprint([sp])
+	assert_eq(fp2, fp1, "non-loading settings edit must not trigger a reload")
+	# Edit a loading key: fingerprint must change.
+	time.sleep(0.01)
+	write({"packages": ["git:github.com/x/y@v2"],
+		   "piConsult": {"enabled": False}, "theme": "dark"})
+	fp3 = daemon.ext_root_fingerprint([sp])
+	assert_true(fp3 != fp1, "loading settings edit must trigger a reload")
+	# Key order is normalized: the same content in a different order
+	# must not change the fingerprint.
+	time.sleep(0.01)
+	write({"theme": "dark", "piConsult": {"enabled": False},
+		   "packages": ["git:github.com/x/y@v2"]})
+	fp4 = daemon.ext_root_fingerprint([sp])
+	assert_eq(fp4, fp3, "key order must not change the fingerprint")
+	# A broken settings.json falls back to the stat fingerprint so the
+	# change is still detected (and a reload can repair it).
+	time.sleep(0.01)
+	with open(sp, "w") as f:
+		f.write("{ broken")
+	fp5 = daemon.ext_root_fingerprint([sp])
+	assert_true(fp5 != fp4, "broken settings.json must still be detected")
+	assert_true(isinstance(fp5[sp][0], int),
+			   "broken settings.json falls back to a stat mtime")
+
+
 # --- exit classification --------------------------------------------------
 
 def test_exit_classification():
@@ -2211,6 +2266,8 @@ def _main():
     ok("ticket store lifecycle", test_ticket_store)
     ok("ticket store reload monotonic", test_ticket_store_reload_monotonic)
     ok("extension fingerprint/diff", test_ext_fingerprint)
+    ok("settings.json fingerprint ignores non-loading keys",
+       test_ext_fingerprint_settings_json)
     ok("exit classification", test_exit_classification, posix_only=True)
     ok("exit seam (base + daemon delegation)", test_exit_seam)
     ok("tty size falls through to stdout", test_tty_size_fallback)
