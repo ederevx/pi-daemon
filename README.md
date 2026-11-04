@@ -178,6 +178,21 @@ attached and busy sessions are never purged.
 - **Reload watch** - the daemon reloads hosted sessions in place when
   extension roots change; a busy session stays owed and is retried, and
   a session that dies during a reload is not respawned.
+- **`pi-rc run-state <name>`** - how that session's last run ended:
+  `verdict`, `cause`, `state`. The daemon, not the session, keeps the
+  record (`run-state/<name>.json`), and it is written from the wire
+  endpoint the extension publishes to (`pi-rc state ... --seq N
+  [--aborted]`), so a session that dies mid-run is never mistaken for a
+  finished one. `settled` (idle published, clean exit), `run-aborted`
+  (the user interrupted it), `exited-mid-run` and `died-mid-run` (the
+  process went away mid-turn, by exit code or signal - the signal path
+  exits 0, so the status alone cannot say), `lost-mid-run` (the daemon
+  or its host died and no exit was seen), `crashed-at-prompt`,
+  `reload-death`, `daemon-stopped`, `stopped`, and `unknown` (nothing
+  was ever published). A run whose record stays `busy` past
+  `PI_PTYD_RUN_BEAT_STALE` (45s, polled every
+  `PI_PTYD_RUN_BEAT` seconds) is logged as suspect once, and is never
+  stopped: the record reports, it does not police.
 
 A hosted session survives client disconnect and daemon restart: when its
 pi dies abnormally it is revived headless from the same conversation,

@@ -2251,6 +2251,152 @@ def test_bridge_enter_failure_restores():
     assert_true(term.restored, "restore not called after enter failed")
 
 
+def test_run_ledger_verdicts():
+    root = os.path.join(SCRATCH, "run-state-verdicts")
+    led = daemon.RunLedger(root, os.getpid(), "tok", boot="boot-1")
+
+    def run(name, state="busy", seq=1, aborted=None):
+        led.open(name, None, 4242, now=100.0)
+        led.transition(name, state, seq=seq, aborted=aborted, now=101.0)
+
+    # A turn killed on the signal path exits 0: the recorded state decides,
+    # not the status, so this must not read as a settle.
+    run("pi-a")
+    rec = led.close("pi-a", abnormal=False, code=0, now=200.0)
+    assert_eq(rec["ended"]["verdict"], "exited-mid-run")
+    assert_eq(rec["ended"]["cause"], "unknown")
+
+    run("pi-b")
+    rec = led.close("pi-b", abnormal=True, signal=True, now=200.0)
+    assert_eq(rec["ended"]["verdict"], "died-mid-run")
+    assert_eq(rec["ended"]["cause"], "signal")
+
+    run("pi-c")
+    led.transition("pi-c", "idle", seq=2, now=150.0)
+    assert_eq(led.close("pi-c", code=0, now=200.0)["ended"]["verdict"],
+              "settled")
+
+    # An interrupted turn is not a finished one, and the next run clears it.
+    run("pi-d")
+    led.transition("pi-d", "idle", seq=2, aborted=True, now=150.0)
+    assert_eq(led.close("pi-d", code=0, now=200.0)["ended"]["verdict"],
+              "run-aborted")
+    run("pi-e")
+    assert_eq(led.close("pi-e", code=0, now=200.0)["ended"]["verdict"],
+              "exited-mid-run")
+
+    # Nothing was ever published: the record cannot say how it ended.
+    led.open("pi-f", None, 4243, now=100.0)
+    assert_eq(led.close("pi-f", code=0, now=200.0)["ended"]["verdict"],
+              "unknown")
+
+    run("pi-g")
+    led.transition("pi-g", "idle", seq=2, now=150.0)
+    assert_eq(led.close("pi-g", abnormal=True, now=200.0)["ended"]["verdict"],
+              "crashed-at-prompt")
+
+    # A death the reload guard caught is not a crash.
+    run("pi-h")
+    rec = led.close("pi-h", kind="reload", abnormal=True, now=200.0)
+    assert_eq(rec["ended"]["verdict"], "reload-death")
+
+    # The daemon's own teardown wins over a status it may have invented.
+    run("pi-i")
+    rec = led.close("pi-i", kind="shutdown", abnormal=True, now=200.0)
+    assert_eq(rec["ended"]["verdict"], "daemon-stopped")
+    assert_eq(rec["ended"]["cause"], "daemon")
+
+    run("pi-j")
+    assert_eq(led.close("pi-j", kind="stopped", now=200.0)["ended"]["verdict"],
+              "stopped")
+
+    # A late publish never moves a record back, and never reopens a closed one.
+    run("pi-k", seq=5)
+    assert_eq(led.transition("pi-k", "idle", seq=4, now=160.0), False)
+    assert_eq(led.read("pi-k")["state"], "busy")
+    led.close("pi-k", now=200.0)
+    assert_eq(led.transition("pi-k", "busy", seq=6, now=210.0), False)
+    assert_eq(led.read("pi-k")["state"], "busy")
+
+    # A wire name never becomes a path.
+    assert_eq(led.path_for("../escape"), None)
+    assert_eq(led.path_for(".hidden"), None)
+    assert_eq(led.read("../escape"), None)
+
+
+def test_run_ledger_owner_scoping():
+    root = os.path.join(SCRATCH, "run-state-owner")
+    # A live foreign daemon: another process, token recorded from it.
+    child = subprocess.Popen([sys.executable, "-c",
+                              "import time; time.sleep(20)"])
+    try:
+        token = daemon.PROCESS.process_start_token(child.pid)
+        peer = daemon.RunLedger(root, child.pid, token, boot="b")
+        peer.open("pi-peer", None, 7, now=100.0)
+        peer.transition("pi-peer", "busy", seq=1, now=110.0)
+
+        mine = daemon.RunLedger(root, os.getpid(), "mine", boot="b")
+        # Every mutation is a no-op on a live peer's record.
+        assert_eq(mine.open("pi-peer", None, 8, now=120.0), None)
+        assert_eq(mine.transition("pi-peer", "idle", seq=9, now=130.0), False)
+        assert_eq(mine.close("pi-peer", now=140.0), None)
+        mine.prune(now=time.time() + 10 * daemon.RUN_STATE_RETENTION)
+        mine.recover()
+        assert_eq(mine.read("pi-peer")["state"], "busy")
+        assert_eq(mine.read("pi-peer")["open"], True)
+    finally:
+        child.kill()
+        child.wait()
+
+    # A dead owner's open record is sealed at boot, with its cause.
+    dead = daemon.RunLedger(root, child.pid, token, boot="b")
+    dead.open("pi-lost", None, 9, now=100.0)
+    dead.transition("pi-lost", "busy", seq=1, now=110.0)
+    succ = daemon.RunLedger(root, os.getpid(), "succ", boot="b")
+    succ.recover()
+    rec = succ.read("pi-lost")
+    assert_eq(rec["open"], False)
+    assert_eq(rec["ended"]["verdict"], "lost-mid-run")
+    assert_eq(rec["ended"]["cause"], "daemon")
+    # An idle session lost the same way was lost at its prompt.
+    dead.open("pi-lost2", None, 10, now=100.0)
+    succ.recover()
+    assert_eq(succ.read("pi-lost2")["ended"]["verdict"], "lost-at-prompt")
+    # Another host boot is a host loss, and no boot id is neither.
+    assert_eq(succ._lost_cause({"boot": "other"}), "host")
+    assert_eq(succ._lost_cause({"boot": None}), "daemon-or-host")
+
+    # Retention drops a closed record past its window, never an open one.
+    succ.open("pi-open", None, 12, now=time.time())
+    succ.prune(now=time.time() + daemon.RUN_STATE_RETENTION + 10.0)
+    assert_eq(succ.read("pi-lost2"), None)
+    assert_eq(succ.read("pi-open")["open"], True)
+
+
+def test_run_ledger_staleness():
+    root = os.path.join(SCRATCH, "run-state-stale")
+    led = daemon.RunLedger(root, os.getpid(), "tok", boot="b")
+    led.open("pi-s", None, 11, now=0.0)
+    led.transition("pi-s", "busy", seq=1, now=0.0)
+
+    class Fake:
+        name = "pi-s"
+        last_activity = 0.0
+        file = None
+
+    sess = Fake()
+    assert_eq(led.suspects([sess], now=daemon.RUN_STATE_STALE + 1.0), ["pi-s"])
+    # Flagged once, not on every tick.
+    assert_eq(led.suspects([sess], now=daemon.RUN_STATE_STALE + 5.0), [])
+    # A publish clears it: the run is moving again.
+    led.transition("pi-s", "busy", seq=2, now=daemon.RUN_STATE_STALE + 6.0)
+    assert_eq(led.read("pi-s")["suspected"], False)
+    # An idle session is never suspected, and a flag never stops anything.
+    led.transition("pi-s", "idle", seq=3, now=daemon.RUN_STATE_STALE + 7.0)
+    assert_eq(led.suspects([sess], now=daemon.RUN_STATE_STALE * 100), [])
+    assert_eq(led.read("pi-s")["open"], True)
+
+
 def main():
     try:
         return _main()
@@ -2259,6 +2405,12 @@ def main():
 
 
 def _main():
+    ok("run-outcome verdicts (mid-run, settled, aborted, unknown)",
+       test_run_ledger_verdicts)
+    ok("run-outcome owner scoping (foreign, gone, recovery, retention)",
+       test_run_ledger_owner_scoping)
+    ok("run-outcome staleness (flag once, never stop)",
+       test_run_ledger_staleness)
     ok("pi-rc name helpers", test_names)
     ok("owned-session selection (native dir, newest, busy tie)",
        test_owned_selection)

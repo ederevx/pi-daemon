@@ -21,6 +21,7 @@ import "./settings.test.ts";
 import "./provisioning.test.ts";
 import "./settings-reconciler.test.ts";
 import "./transcript.test.ts";
+import "./session-state.test.ts";
 
 await registry.runAll();
 cleanupScratch();

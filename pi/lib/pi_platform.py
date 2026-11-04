@@ -680,6 +680,15 @@ class PtyChild:
         """
         return bool(status)
 
+    def exit_outcome(self, status):
+        """(signalled, exit_code) for a reaped status, None where unknown.
+
+        The run-outcome record needs the signal bit separately from the
+        code: a signal death and a clean exit 0 both carry a small
+        status, and only the decoded form tells them apart.
+        """
+        return (False, status)
+
     def wait_nohang(self):
         raise NotImplementedError
 
@@ -764,6 +773,13 @@ class PosixPtyChild(PtyChild):
         if status and os.WIFEXITED(status):
             return os.WEXITSTATUS(status) != 0
         return False
+
+    def exit_outcome(self, status):
+        if status and os.WIFSIGNALED(status):
+            return (True, None)
+        if status and os.WIFEXITED(status):
+            return (False, os.WEXITSTATUS(status))
+        return (False, None)
 
     def wait_nohang(self):
         try:

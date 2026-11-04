@@ -75,6 +75,7 @@ import { COMPLETION_VERSION } from "./completion/protocol.ts";
 import { ToolCompletionService } from "./completion/service.ts";
 import { ToolCompletionTool } from "./completion/tool.ts";
 import { OffloadPolicy } from "./settings/offload-policy.ts";
+import { RunStatePublisher } from "./session-state/publisher.ts";
 import { TicketFeed, type StreamDetail } from "./tickets/ticket-feed.ts";
 import { TicketGroupWait, type GroupOutcome, WaitCancelled } from "./tickets/group-wait.ts";
 import { outcomeColor, TicketStreamView } from "./tickets/stream-view.ts";
@@ -490,13 +491,14 @@ export class TicketClient {
 	}
 
 	/** Publishes a run-state for a session daemon-side (pi-rc state),
-	 *  best-effort: never throws, cosmetic when the daemon is down. */
-	async setState(session: string, state: string): Promise<void> {
-		try {
-			await this.runner.run(this.piRc, ["state", session, state]);
-		} catch {
-			// State display is best-effort.
-		}
+	 *  best-effort: never throws, cosmetic when the daemon is down. The
+	 *  publisher module owns the seq stamp, the abort flag and the
+	 *  stop-at-shutdown rule shared with the backgrounding extension. */
+	async setState(session: string, state: string,
+		aborted = false): Promise<void> {
+		await RunStatePublisher.shared.publish((args) => this.runner.run(this.piRc, args),
+												session, state as "busy" | "idle" | "waiting",
+												aborted);
 	}
 
 	/** Blocks at most timeoutSeconds; timeout 0 is a status probe. */
@@ -1483,6 +1485,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		stopCompletionService();
 		tasks.stopWatching();
+		RunStatePublisher.shared.stop();
 	});
 
 	// User-facing dock: see every daemon ticket, cancel running ones,

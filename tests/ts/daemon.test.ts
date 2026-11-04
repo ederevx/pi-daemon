@@ -18,6 +18,7 @@ import {
   stateHome,
   reloadSignalPath,
   windowlessCandidates,
+  settledAborted,
   default as factory,
 } from "../../pi/extensions/daemon.ts";
 
@@ -294,6 +295,33 @@ test("daemon: purge failure surfaces pi-rc's message", async () => {
   assert(message.includes("daemon unreachable"), message);
 });
 
+test("daemon: a settled run is aborted only when pi recorded the abort", () => {
+  const ctx = (entries: unknown[]) => ({
+    sessionManager: { getBranch: () => entries },
+  });
+  const assistant = (stopReason: string) =>
+    ({ type: "message", message: { role: "assistant", stopReason } });
+  // The last assistant message is the run that just settled: an earlier
+  // turn that was interrupted says nothing about this one.
+  assertEq(settledAborted(ctx([
+    assistant("aborted"),
+    { type: "message", message: { role: "user" } },
+    assistant("stop"),
+  ])), false, "the last run finished");
+  assertEq(settledAborted(ctx([
+    assistant("stop"),
+    { type: "message", message: { role: "user" } },
+    assistant("aborted"),
+  ])), true, "the last run was interrupted");
+  // No payload, no evidence, no abort: never invent one.
+  assertEq(settledAborted(undefined), false, "no ctx");
+  assertEq(settledAborted({}), false, "no session manager");
+  assertEq(settledAborted(ctx([])), false, "an empty branch");
+  assertEq(settledAborted({
+    sessionManager: { getBranch: () => { throw new Error("torn"); } },
+  }), false, "an unreadable branch");
+});
+
 test("daemon: factory wires the command and events", () => {
   const pi = new MockPi();
   factory(pi as never);
@@ -305,9 +333,11 @@ test("daemon: factory wires the command and events", () => {
     "daemon-purge command registered");
   assert(pi.tools.has("daemon_gc_reap"), "gc reap tool registered");
   assertEq(pi.onCalls.get("session_start") ?? 0, 4, "four session_start listeners");
-  assertEq(pi.onCalls.get("session_shutdown") ?? 0, 2);
+  assertEq(pi.onCalls.get("session_shutdown") ?? 0, 3);
   assertEq(pi.onCalls.get("before_agent_start") ?? 0, 1);
-  assertEq(pi.onCalls.get("agent_end") ?? 0, 1);
+  // Only a settled run publishes idle: agent_end fires before retries,
+  // compaction recovery and queued follow-ups have finished.
+  assertEq(pi.onCalls.get("agent_end") ?? 0, 0);
   assertEq(pi.onCalls.get("agent_settled") ?? 0, 1);
   assertEq(pi.onCalls.get("session_before_switch") ?? 0, 1);
 });
@@ -506,7 +536,7 @@ test("daemon: session_shutdown stops the watcher (no leaked watchers)", async ()
       factory(pi as never);
       await pi.sessionStarters[0]({ reason: "startup" });
       // the factory's session_shutdown handlers tear the watchers down
-      assertEq(pi.shutdownHandlers.length, 2);
+      assertEq(pi.shutdownHandlers.length, 3);
       await pi.shutdownHandlers[0]({ reason: "reload" });
       const sig = join(state, "pi-pty-host", "extensions-reload",
         "pi-sigstop.json");

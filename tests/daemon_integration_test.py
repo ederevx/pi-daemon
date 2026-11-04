@@ -233,6 +233,13 @@ def _main():
         fail("session state", r.stderr)
     else:
         ok("session state busy")
+    # The run-outcome record answers from the daemon, not from the session:
+    # an open record reports the state its publisher last sent.
+    r = pi_rc("run-state", "itest")
+    if not r.stdout.startswith("running") or "busy" not in r.stdout:
+        fail("run-state while running", f"out={r.stdout!r} err={r.stderr!r}")
+    else:
+        ok("run-state reports a live run in flight")
     # -- reload is strictly in-place: it must never spawn anything ------
     conv = os.path.join(SCRATCH, "conv-itest.jsonl")
     open(conv, "w").close()
@@ -296,6 +303,13 @@ def _main():
         fail("session gone after stop", r.stdout)
     else:
         ok("session ended")
+    # The record survives the session: a consented stop is sealed by the
+    # daemon, and a name it no longer hosts still answers.
+    r = pi_rc("run-state", "itest")
+    if not r.stdout.startswith("stopped"):
+        fail("run-state after stop", f"out={r.stdout!r} err={r.stderr!r}")
+    else:
+        ok("run-state outlives the stopped session")
 
     r = pi_rc("start", "a", "b", "c")  # start takes at most name+dir
     if r.returncode == 0:

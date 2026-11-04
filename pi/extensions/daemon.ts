@@ -97,6 +97,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { DaemonSettingsPresenter } from "./settings/presenter.ts";
+import { RunStatePublisher } from "./session-state/publisher.ts";
 
 /** Directory of this extension module, when loaded as an ES module. */
 function moduleDir(): string {
@@ -696,6 +697,29 @@ export class GcReapWatcher {
 	}
 }
 
+/** True when the run that just settled was interrupted: pi records a
+ *  user abort as `stopReason: "aborted"` on the assistant message it was
+ *  producing, and `agent_settled` itself carries no payload. Only an
+ *  unreadable branch reads as a clean finish - the record then says
+ *  settled, which is the conservative claim: it never invents an abort. */
+export function settledAborted(ctx?: any): boolean {
+	try {
+		const manager = ctx?.sessionManager;
+		const entries: any[] = manager?.getBranch?.()
+			?? manager?.getEntries?.() ?? [];
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i];
+			if (entry?.type !== "message") continue;
+			const message = entry.message;
+			if (message?.role !== "assistant") continue;
+			return message.stopReason === "aborted";
+		}
+	} catch {
+		// A branch this extension cannot read is not evidence of an abort.
+	}
+	return false;
+}
+
 export class RcBackground {
 	/** Session file already reported to the daemon; skipped announces
 	 *  keep the per-prompt hook free of execs. */
@@ -930,22 +954,34 @@ export class RcBackground {
 		}
 	}
 
+	/** The runtime is going away: no further publish describes this
+	 *  session (see the publisher module). */
+	stopPublishing(): void {
+		RunStatePublisher.shared.stop();
+	}
+
 	/** Publish whether the model is working so other terminals can see
 	 *  the state in `pi-rc ls` and attach notices without attaching.
 	 *  Skipped without a session file: hosted `--no-session` children
 	 *  (one-shots) inherit this session's name in their env,
 	 *  and their start/end would otherwise overwrite the working
 	 *  session's daemon-side state. Fire-and-forget: cosmetic only when
-	 *  the daemon is unreachable. */
-	async setState(state: "busy" | "idle", ctx?: any): Promise<void> {
+	 *  the daemon is unreachable.
+	 *
+	 *  The daemon keeps these publishes as a durable run-outcome record,
+	 *  so two rules matter here: nothing is published after
+	 *  session_shutdown, which always runs before dispose — a turn
+	 *  killed mid-flight must stay `busy` and read as a death, not as a
+	 *  settle — and `aborted` rides along with the idle publish so an
+	 *  interrupted turn is never mistaken for a finished one. `seq`
+	 *  orders this publisher against the offload one. */
+	async setState(state: "busy" | "idle" | "waiting", aborted = false,
+		ctx?: any): Promise<void> {
 		const session = this.hostedSession();
 		if (!session) return;
 		if (ctx && !ctx?.sessionManager?.getSessionFile?.()) return;
-		try {
-			await this.runPiRc( ["state", session, state]);
-		} catch {
-			// State display is best-effort.
-		}
+		await RunStatePublisher.shared.publish((args) => this.runPiRc(args),
+												session, state, aborted);
 	}
 
 	/** The daemon closes every attached client bridge for this session;
@@ -1367,7 +1403,7 @@ export default function (pi: ExtensionAPI) {
 			);
 		}
 		await app.announce(ctx);
-		await app.setState("idle", ctx);
+		await app.setState("idle", false, ctx);
 	});
 	// After an in-place /reload (daemon-triggered extension updates) do
 	// the reload silently: consume the daemon's diff stamp so a later
@@ -1383,16 +1419,19 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("before_agent_start", async (_event, ctx) => {
 		await app.announce(ctx);
-		await app.setState("busy", ctx);
+		await app.setState("busy", false, ctx);
 	});
-	// The loop ended; agent_settled additionally covers automatic retries,
-	// compaction retries and queued follow-ups. Both report the same idle
-	// state, so whichever lands last leaves the correct value behind.
-	pi.on("agent_end", async (_event, ctx) => {
-		await app.setState("idle", ctx);
-	});
+	// A run reports idle only once it has really settled: retries,
+	// compaction recovery and queued follow-ups continue the run after
+	// agent_end without re-firing before_agent_start, so publishing there
+	// would leave a finished-looking state on a session still working.
+	// The event itself carries no payload, so the abort has to be read
+	// off the run it just finished.
 	pi.on("agent_settled", async (_event, ctx) => {
-		await app.setState("idle", ctx);
+		await app.setState("idle", settledAborted(ctx), ctx);
+	});
+	pi.on("session_shutdown", async () => {
+		app.stopPublishing();
 	});
 	pi.on("session_before_switch", async (event, ctx) => {
 		return app.beforeSwitch(event, ctx);

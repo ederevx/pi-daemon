@@ -72,6 +72,15 @@
 #                                       is unreachable); used by the pi
 #                                       wrapper's resume guard
 #   pi-rc stop <name>                   kill one session (ends that pi)
+#   pi-rc run-state <name>              how that session's last run ended:
+#                                       settled, died-mid-run,
+#                                       exited-mid-run, run-aborted,
+#                                       crashed-at-prompt, reload-death,
+#                                       stopped, daemon-stopped,
+#                                       lost-mid-run, lost-at-prompt, or
+#                                       unknown; read from the durable
+#                                       record, so a name the daemon no
+#                                       longer hosts still answers
 #   pi-rc gc-reap-ack <name>            the daemon extension's answer to
 #                                       the daemon's GC reap request: clear
 #                                       the request and the registry entry
@@ -205,7 +214,8 @@ USAGE_LINE = "usage: pi-rc <command> [args]; run 'pi-rc help' for details"
 DETACH_KEY = b"\x1c"  # Ctrl-\: pop out of an attached session without exiting pi
 
 # Commands served by main(); ls has a list alias.
-_COMMANDS = ("which", "whichall", "owned", "state", "carry", "resume", "start",
+_COMMANDS = ("which", "whichall", "owned", "state", "run-state",
+			 "carry", "resume", "start",
 			 "attach", "announce", "detach", "stop", "gc-reap-ack", "handover",
 			 "daemon-start", "daemon-stop", "daemon-restart",
 			 "daemon-purge",
@@ -955,14 +965,63 @@ def cmd_whichall(args, client):
 def cmd_state(args, client):
 	# Published by the daemon extension: whether the model is
 	# working or idle in this hosted session; surfaced by ls and attach.
-	if len(args) != 2:
-		usage_error("state takes exactly a session name and busy|idle|waiting")
-	if args[1] not in ("busy", "idle", "waiting"):
+	# --seq orders two publishers in one session (the extension's
+	# monotonic stamp) and --aborted records that the turn was
+	# interrupted, which is what separates a run-aborted from a settle.
+	seq = None
+	aborted = None
+	rest = []
+	i = 0
+	while i < len(args):
+		if args[i] == "--seq" and i + 1 < len(args):
+			try:
+				seq = int(args[i + 1])
+			except ValueError:
+				usage_error("--seq takes an integer")
+			i += 2
+			continue
+		if args[i] == "--aborted":
+			aborted = True
+			i += 1
+			continue
+		rest.append(args[i])
+		i += 1
+	if len(rest) != 2:
+		usage_error("state takes a session name and busy|idle|waiting")
+	if rest[1] not in ("busy", "idle", "waiting"):
 		usage_error("state must be busy, idle, or waiting")
-	session = session_name(args[0])
-	resp = client.control({"cmd": "state", "name": session, "state": args[1]})
+	session = session_name(rest[0])
+	req = {"cmd": "state", "name": session, "state": rest[1]}
+	if seq is not None:
+		req["seq"] = seq
+	if aborted is not None:
+		req["aborted"] = aborted
+	resp = client.control(req)
 	if not resp.get("ok"):
 		die("state failed: %s" % resp.get("error"))
+
+
+def cmd_run_state(args, client):
+	# How a session's last run ended, read from the daemon's durable
+	# record: the answer survives the session itself, so a name the daemon
+	# no longer hosts still answers.
+	if len(args) != 1:
+		usage_error("run-state takes exactly one session name")
+	resp = client.control({"cmd": "run-state",
+						   "name": session_name(args[0])})
+	if not resp.get("ok"):
+		die("run-state failed: %s" % resp.get("error"))
+	rec = resp.get("record")
+	if rec is None:
+		print("unknown")
+		return
+	ended = rec.get("ended") or {}
+	if rec.get("open"):
+		print("running\t%s\t%s" % (rec.get("name", resp.get("name")),
+								   rec.get("state")))
+		return
+	print("%s\t%s\t%s" % (ended.get("verdict"),
+						ended.get("cause") or "-", ended.get("state")))
 
 
 def cmd_stop(args, client):
@@ -1440,7 +1499,7 @@ def main():
 		cmd_ls(rest, client)
 	elif cmd in _COMMANDS:
 		{"which": cmd_which, "whichall": cmd_whichall, "owned": cmd_owned,
-		 "state": cmd_state,
+		 "state": cmd_state, "run-state": cmd_run_state,
 		 "carry": cmd_carry, "resume": cmd_resume, "start": cmd_start,
 		 "attach": cmd_attach, "announce": cmd_announce,
 		 "detach": cmd_detach, "stop": cmd_stop,
