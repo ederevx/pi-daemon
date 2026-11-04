@@ -189,8 +189,9 @@ attached and busy sessions are never purged.
   [--aborted]`), so the recorded state - not the exit status - decides
   whether a run that stopped looks finished. The publish is best-effort:
   one that never reached the daemon leaves the record at its last state,
-  and the session's conversation is then the only other evidence. `settled` (idle published, clean exit), `run-aborted`
-  (the user interrupted it), `exited-mid-run` (the process went away
+  and the session's conversation is then the only other evidence.
+  `settled` (idle published, clean exit), `run-aborted` (the user
+  interrupted it), `exited-mid-run` (the process went away
   mid-turn but exited 0 - including a handled `SIGTERM`/`SIGHUP`, which is
   pi's own signal path: it disposes the runtime, then exits 0) and
   `died-mid-run` (a nonzero exit or an uncaught signal), `lost-mid-run`
