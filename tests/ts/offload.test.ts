@@ -317,6 +317,10 @@ test("offload: submit queues and the armed watcher delivers on completion", asyn
   const content = (sent!.message as { content?: string }).content ?? "";
   assertMatches(content, /Background task finished: echo hi/);
   assertMatches(content, /ticket t-1 done/);
+  // The delivery triggers a turn without a before_agent_start, so the
+  // watcher publishes busy itself or the run reads as idle while it works.
+  assert(pi.execCalls.some((c) => c.args[0] === "state" && c.args[2] === "busy"),
+    "the triggered turn is published as busy");
 });
 
 test("offload: daemon_tasks status/result/list/cancel/remove/reset", async () => {

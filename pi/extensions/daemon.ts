@@ -1198,6 +1198,10 @@ export default function (pi: ExtensionAPI) {
 	// message telling the agent to call the daemon_gc_reap tool.
 	const gcReapWatcher = new GcReapWatcher(
 		gcReapRequestPath(), (_name, path) => {
+			// A turn started this way emits no before_agent_start (pi runs
+			// the message through its own prompt path), so the publisher
+			// would leave the record idle while the agent works on it.
+			void app.setState("busy");
 			void pi.sendMessage(
 				"pi-daemon: this session has been detached and model-idle " +
 				"past the GC window. Call the `daemon_gc_reap` tool to reap " +

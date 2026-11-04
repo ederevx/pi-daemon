@@ -303,7 +303,7 @@ RUN_STATE_RETENTION = SETTINGS.resolve(
 RUN_STATE_POLL = SETTINGS.resolve("PI_PTYD_RUN_BEAT", "runBeatSeconds",
 								  10.0)
 RUN_STATE_STALE = SETTINGS.resolve("PI_PTYD_RUN_BEAT_STALE",
-								"runBeatStaleSeconds", 45.0)
+								   "runBeatStaleSeconds", 45.0)
 # pi's conversation store: every slug directory pi's /resume picker
 # lists lives under here in the agent home. The session store GC sweeps
 # aged, unheld conversations from it.
@@ -2719,7 +2719,7 @@ class SessionSpawner:
 		if self.owner is not None:
 			self.owner.run_state.open(
 				name, argv_session_file(list(registry_argv)
-									if registry_argv else list(argv)),
+										if registry_argv else list(argv)),
 				child.pid)
 		log("%s '%s' pid %d in %s" % (verb, name, child.pid, dir_))
 		t = threading.Thread(target=sess.relay_loop, args=(self.owner,),

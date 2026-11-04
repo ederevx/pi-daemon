@@ -568,6 +568,11 @@ test("daemon: gc reap request steers the agent once per request", async () => {
         "the request names the tool to call");
       assert(pi.messages[0].includes(sig),
         "the request names the file");
+      // The message triggers a turn without a before_agent_start, so the
+      // watcher publishes busy itself or the run reads as idle while the
+      // agent is working on the request.
+      assert(pi.execCalls.some((c) => c.args[0] === "state" &&
+        c.args[2] === "busy"), "the triggered turn is published as busy");
       // re-arming the same watcher never re-asks an open request
       await pi.sessionStarters[1]({ reason: "startup" });
       await new Promise((resolve) => setTimeout(resolve, 150));

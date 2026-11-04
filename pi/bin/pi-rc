@@ -1021,7 +1021,7 @@ def cmd_run_state(args, client):
 								   rec.get("state")))
 		return
 	print("%s\t%s\t%s" % (ended.get("verdict"),
-						ended.get("cause") or "-", ended.get("state")))
+						  ended.get("cause") or "-", ended.get("state")))
 
 
 def cmd_stop(args, client):

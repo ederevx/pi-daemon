@@ -53,6 +53,11 @@ test("session-state: a failing publish never throws", async () => {
 	await new RunStatePublisher().publish(async () => {
 		throw new Error("daemon down");
 	}, "pi-d", "idle");
+	// A host that throws before it has a promise to reject: the caller is a
+	// turn about to work, so the publish must stay silent, not abort it.
+	await new RunStatePublisher().publish(() => {
+		throw new Error("no such command");
+	}, "pi-d", "idle");
 });
 
 // Last: the stop is process-wide on purpose.

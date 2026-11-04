@@ -74,9 +74,15 @@ export class RunStatePublisher {
 			"state", session, state, "--seq", String(this.state.seq++),
 		];
 		if (aborted) args.push("--aborted");
-		return Promise.resolve(exec(args)).then(
-			() => undefined,
-			() => undefined,
-		);
+		// A host that throws before it launches the client must not abort the
+		// publish's caller, either: the caller is a turn that is about to work.
+		try {
+			return Promise.resolve(exec(args)).then(
+				() => undefined,
+				() => undefined,
+			);
+		} catch {
+			return Promise.resolve();
+		}
 	}
 }

@@ -712,6 +712,10 @@ class DaemonTasks {
 				// its renderer draws a card collapsed to one outcome-
 				// colored line, expanding to the full result the agent
 				// receives.
+				// A turn started this way emits no before_agent_start (pi runs
+				// the message through its own prompt path), so without this
+				// the record would say idle while the agent works on it.
+				this.setSessionState("busy");
 				this.send(
 					{
 						customType: "daemon-task",
