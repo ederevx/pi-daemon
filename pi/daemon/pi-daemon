@@ -994,7 +994,7 @@ class RunLedger:
 		# untouched - it is still running and will seal them itself. The
 		# classification and the seal share the lock, so a record that a
 		# starting session rewrites in between is never sealed behind it.
-		for rec, path, name in self._records():
+		for _rec, path, name in self._records():
 			with self._lock:
 				rec = self._load(path)
 				if not isinstance(rec, dict) or not rec.get("open"):
