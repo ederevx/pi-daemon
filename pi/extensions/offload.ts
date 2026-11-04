@@ -493,7 +493,7 @@ export class TicketClient {
 	/** Publishes a run-state for a session daemon-side (pi-rc state),
 	 *  best-effort: never throws, cosmetic when the daemon is down. The
 	 *  publisher module owns the seq stamp, the abort flag and the
-	 *  stop-at-shutdown rule shared with the backgrounding extension. */
+	 *  stop-at-a-quit rule shared with the backgrounding extension. */
 	async setState(session: string, state: string,
 		aborted = false): Promise<void> {
 		await RunStatePublisher.shared.publish((args) => this.runner.run(this.piRc, args),
