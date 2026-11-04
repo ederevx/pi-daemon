@@ -1,6 +1,6 @@
 /**
  * The one run-state publisher: seq ordering, the aborted flag, and the
- * stop-at-session_shutdown rule.
+ * stop-at-a-quit rule.
  *
  * The counter and the stop flag are process-wide on purpose (pi loads
  * each extension as its own module instance), so this file runs last in
