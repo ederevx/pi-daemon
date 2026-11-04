@@ -21,7 +21,8 @@ import "./settings.test.ts";
 import "./provisioning.test.ts";
 import "./settings-reconciler.test.ts";
 import "./transcript.test.ts";
-// Last: its stop-at-shutdown test stops publishing for the whole process.
+// Isolated from the process-wide state each test needs: this file drives
+// its own SharedState instances, and its last test stops publishing.
 import "./session-state.test.ts";
 
 await registry.runAll();
