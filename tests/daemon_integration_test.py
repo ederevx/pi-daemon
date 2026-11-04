@@ -311,6 +311,39 @@ def _main():
     else:
         ok("run-state outlives the stopped session")
 
+    # -- a mid-run kill is a death, never a settle ----------------------
+    # The signal path is the case the whole record exists for: pi killed by
+    # SIGTERM mid-turn exits 0, so only the recorded state can tell this
+    # apart from a finished run. Publishing busy is what the extension does
+    # at before_agent_start; killing the child then must leave that state
+    # standing (nothing publishes after session_shutdown, which never runs
+    # on a signal death) and the daemon must seal the record as a death.
+    resp = wire({"cmd": "start", "name": "pi-itest-kill", "dir": SCRATCH,
+                 "argv": ["sh", "-c", "exec sleep 30"],
+                 "cols": 80, "rows": 24})
+    if not resp.get("ok"):
+        fail("kill-test start", str(resp))
+    r = pi_rc("state", "itest-kill", "busy")
+    if r.returncode != 0:
+        fail("kill-test state", r.stderr)
+    pid = next((s["pid"] for s in wire({"cmd": "list"}).get("sessions", [])
+                if s["name"] == "pi-itest-kill"), None)
+    if not pid:
+        fail("kill-test pid", "session not listed")
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if not any(s["name"] == "pi-itest-kill"
+                   for s in wire({"cmd": "list"}).get("sessions", [])):
+            break
+        time.sleep(0.1)
+    r = pi_rc("run-state", "itest-kill")
+    if not r.stdout.startswith("died-mid-run"):
+        fail("run-state after a mid-run SIGTERM",
+             f"out={r.stdout!r} err={r.stderr!r}")
+    else:
+        ok("run-state calls a mid-run signal death a death, not a settle")
+
     r = pi_rc("start", "a", "b", "c")  # start takes at most name+dir
     if r.returncode == 0:
         fail("pi-rc usage guard", r.stdout)
