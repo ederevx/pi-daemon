@@ -68,6 +68,13 @@ export class RunStatePublisher {
 		}
 	}
 
+	/** session_start: a runtime that starts after a quit in the same
+	 *  process may publish again - a stop guards the session that ended, not
+	 *  the process it happened to live in. */
+	resume(): void {
+		this.state.stopped = false;
+	}
+
 	/** Publish one state change for `session`. Errors never surface: the
 	 *  state is display and evidence, never a control signal. */
 	publish(

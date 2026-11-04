@@ -1188,6 +1188,9 @@ export default function (pi: ExtensionAPI) {
 	// session runtime; session_shutdown tears it down so a reload or
 	// session switch never leaks a watcher.
 	pi.on("session_start", async () => {
+		// A quit stops publishing for the session it guarded, not for the
+		// process: if pi starts another runtime here, it must be visible.
+		RunStatePublisher.shared.resume();
 		reloadWatcher.start();
 	});
 	pi.on("session_shutdown", async () => {

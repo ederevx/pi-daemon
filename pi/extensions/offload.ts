@@ -1484,6 +1484,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		RunStatePublisher.shared.resume();
 		await tasks.rearm(ctx?.sessionManager?.getSessionFile?.() ?? null);
 	});
 	pi.on("session_shutdown", async (event) => {

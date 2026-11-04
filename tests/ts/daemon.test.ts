@@ -348,6 +348,8 @@ class MockPi {
   readonly onCalls = new Map<string, number>();
   readonly sessionStarters: Array<(event: any) => Promise<void>> = [];
   readonly shutdownHandlers: Array<(event: any) => Promise<void>> = [];
+  readonly agentStarters:
+    Array<(event: any, ctx: any) => Promise<void>> = [];
   readonly beforeSwitchHandlers:
     Array<(event: any, ctx: any) => Promise<any>> = [];
   readonly messages: string[] = [];
@@ -357,6 +359,7 @@ class MockPi {
     this.onCalls.set(name, (this.onCalls.get(name) ?? 0) + 1);
     if (name === "session_start") this.sessionStarters.push(handler);
     if (name === "session_shutdown") this.shutdownHandlers.push(handler);
+    if (name === "agent_start") this.agentStarters.push(handler);
     if (name === "session_before_switch") {
       this.beforeSwitchHandlers.push(handler);
     }
@@ -654,6 +657,34 @@ test("daemon: daemon_gc_reap never shuts an unhosted session down", async () => 
         "unhosted session must not shut down");
       assert(String(result.content[0].text).includes("not a hosted"),
         "the tool reports nothing to reap");
+    });
+  });
+});
+
+test("daemon: a quit silences publishing, the next session start lifts it", async () => {
+  const state = join(scratchDir(), "publish-lifecycle");
+  await hosted("pi-lifecycle", async () => {
+    await withEnv({ XDG_STATE_HOME: state }, async () => {
+      const pi = new MockPi();
+      factory(pi as never);
+      const publishes = () => pi.execCalls.filter(
+        (c) => c.args[0] === "state" && c.args[2] === "busy").length;
+      // session_start listeners: [reload watcher, gc reap watcher]; the
+      // publish stop is the last session_shutdown listener registered.
+      await pi.sessionStarters[0]({ reason: "startup" });
+      await pi.agentStarters[0]({}, ctx());
+      assertEq(publishes(), 1, "a run publishes busy from agent_start");
+      // A quit ends the runtime the stop guarded: a late publish is silent,
+      // or a turn killed on the way out would rewrite the busy record.
+      await pi.shutdownHandlers[pi.shutdownHandlers.length - 1](
+        { reason: "quit" });
+      await pi.agentStarters[0]({}, ctx());
+      assertEq(publishes(), 1, "a dying runtime publishes nothing");
+      // The next runtime in this process must publish again, or every turn
+      // after the first quit would be invisible.
+      await pi.sessionStarters[0]({ reason: "startup" });
+      await pi.agentStarters[0]({}, ctx());
+      assertEq(publishes(), 2, "the next session publishes");
     });
   });
 });
