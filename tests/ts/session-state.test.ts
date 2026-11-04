@@ -1,10 +1,10 @@
 /**
- * The one run-state publisher: seq ordering, the aborted flag, and the
+ * The one run-state publisher: seq ordering, the abort flag, and the
  * stop-at-a-quit rule.
  *
- * The counter and the stop flag are process-wide on purpose (pi loads
- * each extension as its own module instance), so this file runs last in
- * the suite and its stop test runs last in the file.
+ * The counter and the stop flag are process-wide on purpose (pi loads each
+ * extension as its own module instance), so one test here drives two copies
+ * of this module at once; the rest build their own SharedState.
  */
 
 import { test, assert, assertEq, assertMatches } from "./harness.ts";
@@ -35,20 +35,23 @@ test("session-state: a publish carries the state, a seq and no abort", async () 
 	const { calls, exec } = recorder();
 	await publisher().publish(exec, "pi-a", "busy");
 	assertEq(calls.length, 1, "one call");
-	assertMatches(calls[0].join(" "), /^state pi-a busy --seq \d+$/,
-		"state, session, state, seq");
+	assertMatches(calls[0].join(" "), /^state pi-a busy --seq \d+ --pid \d+$/,
+		"state, session, state, seq, the publishing process");
 });
 
 test("session-state: two publishers share one counter", async () => {
 	// pi loads daemon.ts and offload.ts as separate module instances, so a
 	// module-level singleton would give each its own counter and one
-	// publisher's stamps would sink under the other's for good.
+	// publisher's stamps would sink under the other's for good. A
+	// cache-busting specifier is that same duplication inside one process.
+	const copy = await import(
+		"../../pi/extensions/session-state/publisher.ts?copy=2");
+	assert(copy.RunStatePublisher !== RunStatePublisher, "two module copies");
 	const { calls, exec } = recorder();
 	// One SharedState stands for the one globalThis object both module
 	// copies reach through the registered symbol.
-	const state = new SharedState();
-	await new RunStatePublisher(state).publish(exec, "pi-b", "busy");
-	await new RunStatePublisher(state).publish(exec, "pi-b", "idle", true);
+	await copy.RunStatePublisher.shared.publish(exec, "pi-b", "busy");
+	await RunStatePublisher.shared.publish(exec, "pi-b", "idle", true);
 	assertEq(Number(calls[1][4]), Number(calls[0][4]) + 1,
 		"one counter for the process");
 });
@@ -71,16 +74,19 @@ test("session-state: a failing publish never throws", async () => {
 });
 
 test("session-state: a quit stops every publisher", async () => {
+	// The copy is the other extension's instance of this module: the stop
+	// must reach it too, or one extension keeps publishing a dying run as
+	// idle. Lifted afterwards, so the flag guards the session that quit and
+	// not the process it lived in.
+	const copy = await import(
+		"../../pi/extensions/session-state/publisher.ts?copy=2");
 	const { calls, exec } = recorder();
-	const state = new SharedState();
-	const first = new RunStatePublisher(state);
-	first.stop("quit");
-	// A second instance is the other extension's copy of this module: the
-	// stop reaches it too, or one extension would keep publishing a dying
-	// run as idle.
-	await new RunStatePublisher(state).publish(exec, "pi-e", "idle");
-	await first.publish(exec, "pi-e", "idle");
+	copy.RunStatePublisher.shared.stop("quit");
+	await RunStatePublisher.shared.publish(exec, "pi-e", "idle");
 	assertEq(calls.length, 0, "a dying runtime publishes nothing");
+	await RunStatePublisher.shared.publish(exec, "pi-e", "idle", true);
+	assertEq(calls.length, 0, "nor does an aborted one");
+	RunStatePublisher.shared.resume();
 });
 
 test("session-state: a reload keeps publishing, with one climbing seq", async () => {

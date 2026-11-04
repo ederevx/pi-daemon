@@ -8,7 +8,9 @@ with a real daemon object (never `serve()`/`shutdown()` - shutdown ends
 in os._exit and would kill the test process).
 """
 
+import contextlib
 import importlib.util
+import io
 import base64
 import json
 import os
@@ -2363,9 +2365,10 @@ def test_run_ledger_stale_publish_and_replaced_child():
     led.transition("pi-s", "busy", seq=5, now=101.0)
     # A publish older than the record never touches the session's state
     # either: the display and every decision that reads it follow the record.
-    assert_eq(led.fresh("pi-s", 4), False)
-    assert_eq(led.fresh("pi-s", 5), True)
-    assert_eq(led.fresh("pi-s", None), True)
+    rec = led.read("pi-s")
+    assert_eq(led._accepting(rec, None, 4), False)
+    assert_eq(led._accepting(rec, None, 5), True)
+    assert_eq(led._accepting(rec, None, None), True)
 
     # A respawn has taken the name since: the old child's exit must not seal
     # the record that now belongs to its successor.
@@ -2440,6 +2443,132 @@ def test_run_ledger_owner_scoping():
     assert_eq(succ.read("pi-open")["open"], True)
 
 
+def test_run_ledger_publish_keeps_the_display_in_step():
+    # A publish is one write path: the freshness check, the session's own
+    # state and the record move under the ledger lock. Checked separately,
+    # two control threads let the older publish assign the display after
+    # the newer one did, and every reader of the display acts on a state
+    # the record has already left behind. It is also the child check's only
+    # other gate: a client that outlives its pi must not reach the record
+    # its successor opened.
+    root = os.path.join(SCRATCH, "run-state-publish")
+    led = daemon.RunLedger(root, os.getpid(), "tok", boot="b")
+    led.open("pi-p", None, 4242, now=100.0)
+
+    class Fake:
+        name = "pi-p"
+        file = None
+
+        def __init__(self):
+            self.state = "idle"
+            self.activity = 0
+
+        def touch_activity(self):
+            self.activity += 1
+
+    sess = Fake()
+    assert_eq(led.publish(sess, "busy", seq=5, pid=4242), True,
+              "a fresh publish from the hosted child moves the record")
+    assert_eq(sess.state, "busy", "and the session shows it")
+    assert_eq(sess.activity, 1, "and it counts as activity")
+
+    # An older publish changes neither: not the record, and not the display.
+    assert_eq(led.publish(sess, "idle", seq=4, pid=4242), False)
+    assert_eq(sess.state, "busy", "the display never follows a stale publish")
+    rec = led.read("pi-p")
+    assert_eq((rec["state"], rec["seq"]), ("busy", 5))
+
+    # A revive opens the record for its successor: the killed pi's client
+    # can still deliver a publish, with a seq that would outrank every one
+    # the new process has stamped yet.
+    led.open("pi-p", None, 4343, now=102.0)
+    assert_eq(led.publish(sess, "idle", seq=6, pid=4242), False,
+              "a replaced child's publish is refused")
+    rec = led.read("pi-p")
+    assert_eq((rec["state"], rec["seq"], rec["run"]), ("idle", 0, 0),
+              "the successor's record is untouched")
+    assert_eq(led.transition("pi-p", "idle", seq=7, pid=4242), False,
+              "the record-level path refuses it too")
+
+    assert_eq(led.publish(sess, "busy", seq=0, pid=4343), True,
+              "the hosted child publishes from its own seq")
+    assert_eq(sess.state, "busy")
+    assert_eq(led.read("pi-p")["run"], 1)
+
+    # A session this daemon could not ledger - a live peer owns its record -
+    # still shows busy: the display is this daemon's own, and the peer's
+    # record is none of our business. The gate that refuses a replaced
+    # child's publish must not reach this far, or the idle watch and the
+    # reaper read a frozen display while the session works.
+    child = subprocess.Popen([sys.executable, "-c",
+                              "import time; time.sleep(20)"])
+    try:
+        token = daemon.PROCESS.process_start_token(child.pid)
+        peer = daemon.RunLedger(root, child.pid, token, boot="b")
+        peer.open("pi-peerpub", None, 7777, now=100.0)
+        assert_eq(peer.transition("pi-peerpub", "busy", seq=3, now=101.0),
+                  True)
+        assert_eq(led.open("pi-peerpub", None, 8888, now=102.0), None,
+                  "a live peer's record is not taken over")
+        mine = Fake()
+        mine.name = "pi-peerpub"
+        assert_eq(led.publish(mine, "busy", seq=4, pid=8888), False)
+        assert_eq(mine.state, "busy", "the display follows the publish anyway")
+        assert_eq(mine.activity, 1, "and the run counts as activity")
+        assert_eq((peer.read("pi-peerpub")["state"],
+                   peer.read("pi-peerpub")["seq"]), ("busy", 3),
+                  "the peer's record is untouched")
+    finally:
+        child.kill()
+        child.wait()
+
+
+def _run_state_lines(rec, hosted=False):
+    class Client:
+        def control(self, req):
+            return {"ok": True, "name": req["name"], "record": rec,
+                    "hosted": hosted}
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        # The wire name is bare: the client prefixes "pi-" itself.
+        pi_rc.cmd_run_state(["r"], Client())
+    return out.getvalue().splitlines()
+
+
+def test_run_state_reader_shows_carried_deaths():
+    # A death, a revive, then an exit at the prompt: the newest seal says
+    # settled, and the death the reopen carried must still be readable or
+    # the reader is told a run that died in flight finished.
+    root = os.path.join(SCRATCH, "run-state-read")
+    led = daemon.RunLedger(root, os.getpid(), "tok", boot="b")
+    led.open("pi-r", None, 4242, now=100.0)
+    led.transition("pi-r", "busy", seq=1, now=101.0)
+    led.close("pi-r", kind="exit", abnormal=True, signal=9, now=110.0)
+    led.open("pi-r", None, 5252, now=120.0)
+    led.transition("pi-r", "idle", seq=1, now=121.0)
+    led.close("pi-r", kind="exit", now=130.0)
+    rec = led.read("pi-r")
+    assert_eq(rec["ended"]["verdict"], "settled")
+    assert_eq([e["verdict"] for e in rec["history"]], ["died-mid-run"])
+    assert_eq(_run_state_lines(rec),
+              ["settled\t-\tidle",
+               "previous\tdied-mid-run\tsignal\tbusy"],
+              "the newest line first, the carried death after it")
+
+    # A live session prints its state, the seal it reopened from, and what
+    # that seal carried.
+    led.open("pi-r", None, 6262, now=140.0)
+    led.transition("pi-r", "busy", seq=2, now=141.0)
+    assert_eq(_run_state_lines(led.read("pi-r"), hosted=True),
+              ["running\tpi-r\tbusy", "settled\t-\tidle",
+               "previous\tdied-mid-run\tsignal\tbusy"],
+              "a running session's last seal is still the answer")
+
+    # No record at all is an answer, not an error.
+    assert_eq(_run_state_lines(None), ["unknown"])
+
+
 def test_run_ledger_staleness():
     root = os.path.join(SCRATCH, "run-state-stale")
     led = daemon.RunLedger(root, os.getpid(), "tok", boot="b")
@@ -2478,6 +2607,10 @@ def _main():
        test_run_ledger_keeps_a_sealed_verdict_across_reopen)
     ok("run-outcome late publish and a replaced child",
        test_run_ledger_stale_publish_and_replaced_child)
+    ok("run-outcome publish moves display and record together, and only "
+       "for the hosted child", test_run_ledger_publish_keeps_the_display_in_step)
+    ok("run-state reader shows the seals a reopen carried",
+       test_run_state_reader_shows_carried_deaths)
     ok("run-outcome owner scoping (foreign, gone, recovery, retention)",
        test_run_ledger_owner_scoping)
     ok("run-outcome staleness (flag once, never stop)",

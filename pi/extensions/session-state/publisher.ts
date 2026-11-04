@@ -11,6 +11,10 @@
  * - one monotonic seq for the whole process, so the daemon can drop a
  *   publish that arrived out of order and a late `busy` cannot overwrite
  *   the `idle` that came after it;
+ * - every publish names this process, so the daemon can refuse a state
+ *   from a child it has already replaced: the client it launches survives
+ *   a killed pi, and without the name its request would land on the record
+ *   the session's successor has just opened, with a seq that outranks it;
  * - publishing stops at a quit, which pi always emits before it disposes
  *   the runtime. A turn killed mid-flight therefore keeps its `busy`
  *   record and is reported as a death, never as a settle - while a reload
@@ -86,6 +90,7 @@ export class RunStatePublisher {
 		if (this.state.stopped) return Promise.resolve();
 		const args = [
 			"state", session, state, "--seq", String(this.state.seq++),
+			"--pid", String(process.pid),
 		];
 		if (aborted) args.push("--aborted");
 		// A host that throws before it launches the client must not abort the

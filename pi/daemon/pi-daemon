@@ -857,15 +857,6 @@ class RunLedger:
 			return None
 		return pi_platform.AtomicStateFile(path).read_dict() or None
 
-	def fresh(self, name, seq):
-		# Is this publish newer than the record's? Two publishers in one
-		# session still race on the wire, so the extension stamps each
-		# publish and a stale one changes nothing - not the record and not
-		# what the session itself reports as its state.
-		if not isinstance(seq, int) or isinstance(seq, bool):
-			return True
-		return self._fresh(self.read(name), seq)
-
 	@staticmethod
 	def _fresh(rec, seq):
 		if not isinstance(seq, int) or isinstance(seq, bool):
@@ -909,45 +900,95 @@ class RunLedger:
 			return rec
 
 	def transition(self, name, state, seq=None, aborted=None, file=None,
-				   now=None):
-		# A published state change. Returns whether the record moved.
+				   now=None, pid=None):
+		# A published state change from a caller that holds no session
+		# object. Returns whether the record moved.
 		path = self.path_for(name)
 		if path is None:
 			return False
 		with self._lock:
-			rec = self._load(path)
-			if rec is None or not rec.get("open"):
+			return self._transition(self._load(path), path, state, seq,
+									aborted, file, now, pid)
+
+	def publish(self, sess, state, seq=None, aborted=None, pid=None):
+		# The one write path for a publish. The freshness check, the
+		# session's own state and the record move together under the ledger
+		# lock: control connections are served on their own threads, so a
+		# check made outside it lets the older of two publishes assign the
+		# session's state after the newer one already did, and every reader
+		# of that state (idle shutdown, GC reap, carry, reload) then acts on
+		# a state the record has already left behind.
+		path = self.path_for(sess.name)
+		with self._lock:
+			rec = None if path is None else self._load(path)
+			# The gate below guards a record this publish could write. A
+			# record this daemon does not own - a live peer's, which open()
+			# refused, or one a spawn is still replacing - is no reason to
+			# freeze the display: the session it belongs to is still working,
+			# and the idle watch and the reaper read that display.
+			writable = (isinstance(rec, dict) and rec.get("open")
+						and self._classify(rec) != "foreign")
+			if writable and not self._accepting(rec, pid, seq):
+				# The client a session launches can outlive it, and its
+				# publish would land on the record the successor opened with a
+				# seq that outranks the live process's. Refused, and said so.
+				if pid is not None and rec.get("child_pid") not in (None, pid):
+					log("run-state '%s': publish from pid %s, not the hosted "
+						"child" % (sess.name, pid))
 				return False
-			if self._classify(rec) == "foreign":
+			sess.state = state
+			sess.touch_activity()
+			if not writable:
 				return False
-			# Two publishers in one session still race on the wire, so the
-			# extension stamps each publish and a stale one is dropped.
-			if not self._fresh(rec, seq):
-				return False
-			before = (rec.get("state"), rec.get("aborted"), rec.get("seen"),
-					  rec.get("run"))
-			if isinstance(seq, int):
-				rec["seq"] = seq
-			if file:
-				rec["file"] = file
-			rec["seen"] = True
-			rec["suspected"] = False
-			if state == "busy":
-				# A new turn: the previous abort no longer describes it. Two
-				# hooks publish this same turn (before_agent_start and
-				# agent_start) and a retry re-fires neither into a new run, so
-				# only a real transition counts.
-				if rec.get("state") not in ("busy", "waiting"):
-					rec["run"] = int(rec.get("run") or 0) + 1
-				rec["aborted"] = False
-			elif aborted is not None:
-				rec["aborted"] = bool(aborted)
-			rec["state"] = state
-			rec["changed"] = time.time() if now is None else now
-			after = (rec.get("state"), rec.get("aborted"), rec.get("seen"),
-					 rec.get("run"))
-			self._write(path, rec)
-			return before != after
+			return self._transition(rec, path, state, seq, aborted,
+									sess.file, None, pid)
+
+	@staticmethod
+	def _accepting(rec, pid=None, seq=None):
+		# Is this publish from the child the record names, and newer than
+		# what the record holds? A closed record keeps its seq, so a late
+		# publish stays dropped after the seal as well.
+		if not isinstance(rec, dict):
+			return True
+		if pid is not None and rec.get("child_pid") not in (None, pid):
+			return False
+		return RunLedger._fresh(rec, seq)
+
+	def _transition(self, rec, path, state, seq, aborted, file, now,
+					pid=None):
+		# The record body of a publish; the caller holds the ledger lock.
+		if not isinstance(rec, dict) or not rec.get("open"):
+			return False
+		if self._classify(rec) == "foreign":
+			return False
+		# Two publishers in one session still race on the wire, so the
+		# extension stamps each publish and a stale one is dropped.
+		if not self._accepting(rec, pid, seq):
+			return False
+		before = (rec.get("state"), rec.get("aborted"), rec.get("seen"),
+				  rec.get("run"))
+		if isinstance(seq, int):
+			rec["seq"] = seq
+		if file:
+			rec["file"] = file
+		rec["seen"] = True
+		rec["suspected"] = False
+		if state == "busy":
+			# A new turn: the previous abort no longer describes it. Two
+			# hooks publish this same turn (before_agent_start and
+			# agent_start) and a retry re-fires neither into a new run, so
+			# only a real transition counts.
+			if rec.get("state") not in ("busy", "waiting"):
+				rec["run"] = int(rec.get("run") or 0) + 1
+			rec["aborted"] = False
+		elif aborted is not None:
+			rec["aborted"] = bool(aborted)
+		rec["state"] = state
+		rec["changed"] = time.time() if now is None else now
+		after = (rec.get("state"), rec.get("aborted"), rec.get("seen"),
+				 rec.get("run"))
+		self._write(path, rec)
+		return before != after
 
 	def close(self, name, kind="exit", abnormal=False, signal=None,
 			  code=None, now=None, child_pid=None):
@@ -1061,7 +1102,16 @@ class RunLedger:
 				continue
 			with self._lock:
 				fresh = self._load(self.path_for(sess.name))
-				if fresh is None or not fresh.get("open"):
+				# Reloaded, so classified and re-checked again: the record the
+				# flag lands on is the one under this lock, not the one the walk
+				# read before it.
+				if not isinstance(fresh, dict) or not fresh.get("open"):
+					continue
+				if self._classify(fresh) == "foreign":
+					continue
+				if fresh.get("state") not in ("busy", "waiting"):
+					continue
+				if fresh.get("suspected"):
 					continue
 				fresh["suspected"] = True
 				self._write(self.path_for(sess.name), fresh)
@@ -3701,24 +3751,23 @@ class Control:
 			return bad_request()
 		seq = req.get("seq")
 		aborted = req.get("aborted")
+		pid = req.get("pid")
 		if seq is not None and (not isinstance(seq, int) or isinstance(seq, bool)):
 			return bad_request()
 		if aborted is not None and not isinstance(aborted, bool):
 			return bad_request()
+		if pid is not None and (not isinstance(pid, int) or isinstance(pid, bool)):
+			return bad_request()
 		sess = self.daemon.table.get(name)
 		if sess is None:
 			return err("no-session")
-		# A late publish never rewrites what the session shows: the record
-		# keeps the newer state, and so does everything that reads the
-		# session's state (idle shutdown, GC reap, carry, reload).
-		if not self.daemon.run_state.fresh(name, seq):
-			return {"ok": True}
-		sess.state = state
-		sess.touch_activity()
-		# The record is written here, in the daemon, so the session's own
-		# process is never a second writer of run state.
-		self.daemon.run_state.transition(
-			name, state, seq=seq, aborted=aborted, file=sess.file)
+		# One write path, under the ledger's lock: a publish older than the
+		# record changes neither the record nor what the session shows, and
+		# so do the readers that follow (idle shutdown, GC reap, carry,
+		# reload). Neither does a publish from a child this session has
+		# replaced: the client can outlive the pi that launched it.
+		self.daemon.run_state.publish(
+			sess, state, seq=seq, aborted=aborted, pid=pid)
 		return {"ok": True}
 
 	def run_state(self, req):

@@ -971,10 +971,13 @@ def cmd_state(args, client):
 	# Published by the daemon extension: whether the model is
 	# working or idle in this hosted session; surfaced by ls and attach.
 	# --seq orders two publishers in one session (the extension's
-	# monotonic stamp) and --aborted records that the turn was
-	# interrupted, which is what separates a run-aborted from a settle.
+	# monotonic stamp), --aborted records that the turn was interrupted,
+	# which is what separates a run-aborted from a settle, and --pid names
+	# the publisher: the daemon refuses a state from a child it has already
+	# replaced, and the client can outlive the pi that launched it.
 	seq = None
 	aborted = None
+	pid = None
 	rest = []
 	i = 0
 	while i < len(args):
@@ -983,6 +986,13 @@ def cmd_state(args, client):
 				seq = int(args[i + 1])
 			except ValueError:
 				usage_error("--seq takes an integer")
+			i += 2
+			continue
+		if args[i] == "--pid" and i + 1 < len(args):
+			try:
+				pid = int(args[i + 1])
+			except ValueError:
+				usage_error("--pid takes an integer")
 			i += 2
 			continue
 		if args[i] == "--aborted":
@@ -999,6 +1009,8 @@ def cmd_state(args, client):
 	req = {"cmd": "state", "name": session, "state": rest[1]}
 	if seq is not None:
 		req["seq"] = seq
+	if pid is not None:
+		req["pid"] = pid
 	if aborted is not None:
 		req["aborted"] = aborted
 	resp = client.control(req)
@@ -1021,6 +1033,7 @@ def cmd_run_state(args, client):
 		print("unknown")
 		return
 	ended = rec.get("ended") or {}
+	history = rec.get("history") or []
 	if rec.get("open"):
 		# An open record whose session this daemon does not host describes
 		# a child that is gone: unsealed evidence, not a running session.
@@ -1031,12 +1044,16 @@ def cmd_run_state(args, client):
 		if not ended:
 			# A reopen carries the seals of earlier runs forward: while the
 			# session runs again, its last verdict is still the answer.
-			history = rec.get("history") or []
 			ended = history[-1] if history else {}
-	if not ended:
-		return
-	print("%s\t%s\t%s" % (ended.get("verdict"),
-					  ended.get("cause") or "-", ended.get("state")))
+	if ended:
+		print("%s\t%s\t%s" % (ended.get("verdict"),
+						  ended.get("cause") or "-", ended.get("state")))
+	# The chain the record carried forward, newest first: a death, a revive
+	# and then an exit at the prompt would otherwise leave only "settled"
+	# visible, and the reader would never learn the run had died.
+	for entry in reversed([e for e in history if e is not ended]):
+		print("%s\t%s\t%s\t%s" % ("previous", entry.get("verdict"),
+							  entry.get("cause") or "-", entry.get("state")))
 
 
 def cmd_stop(args, client):

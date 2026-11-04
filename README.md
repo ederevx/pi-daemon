@@ -186,10 +186,13 @@ attached and busy sessions are never purged.
   `verdict`, `cause`, `state`. The daemon, not the session, keeps the
   record (`run-state/<name>.json`), and it is written from the wire
   endpoint the extension publishes to (`pi-rc state ... --seq N
-  [--aborted]`), so the recorded state - not the exit status - decides
-  whether a run that stopped looks finished. The publish is best-effort:
-  one that never reached the daemon leaves the record at its last state,
-  and the session's conversation is then the only other evidence.
+  [--aborted] --pid N`), so the recorded state - not the exit status -
+  decides whether a run that stopped looks finished. The publish is
+  best-effort: one that never reached the daemon leaves the record at its
+  last state, and the session's conversation is then the only other
+  evidence. The pid names the publishing process, and a state from a child
+  the record was not opened for is refused: the client a session launches
+  can outlive the pi that launched it.
   `settled` (idle published, clean exit), `run-aborted` (the user
   interrupted it), `exited-mid-run` (the process went away
   mid-turn but exited 0 - including a handled `SIGTERM`/`SIGHUP`, which is
@@ -206,7 +209,10 @@ attached and busy sessions are never purged.
   is logged as suspect once, and is never stopped: the record reports, it
   does not police. A reopen (a revive, a respawn at boot, a daemon
   restart) carries the last few seals forward, so a death survives the
-  session that inherits its name.
+  session that inherits its name; the newest line is the last run, and
+  every seal carried forward follows it as a `previous <verdict> <cause>
+  <state>` line - a death, a revive and then an exit at the prompt still
+  shows the death.
 
 A hosted session survives client disconnect and daemon restart: when its
 pi dies abnormally it is revived headless from the same conversation,
