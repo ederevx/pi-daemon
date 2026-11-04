@@ -2324,6 +2324,73 @@ def test_run_ledger_verdicts():
     assert_eq(led.read("../escape"), None)
 
 
+def test_run_ledger_keeps_a_sealed_verdict_across_reopen():
+    # A revive, a respawn at boot and a daemon restart all reopen the
+    # record under the same name. The verdict of the run that ended is the
+    # answer the record exists for, so a reopen carries it forward instead
+    # of erasing it - and keeps a short chain, because one death followed by
+    # a revive and then an exit would otherwise push the death out of sight.
+    root = os.path.join(SCRATCH, "run-state-history")
+    led = daemon.RunLedger(root, os.getpid(), "tok", boot="boot-1")
+    led.open("pi-h", None, 4242, now=100.0)
+    led.transition("pi-h", "busy", seq=1, now=101.0)
+    led.close("pi-h", kind="exit", abnormal=True, now=110.0)
+    assert_eq(led.read("pi-h")["ended"]["verdict"], "died-mid-run")
+
+    led.open("pi-h", None, 5252, now=120.0)
+    rec = led.read("pi-h")
+    assert_eq(rec["open"], True)
+    assert_eq(rec["ended"], None)
+    assert_eq([e["verdict"] for e in rec["history"]], ["died-mid-run"])
+
+    led.transition("pi-h", "busy", seq=2, now=121.0)
+    led.close("pi-h", kind="exit", abnormal=True, now=130.0)
+    led.open("pi-h", None, 6262, now=140.0)
+    assert_eq([e["verdict"] for e in led.read("pi-h")["history"]],
+              ["died-mid-run", "died-mid-run"])
+
+    for i in range(led.HISTORY + 2):
+        led.close("pi-h", kind="exit", abnormal=True, now=200.0 + i)
+        led.open("pi-h", None, 7000 + i, now=300.0 + i)
+    assert_eq(len(led.read("pi-h")["history"]), led.HISTORY,
+              "the chain is bounded")
+
+
+def test_run_ledger_stale_publish_and_replaced_child():
+    root = os.path.join(SCRATCH, "run-state-fresh")
+    led = daemon.RunLedger(root, os.getpid(), "tok", boot="boot-1")
+    led.open("pi-s", None, 4242, now=100.0)
+    led.transition("pi-s", "busy", seq=5, now=101.0)
+    # A publish older than the record never touches the session's state
+    # either: the display and every decision that reads it follow the record.
+    assert_eq(led.fresh("pi-s", 4), False)
+    assert_eq(led.fresh("pi-s", 5), True)
+    assert_eq(led.fresh("pi-s", None), True)
+
+    # A respawn has taken the name since: the old child's exit must not seal
+    # the record that now belongs to its successor.
+    led.open("pi-s", None, 4343, now=102.0)
+    assert_eq(led.close("pi-s", child_pid=4242, now=110.0), None)
+    assert_eq(led.read("pi-s")["open"], True)
+    assert_eq(led.close("pi-s", child_pid=4343, now=110.0)["open"], False)
+
+    # A recycled pid is not an owner: the token decides.
+    recycled = {"v": daemon.RUN_STATE_VERSION, "boot": "boot-1",
+                "owner_pid": os.getpid(), "owner_token": "someone-else",
+                "child_pid": 1, "file": None, "state": "busy",
+                "aborted": False, "run": 1, "seq": 1, "seen": True,
+                "changed": 100.0, "opened": 100.0, "open": True,
+                "ended": None}
+    pi_platform = getattr(daemon, "pi_platform", None)
+    path = led.path_for("pi-recycled")
+    assert_true(pi_platform is not None, "pi_platform is imported")
+    pi_platform.AtomicStateFile(path).write(recycled)
+    led.recover()
+    assert_eq(led.read("pi-recycled")["open"], False,
+              "a recycled pid's open record is sealed, not adopted")
+    assert_eq(led.read("pi-recycled")["ended"]["verdict"], "lost-mid-run")
+
+
 def test_run_ledger_owner_scoping():
     root = os.path.join(SCRATCH, "run-state-owner")
     # A live foreign daemon: another process, token recorded from it.
@@ -2407,6 +2474,10 @@ def main():
 def _main():
     ok("run-outcome verdicts (mid-run, settled, aborted, unknown)",
        test_run_ledger_verdicts)
+    ok("run-outcome survives a reopen (revive, respawn, restart)",
+       test_run_ledger_keeps_a_sealed_verdict_across_reopen)
+    ok("run-outcome late publish and a replaced child",
+       test_run_ledger_stale_publish_and_replaced_child)
     ok("run-outcome owner scoping (foreign, gone, recovery, retention)",
        test_run_ledger_owner_scoping)
     ok("run-outcome staleness (flag once, never stop)",

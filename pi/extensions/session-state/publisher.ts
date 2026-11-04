@@ -11,9 +11,11 @@
  * - one monotonic seq for the whole process, so the daemon can drop a
  *   publish that arrived out of order and a late `busy` cannot overwrite
  *   the `idle` that came after it;
- * - publishing stops at session_shutdown, which pi always emits before
- *   it disposes the runtime. A turn killed mid-flight therefore keeps its
- *   `busy` record and is reported as a death, never as a settle;
+ * - publishing stops at a quit, which pi always emits before it disposes
+ *   the runtime. A turn killed mid-flight therefore keeps its `busy`
+ *   record and is reported as a death, never as a settle - while a reload
+ *   or a session switch, which replaces the runtime inside the same
+ *   process, goes on publishing;
  * - `aborted` rides with an idle publish, so an interrupted turn is
  *   reported as run-aborted instead of settled.
  *
@@ -35,7 +37,7 @@ export type StateExec = (args: string[]) => Promise<unknown>;
 export type RunState = "busy" | "idle" | "waiting";
 
 /** The process-wide stamp counter and stop flag. */
-class SharedState {
+export class SharedState {
 	seq = 0;
 	stopped = false;
 }
@@ -53,12 +55,17 @@ export class RunStatePublisher {
 	/** The instance the extensions publish through. */
 	static readonly shared = new RunStatePublisher();
 
-	private readonly state = sharedState();
+	constructor(private readonly state: SharedState = sharedState()) {}
 
-	/** Stop every publish for the rest of the process (session_shutdown):
-	 *  the turn that is still running keeps its `busy` record. */
-	stop(): void {
-		this.state.stopped = true;
+	/** session_shutdown: only a quit ends the process. A reload, a new
+	 *  session, a resume or a fork replaces the session runtime inside the
+	 *  same process, and that runtime's publishes must land - a stop that
+	 *  outlived its session would silence every later turn for good, and an
+	 *  idle publish after a death would report it as a settle. */
+	stop(reason?: string): void {
+		if (reason === undefined || reason === "quit") {
+			this.state.stopped = true;
+		}
 	}
 
 	/** Publish one state change for `session`. Errors never surface: the

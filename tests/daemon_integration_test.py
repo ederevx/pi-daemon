@@ -312,12 +312,12 @@ def _main():
         ok("run-state outlives the stopped session")
 
     # -- a mid-run kill is a death, never a settle ----------------------
-    # The signal path is the case the whole record exists for: pi killed by
-    # SIGTERM mid-turn exits 0, so only the recorded state can tell this
-    # apart from a finished run. Publishing busy is what the extension does
-    # at before_agent_start; killing the child then must leave that state
-    # standing (nothing publishes after session_shutdown, which never runs
-    # on a signal death) and the daemon must seal the record as a death.
+    # The recorded state is what decides this: the extension publishes busy
+    # when a turn starts, and nothing publishes after it, so the verdict must
+    # follow the state and not the status. Two shapes are exercised, because
+    # they end in different statuses: an uncaught signal, and a handled
+    # SIGTERM that exits 0 - the shape pi itself has, since its signal
+    # handler disposes the runtime and then exits 0.
     resp = wire({"cmd": "start", "name": "pi-itest-kill", "dir": SCRATCH,
                  "argv": ["sh", "-c", "exec sleep 30"],
                  "cols": 80, "rows": 24})
@@ -342,7 +342,37 @@ def _main():
         fail("run-state after a mid-run SIGTERM",
              f"out={r.stdout!r} err={r.stderr!r}")
     else:
-        ok("run-state calls a mid-run signal death a death, not a settle")
+        ok("run-state calls an uncaught-signal death a death, not a settle")
+
+    # pi's own signal path: the handler disposes the runtime and exits 0, so
+    # the status looks like a clean exit. The recorded busy state is the only
+    # thing that can tell this from a settled run, and the daemon must read
+    # it as a mid-run exit, not as a settle.
+    resp = wire({"cmd": "start", "name": "pi-itest-term", "dir": SCRATCH,
+                 "argv": ["sh", "-c", "trap 'exit 0' TERM; read line"],
+                 "cols": 80, "rows": 24})
+    if not resp.get("ok"):
+        fail("handled-term start", str(resp))
+    r = pi_rc("state", "itest-term", "busy")
+    if r.returncode != 0:
+        fail("handled-term state", r.stderr)
+    pid = next((s["pid"] for s in wire({"cmd": "list"}).get("sessions", [])
+                if s["name"] == "pi-itest-term"), None)
+    if not pid:
+        fail("handled-term pid", "session not listed")
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if not any(s["name"] == "pi-itest-term"
+                   for s in wire({"cmd": "list"}).get("sessions", [])):
+            break
+        time.sleep(0.1)
+    r = pi_rc("run-state", "itest-term")
+    if not r.stdout.startswith("exited-mid-run"):
+        fail("run-state after a handled SIGTERM",
+             f"out={r.stdout!r} err={r.stderr!r}")
+    else:
+        ok("run-state: a handled SIGTERM mid-run is not a settle")
 
     r = pi_rc("start", "a", "b", "c")  # start takes at most name+dir
     if r.returncode == 0:

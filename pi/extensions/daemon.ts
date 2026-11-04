@@ -955,9 +955,10 @@ export class RcBackground {
 	}
 
 	/** The runtime is going away: no further publish describes this
-	 *  session (see the publisher module). */
-	stopPublishing(): void {
-		RunStatePublisher.shared.stop();
+	 *  session (see the publisher module). Only a quit ends the process;
+	 *  a reload or a session switch keeps it, and its publishes must land. */
+	stopPublishing(reason?: string): void {
+		RunStatePublisher.shared.stop(reason);
 	}
 
 	/** Publish whether the model is working so other terminals can see
@@ -1425,6 +1426,15 @@ export default function (pi: ExtensionAPI) {
 		await app.announce(ctx);
 		await app.setState("busy", false, ctx);
 	});
+	// A run pi starts on its own - a `triggerTurn` message from this
+	// extension or the offload one - never reaches before_agent_start; the
+	// agent loop itself emits agent_start for every run, whoever started
+	// it, so the record is busy from the first moment of any turn. The
+	// ledger counts a run only on a real transition, so the user turns that
+	// fire both hooks are one run, not two.
+	pi.on("agent_start", async (_event, ctx) => {
+		await app.setState("busy", false, ctx);
+	});
 	// A run reports idle only once it has really settled: retries,
 	// compaction recovery and queued follow-ups continue the run after
 	// agent_end without re-firing before_agent_start, so publishing there
@@ -1434,8 +1444,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", async (_event, ctx) => {
 		await app.setState("idle", settledAborted(ctx), ctx);
 	});
-	pi.on("session_shutdown", async () => {
-		app.stopPublishing();
+	pi.on("session_shutdown", async (event) => {
+		app.stopPublishing(event?.reason);
 	});
 	pi.on("session_before_switch", async (event, ctx) => {
 		return app.beforeSwitch(event, ctx);

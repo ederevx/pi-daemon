@@ -80,7 +80,12 @@
 #                                       lost-mid-run, lost-at-prompt, or
 #                                       unknown; read from the durable
 #                                       record, so a name the daemon no
-#                                       longer hosts still answers
+#                                       longer hosts still answers. A live
+#                                       session answers `running <name>
+#                                       <state>` and the last seal it
+#                                       reopened from; a record left open
+#                                       by a child that is gone answers
+#                                       `unsealed`
 #   pi-rc gc-reap-ack <name>            the daemon extension's answer to
 #                                       the daemon's GC reap request: clear
 #                                       the request and the registry entry
@@ -1017,11 +1022,21 @@ def cmd_run_state(args, client):
 		return
 	ended = rec.get("ended") or {}
 	if rec.get("open"):
-		print("running\t%s\t%s" % (rec.get("name", resp.get("name")),
-								   rec.get("state")))
+		# An open record whose session this daemon does not host describes
+		# a child that is gone: unsealed evidence, not a running session.
+		print("%s\t%s\t%s" % ("running" if resp.get("hosted")
+							   else "unsealed",
+							   rec.get("name", resp.get("name")),
+							   rec.get("state")))
+		if not ended:
+			# A reopen carries the seals of earlier runs forward: while the
+			# session runs again, its last verdict is still the answer.
+			history = rec.get("history") or []
+			ended = history[-1] if history else {}
+	if not ended:
 		return
 	print("%s\t%s\t%s" % (ended.get("verdict"),
-						  ended.get("cause") or "-", ended.get("state")))
+					  ended.get("cause") or "-", ended.get("state")))
 
 
 def cmd_stop(args, client):

@@ -1486,10 +1486,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		await tasks.rearm(ctx?.sessionManager?.getSessionFile?.() ?? null);
 	});
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
 		stopCompletionService();
 		tasks.stopWatching();
-		RunStatePublisher.shared.stop();
+		// Only a quit ends the process; a reload or a session switch keeps
+		// it, and the replacement runtime's publishes must still land.
+		RunStatePublisher.shared.stop(event?.reason);
 	});
 
 	// User-facing dock: see every daemon ticket, cancel running ones,

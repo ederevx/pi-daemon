@@ -188,15 +188,22 @@ attached and busy sessions are never purged.
   endpoint the extension publishes to (`pi-rc state ... --seq N
   [--aborted]`), so a session that dies mid-run is never mistaken for a
   finished one. `settled` (idle published, clean exit), `run-aborted`
-  (the user interrupted it), `exited-mid-run` and `died-mid-run` (the
-  process went away mid-turn, by exit code or signal - the signal path
-  exits 0, so the status alone cannot say), `lost-mid-run` (the daemon
-  or its host died and no exit was seen), `crashed-at-prompt`,
-  `reload-death`, `daemon-stopped`, `stopped`, and `unknown` (nothing
-  was ever published). A run whose record stays `busy` past
-  `PI_PTYD_RUN_BEAT_STALE` (45s, polled every
-  `PI_PTYD_RUN_BEAT` seconds) is logged as suspect once, and is never
-  stopped: the record reports, it does not police.
+  (the user interrupted it), `exited-mid-run` (the process went away
+  mid-turn but exited 0 - including a handled `SIGTERM`/`SIGHUP`, which is
+  pi's own signal path: it disposes the runtime, then exits 0) and
+  `died-mid-run` (a nonzero exit or an uncaught signal), `lost-mid-run`
+  (the daemon or its host died and no exit was seen), `lost-at-prompt`
+  (the same, with the record idle), `crashed-at-prompt`, `reload-death`,
+  `daemon-stopped`, `stopped`, and `unknown` (nothing was ever
+  published). A live session prints `running <name> <state>` and then the
+  last seal it reopened from; a record left open by a child this daemon
+  does not host prints `unsealed <name> <state>` instead of pretending
+  the session runs. A run whose record stays `busy` or `waiting` past
+  `PI_PTYD_RUN_BEAT_STALE` (45s, polled every `PI_PTYD_RUN_BEAT` seconds)
+  is logged as suspect once, and is never stopped: the record reports, it
+  does not police. A reopen (a revive, a respawn at boot, a daemon
+  restart) carries the last few seals forward, so a death survives the
+  session that inherits its name.
 
 A hosted session survives client disconnect and daemon restart: when its
 pi dies abnormally it is revived headless from the same conversation,

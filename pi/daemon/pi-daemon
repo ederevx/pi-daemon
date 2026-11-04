@@ -833,6 +833,11 @@ class RunLedger:
 
 	NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+	# How many sealed verdicts a record carries forward. One death, a
+	# revive, then an exit at the prompt would otherwise push the death
+	# out of sight again, so a short chain is kept, not a single slot.
+	HISTORY = 4
+
 	def __init__(self, path, owner_pid, owner_token, boot=None):
 		self.dir = path
 		self.owner_pid = int(owner_pid)
@@ -852,6 +857,24 @@ class RunLedger:
 			return None
 		return pi_platform.AtomicStateFile(path).read_dict() or None
 
+	def fresh(self, name, seq):
+		# Is this publish newer than the record's? Two publishers in one
+		# session still race on the wire, so the extension stamps each
+		# publish and a stale one changes nothing - not the record and not
+		# what the session itself reports as its state.
+		if not isinstance(seq, int) or isinstance(seq, bool):
+			return True
+		return self._fresh(self.read(name), seq)
+
+	@staticmethod
+	def _fresh(rec, seq):
+		if not isinstance(seq, int) or isinstance(seq, bool):
+			return True
+		if not isinstance(rec, dict):
+			return True
+		cur = rec.get("seq")
+		return not (isinstance(cur, int) and seq < cur)
+
 	def open(self, name, file=None, child_pid=None, now=None):
 		# A session is being hosted: start its record. A record left by a
 		# gone daemon is taken over; one still owned by a live peer is
@@ -867,13 +890,21 @@ class RunLedger:
 				log("run-state '%s': owned by live pid %s, not recorded"
 					% (name, rec.get("owner_pid")))
 				return None
+			# A reopen - a revive, a respawn at boot, a daemon restart - must
+			# not erase how the last run ended: that verdict is the answer
+			# this record exists for, and only the newest seal would survive
+			# if it were merely copied, so a short chain is carried forward.
+			history = [] if rec is None else list(rec.get("history") or [])
+			if rec is not None and rec.get("ended"):
+				history.append(rec["ended"])
 			rec = {"v": RUN_STATE_VERSION, "boot": self.boot,
 				   "owner_pid": self.owner_pid,
 				   "owner_token": self.owner_token,
 				   "child_pid": child_pid, "file": file,
 				   "state": "idle", "aborted": False, "run": 0,
 				   "seq": 0, "seen": False, "changed": now,
-				   "opened": now, "open": True, "ended": None}
+				   "opened": now, "open": True, "ended": None,
+				   "history": history[-self.HISTORY:]}
 			self._write(path, rec)
 			return rec
 
@@ -891,8 +922,7 @@ class RunLedger:
 				return False
 			# Two publishers in one session still race on the wire, so the
 			# extension stamps each publish and a stale one is dropped.
-			if isinstance(seq, int) and isinstance(rec.get("seq"), int) \
-					and seq < rec["seq"]:
+			if not self._fresh(rec, seq):
 				return False
 			before = (rec.get("state"), rec.get("aborted"), rec.get("seen"),
 					  rec.get("run"))
@@ -903,8 +933,12 @@ class RunLedger:
 			rec["seen"] = True
 			rec["suspected"] = False
 			if state == "busy":
-				# A new turn: the previous abort no longer describes it.
-				rec["run"] = int(rec.get("run") or 0) + 1
+				# A new turn: the previous abort no longer describes it. Two
+				# hooks publish this same turn (before_agent_start and
+				# agent_start) and a retry re-fires neither into a new run, so
+				# only a real transition counts.
+				if rec.get("state") not in ("busy", "waiting"):
+					rec["run"] = int(rec.get("run") or 0) + 1
 				rec["aborted"] = False
 			elif aborted is not None:
 				rec["aborted"] = bool(aborted)
@@ -916,15 +950,19 @@ class RunLedger:
 			return before != after
 
 	def close(self, name, kind="exit", abnormal=False, signal=None,
-			  code=None, now=None):
+			  code=None, now=None, child_pid=None):
 		# The session is gone: seal its record with a verdict. A record
-		# another daemon owns (or one already closed) is never touched.
+		# another daemon owns (or one already closed) is never touched, and
+		# neither is one a respawn has taken over in the meantime: it names
+		# the child it was opened for.
 		path = self.path_for(name)
 		if path is None:
 			return None
 		with self._lock:
 			rec = self._load(path)
 			if rec is None or not rec.get("open"):
+				return None
+			if child_pid is not None and rec.get("child_pid") != child_pid:
 				return None
 			if self._classify(rec) == "foreign":
 				return None
@@ -945,28 +983,32 @@ class RunLedger:
 		# the next boot has to guess about.
 		for sess in sessions:
 			try:
-				self.close(sess.name, kind=kind, now=now)
-			except OSError as exc:
+				self.close(sess.name, kind=kind, now=now,
+						   child_pid=getattr(sess, "pid", None))
+			except Exception as exc:  # never abort a shutdown over a record
 				log("run-state '%s': close failed: %s" % (sess.name, exc))
 
 	def recover(self):
 		# At boot, before any respawn: every record still open was left by
 		# a daemon that never sealed it. A live peer's records stay
-		# untouched - it is still running and will seal them itself.
+		# untouched - it is still running and will seal them itself. The
+		# classification and the seal share the lock, so a record that a
+		# starting session rewrites in between is never sealed behind it.
 		for rec, path, name in self._records():
-			if not rec.get("open"):
-				continue
-			if self._classify(rec) != "gone":
-				continue
-			state = rec.get("state")
-			verdict = ("lost-mid-run" if state in ("busy", "waiting")
-					   else "lost-at-prompt")
-			rec["open"] = False
-			rec["ended"] = {"verdict": verdict,
-							"cause": self._lost_cause(rec),
-							"signal": False, "exit": None,
-							"state": state, "at": time.time()}
 			with self._lock:
+				rec = self._load(path)
+				if not isinstance(rec, dict) or not rec.get("open"):
+					continue
+				if self._classify(rec) != "gone":
+					continue
+				state = rec.get("state")
+				verdict = ("lost-mid-run" if state in ("busy", "waiting")
+						   else "lost-at-prompt")
+				rec["open"] = False
+				rec["ended"] = {"verdict": verdict,
+								"cause": self._lost_cause(rec),
+								"signal": False, "exit": None,
+								"state": state, "at": time.time()}
 				self._write(path, rec)
 			log("run-state '%s': %s (%s)"
 				% (name, verdict, rec["ended"]["cause"]))
@@ -974,21 +1016,27 @@ class RunLedger:
 	def prune(self, now=None):
 		# Retention: this daemon's closed records, and those of gone
 		# owners, older than the window. An open record is evidence until
-		# recover() or its owner seals it.
+		# recover() or its owner seals it. Reloaded, reclassified and
+		# unlinked under the lock: a record `open()` has just rewritten for
+		# a live session must not be unlinked from under it.
 		now = time.time() if now is None else now
-		for rec, path, _name in self._records():
-			if rec.get("open") or self._classify(rec) == "foreign":
-				continue
-			ended = rec.get("ended") or {}
-			at = ended.get("at")
-			if not isinstance(at, (int, float)):
-				continue
-			if now - at <= RUN_STATE_RETENTION:
-				continue
-			try:
-				os.unlink(path)
-			except OSError:
-				pass
+		for _rec, path, _name in self._records():
+			with self._lock:
+				rec = self._load(path)
+				if not isinstance(rec, dict) or rec.get("open"):
+					continue
+				if self._classify(rec) == "foreign":
+					continue
+				ended = rec.get("ended") or {}
+				at = ended.get("at")
+				if not isinstance(at, (int, float)):
+					continue
+				if now - at <= RUN_STATE_RETENTION:
+					continue
+				try:
+					os.unlink(path)
+				except OSError:
+					pass
 
 	def suspects(self, sessions, now=None):
 		# Runs that stopped moving: state busy or waiting, and none of the
@@ -1039,10 +1087,12 @@ class RunLedger:
 			return ("exited-mid-run", "unknown")
 		if not rec.get("seen"):
 			return ("unknown", "never-announced")
-		if rec.get("aborted"):
-			return ("run-aborted", "abort")
+		# A crash outranks the abort: an interrupted turn that then took a
+		# signal ended at the prompt in a crash, not in a tidy interruption.
 		if abnormal:
 			return ("crashed-at-prompt", "signal" if signal else "exit")
+		if rec.get("aborted"):
+			return ("run-aborted", "abort")
 		return ("settled", None)
 
 	def _lost_cause(self, rec):
@@ -1060,7 +1110,13 @@ class RunLedger:
 		if not isinstance(pid, int):
 			return "gone"
 		if pid == self.owner_pid:
-			return "this"
+			# A recycled pid is not an owner: the token says which process
+			# wrote the record, and only this incarnation's token makes it
+			# ours to seal rather than a record left by a dead daemon.
+			token = rec.get("owner_token")
+			if token is None or token == self.owner_token:
+				return "this"
+			return "gone"
 		if not PROCESS.pid_alive(pid):
 			return "gone"
 		if PROCESS.pid_matches_token(pid, rec.get("owner_token")):
@@ -2999,7 +3055,7 @@ class Daemon:
 		self.shutdown_event.set()
 		log("restart (registry holds %d session(s))" % len(keep))
 		self.tickets.stop()
-		self.run_state.close_all(self.table.snapshot(), kind="stopped")
+		self.run_state.close_all(self.table.snapshot(), kind="shutdown")
 		self._terminate_sessions(self.table.snapshot())
 		self.roster.remove(os.getpid())
 		self.restart_planner.spawn_successor(os.path.abspath(__file__),
@@ -3041,14 +3097,15 @@ class Daemon:
 		sess.child.close()
 		# Seal the record only when this session still owns the name: a
 		# respawn may have taken it, and its record is not ours to close.
+		abnormal = sess.child.exit_abnormal(code)
 		dropped = self.table.remove_if(sess)
 		if dropped is not None:
 			self.ledger.repoint_on_drop(dropped)
+			signal, code_num = sess.child.exit_outcome(code)
 			self.run_state.close(
-				dropped, kind=self._exit_kind(sess),
-				abnormal=sess.child.exit_abnormal(code),
-				signal=sess.child.exit_outcome(code)[0],
-				code=sess.child.exit_outcome(code)[1])
+				dropped, kind=self._exit_kind(sess, abnormal),
+				abnormal=abnormal, signal=signal, code=code_num,
+				child_pid=sess.pid)
 		self.registry.drop(sess.name)
 		# A dropped session can no longer answer its GC reap request:
 		# drop the request so no stale ask survives it.
@@ -3056,12 +3113,14 @@ class Daemon:
 		self._discard_session_file(sess)
 		log("child-exit '%s' pid %d status %s" % (sess.name, sess.pid, code))
 
-	def _exit_kind(self, sess):
+	def _exit_kind(self, sess, abnormal):
 		# Why a session ended, for the run-outcome record: a consented
-		# stop, a death inside the reload guard, or an ordinary exit.
+		# stop, a death inside the reload guard, or an ordinary exit. The
+		# guard only decides when the process also died abnormally: a clean
+		# exit there is the session that was reloaded leaving on purpose.
 		if sess.stopping:
 			return "stopped"
-		if sess.reload_injected and sess.reload_injected_at \
+		if abnormal and sess.reload_injected and sess.reload_injected_at \
 				and time.time() - sess.reload_injected_at < RELOAD_GUARD_GRACE:
 			return "reload"
 		return "exit"
@@ -3642,20 +3701,24 @@ class Control:
 			return bad_request()
 		seq = req.get("seq")
 		aborted = req.get("aborted")
-		if seq is not None and not isinstance(seq, (int, float)):
+		if seq is not None and (not isinstance(seq, int) or isinstance(seq, bool)):
 			return bad_request()
 		if aborted is not None and not isinstance(aborted, bool):
 			return bad_request()
 		sess = self.daemon.table.get(name)
 		if sess is None:
 			return err("no-session")
+		# A late publish never rewrites what the session shows: the record
+		# keeps the newer state, and so does everything that reads the
+		# session's state (idle shutdown, GC reap, carry, reload).
+		if not self.daemon.run_state.fresh(name, seq):
+			return {"ok": True}
 		sess.state = state
 		sess.touch_activity()
 		# The record is written here, in the daemon, so the session's own
 		# process is never a second writer of run state.
 		self.daemon.run_state.transition(
-			name, state, seq=int(seq) if seq is not None else None,
-			aborted=aborted, file=sess.file)
+			name, state, seq=seq, aborted=aborted, file=sess.file)
 		return {"ok": True}
 
 	def run_state(self, req):
@@ -3674,7 +3737,10 @@ class Control:
 			name = alt if rec is not None else name
 		if rec is None:
 			return {"ok": True, "name": name, "record": None}
-		return {"ok": True, "name": name, "record": rec}
+		# An open record whose session this daemon does not host is not a
+		# running session: the child is gone and nobody sealed the record.
+		return {"ok": True, "name": name, "record": rec,
+				"hosted": self.daemon.table.get(name) is not None}
 
 	def stop(self, req):
 		name = req.get("name")
