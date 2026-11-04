@@ -865,10 +865,22 @@ test("offload: a huge log stays within the per-tick read and snapshot bounds", a
     { onUpdate: (u) => updates.push((u as { content: Array<{ text: string }> }).content[0].text) },
   );
   assertMatches(result.content[0].text, /still running/);
-  // The stream is pulled at most once per tick; the final fetch never ran.
-  const reads = pi.execCalls.filter(
-    (c) => c.args[0] === "ticket-output" && c.args.length === 3);
-  assert(reads.length <= 16, `one tick reads at most 16 chunks, got ${reads.length}`);
+  // One tick pulls at most its chunk budget. Count the reads that run
+  // together between two status round trips, not the total for the wait:
+  // a second tick can start just before the deadline, and that boundary
+  // belongs to the clock, not to the budget.
+  let run = 0;
+  let longest = 0;
+  for (const call of pi.execCalls) {
+    if (call.args[0] === "ticket-output" && call.args.length === 3) {
+      run += 1;
+      longest = Math.max(longest, run);
+    } else {
+      run = 0;
+    }
+  }
+  assert(longest <= 16, `one tick reads at most 16 chunks, got ${longest}`);
+  assert(longest > 1, "the log was read in several chunks, not one");
   assert(updates.length > 0, "a partial was delivered");
   for (const text of updates) {
     assert(Buffer.byteLength(text, "utf8") <= 16384,
