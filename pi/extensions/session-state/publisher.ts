@@ -17,27 +17,48 @@
  * - `aborted` rides with an idle publish, so an interrupted turn is
  *   reported as run-aborted instead of settled.
  *
- * The shared instance is the process's one runtime, and it owns the
- * counter and the stop flag. Executing `pi-rc state` is injected, so this
- * module owns the protocol and nothing about how a host launches the
- * client.
+ * The counter and the stop flag are process-wide, not merely module-wide:
+ * pi loads each extension with `moduleCache: false`, so daemon.ts and
+ * offload.ts get a separate instance of this module and a plain
+ * module-level singleton would hand each of them its own counter - after
+ * a few turns one publisher's stamps would sit permanently under the
+ * other's and its publishes would be dropped for good. The shared state
+ * therefore hangs off `globalThis` under a registered symbol, which is
+ * the one thing a duplicated module instance cannot duplicate.
+ *
+ * Executing `pi-rc state` is injected, so this module owns the protocol
+ * and nothing about how a host launches the client.
  */
 
 export type StateExec = (args: string[]) => Promise<unknown>;
 
 export type RunState = "busy" | "idle" | "waiting";
 
+/** The process-wide stamp counter and stop flag. */
+class SharedState {
+	seq = 0;
+	stopped = false;
+}
+
+const SHARED_KEY = Symbol.for("pi-daemon.session-state.publisher");
+
+/** The one SharedState in this process, whichever module instance asks. */
+function sharedState(): SharedState {
+	const holder = globalThis as unknown as Record<symbol, SharedState>;
+	holder[SHARED_KEY] ??= new SharedState();
+	return holder[SHARED_KEY];
+}
+
 export class RunStatePublisher {
-	/** Every publisher in this process stamps from this one counter. */
+	/** The instance the extensions publish through. */
 	static readonly shared = new RunStatePublisher();
 
-	private seq = 0;
-	private stopped = false;
+	private readonly state = sharedState();
 
 	/** Stop every publish for the rest of the process (session_shutdown):
 	 *  the turn that is still running keeps its `busy` record. */
 	stop(): void {
-		this.stopped = true;
+		this.state.stopped = true;
 	}
 
 	/** Publish one state change for `session`. Errors never surface: the
@@ -48,8 +69,10 @@ export class RunStatePublisher {
 		state: RunState,
 		aborted = false,
 	): Promise<void> {
-		if (this.stopped) return Promise.resolve();
-		const args = ["state", session, state, "--seq", String(this.seq++)];
+		if (this.state.stopped) return Promise.resolve();
+		const args = [
+			"state", session, state, "--seq", String(this.state.seq++),
+		];
 		if (aborted) args.push("--aborted");
 		return Promise.resolve(exec(args)).then(
 			() => undefined,

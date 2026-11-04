@@ -104,6 +104,9 @@ with the built-in default as the fallback.
 | `transcriptIndexMaxMb` | `4` | Reject and rebuild an index larger than this. |
 | `transcriptIndexMaxLineMb` | `16` | Longest conversation line the index will cover. |
 | `offload.enabled` | `true` | Enable bash offloading; every command is still handed to the daemon immediately when on. |
+| `runStateRetentionHours` | `24` | Keep a closed run-outcome record this long; `0` is not special here, because a disabled idle policy must not stop this cleanup. |
+| `runBeatSeconds` | `10` | How often the daemon re-reads its run records to look for a stalled run. |
+| `runBeatStaleSeconds` | `45` | No progress for this long flags a `busy` run as suspect, once, and never stops it. |
 
 Environment overrides: `PI_DAEMON_GC_IDLE_HOURS`,
 `PI_DAEMON_IDLE_TIMEOUT_HOURS`, `PI_PTYD_MIN_REVIVE_LIFE`,
@@ -112,7 +115,8 @@ Environment overrides: `PI_DAEMON_GC_IDLE_HOURS`,
 `PI_PTYD_EXT_WATCH_INTERVAL`, `PI_PTYD_EXT_WATCH_DEBOUNCE`,
 `PI_PTYD_EXT_WATCH_ROOTS`, `PI_PTYD_TRANSCRIPT_INDEX`,
 `PI_PTYD_TRANSCRIPT_INDEX_INTERVAL`, `PI_PTYD_TRANSCRIPT_INDEX_MAX_MB`,
-`PI_PTYD_TRANSCRIPT_INDEX_MAX_LINE_MB`, and `PI_OFFLOAD`.
+`PI_PTYD_TRANSCRIPT_INDEX_MAX_LINE_MB`, `PI_PTYD_RUN_STATE_RETENTION_HOURS`,
+`PI_PTYD_RUN_BEAT`, `PI_PTYD_RUN_BEAT_STALE`, and `PI_OFFLOAD`.
 
 The remote-work guard keeps `ssh` for file transfer only: a remote
 shell or remote command is refused in `bash`, `powershell`, and

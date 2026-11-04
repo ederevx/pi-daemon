@@ -21,6 +21,7 @@ import "./settings.test.ts";
 import "./provisioning.test.ts";
 import "./settings-reconciler.test.ts";
 import "./transcript.test.ts";
+// Last: its stop-at-shutdown test stops publishing for the whole process.
 import "./session-state.test.ts";
 
 await registry.runAll();
