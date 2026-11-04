@@ -970,12 +970,13 @@ export class RcBackground {
 	 *  the daemon is unreachable.
 	 *
 	 *  The daemon keeps these publishes as a durable run-outcome record,
-	 *  so two rules matter here: nothing is published after
-	 *  session_shutdown, which always runs before dispose — a turn
-	 *  killed mid-flight must stay `busy` and read as a death, not as a
-	 *  settle — and `aborted` rides along with the idle publish so an
-	 *  interrupted turn is never mistaken for a finished one. `seq`
-	 *  orders this publisher against the offload one. */
+	 *  so two rules matter here: nothing is published after a quit, which
+	 *  pi always emits before it disposes the runtime — a turn killed
+	 *  mid-flight must stay `busy` and read as a death, not as a settle,
+	 *  while a reload in the same process goes on publishing — and
+	 *  `aborted` rides along with the idle publish so an interrupted turn
+	 *  is never mistaken for a finished one. `seq` orders this publisher
+	 *  against the offload one. */
 	async setState(state: "busy" | "idle" | "waiting", aborted = false,
 		ctx?: any): Promise<void> {
 		const session = this.hostedSession();
