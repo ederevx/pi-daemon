@@ -804,6 +804,12 @@ export class RemoteWorkClassifier {
 				if (text[index] !== "\n") word += text[index] ?? "";
 				continue;
 			}
+			if (char === "$" && text[index + 1] === "'") {
+				const quoted = this.ansiQuoted(text.slice(index + 2));
+				word += quoted.word;
+				index += 1 + quoted.consumed;
+				continue;
+			}
 			if (char === "'" || char === "\"") {
 				const close = text.indexOf(char, index + 1);
 				word += this.quotedWord(
@@ -819,6 +825,35 @@ export class RemoteWorkClassifier {
 			word += char;
 		}
 		return { word, end };
+	}
+
+	/** An ANSI-C quoted word's value and the source it spans. */
+	private ansiQuoted(text: string): { word: string; consumed: number } {
+		let word = "";
+		for (let index = 0; index < text.length; index++) {
+			const char = text[index];
+			if (char === "'") return { word, consumed: index + 1 };
+			if (char !== "\\") {
+				word += char;
+				continue;
+			}
+			index += 1;
+			const octal = /^[0-7]{1,3}/.exec(text.slice(index, index + 3))?.[0];
+			if (octal !== undefined) {
+				index += octal.length - 1;
+				word += String.fromCharCode(parseInt(octal, 8));
+				continue;
+			}
+			const hex = /^x([0-9a-fA-F]{1,2})/.exec(text.slice(index, index + 3))?.[1];
+			if (hex !== undefined) {
+				index += hex.length;
+				word += String.fromCharCode(parseInt(hex, 16));
+				continue;
+			}
+			const escaped = text[index] ?? "";
+			word += /['"\\?]/.test(escaped) ? escaped : "\\" + escaped;
+		}
+		return { word, consumed: text.length };
 	}
 
 	/** A quoted word's value: single quotes are literal, double quotes decode. */
