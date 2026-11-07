@@ -38,6 +38,8 @@ type PendingHeredoc = {
 	stripTabs: boolean;
 	/** Segments already collected for the declaring command. */
 	lineStart: number;
+	/** How much of that command's text came before the declaration. */
+	offset: number;
 };
 
 /** Owns the verdicts for a command string; stateless. */
@@ -377,6 +379,7 @@ export class RemoteWorkClassifier {
 						quoted: declared.quoted,
 						stripTabs: declared.stripTabs,
 						lineStart: segments.length,
+						offset: current.length,
 					});
 					index = declared.end;
 					continue;
@@ -463,7 +466,7 @@ export class RemoteWorkClassifier {
 			delimiter += char;
 			index += 1;
 		}
-		return delimiter === "" ? undefined
+		return delimiter === "" && !quoted ? undefined
 			: { delimiter, quoted, stripTabs, end: index };
 	}
 
@@ -491,7 +494,7 @@ export class RemoteWorkClassifier {
 			// Only the last redirection of a command supplies its stdin.
 			const last = next === undefined || next.lineStart !== entry.lineStart;
 			const program = last && this.commandRunsStdin(command)
-				&& !this.redirectsStdin(command[0] ?? "");
+				&& !this.redirectsStdin(command[0] ?? "", entry.offset);
 			if (program) nested.push(body.text);
 			else if (!entry.quoted) nested.push(...this.expansions(body.text));
 		}
@@ -554,9 +557,9 @@ export class RemoteWorkClassifier {
 		});
 	}
 
-	/** True when a `<` redirection in the command overrides its stdin. */
-	private redirectsStdin(segment: string): boolean {
-		return /(^|\s)\d*<(?![<(])/.test(segment);
+	/** True when a `<` redirection after the heredoc overrides its stdin. */
+	private redirectsStdin(segment: string, offset: number): boolean {
+		return /(^|\s)\d*<(?![<(])/.test(segment.slice(offset));
 	}
 
 	/** A shell with no script operand runs the program on its stdin. */
