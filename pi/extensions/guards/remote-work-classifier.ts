@@ -376,7 +376,9 @@ export class RemoteWorkClassifier {
 			}
 			if (char === "<" && text.slice(index, index + 3) === "<<<") {
 				// A here-string takes one word, not a body.
-				index += 3;
+				const span = 3 + this.redirectionOperand(text.slice(index + 3)).end;
+				current += text.slice(index, index + span);
+				index += span;
 				continue;
 			}
 			if (char === "<" && text[index + 1] === "<"
@@ -1054,6 +1056,12 @@ export class RemoteWorkClassifier {
 				const end = this.substitutionEnd(segment, index + 1) + 1;
 				current += segment.slice(index, end);
 				index = end;
+				continue;
+			}
+			if (segment.startsWith("<<<", index)) {
+				// A here-string takes one word, and neither is a command word.
+				current = "";
+				index += 3 + this.redirectionOperand(segment.slice(index + 3)).end;
 				continue;
 			}
 			if (char === "`") {
