@@ -658,6 +658,15 @@ export class RemoteWorkClassifier {
 				quote = char;
 				continue;
 			}
+			if (char === "$" && entry.rest[index + 1] === "(") {
+				index = this.substitutionEnd(entry.rest, index + 1);
+				continue;
+			}
+			if (char === "`") {
+				const end = entry.rest.indexOf("`", index + 1);
+				index = end < 0 ? entry.rest.length : end;
+				continue;
+			}
 			if (char !== "<" && char !== ">") continue;
 			const target = where(/(\d*)$/.exec(entry.rest.slice(0, index))?.[1],
 				char === "<" ? "0" : "1");
@@ -838,6 +847,19 @@ export class RemoteWorkClassifier {
 			if (char === "\\") {
 				current += segment[index + 1] ?? "";
 				index += 2;
+				continue;
+			}
+			if ((char === "$" || char === "<" || char === ">")
+				&& segment[index + 1] === "(") {
+				const end = this.substitutionEnd(segment, index + 1) + 1;
+				current += segment.slice(index, end);
+				index = end;
+				continue;
+			}
+			if (char === "`") {
+				const end = segment.indexOf("`", index + 1) + 1;
+				current += segment.slice(index, end === 0 ? segment.length : end);
+				index = end === 0 ? segment.length : end;
 				continue;
 			}
 			if (/\s/.test(char)) {
