@@ -778,11 +778,13 @@ export class RemoteWorkClassifier {
 				if (this.mayVanish(arg)) continue;
 				return stdin;
 			}
-			// Short-option bundles are read a letter at a time.
+			// Short-option bundles are read a letter at a time, and a leading `+`
+			// turns an option off instead of on.
+			const enabled = value[0] === "-";
 			const flags = value.slice(1).split("");
 			for (let flag = 0; flag < flags.length; flag++) {
 				if (flags[flag] === "c") return false;
-				if (flags[flag] === "s") stdin = true;
+				if (flags[flag] === "s") stdin = enabled;
 				if (flags[flag] !== "o" && flags[flag] !== "O") continue;
 				// `-o` names an option, and the rest of the bundle or the next
 				// word is its value.
