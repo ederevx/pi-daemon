@@ -638,8 +638,14 @@ export class RemoteWorkClassifier {
 			return false;
 		}
 		const args = words.slice(1);
-		if (this.scriptArg(args) !== undefined) return false;
-		return !args.some((arg) => !arg.startsWith("-"));
+		const end = args.indexOf("--");
+		const options = end < 0 ? args : args.slice(0, end);
+		const operands = end < 0 ? [] : args.slice(end + 1);
+		// `-s` reads the program from stdin whatever follows as arguments.
+		if (options.some((arg) => /^-[A-Za-z]*s[A-Za-z]*$/.test(arg))) return true;
+		if (operands.length > 0) return false;
+		if (this.scriptArg(options) !== undefined) return false;
+		return !options.some((arg) => !arg.startsWith("-"));
 	}
 
 	/** The body of a balanced `$(...)` with the index just past it. */
