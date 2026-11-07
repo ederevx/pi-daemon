@@ -102,6 +102,7 @@ test("remote guard: a heredoc body is data unless a shell runs it", () => {
 		"bash <<'EOF' 1>&2 </dev/null\nssh host id\nEOF",
 		"bash <<'EOF' >3</dev/null\nssh host id\nEOF",
 		"bash <<'EOF' > 3</dev/null\nssh host id\nEOF",
+		"bash <<'A' 3<&0 <<'B' <&0\nssh host id\nA\nplain\nB",
 		"bash 3<<'EOF' <& 3</dev/null\nssh host id\nEOF",
 		"bash <<'EOF' >>3<file\nssh host id\nEOF",
 		"bash <<'EOF' >out3</dev/null\nssh host id\nEOF",
@@ -146,6 +147,7 @@ test("remote guard: a heredoc body is data unless a shell runs it", () => {
 	}
 	for (const command of [
 		"bash - <<'SH'\nssh host id\nSH",
+		"bash <<'A' 3<&0 <<'B' <&3\nssh host id\nA\nplain\nB",
 		"bash <<'EOF' 1>&2 <&0\nssh host id\nEOF",
 		"sudo bash <<'SH'\nssh host id\nSH",
 		"sh <<-EOF\n\tssh host id\n\tEOF",

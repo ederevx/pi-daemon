@@ -40,8 +40,6 @@ type PendingHeredoc = {
 	lineStart: number;
 	/** How much of that command's text came before the declaration. */
 	offset: number;
-	/** True when the body feeds standard input, which `3<<` does not. */
-	stdin: boolean;
 	/** The descriptor the body was written to; empty means standard input. */
 	descriptor: string;
 	/** The rest of the command's own text, where later redirections sit. */
@@ -388,7 +386,6 @@ export class RemoteWorkClassifier {
 						stripTabs: declared.stripTabs,
 						lineStart: segments.length,
 						offset: current.trimStart().length,
-						stdin: descriptor === "" || descriptor === "0",
 						descriptor,
 						rest: this.commandRest(text, declared.end),
 					});
@@ -501,11 +498,8 @@ export class RemoteWorkClassifier {
 				&& bounds[later - 1] === "|"; later++) {
 				command.push(segments[later]);
 			}
-			// Only the last redirection to a descriptor supplies it.
-			const last = !pending.slice(at + 1).some((other) =>
-				other.lineStart === entry.lineStart && other.stdin && entry.stdin);
-			const stdin = this.suppliesStdin(entry);
-			const program = last && stdin && this.commandRunsStdin(command);
+			const program = this.suppliesStdin(entry)
+				&& this.commandRunsStdin(command);
 			if (program) nested.push(body.text);
 			// An unquoted body expands even when a shell reads it as a program,
 			// and an escaped substitution is left for that shell to resolve.
