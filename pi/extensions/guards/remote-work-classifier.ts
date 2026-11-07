@@ -637,15 +637,26 @@ export class RemoteWorkClassifier {
 		if (!RemoteWorkClassifier.SHELL_NAMES.has(this.basename(words[0]))) {
 			return false;
 		}
+		// Options are read in order; the first operand names a script unless
+		// `-s` already asked for the program on stdin.
+		let stdin = false;
 		const args = words.slice(1);
-		const end = args.indexOf("--");
-		const options = end < 0 ? args : args.slice(0, end);
-		const operands = end < 0 ? [] : args.slice(end + 1);
-		// `-s` reads the program from stdin whatever follows as arguments.
-		if (options.some((arg) => /^-[A-Za-z]*s[A-Za-z]*$/.test(arg))) return true;
-		if (operands.length > 0) return false;
-		if (this.scriptArg(options) !== undefined) return false;
-		return !options.some((arg) => !arg.startsWith("-"));
+		for (let at = 0; at < args.length; at++) {
+			const arg = args[at];
+			if (arg === "--") return stdin;
+			if (arg === "-") {
+				stdin = true;
+				continue;
+			}
+			if (!arg.startsWith("-")) return stdin;
+			if (/^-[A-Za-z]*c[A-Za-z]*$/.test(arg)) return false;
+			if (/^-[oO]$/.test(arg)) {
+				at += 1;
+				continue;
+			}
+			if (/^-[A-Za-z]*s[A-Za-z]*$/.test(arg)) stdin = true;
+		}
+		return true;
 	}
 
 	/** The body of a balanced `$(...)` with the index just past it. */

@@ -100,6 +100,8 @@ test("remote guard: a heredoc body is data unless a shell runs it", () => {
 		"cat <<'EOF'\n$(ssh host id)\nEOF",
 		"bash script.sh <<'EOF'\nssh host id\nEOF",
 		"bash -- -s <<'EOF'\nssh host id\nEOF",
+		"bash -c 'printf safe' -s <<'EOF'\nssh host id\nEOF",
+		"bash script.sh -s <<'EOF'\nssh host id\nEOF",
 		"bash <<'EOF' 'x<y'\nssh host id\nEOF",
 		"bash 3<<'EOF'\nssh host id\nEOF",
 		"bash 3<<EOF\nssh host id\nEOF",
