@@ -679,24 +679,25 @@ export class RemoteWorkClassifier {
 
 	/** The digits a duplication's operand names, after quote removal. */
 	private descriptorOperand(text: string): string {
-		let digits = "";
+		let word = "";
 		for (let index = 0; index < text.length; index++) {
 			const char = text[index] ?? "";
 			if (char === "\\") {
 				index += 1;
-				digits += text[index] ?? "";
+				word += text[index] ?? "";
 				continue;
 			}
 			if (char === "'" || char === "\"") {
 				const end = text.indexOf(char, index + 1);
-				digits += text.slice(index + 1, end < 0 ? text.length : end);
+				word += text.slice(index + 1, end < 0 ? text.length : end);
 				index = end < 0 ? text.length : end;
 				continue;
 			}
-			if (!/[0-9]/.test(char)) break;
-			digits += char;
+			if (word === "" && /\s/.test(char)) continue;
+			if (/[\s;|&<>()]/.test(char)) break;
+			word += char;
 		}
-		return /^\d+$/.test(digits) ? digits : "";
+		return /^\d+$/.test(word) ? word : "";
 	}
 
 	/** A shell with no script operand runs the program on its stdin. */
