@@ -378,7 +378,7 @@ export class RemoteWorkClassifier {
 				// A here-string takes one word, not a body, but its expansions run.
 				const operand = this.redirectionOperand(text.slice(index + 3));
 				const source = text.slice(index + 3, index + 3 + operand.end);
-				nested.push(...this.expansions(source.replace(/'[^']*'/g, "")));
+				nested.push(...this.wordExpansions(source));
 				const span = 3 + operand.end;
 				current += text.slice(index, index + span);
 				index += span;
@@ -618,6 +618,45 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			if (text[index] === "`") {
+				const close = text.indexOf("`", index + 1);
+				const end = close < 0 ? text.length : close;
+				bodies.push(text.slice(index + 1, end));
+				index = end + 1;
+				continue;
+			}
+			index += 1;
+		}
+		return bodies;
+	}
+
+	/** The substitutions a word runs, which quoting can leave literal. */
+	private wordExpansions(text: string): string[] {
+		const bodies: string[] = [];
+		let quote: string | null = null;
+		let index = 0;
+		while (index < text.length) {
+			const char = text[index] ?? "";
+			if (char === "\\") {
+				index += 2;
+				continue;
+			}
+			if (quote === null && (char === "'" || char === '"')) {
+				quote = char;
+				index += 1;
+				continue;
+			}
+			if (char === quote) {
+				quote = null;
+				index += 1;
+				continue;
+			}
+			if (quote !== "'" && char === "$" && text[index + 1] === "(") {
+				const inner = this.balanced(text, index + 2, "(", ")");
+				bodies.push(inner.body);
+				index = inner.end;
+				continue;
+			}
+			if (quote !== "'" && char === "`") {
 				const close = text.indexOf("`", index + 1);
 				const end = close < 0 ? text.length : close;
 				bodies.push(text.slice(index + 1, end));
