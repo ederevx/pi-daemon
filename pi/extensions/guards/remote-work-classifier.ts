@@ -766,6 +766,8 @@ export class RemoteWorkClassifier {
 				if (/^--(rcfile|init-file)$/.test(arg)) at += 1;
 				continue;
 			}
+			// A substitution may expand to nothing, leaving no operand at all.
+			if (/^(\$\(|`)/.test(arg)) continue;
 			if (!/^[-+][A-Za-z]/.test(arg)) return stdin;
 			if (/^-[A-Za-z]*c[A-Za-z]*$/.test(arg)) return false;
 			if (/^[-+][oO]$/.test(arg)) {
