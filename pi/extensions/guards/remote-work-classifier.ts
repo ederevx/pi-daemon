@@ -689,7 +689,7 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			if (char !== "<" && char !== ">") continue;
-			const target = where(/(\d*)$/.exec(entry.rest.slice(0, index))?.[1],
+			const target = where(this.descriptorNumber(entry.rest, index),
 				char === "<" ? "0" : "1");
 			const next = entry.rest.slice(index + 1);
 			if (next.startsWith("(")) {
@@ -743,6 +743,17 @@ export class RemoteWorkClassifier {
 	}
 
 	/** The digits a duplication's operand names, after quote removal. */
+	/** The descriptor written as its own token before a redirection operator. */
+	private descriptorNumber(text: string, index: number): string | undefined {
+		let at = index;
+		while (at > 0 && /\d/.test(text[at - 1] ?? "")) at -= 1;
+		if (at === index) return undefined;
+		// A number glued to a word is part of that word, as in `>out3`.
+		const before = text[at - 1];
+		if (before !== undefined && !/[\s;&|()<>]/.test(before)) return undefined;
+		return text.slice(at, index);
+	}
+
 	private descriptorOperand(text: string): string {
 		let word = "";
 		for (let index = 0; index < text.length; index++) {
