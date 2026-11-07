@@ -514,16 +514,16 @@ export class RemoteWorkClassifier {
 		while (index < text.length) {
 			let line = this.heredocLine(text, index, entry);
 			index = line.end;
-			if (line.text === entry.delimiter) {
-				return this.heredocResult(lines, entry, index);
-			}
-			// A trailing backslash joins the next line to this one, so the
-			// delimiter it carries is not a delimiter.
+			// A trailing backslash joins the next line to this one, and the
+			// line the join forms may carry the delimiter at its end.
 			while (!entry.quoted && this.continues(line.text)) {
 				line.text = line.text.slice(0, -1);
 				const next = this.heredocLine(text, index, entry);
 				line = { text: line.text + next.text, end: next.end };
 				index = line.end;
+			}
+			if (line.text === entry.delimiter) {
+				return this.heredocResult(lines, entry, index);
 			}
 			lines.push(line.text);
 		}
