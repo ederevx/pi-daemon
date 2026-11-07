@@ -838,6 +838,14 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			index += 1;
+			const slice = text.slice(index, index + 9);
+			const code = /^u([0-9a-fA-F]{4})/.exec(slice)?.[1]
+				?? /^U([0-9a-fA-F]{8})/.exec(slice)?.[1];
+			if (code !== undefined) {
+				index += code.length;
+				word += String.fromCodePoint(parseInt(code, 16));
+				continue;
+			}
 			const octal = /^[0-7]{1,3}/.exec(text.slice(index, index + 3))?.[0];
 			if (octal !== undefined) {
 				index += octal.length - 1;
