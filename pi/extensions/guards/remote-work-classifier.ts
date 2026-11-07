@@ -476,7 +476,9 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			if (quote === '"' && char === "\\") {
-				delimiter += text[index + 1] ?? "";
+				// Inside double quotes a backslash is special only before these.
+				const escaped = text[index + 1] ?? "";
+				delimiter += /[$`"\\]/.test(escaped) ? escaped : "\\" + escaped;
 				index += 2;
 				continue;
 			}
