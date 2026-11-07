@@ -756,30 +756,34 @@ export class RemoteWorkClassifier {
 		const args = words.slice(1);
 		for (let at = 0; at < args.length; at++) {
 			const arg = args[at];
+			// Quotes are marked in `arg`; the value a shell passes carries none.
+			const value = arg.replace(/\u0001/g, "");
 			if (rest) {
 				// After `--` every word is an operand, but one that may vanish
 				// cannot stand for a script.
 				if (!this.mayVanish(arg)) return stdin;
 				continue;
 			}
-			if (arg === "--") {
+			if (value === "--") {
 				rest = true;
 				continue;
 			}
-			if (arg === "-") continue;
-			if (arg.startsWith("--")) {
-				if (/^--(rcfile|init-file)$/.test(arg)) at += 1;
+			if (value === "-") continue;
+			if (value.startsWith("--")) {
+				if (/^--(rcfile|init-file)$/.test(value)) at += 1;
 				continue;
 			}
-			// A substitution may expand to nothing, leaving no operand at all.
-			if (this.mayVanish(arg)) continue;
-			if (!/^[-+][A-Za-z]/.test(arg)) return stdin;
-			if (/^-[A-Za-z]*c[A-Za-z]*$/.test(arg)) return false;
-			if (/^[-+][oO]$/.test(arg)) {
+			if (!/^[-+][A-Za-z]/.test(value)) {
+				// A substitution may expand to nothing, leaving no operand at all.
+				if (this.mayVanish(arg)) continue;
+				return stdin;
+			}
+			if (/^-[A-Za-z]*c[A-Za-z]*$/.test(value)) return false;
+			if (/^[-+][oO]$/.test(value)) {
 				at += 1;
 				continue;
 			}
-			if (/^-[A-Za-z]*s[A-Za-z]*$/.test(arg)) stdin = true;
+			if (/^-[A-Za-z]*s[A-Za-z]*$/.test(value)) stdin = true;
 		}
 		return true;
 	}
