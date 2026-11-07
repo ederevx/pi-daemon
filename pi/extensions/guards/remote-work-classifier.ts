@@ -40,6 +40,8 @@ type PendingHeredoc = {
 	lineStart: number;
 	/** How much of that command's text came before the declaration. */
 	offset: number;
+	/** True when the body feeds standard input, which `3<<` does not. */
+	stdin: boolean;
 };
 
 /** Owns the verdicts for a command string; stateless. */
@@ -374,12 +376,15 @@ export class RemoteWorkClassifier {
 				&& text[index + 2] !== "<") {
 				const declared = this.heredocWord(text, index + 2);
 				if (declared !== undefined) {
+					const descriptor = /(?:^|\s)(\d*)$/.exec(current)?.[1] ?? "";
+					current = current.slice(0, current.length - descriptor.length);
 					pending.push({
 						delimiter: declared.delimiter,
 						quoted: declared.quoted,
 						stripTabs: declared.stripTabs,
 						lineStart: segments.length,
 						offset: current.trimStart().length,
+						stdin: descriptor === "" || descriptor === "0",
 					});
 					index = declared.end;
 					continue;
@@ -493,7 +498,7 @@ export class RemoteWorkClassifier {
 			}
 			// Only the last redirection of a command supplies its stdin.
 			const last = next === undefined || next.lineStart !== entry.lineStart;
-			const program = last && this.commandRunsStdin(command)
+			const program = last && entry.stdin && this.commandRunsStdin(command)
 				&& !this.redirectsStdin(command[0] ?? "", entry.offset);
 			if (program) nested.push(body.text);
 			// An unquoted body expands even when a shell reads it as a program,
