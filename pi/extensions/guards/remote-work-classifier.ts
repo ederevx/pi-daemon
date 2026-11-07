@@ -662,6 +662,10 @@ export class RemoteWorkClassifier {
 			const target = where(/(\d*)$/.exec(entry.rest.slice(0, index))?.[1],
 				char === "<" ? "0" : "1");
 			const next = entry.rest.slice(index + 1);
+			if (next.startsWith("(")) {
+				index = this.substitutionEnd(entry.rest, index + 1);
+				continue;
+			}
 			if (next.startsWith(char)) {
 				index += 1;
 				read.set(target, "other");
@@ -682,6 +686,30 @@ export class RemoteWorkClassifier {
 			read.set(target, "other");
 		}
 		return read.get("0") === "body";
+	}
+
+	/** The index of the parenthesis closing the substitution at `start`. */
+	private substitutionEnd(text: string, start: number): number {
+		let depth = 0;
+		let quote: string | null = null;
+		for (let index = start; index < text.length; index++) {
+			const char = text[index] ?? "";
+			if (char === "\\") {
+				index += 1;
+				continue;
+			}
+			if (quote !== null) {
+				if (char === quote) quote = null;
+				continue;
+			}
+			if (char === "'" || char === "\"") {
+				quote = char;
+				continue;
+			}
+			if (char === "(") depth += 1;
+			if (char === ")" && --depth === 0) return index;
+		}
+		return text.length;
 	}
 
 	/** The digits a duplication's operand names, after quote removal. */
