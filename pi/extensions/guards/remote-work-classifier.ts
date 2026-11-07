@@ -778,12 +778,17 @@ export class RemoteWorkClassifier {
 				if (this.mayVanish(arg)) continue;
 				return stdin;
 			}
-			if (/^-[A-Za-z]*c[A-Za-z]*$/.test(value)) return false;
-			if (/^[-+][oO]$/.test(value)) {
-				at += 1;
-				continue;
+			// Short-option bundles are read a letter at a time.
+			const flags = value.slice(1).split("");
+			for (let flag = 0; flag < flags.length; flag++) {
+				if (flags[flag] === "c") return false;
+				if (flags[flag] === "s") stdin = true;
+				if (flags[flag] !== "o" && flags[flag] !== "O") continue;
+				// `-o` names an option, and the rest of the bundle or the next
+				// word is its value.
+				if (flag + 1 === flags.length) at += 1;
+				break;
 			}
-			if (/^-[A-Za-z]*s[A-Za-z]*$/.test(value)) stdin = true;
 		}
 		return true;
 	}
