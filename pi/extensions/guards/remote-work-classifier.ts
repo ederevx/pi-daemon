@@ -1060,6 +1060,7 @@ export class RemoteWorkClassifier {
 			}
 			if (segment.startsWith("<<<", index)) {
 				// A here-string takes one word, and neither is a command word.
+				if (!/^\d*$/.test(current)) flush();
 				current = "";
 				index += 3 + this.redirectionOperand(segment.slice(index + 3)).end;
 				continue;
