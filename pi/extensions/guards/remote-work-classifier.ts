@@ -15,6 +15,10 @@
  *   ssh-exec    - a remote command that is not transfer-only
  *   headless-pi - a pi agent run that is not a management subcommand
  *
+ * A heredoc body is data, not command positions, unless a shell on that
+ * line reads its standard input as a program; an unquoted body still runs
+ * the substitutions it carries.
+ *
  * This is a guard, not a sandbox: a command built at runtime (a script
  * written first, an interpreter, eval of a variable) is not seen.
  */
@@ -26,6 +30,15 @@ export type RemoteVerdict =
 	| "ssh-shell"
 	| "ssh-exec"
 	| "headless-pi";
+
+/** A heredoc whose body starts after the newline of its own line. */
+type PendingHeredoc = {
+	delimiter: string;
+	quoted: boolean;
+	stripTabs: boolean;
+	/** Segments already collected for the declaring line. */
+	lineStart: number;
+};
 
 /** Owns the verdicts for a command string; stateless. */
 export class RemoteWorkClassifier {
@@ -287,6 +300,7 @@ export class RemoteWorkClassifier {
 		const nested: string[] = [];
 		let current = "";
 		let quote: string | null = null;
+		let pending: PendingHeredoc[] = [];
 		let index = 0;
 		const push = (): void => {
 			const segment = current.trim();
@@ -350,9 +364,28 @@ export class RemoteWorkClassifier {
 				index = end + 1;
 				continue;
 			}
+			if (char === "<" && text[index + 1] === "<"
+				&& text[index + 2] !== "<") {
+				const declared = this.heredocWord(text, index + 2);
+				if (declared !== undefined) {
+					pending.push({
+						delimiter: declared.delimiter,
+						quoted: declared.quoted,
+						stripTabs: declared.stripTabs,
+						lineStart: segments.length,
+					});
+					index = declared.end;
+					continue;
+				}
+			}
 			if (char === ";" || char === "\n") {
 				push();
 				index += 1;
+				if (char === "\n" && pending.length > 0) {
+					index = this.consumeHeredocs(
+						text, index, pending, segments, nested);
+					pending = [];
+				}
 				continue;
 			}
 			if (char === "(" || char === ")") {
@@ -369,7 +402,160 @@ export class RemoteWorkClassifier {
 			index += 1;
 		}
 		push();
+		if (pending.length > 0) {
+			this.consumeHeredocs(text, index, pending, segments, nested);
+		}
 		return { segments, nested };
+	}
+
+	/** The `<<` operand: an optional `-`, the delimiter, and its end. */
+	private heredocWord(
+		text: string,
+		start: number,
+	): {
+		delimiter: string;
+		quoted: boolean;
+		stripTabs: boolean;
+		end: number;
+	} | undefined {
+		let index = start;
+		const stripTabs = text[index] === "-";
+		if (stripTabs) index += 1;
+		while (text[index] === " " || text[index] === "\t") index += 1;
+		let delimiter = "";
+		let quoted = false;
+		let quote: string | null = null;
+		while (index < text.length) {
+			const char = text[index];
+			if (quote === null) {
+				if (char === "'" || char === '"') {
+					quoted = true;
+					quote = char;
+					index += 1;
+					continue;
+				}
+				if (char === "\\") {
+					quoted = true;
+					delimiter += text[index + 1] ?? "";
+					index += 2;
+					continue;
+				}
+				if (/[\s;|&<>()]/.test(char)) break;
+				delimiter += char;
+				index += 1;
+				continue;
+			}
+			if (char === quote) {
+				quote = null;
+				index += 1;
+				continue;
+			}
+			if (quote === '"' && char === "\\") {
+				delimiter += text[index + 1] ?? "";
+				index += 2;
+				continue;
+			}
+			delimiter += char;
+			index += 1;
+		}
+		return delimiter === "" ? undefined
+			: { delimiter, quoted, stripTabs, end: index };
+	}
+
+	/** Take the queued bodies, routing each by the command that reads it. */
+	private consumeHeredocs(
+		text: string,
+		start: number,
+		pending: PendingHeredoc[],
+		segments: string[],
+		nested: string[],
+	): number {
+		let index = start;
+		for (let at = 0; at < pending.length; at++) {
+			const entry = pending[at];
+			const body = this.heredocBody(text, index, entry);
+			index = body.end;
+			const line = segments.slice(entry.lineStart);
+			// Only the last redirection of a command supplies its stdin.
+			const program = at === pending.length - 1
+				&& this.lineRunsStdin(line)
+				&& !this.lineRedirectsStdin(line);
+			if (program) nested.push(body.text);
+			else if (!entry.quoted) nested.push(...this.expansions(body.text));
+		}
+		return index;
+	}
+
+	/** The body up to its delimiter line, and the index just past it. */
+	private heredocBody(
+		text: string,
+		start: number,
+		entry: PendingHeredoc,
+	): { text: string; end: number } {
+		const lines: string[] = [];
+		let index = start;
+		while (index < text.length) {
+			const stop = text.indexOf("\n", index);
+			const end = stop < 0 ? text.length : stop;
+			const raw = text.slice(index, end);
+			const line = entry.stripTabs ? raw.replace(/^\t+/, "") : raw;
+			if (line === entry.delimiter) {
+				return {
+					text: lines.join("\n"),
+					end: Math.min(end + 1, text.length),
+				};
+			}
+			lines.push(line);
+			index = end + 1;
+		}
+		return { text: lines.join("\n"), end: text.length };
+	}
+
+	/** Substitution bodies an unquoted heredoc still runs. */
+	private expansions(text: string): string[] {
+		const bodies: string[] = [];
+		let index = 0;
+		while (index < text.length) {
+			if (text[index] === "$" && text[index + 1] === "(") {
+				const inner = this.balanced(text, index + 2, "(", ")");
+				bodies.push(inner.body);
+				index = inner.end;
+				continue;
+			}
+			if (text[index] === "`") {
+				const close = text.indexOf("`", index + 1);
+				const end = close < 0 ? text.length : close;
+				bodies.push(text.slice(index + 1, end));
+				index = end + 1;
+				continue;
+			}
+			index += 1;
+		}
+		return bodies;
+	}
+
+	/** True when a command on the line reads stdin as a shell program. */
+	private lineRunsStdin(segments: string[]): boolean {
+		return segments.some((segment) => {
+			const words = this.commandWords(this.words(segment));
+			return words.length > 0 && this.stdinProgram(words);
+		});
+	}
+
+	/** True when a `<` redirection after the heredoc overrides its stdin. */
+	private lineRedirectsStdin(segments: string[]): boolean {
+		const declaring = segments[segments.length - 1] ?? "";
+		return /(^|\s)\d*<(?![<(])/.test(declaring);
+	}
+
+	/** A shell with no script operand runs the program on its stdin. */
+	private stdinProgram(words: string[]): boolean {
+		if (!RemoteWorkClassifier.SHELL_NAMES.has(this.basename(words[0]))) {
+			return false;
+		}
+		const args = words.slice(1);
+		if (this.scriptArg(args) !== undefined) return false;
+		return !args.some((arg) => !arg.startsWith("-"));
 	}
 
 	/** The body of a balanced `$(...)` with the index just past it. */

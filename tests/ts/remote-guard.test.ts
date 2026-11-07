@@ -92,6 +92,31 @@ test("remote guard: allows transfers, ssh queries, and tunnels", () => {
 	}
 });
 
+test("remote guard: a heredoc body is data unless a shell runs it", () => {
+	const { gate } = guard();
+	for (const command of [
+		"python - <<'PY'\npi = e.get('pi') if e else None\nPY",
+		"cat > notes.txt <<'EOF'\nssh host rm -rf /tmp/x\nEOF",
+		"cat <<'EOF'\n$(ssh host id)\nEOF",
+		"bash script.sh <<'EOF'\nssh host id\nEOF",
+		"bash -c 'make' <<'EOF'\nssh host id\nEOF",
+	]) {
+		assertEq(gate(bash(command))?.block, undefined,
+			`the body is data: ${command}`);
+	}
+	for (const command of [
+		"bash - <<'SH'\nssh host id\nSH",
+		"sudo bash <<'SH'\nssh host id\nSH",
+		"sh <<-EOF\n\tssh host id\n\tEOF",
+		"cat <<EOF\n$(ssh host id)\nEOF",
+		"cat <<'EOF' | bash\nssh host id\nEOF",
+		"bash <<'OUT'\nsh <<'IN'\nssh host id\nIN\nOUT",
+	]) {
+		assertEq(gate(bash(command))?.block, true,
+			`the shell runs the body: ${command}`);
+	}
+});
+
 test("remote guard: covers powershell and daemon_tasks submit", () => {
 	const { gate } = guard();
 	assertEq(gate({
