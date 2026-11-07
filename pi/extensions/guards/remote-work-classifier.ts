@@ -663,7 +663,7 @@ export class RemoteWorkClassifier {
 			const next = entry.rest.slice(index + 1);
 			if (next.startsWith(char)) {
 				index += 1;
-				if (char === "<") read.set(target, "other");
+				read.set(target, "other");
 				continue;
 			}
 			if (next.startsWith("&")) {
@@ -672,7 +672,7 @@ export class RemoteWorkClassifier {
 					? "other" : read.get(source) ?? "other");
 				continue;
 			}
-			if (char === "<") read.set(target, "other");
+			read.set(target, "other");
 		}
 		return read.get("0") === "body";
 	}
