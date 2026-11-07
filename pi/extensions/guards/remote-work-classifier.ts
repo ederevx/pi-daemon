@@ -806,7 +806,8 @@ export class RemoteWorkClassifier {
 			}
 			if (char === "'" || char === "\"") {
 				const close = text.indexOf(char, index + 1);
-				word += text.slice(index + 1, close < 0 ? text.length : close);
+				word += this.quotedWord(
+					text.slice(index + 1, close < 0 ? text.length : close), char);
 				index = close < 0 ? text.length : close;
 				continue;
 			}
@@ -818,6 +819,26 @@ export class RemoteWorkClassifier {
 			word += char;
 		}
 		return { word, end };
+	}
+
+	/** A quoted word's value: single quotes are literal, double quotes decode. */
+	private quotedWord(content: string, quote: string): string {
+		if (quote === "'") return content;
+		let word = "";
+		for (let index = 0; index < content.length; index++) {
+			const char = content[index];
+			if (char !== "\\") {
+				word += char;
+				continue;
+			}
+			const escaped = content[index + 1] ?? "";
+			index += 1;
+			// A backslash-newline continues the word and leaves nothing behind.
+			if (escaped === "\n") continue;
+			// Inside double quotes a backslash is special only before these.
+			word += /[$`"\\]/.test(escaped) ? escaped : "\\" + escaped;
+		}
+		return word;
 	}
 
 	/** The descriptor an `&` copy reads by name, if it is one. */
