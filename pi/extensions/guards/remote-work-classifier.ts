@@ -379,7 +379,7 @@ export class RemoteWorkClassifier {
 						quoted: declared.quoted,
 						stripTabs: declared.stripTabs,
 						lineStart: segments.length,
-						offset: current.length,
+						offset: current.trimStart().length,
 					});
 					index = declared.end;
 					continue;
@@ -559,7 +559,7 @@ export class RemoteWorkClassifier {
 
 	/** True when a `<` redirection after the heredoc overrides its stdin. */
 	private redirectsStdin(segment: string, offset: number): boolean {
-		return /(^|\s)\d*<(?![<(])/.test(segment.slice(offset));
+		return /(^|\s)(?:0)?<(?![<(])/.test(segment.slice(offset));
 	}
 
 	/** A shell with no script operand runs the program on its stdin. */
