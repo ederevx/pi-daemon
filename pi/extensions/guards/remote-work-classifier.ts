@@ -756,7 +756,12 @@ export class RemoteWorkClassifier {
 		const args = words.slice(1);
 		for (let at = 0; at < args.length; at++) {
 			const arg = args[at];
-			if (rest) return stdin;
+			if (rest) {
+				// After `--` every word is an operand, but one that may vanish
+				// cannot stand for a script.
+				if (!/^(\$\(|`)/.test(arg)) return stdin;
+				continue;
+			}
 			if (arg === "--") {
 				rest = true;
 				continue;
@@ -826,7 +831,7 @@ export class RemoteWorkClassifier {
 			const char = segment[index];
 			if (quote === "'") {
 				if (char === "'") quote = null;
-				else current += char;
+				else current += this.quoted(char);
 				index += 1;
 				continue;
 			}
@@ -837,7 +842,7 @@ export class RemoteWorkClassifier {
 					continue;
 				}
 				if (char === '"') quote = null;
-				else current += char;
+				else current += this.quoted(char);
 				index += 1;
 				continue;
 			}
@@ -874,6 +879,11 @@ export class RemoteWorkClassifier {
 		}
 		flush();
 		return this.withoutRedirections(words);
+	}
+
+	/** Keep a quoted substitution from reading as an operand of its own. */
+	private quoted(char: string): string {
+		return char === "$" || char === "`" ? `\u0001${char}` : char;
 	}
 
 	private withoutRedirections(words: string[]): string[] {
