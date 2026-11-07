@@ -374,6 +374,11 @@ export class RemoteWorkClassifier {
 				index = end + 1;
 				continue;
 			}
+			if (char === "<" && text.slice(index, index + 3) === "<<<") {
+				// A here-string takes one word, not a body.
+				index += 3;
+				continue;
+			}
 			if (char === "<" && text[index + 1] === "<"
 				&& text[index + 2] !== "<") {
 				const declared = this.heredocWord(text, index + 2);
