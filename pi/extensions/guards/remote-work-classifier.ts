@@ -375,8 +375,11 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			if (char === "<" && text.slice(index, index + 3) === "<<<") {
-				// A here-string takes one word, not a body.
-				const span = 3 + this.redirectionOperand(text.slice(index + 3)).end;
+				// A here-string takes one word, not a body, but its expansions run.
+				const operand = this.redirectionOperand(text.slice(index + 3));
+				const source = text.slice(index + 3, index + 3 + operand.end);
+				nested.push(...this.expansions(source.replace(/'[^']*'/g, "")));
+				const span = 3 + operand.end;
 				current += text.slice(index, index + span);
 				index += span;
 				continue;
