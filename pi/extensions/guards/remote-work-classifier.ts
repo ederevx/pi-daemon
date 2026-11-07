@@ -489,15 +489,15 @@ export class RemoteWorkClassifier {
 			const entry = pending[at];
 			const body = this.heredocBody(text, index, entry);
 			index = body.end;
-			const next = pending[at + 1];
 			// The declaring command, and the commands a pipe feeds from it.
 			const command = [segments[entry.lineStart] ?? ""];
 			for (let later = entry.lineStart + 1; later < segments.length
 				&& bounds[later - 1] === "|"; later++) {
 				command.push(segments[later]);
 			}
-			// Only the last redirection of a command supplies its stdin.
-			const last = next === undefined || next.lineStart !== entry.lineStart;
+			// Only the last redirection to a descriptor supplies it.
+			const last = !pending.slice(at + 1).some((other) =>
+				other.lineStart === entry.lineStart && other.stdin && entry.stdin);
 			const program = last && entry.stdin && this.commandRunsStdin(command)
 				&& !this.redirectsStdin(command[0] ?? "", entry.offset);
 			if (program) nested.push(body.text);
