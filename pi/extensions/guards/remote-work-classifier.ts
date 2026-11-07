@@ -44,6 +44,8 @@ type PendingHeredoc = {
 	stdin: boolean;
 	/** The descriptor the body was written to; empty means standard input. */
 	descriptor: string;
+	/** The rest of the command's own text, where later redirections sit. */
+	rest: string;
 };
 
 /** Owns the verdicts for a command string; stateless. */
@@ -388,6 +390,7 @@ export class RemoteWorkClassifier {
 						offset: current.trimStart().length,
 						stdin: descriptor === "" || descriptor === "0",
 						descriptor,
+						rest: this.commandRest(text, declared.end),
 					});
 					index = declared.end;
 					continue;
@@ -501,10 +504,7 @@ export class RemoteWorkClassifier {
 			// Only the last redirection to a descriptor supplies it.
 			const last = !pending.slice(at + 1).some((other) =>
 				other.lineStart === entry.lineStart && other.stdin && entry.stdin);
-			const stdin = this.duplicatesStdin(
-				segments.slice(entry.lineStart), entry.descriptor)
-				|| (entry.stdin
-					&& !this.redirectsStdin(command[0] ?? "", entry.offset));
+			const stdin = this.suppliesStdin(entry);
 			const program = last && stdin && this.commandRunsStdin(command);
 			if (program) nested.push(body.text);
 			// An unquoted body expands even when a shell reads it as a program,
@@ -611,11 +611,10 @@ export class RemoteWorkClassifier {
 		});
 	}
 
-	/** True when a later `<` redirection after the heredoc supplies stdin. */
-	private redirectsStdin(segment: string, offset: number): boolean {
-		const text = segment.slice(offset);
+	/** The rest of the declaring command, up to the next `;` or pipe. */
+	private commandRest(text: string, start: number): string {
 		let quote: string | null = null;
-		for (let index = 0; index < text.length; index++) {
+		for (let index = start; index < text.length; index++) {
 			const char = text[index];
 			if (char === "\\") {
 				index += 1;
@@ -629,22 +628,48 @@ export class RemoteWorkClassifier {
 				quote = char;
 				continue;
 			}
-			if (char !== "<" || text[index + 1] === "<" || text[index + 1] === "(") {
-				continue;
+			if (char === ";" || char === "|" || char === "\n") {
+				return text.slice(start, index);
 			}
-			const target = /(?:^|\s)(\d*)$/.exec(text.slice(0, index))?.[1] ?? "";
-			if (target === "" || target === "0") return true;
 		}
-		return false;
+		return text.slice(start);
 	}
 
-	/** True when `<&N` hands stdin the descriptor the body was written to. */
-	private duplicatesStdin(segments: string[], descriptor: string): boolean {
-		const target = descriptor === "" ? "0" : descriptor;
-		return segments.some((segment, index) => {
-			if (!/<$/.test(segments[index - 1] ?? "")) return false;
-			return (segment === "" ? "0" : segment) === target;
-		});
+	/** True when the redirections leave stdin reading the body itself. */
+	private suppliesStdin(entry: PendingHeredoc): boolean {
+		const where = (digits: string | undefined): string => digits || "0";
+		const read = new Map<string, string>([[where(entry.descriptor), "body"]]);
+		let quote: string | null = null;
+		for (let index = 0; index < entry.rest.length; index++) {
+			const char = entry.rest[index] ?? "";
+			if (char === "\\") {
+				index += 1;
+				continue;
+			}
+			if (quote !== null) {
+				if (char === quote) quote = null;
+				continue;
+			}
+			if (char === "'" || char === "\"") {
+				quote = char;
+				continue;
+			}
+			if (char !== "<") continue;
+			const target = where(/(\d*)$/.exec(entry.rest.slice(0, index))?.[1]);
+			const next = entry.rest.slice(index + 1);
+			if (next.startsWith("<")) {
+				index += 1;
+				read.set(target, "other");
+				continue;
+			}
+			if (next.startsWith("&")) {
+				const source = where(/^&(\d*)/.exec(next)?.[1]);
+				read.set(target, read.get(source) ?? "other");
+				continue;
+			}
+			read.set(target, "other");
+		}
+		return read.get("0") === "body";
 	}
 
 	/** A shell with no script operand runs the program on its stdin. */
