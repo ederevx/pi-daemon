@@ -36,7 +36,7 @@ type PendingHeredoc = {
 	delimiter: string;
 	quoted: boolean;
 	stripTabs: boolean;
-	/** Segments already collected for the declaring line. */
+	/** Segments already collected for the declaring command. */
 	lineStart: number;
 };
 
@@ -475,11 +475,13 @@ export class RemoteWorkClassifier {
 			const entry = pending[at];
 			const body = this.heredocBody(text, index, entry);
 			index = body.end;
-			const line = segments.slice(entry.lineStart);
+			const next = pending[at + 1];
+			const command = segments.slice(entry.lineStart,
+				next === undefined ? segments.length : next.lineStart);
 			// Only the last redirection of a command supplies its stdin.
-			const program = at === pending.length - 1
-				&& this.lineRunsStdin(line)
-				&& !this.lineRedirectsStdin(line);
+			const last = next === undefined || next.lineStart !== entry.lineStart;
+			const program = last && this.lineRunsStdin(command)
+				&& !this.lineRedirectsStdin(command);
 			if (program) nested.push(body.text);
 			else if (!entry.quoted) nested.push(...this.expansions(body.text));
 		}
