@@ -446,6 +446,13 @@ export class RemoteWorkClassifier {
 		while (index < text.length) {
 			const char = text[index];
 			if (quote === null) {
+				if (char === "$" && text[index + 1] === "'") {
+					quoted = true;
+					const inner = this.ansiQuoted(text.slice(index + 2));
+					delimiter += inner.word;
+					index += 2 + inner.consumed;
+					continue;
+				}
 				if (char === "'" || char === '"') {
 					quoted = true;
 					quote = char;
