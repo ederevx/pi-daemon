@@ -63,6 +63,10 @@ test("remote guard: refuses a remote shell and remote work", () => {
 		"ssh host -T",
 		"ssh host -o RemoteCommand=make",
 		"(cd x && ssh host make)",
+		"cat <<<\"$(ssh host id)\"",
+		"cat <<<\"\\\\$(ssh host id)\"",
+		"cat <<<\"'$(ssh host id)'\"",
+		"cat <<<'a\\'\"$(ssh host id)\"",
 	]) {
 		const result = gate(bash(command));
 		assertEq(result?.block, true, `must block: ${command}`);
@@ -86,6 +90,9 @@ test("remote guard: allows transfers, ssh queries, and tunnels", () => {
 		"ssh host -- cat f",
 		"pi -p x",
 		"grep -rn ssh README.md",
+		"cat <<<'$(ssh host id)'",
+		"cat <<<\"\\$(ssh host id)\"",
+		"bash <<<safe",
 	]) {
 		assertEq(gate(bash(command))?.block, undefined,
 			`must stay allowed: ${command}`);
@@ -109,7 +116,6 @@ test("remote guard: a heredoc body is data unless a shell runs it", () => {
 		"cat <<'A' | bash 3<&0 <<'B'\nssh host id\nA\nprintf safe\nB",
 		"bash 3<<'EOF' <& 3</dev/null\nssh host id\nEOF",
 		"bash<<<safe",
-		"cat <<<'$(ssh host id)'",
 		"bash <<'EOF' <<<safe\nssh host id\nEOF",
 		"bash <<<EOF",
 		"bash <<E\\\nOF\nsafe\nEOF",
@@ -216,9 +222,6 @@ test("remote guard: a heredoc body is data unless a shell runs it", () => {
 		"bash <<$'\\u0045OF'\nssh host id\nEOF",
 		"cat <<\"E\\OF\"\nsafe\nE\\OF\nssh host id",
 		"cat <<\"E\\\nOF\"\nsafe\nEOF\nssh host id",
-		"cat <<<'a\\'\"$(ssh host id)\"",
-		"cat <<<\"'$(ssh host id)'\"",
-		"cat <<<\"$(ssh host id)\"",
 		"bash<<<safe <<'EOF'\nssh host id\nEOF",
 		"bash <<<safe <<'EOF'\nssh host id\nEOF",
 		"bash <<< safe <<'EOF'\nssh host id\nEOF",
