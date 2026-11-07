@@ -832,7 +832,7 @@ export class RemoteWorkClassifier {
 		let word = "";
 		for (let index = 0; index < text.length; index++) {
 			const char = text[index];
-			if (char === "'") return { word, consumed: index + 1 };
+			if (char === "'") return { word: this.beforeNul(word), consumed: index + 1 };
 			if (char !== "\\") {
 				word += char;
 				continue;
@@ -862,7 +862,13 @@ export class RemoteWorkClassifier {
 			const escaped = text[index] ?? "";
 			word += /['"\\?]/.test(escaped) ? escaped : "\\" + escaped;
 		}
-		return { word, consumed: text.length };
+		return { word: this.beforeNul(word), consumed: text.length };
+	}
+
+	/** Bash cannot hold a NUL, so a value ends at the first one. */
+	private beforeNul(word: string): string {
+		const nul = word.indexOf("\u0000");
+		return nul < 0 ? word : word.slice(0, nul);
 	}
 
 	/** A quoted word's value: single quotes are literal, double quotes decode. */
