@@ -658,6 +658,13 @@ export class RemoteWorkClassifier {
 				quote = char;
 				continue;
 			}
+			if (char === "#" && (index === 0 || /\s/.test(entry.rest[index - 1] ?? ""))) {
+				// A word that starts with `#` begins a comment, which runs to the
+				// end of the line and carries no redirection of its own.
+				const end = entry.rest.indexOf("\n", index);
+				index = end < 0 ? entry.rest.length : end;
+				continue;
+			}
 			if (char === "$" && entry.rest[index + 1] === "(") {
 				index = this.substitutionEnd(entry.rest, index + 1);
 				continue;
@@ -861,6 +868,13 @@ export class RemoteWorkClassifier {
 				quote = char;
 				current += "\u0001";
 				index += 1;
+				continue;
+			}
+			if (char === "#" && current === "") {
+				// A word that starts with `#` begins a comment, which runs to the
+				// end of the line and carries no syntax of its own.
+				const end = segment.indexOf("\n", index);
+				index = end < 0 ? segment.length : end;
 				continue;
 			}
 			if (char === "\\") {
