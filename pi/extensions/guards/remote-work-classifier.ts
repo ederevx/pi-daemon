@@ -631,6 +631,9 @@ export class RemoteWorkClassifier {
 			if (char === ";" || char === "|" || char === "\n") {
 				return text.slice(start, index);
 			}
+			if (char === "&" && text[index - 1] !== "<" && text[index - 1] !== ">") {
+				return text.slice(start, index);
+			}
 		}
 		return text.slice(start);
 	}
