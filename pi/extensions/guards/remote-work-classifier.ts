@@ -460,8 +460,12 @@ export class RemoteWorkClassifier {
 					continue;
 				}
 				if (char === "\\") {
-					quoted = true;
-					delimiter += text[index + 1] ?? "";
+					// A backslash-newline continues the line and quotes nothing.
+					const escaped = text[index + 1] ?? "";
+					if (escaped !== "\n") {
+						quoted = true;
+						delimiter += escaped;
+					}
 					index += 2;
 					continue;
 				}
