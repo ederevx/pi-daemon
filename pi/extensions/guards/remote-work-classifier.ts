@@ -640,8 +640,8 @@ export class RemoteWorkClassifier {
 
 	/** True when the redirections leave stdin reading the body itself. */
 	private suppliesStdin(entry: PendingHeredoc): boolean {
-		const where = (digits: string | undefined): string => digits || "0";
-		const read = new Map<string, string>([[where(entry.descriptor), "body"]]);
+		const where = (digits: string | undefined, fallback: string): string => digits || fallback;
+		const read = new Map<string, string>([[where(entry.descriptor, "0"), "body"]]);
 		let quote: string | null = null;
 		for (let index = 0; index < entry.rest.length; index++) {
 			const char = entry.rest[index] ?? "";
@@ -657,20 +657,22 @@ export class RemoteWorkClassifier {
 				quote = char;
 				continue;
 			}
-			if (char !== "<") continue;
-			const target = where(/(\d*)$/.exec(entry.rest.slice(0, index))?.[1]);
+			if (char !== "<" && char !== ">") continue;
+			const target = where(/(\d*)$/.exec(entry.rest.slice(0, index))?.[1],
+				char === "<" ? "0" : "1");
 			const next = entry.rest.slice(index + 1);
-			if (next.startsWith("<")) {
+			if (next.startsWith(char)) {
 				index += 1;
-				read.set(target, "other");
+				if (char === "<") read.set(target, "other");
 				continue;
 			}
 			if (next.startsWith("&")) {
-				const source = where(/^&(\d*)/.exec(next)?.[1]);
-				read.set(target, read.get(source) ?? "other");
+				const source = /^&(\d+)/.exec(next)?.[1];
+				read.set(target, source === undefined
+					? "other" : read.get(source) ?? "other");
 				continue;
 			}
-			read.set(target, "other");
+			if (char === "<") read.set(target, "other");
 		}
 		return read.get("0") === "body";
 	}
