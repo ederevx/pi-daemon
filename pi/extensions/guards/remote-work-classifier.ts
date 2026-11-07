@@ -496,7 +496,8 @@ export class RemoteWorkClassifier {
 			const program = last && this.commandRunsStdin(command)
 				&& !this.redirectsStdin(command[0] ?? "", entry.offset);
 			if (program) nested.push(body.text);
-			else if (!entry.quoted) nested.push(...this.expansions(body.text));
+			// An unquoted body expands even when a shell reads it as a program.
+			if (!entry.quoted) nested.push(...this.expansions(body.text));
 		}
 		return index;
 	}
@@ -531,6 +532,10 @@ export class RemoteWorkClassifier {
 		const bodies: string[] = [];
 		let index = 0;
 		while (index < text.length) {
+			if (text[index] === "\\") {
+				index += 2;
+				continue;
+			}
 			if (text[index] === "$" && text[index + 1] === "(") {
 				const inner = this.balanced(text, index + 2, "(", ")");
 				bodies.push(inner.body);
