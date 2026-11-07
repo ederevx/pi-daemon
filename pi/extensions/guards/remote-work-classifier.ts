@@ -297,14 +297,18 @@ export class RemoteWorkClassifier {
 	/** Split into command positions and collect substitution bodies. */
 	private scan(text: string): { segments: string[]; nested: string[] } {
 		const segments: string[] = [];
+		const bounds: string[] = [];
 		const nested: string[] = [];
 		let current = "";
 		let quote: string | null = null;
 		let pending: PendingHeredoc[] = [];
 		let index = 0;
-		const push = (): void => {
+		const push = (bound: string): void => {
 			const segment = current.trim();
-			if (segment !== "") segments.push(segment);
+			if (segment !== "") {
+				segments.push(segment);
+				bounds.push(bound);
+			}
 			current = "";
 		};
 		while (index < text.length) {
@@ -379,31 +383,32 @@ export class RemoteWorkClassifier {
 				}
 			}
 			if (char === ";" || char === "\n") {
-				push();
+				push(char);
 				index += 1;
 				if (char === "\n" && pending.length > 0) {
 					index = this.consumeHeredocs(
-						text, index, pending, segments, nested);
+						text, index, pending, segments, bounds, nested);
 					pending = [];
 				}
 				continue;
 			}
 			if (char === "(" || char === ")") {
-				push();
+				push(char);
 				index += 1;
 				continue;
 			}
 			if (char === "&" || char === "|") {
-				push();
-				index += text[index + 1] === char ? 2 : 1;
+				const doubled = text[index + 1] === char;
+				push(doubled ? char + char : char);
+				index += doubled ? 2 : 1;
 				continue;
 			}
 			current += char;
 			index += 1;
 		}
-		push();
+		push("");
 		if (pending.length > 0) {
-			this.consumeHeredocs(text, index, pending, segments, nested);
+			this.consumeHeredocs(text, index, pending, segments, bounds, nested);
 		}
 		return { segments, nested };
 	}
@@ -468,6 +473,7 @@ export class RemoteWorkClassifier {
 		start: number,
 		pending: PendingHeredoc[],
 		segments: string[],
+		bounds: string[],
 		nested: string[],
 	): number {
 		let index = start;
@@ -476,12 +482,16 @@ export class RemoteWorkClassifier {
 			const body = this.heredocBody(text, index, entry);
 			index = body.end;
 			const next = pending[at + 1];
-			const command = segments.slice(entry.lineStart,
-				next === undefined ? segments.length : next.lineStart);
+			// The declaring command, and the commands a pipe feeds from it.
+			const command = [segments[entry.lineStart] ?? ""];
+			for (let later = entry.lineStart + 1; later < segments.length
+				&& bounds[later - 1] === "|"; later++) {
+				command.push(segments[later]);
+			}
 			// Only the last redirection of a command supplies its stdin.
 			const last = next === undefined || next.lineStart !== entry.lineStart;
-			const program = last && this.lineRunsStdin(command)
-				&& !this.lineRedirectsStdin(command);
+			const program = last && this.commandRunsStdin(command)
+				&& !this.redirectsStdin(command[0] ?? "");
 			if (program) nested.push(body.text);
 			else if (!entry.quoted) nested.push(...this.expansions(body.text));
 		}
@@ -536,18 +546,17 @@ export class RemoteWorkClassifier {
 		return bodies;
 	}
 
-	/** True when a command on the line reads stdin as a shell program. */
-	private lineRunsStdin(segments: string[]): boolean {
+	/** True when a command in the pipeline reads stdin as a shell program. */
+	private commandRunsStdin(segments: string[]): boolean {
 		return segments.some((segment) => {
 			const words = this.commandWords(this.words(segment));
 			return words.length > 0 && this.stdinProgram(words);
 		});
 	}
 
-	/** True when a `<` redirection after the heredoc overrides its stdin. */
-	private lineRedirectsStdin(segments: string[]): boolean {
-		const declaring = segments[segments.length - 1] ?? "";
-		return /(^|\s)\d*<(?![<(])/.test(declaring);
+	/** True when a `<` redirection in the command overrides its stdin. */
+	private redirectsStdin(segment: string): boolean {
+		return /(^|\s)\d*<(?![<(])/.test(segment);
 	}
 
 	/** A shell with no script operand runs the program on its stdin. */
