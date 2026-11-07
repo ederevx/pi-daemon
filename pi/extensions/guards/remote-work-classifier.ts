@@ -497,7 +497,7 @@ export class RemoteWorkClassifier {
 			for (let later = entry.lineStart + 1; later < segments.length
 				&& bounds[later - 1] === "|"; later++) {
 				// A command that redirects its own stdin does not read the pipe.
-				if (this.redirectsStdin(segments[later] ?? "")
+				if (!this.readsPipeline(segments[later] ?? "")
 					|| pending.some((other) => other.lineStart === later
 						&& (other.descriptor === "" || other.descriptor === "0"))) break;
 				command.push(segments[later]);
@@ -510,25 +510,6 @@ export class RemoteWorkClassifier {
 			if (!entry.quoted) nested.push(...this.expansions(body.raw));
 		}
 		return index;
-	}
-
-	/** True when a command's own text sends something other than the pipe to stdin. */
-	private redirectsStdin(text: string): boolean {
-		for (let index = 0; index < text.length; index++) {
-			const char = text[index] ?? "";
-			if (char === "\\") {
-				index += 1;
-				continue;
-			}
-			if (char === "'" || char === "\"") {
-				const end = text.indexOf(char, index + 1);
-				index = end < 0 ? text.length : end;
-				continue;
-			}
-			// A process substitution is an argument, not a redirection.
-			if (char === "<" && text[index + 1] !== "(") return true;
-		}
-		return false;
 	}
 
 	/** The body up to its delimiter line, as the command receives it. */
@@ -671,14 +652,32 @@ export class RemoteWorkClassifier {
 
 	/** True when the redirections leave stdin reading the body itself. */
 	private suppliesStdin(entry: PendingHeredoc): boolean {
+		const read = new Map<string, string>([[this.descriptorKey(entry.descriptor), "body"]]);
+		this.applyRedirections(entry.rest, read);
+		return read.get("0") === "body";
+	}
+
+	/** A descriptor spelled one way, so `03` and `3` are the same stream. */
+	private descriptorKey(digits: string | undefined): string {
+		return String(Number(digits || "0"));
+	}
+
+	/** True when a command keeps the stdin a pipe hands it. */
+	private readsPipeline(text: string): boolean {
+		const read = new Map<string, string>([["0", "pipe"]]);
+		this.applyRedirections(text, read);
+		return read.get("0") === "pipe";
+	}
+
+	/** Follow a command's redirections, recording what each descriptor reads. */
+	private applyRedirections(text: string, read: Map<string, string>): void {
 		const where = (digits: string | undefined, fallback: string): string =>
-			String(Number(digits || fallback));
-		const read = new Map<string, string>([[where(entry.descriptor, "0"), "body"]]);
+			this.descriptorKey(digits || fallback);
 		let quote: string | null = null;
 		// Where the operand of the previous redirection ended.
 		let consumed = -1;
-		for (let index = 0; index < entry.rest.length; index++) {
-			const char = entry.rest[index] ?? "";
+		for (let index = 0; index < text.length; index++) {
+			const char = text[index] ?? "";
 			if (char === "\\") {
 				index += 1;
 				continue;
@@ -691,28 +690,28 @@ export class RemoteWorkClassifier {
 				quote = char;
 				continue;
 			}
-			if (char === "#" && (index === 0 || /\s/.test(entry.rest[index - 1] ?? ""))) {
+			if (char === "#" && (index === 0 || /\s/.test(text[index - 1] ?? ""))) {
 				// A word that starts with `#` begins a comment, which runs to the
 				// end of the line and carries no redirection of its own.
-				const end = entry.rest.indexOf("\n", index);
-				index = end < 0 ? entry.rest.length : end;
+				const end = text.indexOf("\n", index);
+				index = end < 0 ? text.length : end;
 				continue;
 			}
-			if (char === "$" && entry.rest[index + 1] === "(") {
-				index = this.substitutionEnd(entry.rest, index + 1);
+			if (char === "$" && text[index + 1] === "(") {
+				index = this.substitutionEnd(text, index + 1);
 				continue;
 			}
 			if (char === "`") {
-				const end = entry.rest.indexOf("`", index + 1);
-				index = end < 0 ? entry.rest.length : end;
+				const end = text.indexOf("`", index + 1);
+				index = end < 0 ? text.length : end;
 				continue;
 			}
 			if (char !== "<" && char !== ">") continue;
-			const target = where(this.descriptorNumber(entry.rest, index, consumed),
+			const target = where(this.descriptorNumber(text, index, consumed),
 				char === "<" ? "0" : "1");
-			const next = entry.rest.slice(index + 1);
+			const next = text.slice(index + 1);
 			if (next.startsWith("(")) {
-				index = this.substitutionEnd(entry.rest, index + 1);
+				index = this.substitutionEnd(text, index + 1);
 				continue;
 			}
 			if (next.startsWith(char)) {
@@ -738,7 +737,6 @@ export class RemoteWorkClassifier {
 			consumed = index + 1 + this.redirectionOperand(next).end;
 			read.set(target, "other");
 		}
-		return read.get("0") === "body";
 	}
 
 	/** The index of the parenthesis closing the substitution at `start`. */
