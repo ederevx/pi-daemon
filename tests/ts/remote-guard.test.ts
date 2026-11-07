@@ -99,6 +99,9 @@ test("remote guard: a heredoc body is data unless a shell runs it", () => {
 		"cat > notes.txt <<'EOF'\nssh host rm -rf /tmp/x\nEOF",
 		"cat <<'EOF'\n$(ssh host id)\nEOF",
 		"bash script.sh <<'EOF'\nssh host id\nEOF",
+		"bash <<'EOF' 1>&2 </dev/null\nssh host id\nEOF",
+		"bash <<'EOF' >3</dev/null\nssh host id\nEOF",
+		"bash <<'EOF' >>3<file\nssh host id\nEOF",
 		"bash <<'EOF' >out3</dev/null\nssh host id\nEOF",
 		"bash <<'EOF' > >(cat; :) </dev/null\nssh host id\nEOF",
 		"bash <<'EOF' >$(printf /dev/null) </dev/null\nssh host id\nEOF",
@@ -136,12 +139,12 @@ test("remote guard: a heredoc body is data unless a shell runs it", () => {
 		"bash -c 'make' <<'EOF'\nssh host id\nEOF",
 		"bash <<'EOF' 0</dev/null\nssh host id\nEOF",
 	]) {
-		"cat <<''\nssh host id\n\n",
 		assertEq(gate(bash(command))?.block, undefined,
 			`the body is data: ${command}`);
 	}
 	for (const command of [
 		"bash - <<'SH'\nssh host id\nSH",
+		"bash <<'EOF' 1>&2 <&0\nssh host id\nEOF",
 		"sudo bash <<'SH'\nssh host id\nSH",
 		"sh <<-EOF\n\tssh host id\n\tEOF",
 		"cat <<EOF\n$(ssh host id)\nEOF",

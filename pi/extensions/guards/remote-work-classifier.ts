@@ -656,8 +656,12 @@ export class RemoteWorkClassifier {
 	private suppliesStdin(entry: PendingHeredoc): boolean {
 		const where = (digits: string | undefined, fallback: string): string =>
 			String(Number(digits || fallback));
+		const wordLength = (text: string): number =>
+			/^[^\s;&|<>()]*/.exec(text)?.[0].length ?? 0;
 		const read = new Map<string, string>([[where(entry.descriptor, "0"), "body"]]);
 		let quote: string | null = null;
+		// Where the operand of the previous redirection ended.
+		let consumed = -1;
 		for (let index = 0; index < entry.rest.length; index++) {
 			const char = entry.rest[index] ?? "";
 			if (char === "\\") {
@@ -689,7 +693,7 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			if (char !== "<" && char !== ">") continue;
-			const target = where(this.descriptorNumber(entry.rest, index),
+			const target = where(this.descriptorNumber(entry.rest, index, consumed),
 				char === "<" ? "0" : "1");
 			const next = entry.rest.slice(index + 1);
 			if (next.startsWith("(")) {
@@ -697,12 +701,14 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			if (next.startsWith(char)) {
+				consumed = index + 2 + wordLength(next.slice(1));
 				index += 1;
 				read.set(target, "other");
 				continue;
 			}
 			if (next.startsWith("&")) {
 				const moved = this.descriptorOperand(next.slice(1));
+				consumed = index + 2 + moved.length;
 				const digits = moved.replace(/-$/, "");
 				if (digits === "") {
 					read.set(target, "other");
@@ -713,6 +719,7 @@ export class RemoteWorkClassifier {
 				if (moved !== digits) read.set(source, "other");
 				continue;
 			}
+			consumed = index + 1 + wordLength(next);
 			read.set(target, "other");
 		}
 		return read.get("0") === "body";
@@ -744,9 +751,9 @@ export class RemoteWorkClassifier {
 
 	/** The digits a duplication's operand names, after quote removal. */
 	/** The descriptor written as its own token before a redirection operator. */
-	private descriptorNumber(text: string, index: number): string | undefined {
+	private descriptorNumber(text: string, index: number, consumed: number): string | undefined {
 		let at = index;
-		while (at > 0 && /\d/.test(text[at - 1] ?? "")) at -= 1;
+		while (at > consumed && /\d/.test(text[at - 1] ?? "")) at -= 1;
 		if (at === index) return undefined;
 		// A number glued to a word is part of that word, as in `>out3`.
 		const before = text[at - 1];
