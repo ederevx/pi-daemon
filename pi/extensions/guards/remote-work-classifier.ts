@@ -656,8 +656,6 @@ export class RemoteWorkClassifier {
 	private suppliesStdin(entry: PendingHeredoc): boolean {
 		const where = (digits: string | undefined, fallback: string): string =>
 			String(Number(digits || fallback));
-		const wordLength = (text: string): number =>
-			/^[^\s;&|<>()]*/.exec(text)?.[0].length ?? 0;
 		const read = new Map<string, string>([[where(entry.descriptor, "0"), "body"]]);
 		let quote: string | null = null;
 		// Where the operand of the previous redirection ended.
@@ -701,7 +699,7 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			if (next.startsWith(char)) {
-				consumed = index + 2 + wordLength(next.slice(1));
+				consumed = index + 2 + this.redirectionOperand(next.slice(1)).end;
 				index += 1;
 				read.set(target, "other");
 				continue;
@@ -720,7 +718,7 @@ export class RemoteWorkClassifier {
 				if (moved !== digits) read.set(source, "other");
 				continue;
 			}
-			consumed = index + 1 + wordLength(next);
+			consumed = index + 1 + this.redirectionOperand(next).end;
 			read.set(target, "other");
 		}
 		return read.get("0") === "body";
@@ -762,7 +760,8 @@ export class RemoteWorkClassifier {
 		return text.slice(at, index);
 	}
 
-	private descriptorOperand(text: string): { value: string; end: number } {
+	/** The word a redirection takes, and where it ends in the source. */
+	private redirectionOperand(text: string): { word: string; end: number } {
 		let word = "";
 		let end = text.length;
 		for (let index = 0; index < text.length; index++) {
@@ -785,6 +784,12 @@ export class RemoteWorkClassifier {
 			}
 			word += char;
 		}
+		return { word, end };
+	}
+
+	/** The descriptor an `&` copy reads by name, if it is one. */
+	private descriptorOperand(text: string): { value: string; end: number } {
+		const { word, end } = this.redirectionOperand(text);
 		return { value: /^\d+-?$/.test(word) ? word : "", end };
 	}
 
