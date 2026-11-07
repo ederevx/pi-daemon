@@ -759,7 +759,7 @@ export class RemoteWorkClassifier {
 			if (rest) {
 				// After `--` every word is an operand, but one that may vanish
 				// cannot stand for a script.
-				if (!/^(\$\(|`)/.test(arg)) return stdin;
+				if (!this.mayVanish(arg)) return stdin;
 				continue;
 			}
 			if (arg === "--") {
@@ -772,7 +772,7 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			// A substitution may expand to nothing, leaving no operand at all.
-			if (/^(\$\(|`)/.test(arg)) continue;
+			if (this.mayVanish(arg)) continue;
 			if (!/^[-+][A-Za-z]/.test(arg)) return stdin;
 			if (/^-[A-Za-z]*c[A-Za-z]*$/.test(arg)) return false;
 			if (/^[-+][oO]$/.test(arg)) {
@@ -831,7 +831,7 @@ export class RemoteWorkClassifier {
 			const char = segment[index];
 			if (quote === "'") {
 				if (char === "'") quote = null;
-				else current += this.quoted(char);
+				else current += char;
 				index += 1;
 				continue;
 			}
@@ -842,12 +842,13 @@ export class RemoteWorkClassifier {
 					continue;
 				}
 				if (char === '"') quote = null;
-				else current += this.quoted(char);
+				else current += char;
 				index += 1;
 				continue;
 			}
 			if (char === "'" || char === '"') {
 				quote = char;
+				current += "\u0001";
 				index += 1;
 				continue;
 			}
@@ -881,9 +882,18 @@ export class RemoteWorkClassifier {
 		return this.withoutRedirections(words);
 	}
 
-	/** Keep a quoted substitution from reading as an operand of its own. */
-	private quoted(char: string): string {
-		return char === "$" || char === "`" ? `\u0001${char}` : char;
+	/** True when the whole word can expand to nothing at all. */
+	private mayVanish(word: string): boolean {
+		let index = 0;
+		while (index < word.length) {
+			if (!word.startsWith("$(", index) && word[index] !== "`") return false;
+			const end = word[index] === "`"
+				? word.indexOf("`", index + 1)
+				: this.substitutionEnd(word, index + 1);
+			if (end < 0) return false;
+			index = end + 1;
+		}
+		return word.length > 0;
 	}
 
 	private withoutRedirections(words: string[]): string[] {
@@ -1011,6 +1021,6 @@ export class RemoteWorkClassifier {
 
 	private basename(word: string): string {
 		const parts = word.split(/[\\/]/);
-		return parts[parts.length - 1] ?? "";
+		return (parts[parts.length - 1] ?? "").replace(/\u0001/g, "");
 	}
 }
