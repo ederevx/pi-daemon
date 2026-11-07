@@ -707,8 +707,9 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			if (next.startsWith("&")) {
-				const moved = this.descriptorOperand(next.slice(1));
-				consumed = index + 2 + moved.length;
+				const operand = this.descriptorOperand(next.slice(1));
+				const moved = operand.value;
+				consumed = index + 2 + operand.end;
 				const digits = moved.replace(/-$/, "");
 				if (digits === "") {
 					read.set(target, "other");
@@ -761,8 +762,9 @@ export class RemoteWorkClassifier {
 		return text.slice(at, index);
 	}
 
-	private descriptorOperand(text: string): string {
+	private descriptorOperand(text: string): { value: string; end: number } {
 		let word = "";
+		let end = text.length;
 		for (let index = 0; index < text.length; index++) {
 			const char = text[index] ?? "";
 			if (char === "\\") {
@@ -771,16 +773,19 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			if (char === "'" || char === "\"") {
-				const end = text.indexOf(char, index + 1);
-				word += text.slice(index + 1, end < 0 ? text.length : end);
-				index = end < 0 ? text.length : end;
+				const close = text.indexOf(char, index + 1);
+				word += text.slice(index + 1, close < 0 ? text.length : close);
+				index = close < 0 ? text.length : close;
 				continue;
 			}
 			if (word === "" && /\s/.test(char)) continue;
-			if (/[\s;|&<>()]/.test(char)) break;
+			if (/[\s;|&<>()]/.test(char)) {
+				end = index;
+				break;
+			}
 			word += char;
 		}
-		return /^\d+-?$/.test(word) ? word : "";
+		return { value: /^\d+-?$/.test(word) ? word : "", end };
 	}
 
 	/** A shell with no script operand runs the program on its stdin. */
