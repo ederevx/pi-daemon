@@ -496,6 +496,10 @@ export class RemoteWorkClassifier {
 			const command = [segments[entry.lineStart] ?? ""];
 			for (let later = entry.lineStart + 1; later < segments.length
 				&& bounds[later - 1] === "|"; later++) {
+				// A command that redirects its own stdin does not read the pipe.
+				if (this.redirectsStdin(segments[later] ?? "")
+					|| pending.some((other) => other.lineStart === later
+						&& (other.descriptor === "" || other.descriptor === "0"))) break;
 				command.push(segments[later]);
 			}
 			const program = this.suppliesStdin(entry)
@@ -506,6 +510,25 @@ export class RemoteWorkClassifier {
 			if (!entry.quoted) nested.push(...this.expansions(body.raw));
 		}
 		return index;
+	}
+
+	/** True when a command's own text sends something other than the pipe to stdin. */
+	private redirectsStdin(text: string): boolean {
+		for (let index = 0; index < text.length; index++) {
+			const char = text[index] ?? "";
+			if (char === "\\") {
+				index += 1;
+				continue;
+			}
+			if (char === "'" || char === "\"") {
+				const end = text.indexOf(char, index + 1);
+				index = end < 0 ? text.length : end;
+				continue;
+			}
+			// A process substitution is an argument, not a redirection.
+			if (char === "<" && text[index + 1] !== "(") return true;
+		}
+		return false;
 	}
 
 	/** The body up to its delimiter line, as the command receives it. */
