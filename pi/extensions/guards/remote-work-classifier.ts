@@ -644,7 +644,7 @@ export class RemoteWorkClassifier {
 		const args = words.slice(1);
 		for (let at = 0; at < args.length; at++) {
 			const arg = args[at];
-			if (rest) return false;
+			if (rest) return stdin;
 			if (arg === "--") {
 				rest = true;
 				continue;
