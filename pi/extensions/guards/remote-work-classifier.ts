@@ -839,11 +839,12 @@ export class RemoteWorkClassifier {
 			}
 			index += 1;
 			const slice = text.slice(index, index + 9);
-			const code = /^u([0-9a-fA-F]{4})/.exec(slice)?.[1]
-				?? /^U([0-9a-fA-F]{8})/.exec(slice)?.[1];
-			if (code !== undefined) {
+			const code = /^u([0-9a-fA-F]{1,4})/.exec(slice)?.[1]
+				?? /^U([0-9a-fA-F]{1,8})/.exec(slice)?.[1];
+			const point = code === undefined ? -1 : parseInt(code, 16);
+			if (point >= 0 && point <= 0x10ffff) {
 				index += code.length;
-				word += String.fromCodePoint(parseInt(code, 16));
+				word += String.fromCodePoint(point);
 				continue;
 			}
 			const octal = /^[0-7]{1,3}/.exec(text.slice(index, index + 3))?.[0];
