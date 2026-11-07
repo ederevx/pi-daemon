@@ -385,7 +385,7 @@ export class RemoteWorkClassifier {
 						quoted: declared.quoted,
 						stripTabs: declared.stripTabs,
 						lineStart: segments.length,
-						offset: current.trimStart().length,
+						offset: current.trim().length,
 						descriptor,
 						rest: this.commandRest(text, declared.end),
 					});
@@ -408,7 +408,9 @@ export class RemoteWorkClassifier {
 				index += 1;
 				continue;
 			}
-			if (char === "&" || char === "|") {
+			// `<&3` copies a descriptor; only a bare `&` backgrounds the command.
+			if ((char === "&" && (text[index - 1] ?? "") !== "<")
+				|| char === "|") {
 				const doubled = text[index + 1] === char;
 				push(doubled ? char + char : char);
 				index += doubled ? 2 : 1;
@@ -497,9 +499,10 @@ export class RemoteWorkClassifier {
 			for (let later = entry.lineStart + 1; later < segments.length
 				&& bounds[later - 1] === "|"; later++) {
 				// A command that redirects its own stdin does not read the pipe.
-				if (!this.readsPipeline(segments[later] ?? "")
-					|| pending.some((other) => other.lineStart === later
-						&& (other.descriptor === "" || other.descriptor === "0"))) break;
+				const declared = pending
+					.filter((other) => other.lineStart === later)
+					.map((other) => ({ at: other.offset, to: other.descriptor }));
+				if (!this.readsPipeline(segments[later] ?? "", declared)) break;
 				command.push(segments[later]);
 			}
 			const program = this.suppliesStdin(entry)
@@ -663,20 +666,34 @@ export class RemoteWorkClassifier {
 	}
 
 	/** True when a command keeps the stdin a pipe hands it. */
-	private readsPipeline(text: string): boolean {
+	private readsPipeline(
+		text: string,
+		declared: Array<{ at: number; to: string }>,
+	): boolean {
 		const read = new Map<string, string>([["0", "pipe"]]);
-		this.applyRedirections(text, read);
+		this.applyRedirections(text, read, declared);
 		return read.get("0") === "pipe";
 	}
 
-	/** Follow a command's redirections, recording what each descriptor reads. */
-	private applyRedirections(text: string, read: Map<string, string>): void {
+	/**
+	 * Follow a command's redirections, recording what each descriptor reads.
+	 * A heredoc's own redirection is missing from the text, so `declared` puts
+	 * it back where it stood.
+	 */
+	private applyRedirections(
+		text: string,
+		read: Map<string, string>,
+		declared: Array<{ at: number; to: string }> = [],
+	): void {
 		const where = (digits: string | undefined, fallback: string): string =>
 			this.descriptorKey(digits || fallback);
 		let quote: string | null = null;
 		// Where the operand of the previous redirection ended.
 		let consumed = -1;
-		for (let index = 0; index < text.length; index++) {
+		for (let index = 0; index <= text.length; index++) {
+			for (const heredoc of declared) {
+				if (heredoc.at === index) read.set(where(heredoc.to, "0"), "other");
+			}
 			const char = text[index] ?? "";
 			if (char === "\\") {
 				index += 1;
@@ -984,6 +1001,11 @@ export class RemoteWorkClassifier {
 			const word = words[index];
 			if (/^\d*(>>?|<<?)(&\d+)?$/.test(word)) {
 				if (/^\d*(>>?|<<?)$/.test(word)) index += 1;
+				continue;
+			}
+			if (/^\d*(>>?|<<?)&\d*$/.test(word)) {
+				// `3<& 3` names its source in the next word.
+				index += 1;
 				continue;
 			}
 			if (/^\d*(>>?|<<?).+/.test(word)) continue;
