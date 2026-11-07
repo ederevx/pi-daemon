@@ -607,7 +607,29 @@ export class RemoteWorkClassifier {
 
 	/** True when a `<` redirection after the heredoc overrides its stdin. */
 	private redirectsStdin(segment: string, offset: number): boolean {
-		return /(^|\s)(?:0)?<(?![<(])/.test(segment.slice(offset));
+		const text = segment.slice(offset);
+		let quote: string | null = null;
+		for (let index = 0; index < text.length; index++) {
+			const char = text[index];
+			if (char === "\\") {
+				index += 1;
+				continue;
+			}
+			if (quote !== null) {
+				if (char === quote) quote = null;
+				continue;
+			}
+			if (char === "'" || char === "\"") {
+				quote = char;
+				continue;
+			}
+			if (char !== "<" || text[index + 1] === "<" || text[index + 1] === "(") {
+				continue;
+			}
+			const descriptor = /(?:^|\s)(\d*)$/.exec(text.slice(0, index))?.[1] ?? "";
+			if (descriptor === "" || descriptor === "0") return true;
+		}
+		return false;
 	}
 
 	/** A shell with no script operand runs the program on its stdin. */
