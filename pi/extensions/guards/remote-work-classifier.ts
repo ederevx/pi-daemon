@@ -628,7 +628,8 @@ export class RemoteWorkClassifier {
 				quote = char;
 				continue;
 			}
-			if (char === "$" && text[index + 1] === "(") {
+			if ((char === "$" || char === "<" || char === ">")
+				&& text[index + 1] === "(") {
 				// A separator inside a substitution belongs to that command.
 				index = this.substitutionEnd(text, index + 1);
 				continue;
