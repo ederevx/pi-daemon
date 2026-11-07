@@ -409,7 +409,7 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			// `<&3` copies a descriptor; only a bare `&` backgrounds the command.
-			if ((char === "&" && (text[index - 1] ?? "") !== "<")
+			if ((char === "&" && !/[<>]/.test(text[index - 1] ?? ""))
 				|| char === "|") {
 				const doubled = text[index + 1] === char;
 				push(doubled ? char + char : char);
@@ -1003,7 +1003,7 @@ export class RemoteWorkClassifier {
 				if (/^\d*(>>?|<<?)$/.test(word)) index += 1;
 				continue;
 			}
-			if (/^\d*(>>?|<<?)&\d*$/.test(word)) {
+			if (/^\d*(>>?|<<?)&$/.test(word)) {
 				// `3<& 3` names its source in the next word.
 				index += 1;
 				continue;
