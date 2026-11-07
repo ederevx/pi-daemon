@@ -640,17 +640,19 @@ export class RemoteWorkClassifier {
 		// Options are read in order; the first operand names a script unless
 		// `-s` already asked for the program on stdin.
 		let stdin = false;
+		let rest = false;
 		const args = words.slice(1);
 		for (let at = 0; at < args.length; at++) {
 			const arg = args[at];
-			if (arg === "--") return stdin;
-			if (arg === "-") {
-				stdin = true;
+			if (rest) return false;
+			if (arg === "--") {
+				rest = true;
 				continue;
 			}
-			if (!arg.startsWith("-")) return stdin;
+			if (arg === "-") continue;
+			if (!/^[-+][A-Za-z]/.test(arg)) return stdin;
 			if (/^-[A-Za-z]*c[A-Za-z]*$/.test(arg)) return false;
-			if (/^-[oO]$/.test(arg)) {
+			if (/^[-+][oO]$/.test(arg)) {
 				at += 1;
 				continue;
 			}
