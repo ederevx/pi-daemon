@@ -800,7 +800,8 @@ export class RemoteWorkClassifier {
 			const char = text[index] ?? "";
 			if (char === "\\") {
 				index += 1;
-				word += text[index] ?? "";
+				// A backslash-newline continues the word and leaves nothing behind.
+				if (text[index] !== "\n") word += text[index] ?? "";
 				continue;
 			}
 			if (char === "'" || char === "\"") {
@@ -952,7 +953,8 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			if (char === "\\") {
-				current += segment[index + 1] ?? "";
+				// A backslash-newline continues the word and leaves nothing behind.
+				if (segment[index + 1] !== "\n") current += segment[index + 1] ?? "";
 				index += 2;
 				continue;
 			}
