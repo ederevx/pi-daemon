@@ -42,6 +42,8 @@ type PendingHeredoc = {
 	offset: number;
 	/** True when the body feeds standard input, which `3<<` does not. */
 	stdin: boolean;
+	/** The descriptor the body was written to; empty means standard input. */
+	descriptor: string;
 };
 
 /** Owns the verdicts for a command string; stateless. */
@@ -385,6 +387,7 @@ export class RemoteWorkClassifier {
 						lineStart: segments.length,
 						offset: current.trimStart().length,
 						stdin: descriptor === "" || descriptor === "0",
+						descriptor,
 					});
 					index = declared.end;
 					continue;
@@ -498,8 +501,11 @@ export class RemoteWorkClassifier {
 			// Only the last redirection to a descriptor supplies it.
 			const last = !pending.slice(at + 1).some((other) =>
 				other.lineStart === entry.lineStart && other.stdin && entry.stdin);
-			const program = last && entry.stdin && this.commandRunsStdin(command)
-				&& !this.redirectsStdin(command[0] ?? "", entry.offset);
+			const stdin = this.duplicatesStdin(
+				segments.slice(entry.lineStart), entry.descriptor)
+				|| (entry.stdin
+					&& !this.redirectsStdin(command[0] ?? "", entry.offset));
+			const program = last && stdin && this.commandRunsStdin(command);
 			if (program) nested.push(body.text);
 			// An unquoted body expands even when a shell reads it as a program,
 			// and an escaped substitution is left for that shell to resolve.
@@ -605,7 +611,7 @@ export class RemoteWorkClassifier {
 		});
 	}
 
-	/** True when a `<` redirection after the heredoc overrides its stdin. */
+	/** True when a later `<` redirection after the heredoc supplies stdin. */
 	private redirectsStdin(segment: string, offset: number): boolean {
 		const text = segment.slice(offset);
 		let quote: string | null = null;
@@ -626,10 +632,19 @@ export class RemoteWorkClassifier {
 			if (char !== "<" || text[index + 1] === "<" || text[index + 1] === "(") {
 				continue;
 			}
-			const descriptor = /(?:^|\s)(\d*)$/.exec(text.slice(0, index))?.[1] ?? "";
-			if (descriptor === "" || descriptor === "0") return true;
+			const target = /(?:^|\s)(\d*)$/.exec(text.slice(0, index))?.[1] ?? "";
+			if (target === "" || target === "0") return true;
 		}
 		return false;
+	}
+
+	/** True when `<&N` hands stdin the descriptor the body was written to. */
+	private duplicatesStdin(segments: string[], descriptor: string): boolean {
+		const target = descriptor === "" ? "0" : descriptor;
+		return segments.some((segment, index) => {
+			if (!/<$/.test(segments[index - 1] ?? "")) return false;
+			return (segment === "" ? "0" : segment) === target;
+		});
 	}
 
 	/** A shell with no script operand runs the program on its stdin. */
@@ -650,6 +665,10 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			if (arg === "-") continue;
+			if (arg.startsWith("--")) {
+				if (/^--(rcfile|init-file)$/.test(arg)) at += 1;
+				continue;
+			}
 			if (!/^[-+][A-Za-z]/.test(arg)) return stdin;
 			if (/^-[A-Za-z]*c[A-Za-z]*$/.test(arg)) return false;
 			if (/^[-+][oO]$/.test(arg)) {
