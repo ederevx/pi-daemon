@@ -496,35 +496,73 @@ export class RemoteWorkClassifier {
 			const program = last && this.commandRunsStdin(command)
 				&& !this.redirectsStdin(command[0] ?? "", entry.offset);
 			if (program) nested.push(body.text);
-			// An unquoted body expands even when a shell reads it as a program.
-			if (!entry.quoted) nested.push(...this.expansions(body.text));
+			// An unquoted body expands even when a shell reads it as a program,
+			// and an escaped substitution is left for that shell to resolve.
+			if (!entry.quoted) nested.push(...this.expansions(body.raw));
 		}
 		return index;
 	}
 
-	/** The body up to its delimiter line, and the index just past it. */
+	/** The body up to its delimiter line, as the command receives it. */
 	private heredocBody(
 		text: string,
 		start: number,
 		entry: PendingHeredoc,
-	): { text: string; end: number } {
+	): { raw: string; text: string; end: number } {
 		const lines: string[] = [];
 		let index = start;
 		while (index < text.length) {
-			const stop = text.indexOf("\n", index);
-			const end = stop < 0 ? text.length : stop;
-			const raw = text.slice(index, end);
-			const line = entry.stripTabs ? raw.replace(/^\t+/, "") : raw;
-			if (line === entry.delimiter) {
-				return {
-					text: lines.join("\n"),
-					end: Math.min(end + 1, text.length),
-				};
+			let line = this.heredocLine(text, index, entry);
+			index = line.end;
+			if (line.text === entry.delimiter) {
+				return this.heredocResult(lines, entry, index);
 			}
-			lines.push(line);
-			index = end + 1;
+			// A trailing backslash joins the next line to this one, so the
+			// delimiter it carries is not a delimiter.
+			while (!entry.quoted && this.continues(line.text)) {
+				line.text = line.text.slice(0, -1);
+				const next = this.heredocLine(text, index, entry);
+				line = { text: line.text + next.text, end: next.end };
+				index = line.end;
+			}
+			lines.push(line.text);
 		}
-		return { text: lines.join("\n"), end: text.length };
+		return this.heredocResult(lines, entry, text.length);
+	}
+
+	/** One raw line of a body, its tabs stripped when `<<-` asked for it. */
+	private heredocLine(
+		text: string,
+		start: number,
+		entry: PendingHeredoc,
+	): { text: string; end: number } {
+		const stop = text.indexOf("\n", start);
+		const end = stop < 0 ? text.length : stop;
+		const raw = text.slice(start, end);
+		return {
+			text: entry.stripTabs ? raw.replace(/^\t+/, "") : raw,
+			end: Math.min(end + 1, text.length),
+		};
+	}
+
+	/** True when the line ends in an unescaped backslash. */
+	private continues(line: string): boolean {
+		const trailing = /\\+$/.exec(line)?.[0].length ?? 0;
+		return trailing % 2 === 1;
+	}
+
+	/** The body as written, and as delivered: an unquoted one loses its escapes. */
+	private heredocResult(
+		lines: string[],
+		entry: PendingHeredoc,
+		end: number,
+	): { raw: string; text: string; end: number } {
+		const raw = lines.join("\n");
+		return {
+			raw,
+			text: entry.quoted ? raw : raw.replace(/\\([$`\\])/g, "$1"),
+			end,
+		};
 	}
 
 	/** Substitution bodies an unquoted heredoc still runs. */
