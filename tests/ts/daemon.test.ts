@@ -342,6 +342,12 @@ test("daemon: factory wires the command and events", () => {
   assertEq(pi.onCalls.get("session_before_switch") ?? 0, 1);
 });
 
+/** The arguments the daemon asked the state script to run with: Windows
+ *  leads them with the interpreter's script path (see ProcessRunner). */
+function stateCommand(args: string[]): string[] {
+  return process.platform === "win32" ? args.slice(1) : args;
+}
+
 class MockPi {
   readonly commands = new Map<string, unknown>();
   readonly tools = new Map<string, any>();
@@ -574,8 +580,9 @@ test("daemon: gc reap request steers the agent once per request", async () => {
       // The message triggers a turn without a before_agent_start, so the
       // watcher publishes busy itself or the run reads as idle while the
       // agent is working on the request.
-      assert(pi.execCalls.some((c) => c.args[0] === "state" &&
-        c.args[2] === "busy"), "the triggered turn is published as busy");
+      assert(pi.execCalls.some((c) => stateCommand(c.args)[0] === "state" &&
+        stateCommand(c.args)[2] === "busy"),
+        "the triggered turn is published as busy");
       // re-arming the same watcher never re-asks an open request
       await pi.sessionStarters[1]({ reason: "startup" });
       await new Promise((resolve) => setTimeout(resolve, 150));
@@ -668,7 +675,8 @@ test("daemon: a quit silences publishing, the next session start lifts it", asyn
       const pi = new MockPi();
       factory(pi as never);
       const publishes = () => pi.execCalls.filter(
-        (c) => c.args[0] === "state" && c.args[2] === "busy").length;
+        (c) => stateCommand(c.args)[0] === "state"
+          && stateCommand(c.args)[2] === "busy").length;
       // session_start listeners: [reload watcher, gc reap watcher]; the
       // publish stop is the last session_shutdown listener registered.
       await pi.sessionStarters[0]({ reason: "startup" });
