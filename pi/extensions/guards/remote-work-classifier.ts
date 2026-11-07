@@ -636,7 +636,7 @@ export class RemoteWorkClassifier {
 		let index = 0;
 		while (index < text.length) {
 			const char = text[index] ?? "";
-			if (char === "\\") {
+			if (char === "\\" && quote !== "'") {
 				index += 2;
 				continue;
 			}
