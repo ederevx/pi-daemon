@@ -640,7 +640,8 @@ export class RemoteWorkClassifier {
 
 	/** True when the redirections leave stdin reading the body itself. */
 	private suppliesStdin(entry: PendingHeredoc): boolean {
-		const where = (digits: string | undefined, fallback: string): string => digits || fallback;
+		const where = (digits: string | undefined, fallback: string): string =>
+			String(Number(digits || fallback));
 		const read = new Map<string, string>([[where(entry.descriptor, "0"), "body"]]);
 		let quote: string | null = null;
 		for (let index = 0; index < entry.rest.length; index++) {
@@ -667,9 +668,15 @@ export class RemoteWorkClassifier {
 				continue;
 			}
 			if (next.startsWith("&")) {
-				const source = this.descriptorOperand(next.slice(1));
-				read.set(target, source === ""
-					? "other" : read.get(source) ?? "other");
+				const moved = this.descriptorOperand(next.slice(1));
+				const digits = moved.replace(/-$/, "");
+				if (digits === "") {
+					read.set(target, "other");
+					continue;
+				}
+				const source = where(digits, "0");
+				read.set(target, read.get(source) ?? "other");
+				if (moved !== digits) read.set(source, "other");
 				continue;
 			}
 			read.set(target, "other");
@@ -697,7 +704,7 @@ export class RemoteWorkClassifier {
 			if (/[\s;|&<>()]/.test(char)) break;
 			word += char;
 		}
-		return /^\d+$/.test(word) ? word : "";
+		return /^\d+-?$/.test(word) ? word : "";
 	}
 
 	/** A shell with no script operand runs the program on its stdin. */
