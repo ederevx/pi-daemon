@@ -628,6 +628,19 @@ export class RemoteWorkClassifier {
 				quote = char;
 				continue;
 			}
+			if (char === "$" && text[index + 1] === "(") {
+				// A separator inside a substitution belongs to that command.
+				index = this.substitutionEnd(text, index + 1);
+				continue;
+			}
+			if (char === "`") {
+				const end = text.indexOf("`", index + 1);
+				index = end < 0 ? text.length : end;
+				continue;
+			}
+			if (char === "#" && (index === start || /\s/.test(text[index - 1] ?? ""))) {
+				return text.slice(start, index);
+			}
 			if (char === ";" || char === "|" || char === "\n") {
 				return text.slice(start, index);
 			}
