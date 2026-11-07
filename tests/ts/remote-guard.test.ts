@@ -163,6 +163,7 @@ test("remote guard: a heredoc body is data unless a shell runs it", () => {
 		"cat <<'E'; bash\nssh host id\nE",
 		"bash -c 'make' <<'EOF'\nssh host id\nEOF",
 		"bash <<'EOF' 0</dev/null\nssh host id\nEOF",
+		"python - <<'PY'\nx = \"cat <<<\\\"\\\\$(ssh host id)\\\"\"\nPY",
 	]) {
 		assertEq(gate(bash(command))?.block, undefined,
 			`the body is data: ${command}`);
