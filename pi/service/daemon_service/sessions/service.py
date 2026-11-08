@@ -37,12 +37,12 @@ class SessionService:
         return views
 
     def which(self, file):
-        holders = self._store.holders(file)
+        holders = self._holders(file)
         return {"name": holders[0][0] if holders else None}
 
     def whichall(self, file):
         return [{"name": name, "state": state}
-                for name, state in self._store.holders(file)]
+                for name, state in self._holders(file)]
 
     def recorded_file(self, name):
         canonical = self._store.resolve(name)
@@ -136,7 +136,7 @@ class SessionService:
         """Bind a name to its conversation, resolving duplicate holders."""
         record = self._record(name, live=True)
         self._store.announce(record.name, file)
-        others = [holder for holder in self._store.holders(file)
+        others = [holder for holder in self._holders(file)
                   if holder[0] != record.name]
         if not takeover or not others:
             return self._announced(record.name, None, [], others)
@@ -177,7 +177,7 @@ class SessionService:
     def resume(self, name, file):
         """Point a conversation's viewers at its live holder, or refuse."""
         record = self._record(name)
-        holders = [holder for holder in self._store.holders(file)
+        holders = [holder for holder in self._holders(file)
                    if holder[0] != record.name]
         if not holders:
             raise SessionError(NO_SESSION)
@@ -221,6 +221,13 @@ class SessionService:
         if record is None or (live and not record.live()):
             raise SessionError(NO_SESSION)
         return record
+
+    def _holders(self, file):
+        """Live holders of a conversation, the busiest viewer count first."""
+        holders = self._store.holders(file)
+        return sorted(holders,
+                      key=lambda holder: -self._relay.viewer_count(
+                          self._key(holder[0])))
 
     def _key(self, name):
         record = self._store.get(name)

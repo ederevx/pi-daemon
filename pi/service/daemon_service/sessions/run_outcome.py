@@ -6,14 +6,14 @@ import signal
 DAEMON_STOPPED = "daemon-stopped"
 STOPPED = "stopped"
 RELOAD_DEATH = "reload-death"
+LOST_MID_RUN = "lost-mid-run"
+LOST_AT_PROMPT = "lost-at-prompt"
 DIED_MID_RUN = "died-mid-run"
 EXITED_MID_RUN = "exited-mid-run"
 CRASHED_AT_PROMPT = "crashed-at-prompt"
 RUN_ABORTED = "run-aborted"
-SETTLED = "settled"
 UNKNOWN_RUN = "unknown"
-LOST_MID_RUN = "lost-mid-run"
-LOST_AT_PROMPT = "lost-at-prompt"
+SETTLED = "settled"
 
 CAUSES = ("daemon", "reload", "signal", "exit", "unknown", "abort", "lost")
 
