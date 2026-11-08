@@ -44,6 +44,7 @@ pi/service/daemon_service/sessions/pty_backend.py PosixPtyBackend
 pi/service/daemon_service/sessions/pty_child.py  PtyChild
 pi/service/daemon_service/sessions/pty_exec.py   PtyExec
 pi/service/daemon_service/transport/control_action.py ControlAction
+pi/service/daemon_service/migration/error.py       MigrationError
 pi/service/daemon_service/migration/legacy_root.py LegacyRoot
 pi/service/daemon_service/migration/translator.py  LegacyTranslator
 pi/service/daemon_service/migration/plan.py        MigrationPlan
@@ -582,15 +583,16 @@ is not a merge; a run while the new instance lock is held refuses
 outright. The legacy root is never written, which is what makes rollback
 independent of the new code.
 
-Every run prints the plan as JSON, and `--dry-run` differs only in that it
-writes nothing, so it fails exactly where the real run would. The exit
-status names the outcome: 0 for a translation or an already-current root,
-1 for an unreadable input, 3 for a held instance lock, 4 for sources that
-moved since the marker, and 5 for a state root that holds untranslated
-state. Nothing is written on any refusal. A translation writes the ticket
-and session stores through their owners and records the marker last, with
-the digests of the files it actually read; a file that moved in between
-leaves no marker, and the next run then refuses as untranslated state.
+A run that reaches a decision prints the plan as JSON, and `--dry-run`
+differs only in that it writes nothing, so it fails exactly where the real
+run would; an unreadable input prints only its message. The exit status
+names the outcome: 0 for a translation or an already-current root, 1 for
+an unreadable input, 3 for a held instance lock, 4 for sources that moved
+since the marker, and 5 for a state root that holds untranslated state.
+A refusal writes nothing. A translation writes the ticket and session
+stores through their owners and records the marker last, with the digests
+of the files it actually read; a file that moved in between exits 4
+without a marker, and the next run then refuses as untranslated state.
 
 The order follows from `migrate` belonging to the new entry, which only
 exists after the swap. `migrate` lives in the staging entry and is tested
@@ -625,12 +627,12 @@ written:
 The new state root stays in place as evidence. A rollback moves the
 legacy state again, because the legacy daemon keeps writing it, so the
 next `migrate` refuses on the changed hashes; `--force` is what
-retranslates it. A forced run replaces the ticket and session stores and
-leaves `comms/` (the node identity, the mailbox, the peers) and
-`settings.json` alone, which is why the marker never re-adopts a
-translated root silently. The
-instance lock and the runtime descriptor are per-root, so the two
-implementations never share a runtime directory.
+retranslates it, and a forced run replaces the ticket and session stores
+while leaving `comms/` (the node identity, the mailbox, the peers) and
+`settings.json` alone. Because a rerun is decided by the recorded hashes,
+the marker never re-adopts a translated root silently. The instance lock
+and the runtime descriptor are per-root, so the two implementations never
+share a runtime directory.
 
 ## Open work
 

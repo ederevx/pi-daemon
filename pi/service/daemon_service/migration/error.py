@@ -1,7 +1,9 @@
-"""The one failure a translation raises, carrying its exit code."""
+"""The exit statuses a translation returns, and the failure it raises."""
 
 UNREADABLE = 1
+LOCKED = 3
 SOURCES_MOVED = 4
+UNMARKED = 5
 
 
 class MigrationError(Exception):

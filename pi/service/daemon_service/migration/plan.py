@@ -2,6 +2,7 @@
 
 import os
 
+from .error import LOCKED, SOURCES_MOVED, UNMARKED
 from .marker import MigrationMarker
 from .translator import LegacyTranslator
 
@@ -11,23 +12,24 @@ RUN_STATE = "run-state"
 LOGS = "tickets"
 SESSION_FILES = "session-files.json"
 REAP = "gc-reap"
-SETTINGS = "settings.json"
 
 TRANSLATE = "translate"
 CURRENT = "current"
 REFUSE = "refuse"
 
-LOCKED = "instance-locked"
+INSTANCE_LOCKED = "instance-locked"
 SOURCES_CHANGED = "sources-changed"
-UNMARKED = "unmarked-state"
+UNMARKED_STATE = "unmarked-state"
 
 REFUSALS = {
-    LOCKED: (3, "the instance lock is held; stop the service first"),
+    INSTANCE_LOCKED: (LOCKED,
+                      "the instance lock is held; stop the service first"),
     SOURCES_CHANGED: (
-        4, "the legacy state changed since the last migration; --force "
-           "replaces the translated stores"),
-    UNMARKED: (5, "the state root holds untranslated state; --force replaces "
-                  "the translated stores"),
+        SOURCES_MOVED, "the legacy state changed since the last migration; "
+        "--force replaces the translated stores"),
+    UNMARKED_STATE: (
+        UNMARKED, "the state root holds untranslated state; --force "
+        "replaces the translated stores"),
 }
 
 
@@ -66,11 +68,11 @@ class MigrationPlan:
     def _decide(self):
         sources = self._legacy.digests()
         if self._locked:
-            self._action, self._refusal = REFUSE, LOCKED
+            self._action, self._refusal = REFUSE, INSTANCE_LOCKED
             return
         if self._marker is None:
             if self._state_present() and not self._force:
-                self._action, self._refusal = REFUSE, UNMARKED
+                self._action, self._refusal = REFUSE, UNMARKED_STATE
             return
         self._changed = self._moved(self._marker, sources)
         if not self._changed:
@@ -91,7 +93,8 @@ class MigrationPlan:
             entries = os.listdir(self._layout.state_root())
         except (FileNotFoundError, NotADirectoryError):
             return False
-        return any(entry != SETTINGS for entry in entries)
+        settings = os.path.basename(self._layout.settings_path())
+        return any(entry != settings for entry in entries)
 
     # -- the translated state ---------------------------------------------
 
@@ -165,7 +168,7 @@ class MigrationPlan:
     def run_states(self):
         return dict(self._run_states)
 
-    def refunds(self):
+    def refusal_status(self):
         """The refusal's exit code and message, for the command to print."""
         return REFUSALS[self._refusal]
 

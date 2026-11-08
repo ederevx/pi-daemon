@@ -48,7 +48,7 @@ class MigrateCommand:
         print(json.dumps(plan.to_dict(options.dry_run), sort_keys=True,
                          indent=2), file=stdout)
         if plan.refusal() is not None:
-            code, message = plan.refunds()
+            code, message = plan.refusal_status()
             print(f"pi-daemon: migrate: {message}", file=stderr)
             return code
         return 0
