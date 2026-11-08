@@ -23,6 +23,11 @@
  * written first, an interpreter, eval of a variable) is not seen.
  */
 
+import { ShellCommandWords } from "./shell-command-words.ts";
+
+/** The shell-word rules every command is read through. */
+const COMMANDS = new ShellCommandWords();
+
 export type RemoteVerdict =
 	| "transfer"
 	| "ssh-info"
@@ -63,17 +68,6 @@ export class RemoteWorkClassifier {
 	static readonly PI_MANAGEMENT: ReadonlySet<string> = new Set([
 		"install", "remove", "uninstall", "update", "list", "config",
 	]);
-	/** Shell control words that are not the command itself. */
-	static readonly KEYWORDS: ReadonlySet<string> = new Set([
-		"if", "then", "else", "elif", "fi", "while", "until", "do",
-		"done", "for", "in", "esac", "case", "function", "{", "}",
-		"!", "time",
-	]);
-	static readonly LAUNCHERS: ReadonlySet<string> = new Set([
-		"sudo", "env", "nohup", "exec", "command", "builtin", "time",
-		"timeout", "nice", "ionice", "stdbuf", "xargs", "sshpass",
-		"setsid",
-	]);
 	static readonly TAR_DANGEROUS: ReadonlySet<string> = new Set([
 		"--to-command", "--checkpoint-action", "-I",
 		"--use-compress-program", "-F", "--info-script",
@@ -109,9 +103,9 @@ export class RemoteWorkClassifier {
 		out: RemoteVerdict[],
 		depth: number,
 	): void {
-		const words = this.commandWords(this.words(segment));
+		const words = COMMANDS.resolve(this.words(segment));
 		if (words.length === 0) return;
-		const name = this.basename(words[0]);
+		const name = COMMANDS.basename(words[0]);
 		const args = words.slice(1);
 		if (RemoteWorkClassifier.SHELL_NAMES.has(name)) {
 			const script = this.scriptArg(args);
@@ -209,10 +203,10 @@ export class RemoteWorkClassifier {
 		}
 		let sawCommand = false;
 		for (const segment of scan.segments) {
-			const words = this.commandWords(this.words(segment));
+			const words = COMMANDS.resolve(this.words(segment));
 			if (words.length === 0) continue;
 			sawCommand = true;
-			const name = this.basename(words[0]);
+			const name = COMMANDS.basename(words[0]);
 			if (!RemoteWorkClassifier.TRANSFER_WORDS.has(name)) {
 				return false;
 			}
@@ -240,7 +234,7 @@ export class RemoteWorkClassifier {
 				: arg.startsWith("-S") ? arg.slice(2) : "";
 			if (program !== ""
 				&& !RemoteWorkClassifier.SSH_NAMES
-					.has(this.basename(program))) {
+					.has(COMMANDS.basename(program))) {
 				return "ssh-exec";
 			}
 		}
@@ -269,10 +263,10 @@ export class RemoteWorkClassifier {
 			return "ssh-exec";
 		}
 		if (shell === "") return "transfer";
-		const words = this.commandWords(this.words(shell));
+		const words = COMMANDS.resolve(this.words(shell));
 		if (words.length === 0) return "ssh-exec";
 		if (!RemoteWorkClassifier.SSH_NAMES
-			.has(this.basename(words[0]))) {
+			.has(COMMANDS.basename(words[0]))) {
 			return "ssh-exec";
 		}
 		return this.sshOperands(words.slice(1)).positional.length >= 2
@@ -671,7 +665,7 @@ export class RemoteWorkClassifier {
 	/** True when a command in the pipeline reads stdin as a shell program. */
 	private commandRunsStdin(segments: string[]): boolean {
 		return segments.some((segment) => {
-			const words = this.commandWords(this.words(segment));
+			const words = COMMANDS.resolve(this.words(segment));
 			return words.length > 0 && this.stdinProgram(words);
 		});
 	}
@@ -963,7 +957,7 @@ export class RemoteWorkClassifier {
 
 	/** A shell with no script operand runs the program on its stdin. */
 	private stdinProgram(words: string[]): boolean {
-		if (!RemoteWorkClassifier.SHELL_NAMES.has(this.basename(words[0]))) {
+		if (!RemoteWorkClassifier.SHELL_NAMES.has(COMMANDS.basename(words[0]))) {
 			return false;
 		}
 		// Options are read in order; the first operand names a script unless
@@ -1158,102 +1152,6 @@ export class RemoteWorkClassifier {
 		return kept;
 	}
 
-	// -- launchers ---------------------------------------------------------
-
-	/** Skip assignments, control words, and launchers so the real command
-	 *  word is first. */
-	private commandWords(words: string[]): string[] {
-		let rest = [...words];
-		for (;;) {
-			if (rest.length === 0) return rest;
-			const word = rest[0];
-			const name = this.basename(word);
-			if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) {
-				rest = rest.slice(1);
-				continue;
-			}
-			if (RemoteWorkClassifier.KEYWORDS.has(word)) {
-				rest = rest.slice(1);
-				continue;
-			}
-			if (word.startsWith("-")) {
-				rest = rest.slice(1);
-				continue;
-			}
-			if (RemoteWorkClassifier.LAUNCHERS.has(name)) {
-				rest = this.skipLauncher(name, rest.slice(1));
-				continue;
-			}
-			return rest;
-		}
-	}
-
-	private skipLauncher(name: string, args: string[]): string[] {
-		let rest = [...args];
-		while (rest.length > 0) {
-			const arg = rest[0];
-			if (arg === "--") return rest.slice(1);
-			if (!arg.startsWith("-") || arg === "-") break;
-			rest = rest.slice(1);
-			if (this.launcherOptionTakesValue(name, arg)) {
-				rest = rest.slice(1);
-			}
-		}
-		// timeout's first operand is a duration, never the command.
-		if (name === "timeout" && rest.length > 0) rest = rest.slice(1);
-		return rest;
-	}
-
-	private launcherOptionTakesValue(name: string, arg: string): boolean {
-		if (arg.startsWith("--")) {
-			const [long, inline] = arg.slice(2).split("=");
-			if (inline !== undefined) return false;
-			return this.launcherLongValue(name, long);
-		}
-		const letter = arg[1];
-		if (!this.launcherShortValues(name).includes(letter)) return false;
-		return arg.length === 2;
-	}
-
-	private launcherShortValues(name: string): string {
-		switch (name) {
-			case "sudo": return "ugpCTrUt";
-			case "env": return "uCS";
-			case "timeout": return "sk";
-			case "nice": return "n";
-			case "ionice": return "cnpu";
-			case "stdbuf": return "ioe";
-			case "xargs": return "nIPEsLdas";
-			case "sshpass": return "pfd";
-			default: return "";
-		}
-	}
-
-	private launcherLongValue(name: string, long: string): boolean {
-		switch (name) {
-			case "sudo":
-				return ["user", "group", "prompt", "close-from", "chdir",
-					"role", "type", "other-user", "host"].includes(long);
-			case "env":
-				return ["unset", "chdir", "split-string"].includes(long);
-			case "timeout":
-				return ["signal", "kill-after"].includes(long);
-			case "nice":
-				return long === "adjustment";
-			case "ionice":
-				return ["class", "classdata", "pid", "pgid"].includes(long);
-			case "stdbuf":
-				return ["input", "output", "error"].includes(long);
-			case "xargs":
-				return ["delimiter", "max-args", "max-procs", "max-chars",
-					"arg-file", "replace", "eof"].includes(long);
-			case "sshpass":
-				return long === "password";
-			default:
-				return false;
-		}
-	}
-
 	/** The argument of a `-c` script flag, if the shell has one. */
 	private scriptArg(args: string[]): string | undefined {
 		for (let index = 0; index < args.length; index++) {
@@ -1265,10 +1163,5 @@ export class RemoteWorkClassifier {
 			}
 		}
 		return undefined;
-	}
-
-	private basename(word: string): string {
-		const parts = word.split(/[\\/]/);
-		return (parts[parts.length - 1] ?? "").replace(/\u0001/g, "");
 	}
 }
