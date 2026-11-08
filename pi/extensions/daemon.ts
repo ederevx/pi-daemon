@@ -96,8 +96,11 @@ import type {
 	ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { CommsCli } from "./comms/client.ts";
+import { CommsTools } from "./comms/tools.ts";
 import { DaemonSettingsPresenter } from "./settings/presenter.ts";
 import { RunStatePublisher } from "./session-state/publisher.ts";
+import { resolveEndpointPath } from "./services/discovery.ts";
 
 /** Directory of this extension module, when loaded as an ES module. */
 function moduleDir(): string {
@@ -131,18 +134,11 @@ function resolveDaemon(): string {
 	return join(process.env.HOME || homedir(), ".local", "bin", "pi-daemon");
 }
 
-/** The control endpoint file, mirroring pi_platform.RuntimeLayout.
- *  `platform` is injectable so the Windows branches are testable. */
+/** The control endpoint file: explicit override, the live session-host
+ *  descriptor, then the legacy RuntimeLayout path. `platform` is
+ *  injectable so the Windows branches are testable. */
 export function endpointPath(platform: string = process.platform): string {
-	if (process.env.XDG_RUNTIME_DIR) {
-		return join(process.env.XDG_RUNTIME_DIR, "pi-pty-host.sock");
-	}
-	if (platform === "win32") {
-		const base = process.env.TEMP || process.env.TMP || homedir();
-		return join(base, "pi-daemon", "pi-pty-host.sock");
-	}
-	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-	return join("/run/user", String(uid), "pi-pty-host.sock");
+	return resolveEndpointPath(undefined, platform);
 }
 
 /** The daemon's state home for the log path, mirroring RuntimeLayout. */
@@ -271,10 +267,10 @@ interface Handoff {
  *  the handed-over session when the connection reaches EOF, so liveness
  *  is connection-based and never a pid probe. */
 export class HandoverHold {
-	private readonly path: string;
+	private readonly path: string | undefined;
 	private socket: ReturnType<typeof createConnection> | null = null;
 
-	constructor(path: string = endpointPath()) {
+	constructor(path?: string) {
 		this.path = path;
 	}
 
@@ -284,7 +280,8 @@ export class HandoverHold {
 	async open(file: string, dir: string): Promise<boolean> {
 		let endpoint: { host?: string; port?: number; token?: string };
 		try {
-			endpoint = JSON.parse(readFileSync(this.path, "utf8"));
+			endpoint = JSON.parse(
+				readFileSync(this.path ?? endpointPath(), "utf8"));
 		} catch {
 			return false;
 		}
@@ -1255,6 +1252,12 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 	});
+
+	// Agent comms: the documented operator CLI is the only client, so the
+	// tools shell out to it and return its JSON answer unchanged.
+	new CommsTools(new CommsCli(
+		new ProcessRunner((file, args, options) => pi.exec(file, args, options)),
+	)).register(pi);
 
 	// Reload entrypoint queued by the signal watcher. With a fresh
 	// pending signal this is terminal per pi's ctx.reload() contract:

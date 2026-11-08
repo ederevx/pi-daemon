@@ -64,10 +64,15 @@ pi/
   extensions/provision.ts # session-start provisioning reconciliation
   extensions/transcript.ts # transcript_read: index-backed conversation reads
   extensions/transcript/ # control client + transcript_read implementation
+  extensions/comms/      # comms_* + peers tools over the pi-comms CLI
+  extensions/services/   # session-host discovery for the control endpoint
   bin/pi-rc              # client: tickets, bridge, input, reload,
                          # start/attach/detach/announce/ls/which/stop
+  bin/pi-comms           # agent-comms client: mail, waits, launches, peers
   daemon/pi-daemon       # stdlib Python PTY host + shell ticket runners
   lib/pi_platform.py     # transport, process, PTY, terminal seams
+  lib/pi_services.py     # service descriptors: discovery, publish, sweep
+  lib/pi_rpc_client.py   # pi-rpc/1 socket client: discover, greet, call
   lib/pi_conpty.py       # Windows ConPTY backend
   lib/pi_settings.py     # the piDaemon settings reader
   lib/pi_transcript.py   # conversation index + read-only body serving

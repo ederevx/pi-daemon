@@ -227,6 +227,14 @@ present, and makes them itself otherwise.
 - **Adopted:** `session-host` discovery (`pi_services.py`, pi-teams
   `service_registry.py`) publishes and reads the descriptor above, with
   its control protocol kept at `pi-pty-host/1`.
+- **Adopted:** the daemon client resolves its control endpoint by
+  discovery: `pi-rc` and the extension's `endpointPath()` take an
+  explicit `--endpoint`/`PI_DAEMON_ENDPOINT` first, then the
+  highest-version live `session-host` descriptor, then the legacy
+  runtime path. The client resolves when the endpoint is used
+  (`HandoverHold` on `open()`), not at import. An explicit path is
+  final and probes nothing; a stale descriptor is skipped and left for
+  the provider's own sweep.
 - **Adopted:** `agent-comms`, socket profile. The unified service
   publishes `agent-comms/pi-daemon.json` over its comms endpoint file and
   ships `pi_rpc_client.py` (the socket-profile library) with `pi-comms`,

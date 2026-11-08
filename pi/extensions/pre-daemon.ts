@@ -43,6 +43,12 @@ export class PreDaemonTool {
 		"daemon_tasks",
 		"daemon_gc_reap",
 		"transcript_read",
+		"comms_send",
+		"comms_wait",
+		"comms_replay",
+		"comms_ack",
+		"comms_spawn",
+		"peers",
 	]);
 
 	/** The offload policy, asked per decision and never cached. */
@@ -86,9 +92,12 @@ export class PreDaemonTool {
 			"- daemon_tasks: submit/status/result/watch/cancel/remove/list tickets.",
 			"- daemon_gc_reap: reap this hosted session when the daemon requests it.",
 			"- transcript_read: read this conversation from the daemon index (stat/path/entries/tree/range) instead of loading the whole session file.",
+			"- comms_send, comms_wait, comms_replay, comms_ack: mail another agent identity on this node (or a peer's), wait for mail, replay from a cursor, and acknowledge what you were given.",
+			"- comms_spawn: launch another agent as a daemon-hosted session.",
+			"- peers: list the peer links this node reaches out over.",
 			"",
 			"Conventions:",
-			"- Call pre_daemon once per session before daemon_tasks, daemon_gc_reap, or transcript_read, and before bash when offloading is enabled. When offloading is disabled, bash runs locally without this prerequisite.",
+			"- Call pre_daemon once per session before daemon_tasks, daemon_gc_reap, transcript_read, or any comms tool, and before bash when offloading is enabled. When offloading is disabled, bash runs locally without this prerequisite.",
 			"- Every bash call is already daemon-owned and non-blocking; pass the bash timeout to bound it daemon-side, and use daemon_tasks result <id> wait=<seconds> only to block for a result deliberately.",
 			"- A blocking result wait is interruptible and steerable: Escape or a queued message releases it; the ticket keeps running and still delivers on completion.",
 			"- Call daemon_gc_reap only when pi-daemon asks this idle detached session to reap, or when you are deliberately done.",

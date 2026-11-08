@@ -323,6 +323,18 @@ missing service and exits 4 rather than starting a daemon behind the
 user's back, and binding is explicit. `session-host` keeps its own
 `pi-pty-host/1` entry beside it.
 
+The daemon client resolves the control endpoint the same way on both
+sides of the repo. `PI_DAEMON_ENDPOINT` (or a leading `--endpoint PATH`
+for `pi-rc`) wins without probing anything; otherwise the highest-version
+live `session-host` descriptor for `pi-pty-host/1` names the endpoint
+file; otherwise the legacy runtime path from `RuntimeLayout` is used.
+Resolution happens when the path is used (`HandoverHold` resolves on
+`open()`), not at module load, so a provider that published after the
+client started is still found. Staleness is the directory's rule -
+malformed JSON, a dead pid, or an endpoint file that is missing or
+publishes no dialable coordinates - and a stale descriptor is skipped
+without being removed.
+
 `pi/lib/pi_rpc_client.py` is the socket-profile library: it discovers,
 dials, greets, frames and reports failures as data. `pi/bin/pi-comms` is
 its first consumer - `node`, `peer list`, `send`, `broadcast`, `wait`,
@@ -330,6 +342,14 @@ its first consumer - `node`, `peer list`, `send`, `broadcast`, `wait`,
 `--format text` for people. Its exit codes are the failure vocabulary of
 the profile: 1 usage, 2 declined, 3 empty wait, 4 no service, 5 remote
 method, 6 authorization, 7 no answer after a request was written.
+
+The pi extension exposes the same surface to the model as `comms_send`,
+`comms_wait`, `comms_replay`, `comms_ack`, `comms_spawn` and `peers`,
+registered from `daemon.ts` and shelling out to
+`pi/bin/pi-comms --format json` (`PI_COMMS_BIN` overrides the binary).
+Each tool returns the service's JSON as its structured result, and a
+non-zero exit becomes a tool error carrying the CLI's stderr and exit
+code; there is no second RPC client in TypeScript.
 
 ## Peers
 

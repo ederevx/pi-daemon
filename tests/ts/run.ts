@@ -19,6 +19,8 @@ import "./pre-daemon.test.ts";
 import "./remote-guard.test.ts";
 import "./settings.test.ts";
 import "./provisioning.test.ts";
+import "./discovery.test.ts";
+import "./comms-tools.test.ts";
 import "./settings-reconciler.test.ts";
 import "./transcript.test.ts";
 // Isolated from the process-wide state each test needs: this file drives
