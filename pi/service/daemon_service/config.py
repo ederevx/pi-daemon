@@ -1,70 +1,101 @@
-"""The service's configuration: every tunable, resolved once.
-
-Resolution order, identical for every value: an explicit environment
-variable, then the `piDaemon` namespace of the pi settings file, then a
-legacy environment name (one release of migration), then the built-in
-default. A value that fails to parse falls through to the next source,
-so a typo cannot mask a valid setting. Nothing else in the service
-reads the settings file.
-"""
+"""Validated configuration snapshots; one immutable record per owner."""
 
 import json
+import math
 import os
+from dataclasses import dataclass
 
-HOUR = 3600.0
-MEGABYTE = 1 << 20
-
-# The one settings namespace the service owns.
-SECTION = "piDaemon"
+ENV_PREFIX = "PI_DAEMON_"
 
 
+@dataclass(frozen=True)
 class ServiceConfig:
-    """The resolved tunables of one service instance."""
+    """Every operational default the service reads, resolved once."""
 
-    def __init__(self, state, environ=None):
-        self.state = state
-        self.environ = os.environ if environ is None else environ
-        self.section = self._section()
-        self.ticket_ttl = self._hours(
-            "PI_DAEMON_TICKET_TTL_HOURS", "ticketTtlHours", 72.0,
-            "PI_PTYD_TICKET_TTL_HOURS")
-        self.ticket_gc_seconds = self._number(
-            "PI_DAEMON_TICKET_GC", "ticketGcSeconds", 60.0,
-            "PI_PTYD_TICKET_GC")
-        self.max_running_tickets = int(self._number(
-            "PI_DAEMON_MAX_TICKETS", "maxRunningTickets", 32.0))
-        self.max_output_bytes = int(self._number(
-            "PI_DAEMON_TICKET_OUTPUT_MB", "ticketOutputMb", 4.0) * MEGABYTE)
-        self.request_timeout = self._number(
-            "PI_DAEMON_REQUEST_TIMEOUT", "requestTimeoutSeconds", 30.0)
-        self.shell = self.environ.get("PI_SHELL") or None
+    state_dir: str = ""
+    runtime_dir: str = ""
+    settings_path: str = ""
+    frame_bytes: int = 65536
+    read_chunk_bytes: int = 8192
+    backlog: int = 16
+    connect_timeout: float = 2.0
+    probe_timeout: float = 1.0
+    drain_grace: float = 2.0
+    cancel_grace: float = 2.0
+    stop_grace: float = 5.0
+    record_cap: int = 200
+    output_cap: int = 1048576
+    file_mode: int = 0o600
+    write_retries: int = 5
+    write_retry_delay: float = 0.05
+    shell: str = ""
+    revision: int = 0
 
-    def _section(self):
-        path = os.path.join(self.state.agent_home(), "settings.json")
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                top = json.load(f)
-        except (OSError, ValueError):
-            return {}
-        section = top.get(SECTION) if isinstance(top, dict) else None
-        return section if isinstance(section, dict) else {}
+    @classmethod
+    def load(cls, settings_path=None, environ=None, overrides=None):
+        environment = dict(os.environ if environ is None else environ)
+        settings = _read_settings(settings_path)
+        values = {}
+        for name, default in cls().items():
+            for supplied in (environment.get(ENV_PREFIX + name.upper()),
+                             settings.get(name)):
+                if supplied is None:
+                    continue
+                try:
+                    values[name] = _coerce(name, supplied, default)
+                except ValueError:
+                    continue
+                break
+        if settings_path is not None:
+            values["settings_path"] = str(settings_path)
+        for name, value in (overrides or {}).items():
+            values[name] = _coerce(name, value, getattr(cls(), name))
+        return cls(**values)
 
-    def _candidates(self, env_name, key, legacy_env):
-        """Every configured source, in resolution order."""
-        values = [self.environ.get(env_name), self.section.get(key)]
-        if legacy_env:
-            values.append(self.environ.get(legacy_env))
-        return [raw for raw in values if raw is not None and raw != ""]
+    def items(self):
+        for name in self.__dataclass_fields__:
+            yield name, getattr(self, name)
 
-    def _number(self, env_name, key, default, legacy_env=None):
-        for raw in self._candidates(env_name, key, legacy_env):
-            try:
-                value = float(raw)
-            except (TypeError, ValueError):
-                continue  # a malformed source never masks the next one
-            if value >= 0 and value == value:
-                return value
-        return default
+    def with_revision(self, revision):
+        return ServiceConfig(revision=revision, **{
+            name: value for name, value in self.items() if name != "revision"
+        })
 
-    def _hours(self, env_name, key, default, legacy_env=None):
-        return self._number(env_name, key, default, legacy_env) * HOUR
+
+def _read_settings(path):
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    section = loaded.get("daemon") if isinstance(loaded, dict) else None
+    if isinstance(section, dict):
+        return section
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _coerce(name, value, default):
+    if isinstance(value, bool):
+        raise ValueError(f"{name}: a boolean is not a value")
+    if isinstance(default, bool):
+        return bool(value)
+    if isinstance(default, int):
+        number = _finite(value, name)
+        if number != int(number):
+            raise ValueError(f"{name}: an integer is required")
+        return int(number)
+    if isinstance(default, float):
+        return float(_finite(value, name))
+    return str(value)
+
+
+def _finite(value, name):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name}: a number is required") from None
+    if not math.isfinite(number):
+        raise ValueError(f"{name}: a finite number is required")
+    return number

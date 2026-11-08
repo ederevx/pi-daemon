@@ -1,162 +1,193 @@
-"""Ticket execution: one detached child per running ticket.
-
-The runner owns processes. A ticket outlives the client that submitted
-it, so a child is spawned in its own session and its output goes to the
-ticket's log, not to a connection.
-"""
+"""Ticket execution: one child, one output worker, one completion boundary."""
 
 import os
+import shutil
 import signal
 import subprocess
 import threading
+import time
 
-from .model import CANCELLED, DONE, FAILED, RUNNING, TIMEOUT, Ticket
+from .model import CANCELLED, DONE, FAILED
 
 
 class TicketRunner:
-    """Owns the child processes of tickets and their state changes."""
+    """Completion is child exit plus settled output, then the record."""
 
     def __init__(self, store, config):
-        self.store = store
-        self.config = config
-        self.lock = threading.Lock()
-        self.processes = {}
-        self.events = {}
-        self.cancelled = set()
+        self._store = store
+        self._config = config
+        self._lock = threading.Lock()
+        self._children = {}
+        self._drains = {}
+        self._events = {}
+        self._timeouts = {}
+        self._cancelled = set()
+        self._closed = False
+        self._shell = config.shell or (
+            "cmd" if os.name == "nt" else (shutil.which("sh") or "/bin/sh"))
 
-    def submit(self, session, cwd, command, env=None, timeout=None):
-        with self.lock:
-            if len(self.processes) >= self.config.max_running_tickets:
-                return None
-            ticket = Ticket(self.store.alloc(session), session, cwd, command,
-                            env, timeout)
-            self.store.put(ticket)
+    def submit(self, session, cwd, command, timeout=0.0):
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("the service is shutting down")
+            snapshot, created = self._store.reserve(session, cwd, command,
+                                                    timeout)
+            ticket_id = snapshot["ticket_id"]
+            if not created:
+                return snapshot
             event = threading.Event()
-            self.events[ticket.id] = event
-            self.cancelled.discard(ticket.id)
-            try:
-                process = self._spawn(ticket)
-            except OSError as exc:
-                ticket.finish(FAILED, error=str(exc))
-                self.store.put(ticket)
-                self.events.pop(ticket.id, None)
-                event.set()
-                return ticket
-            self.processes[ticket.id] = process
-            ticket.status = RUNNING
-            ticket.pid = process.pid
-            ticket.started = ticket.created
-            self.store.put(ticket)
-        threading.Thread(target=self._drain, args=(ticket, process),
-                         daemon=True).start()
-        threading.Thread(target=self._wait, args=(ticket, process, event),
-                         daemon=True).start()
-        return ticket
-
-    def _spawn(self, ticket):
-        return subprocess.Popen(
-            self._argv(ticket.command),
-            cwd=ticket.cwd,
-            env=self._environment(ticket),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0,
-            **self._group_kwargs())
-
-    def _argv(self, command):
-        if os.name == "nt":
-            # Windows runs a command line through its own interpreter; the
-            # shell is part of the platform, not a tunable.
-            return [os.environ.get("COMSPEC") or "cmd.exe", "/d", "/c",
-                    command]
-        return [self.config.shell or "/bin/sh", "-lc", command]
-
-    def _environment(self, ticket):
-        environment = os.environ.copy()
-        environment.update(ticket.env)
-        return environment
-
-    @staticmethod
-    def _group_kwargs():
-        if os.name == "nt":
-            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} \
-                if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP") else {}
-        return {"start_new_session": True}
-
-    def _drain(self, ticket, process):
-        while True:
-            chunk = process.stdout.read(65536)
-            if not chunk:
-                break
-            if self.store.append_output(ticket.id, chunk):
-                ticket.truncated = True
+            self._events[ticket_id] = event
+            self._timeouts[ticket_id] = snapshot["timeout"]
         try:
-            process.stdout.close()
-        except OSError:
-            pass
+            child = self._spawn(snapshot)
+        except (OSError, ValueError) as exc:
+            self._store.finish(ticket_id, FAILED, None, str(exc))
+            self._release(ticket_id)
+            return self._store.snapshot_one(ticket_id)
+        with self._lock:
+            self._children[ticket_id] = child
+        self._store.mark_running(ticket_id, child.pid, time.time())
+        drain = threading.Thread(target=self._drain, name="ticket-output",
+                                 args=(ticket_id, child.stdout), daemon=True)
+        with self._lock:
+            self._drains[ticket_id] = drain
+        drain.start()
+        threading.Thread(target=self._watch, name="ticket-watch", daemon=True,
+                         args=(ticket_id, child)).start()
+        return self._store.snapshot_one(ticket_id)
 
-    def _wait(self, ticket, process, event):
-        status = DONE
-        code = None
-        error = None
-        try:
-            code = process.wait(timeout=ticket.timeout or None)
-            if code != 0:
-                status = FAILED
-        except subprocess.TimeoutExpired:
-            self._kill(process)
-            code = process.wait()
-            status = TIMEOUT
-        except OSError as exc:
-            status = FAILED
-            error = str(exc)
-        with self.lock:
-            self.processes.pop(ticket.id, None)
-            if ticket.id in self.cancelled:
-                status = CANCELLED
-            self.cancelled.discard(ticket.id)
-        ticket.finish(status, code, error)
-        self.store.put(ticket)
-        event.set()
+    def wait(self, ticket_id, timeout=0.0):
+        with self._lock:
+            event = self._events.get(ticket_id)
+        if event is not None and timeout is not None and timeout > 0:
+            event.wait(timeout)
+        return self._store.snapshot_one(ticket_id)
 
-    def _kill(self, process):
-        try:
-            if os.name == "nt":
-                process.kill()
-            else:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            pass
-
-    def wait(self, tid, timeout):
-        with self.lock:
-            event = self.events.get(tid)
+    def cancel(self, ticket_id):
+        with self._lock:
+            child = self._children.get(ticket_id)
+            event = self._events.get(ticket_id)
+        if child is None:
+            raise LookupError(f"no running ticket: {ticket_id}")
+        with self._lock:
+            self._cancelled.add(ticket_id)
+        self._terminate(child)
         if event is not None:
-            event.wait(timeout if timeout else None)
-        return self.store.get(tid)
+            event.wait(self._config.cancel_grace)
+        return self._store.snapshot_one(ticket_id)
 
-    def output(self, tid, offset):
-        if self.store.get(tid) is None:
-            return None
-        return self.store.read_output(tid, offset)
-
-    def cancel(self, tid):
-        with self.lock:
-            process = self.processes.get(tid)
-            if process is not None:
-                self.cancelled.add(tid)
-        if process is None:
-            return self.store.get(tid)
-        self._kill(process)
-        return self.wait(tid, 5.0) or self.store.get(tid)
-
-    def running(self):
-        with self.lock:
-            return len(self.processes)
+    def begin_shutdown(self):
+        with self._lock:
+            self._closed = True
 
     def stop(self):
-        with self.lock:
-            processes = list(self.processes.values())
-        for process in processes:
-            self._kill(process)
+        self.begin_shutdown()
+        with self._lock:
+            ticket_ids = list(self._children)
+        for ticket_id in ticket_ids:
+            with self._lock:
+                child = self._children.get(ticket_id)
+                event = self._events.get(ticket_id)
+                self._cancelled.add(ticket_id)
+            if child is not None:
+                self._terminate(child)
+            if event is not None:
+                event.wait(self._config.cancel_grace)
+        with self._lock:
+            drains = list(self._drains.values())
+        for drain in drains:
+            drain.join(self._config.stop_grace)
+
+    def _spawn(self, snapshot):
+        cwd = snapshot["cwd"]
+        if not os.path.isdir(cwd):
+            raise ValueError(f"no such directory: {cwd}")
+        if os.name == "nt":
+            args = [self._shell, "/c", snapshot["command"]]
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP
+            session = False
+        else:
+            args = [self._shell, "-c", snapshot["command"]]
+            flags = 0
+            session = True
+        return subprocess.Popen(
+            args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, start_new_session=session,
+            creationflags=flags,
+        )
+
+    def _drain(self, ticket_id, pipe):
+        try:
+            while True:
+                chunk = pipe.read(self._config.read_chunk_bytes)
+                if not chunk:
+                    break
+                self._store.append_output(ticket_id, chunk)
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+    def _watch(self, ticket_id, child):
+        outcome, error, exit_code = DONE, "", None
+        timeout = self._timeouts.get(ticket_id) or 0.0
+        try:
+            exit_code = child.wait(timeout=timeout if timeout > 0 else None)
+        except subprocess.TimeoutExpired:
+            self._terminate(child)
+            outcome, error = FAILED, "timed out"
+        except OSError as exc:
+            outcome, error = FAILED, str(exc)
+        drain = self._drains.get(ticket_id)
+        if drain is not None:
+            drain.join(self._config.drain_grace)
+            if drain.is_alive():
+                self._store.mark_truncated(ticket_id)
+        with self._lock:
+            cancelled = ticket_id in self._cancelled
+        if cancelled:
+            outcome = CANCELLED
+        elif outcome == DONE and child.returncode not in (0, None):
+            outcome, error = FAILED, f"exit code {child.returncode}"
+        try:
+            self._store.finish(ticket_id, outcome, child.returncode, error)
+        except OSError:
+            pass
+        finally:
+            self._release(ticket_id)
+
+    def _release(self, ticket_id):
+        with self._lock:
+            self._children.pop(ticket_id, None)
+            self._drains.pop(ticket_id, None)
+            self._timeouts.pop(ticket_id, None)
+            self._cancelled.discard(ticket_id)
+            event = self._events.pop(ticket_id, None)
+        if event is not None:
+            event.set()
+
+    def _terminate(self, child):
+        self._signal(child, signal.SIGTERM)
+        try:
+            child.wait(self._config.cancel_grace)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except OSError:
+            return
+        self._signal(child, signal.SIGKILL)
+
+    def _signal(self, child, number):
+        try:
+            if os.name == "nt":
+                child.kill() if number == signal.SIGKILL else child.terminate()
+                return
+            os.killpg(os.getpgid(child.pid), number)
+        except OSError:
+            try:
+                child.kill()
+            except OSError:
+                pass
