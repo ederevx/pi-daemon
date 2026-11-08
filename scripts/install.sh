@@ -465,6 +465,9 @@ mkdir "$lock" 2>/dev/null || {
 trap 'rmdir "$lock" 2>/dev/null' EXIT
 
 recover_transaction
+# A run killed between staging the manifest and moving it into place leaves
+# its temp behind, and uninstall's rmdir of the state directory would fail.
+rm -f "$manifest".tmp.*
 sweep_releases
 
 # Older installs could place extension copies in the agent home, where a
