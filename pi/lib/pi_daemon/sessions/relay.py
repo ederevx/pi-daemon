@@ -165,6 +165,9 @@ class SessionRelay:
     def _resize(self, key, cols, rows):
         session = self._sessions.get(key)
         if session is not None and self._backend is not None:
+            # A resize settles the size the client wants: a nudge still
+            # owing its restore would put back the size it stepped from.
+            self._repaints.pop(key, None)
             self._backend.resize(session.master, cols, rows)
         return True
 

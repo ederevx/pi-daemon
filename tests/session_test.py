@@ -631,6 +631,27 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(self.relay._repaints, {})
         viewer.close()
 
+    def test_a_resize_cancels_a_pending_repaint_restore(self):
+        import fcntl
+        import struct
+        import termios
+
+        self.spawn("printf 'X\\n'; read line")
+        other = self.spawn_second()
+        time.sleep(0.3)
+        viewer = self.attach()
+        self.assertIn(b"X", self.read_until(viewer, b"X"))
+        self.relay.carry_viewers("k", "g", other, "g2", 100, 40)
+        self.relay.resize(other, 120, 50)
+        # The restore the carry still owed must not undo the new size.
+        time.sleep(self.config.repaint_tick * 4)
+        master = self.relay._sessions[other].master
+        packed = fcntl.ioctl(master, termios.TIOCGWINSZ, b"\0" * 8)
+        rows, cols = struct.unpack("HH", packed[:4])
+        self.assertEqual((cols, rows), (120, 50))
+        self.assertEqual(self.relay._repaints, {})
+        viewer.close()
+
     def test_a_carry_across_a_replaced_generation_is_refused(self):
         self.spawn("printf 'X\\n'; sleep 5")
         other = self.spawn_second()
