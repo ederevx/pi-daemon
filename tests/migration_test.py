@@ -22,7 +22,7 @@ from pi_daemon.runtime_layout import RuntimeLayout
 from pi_daemon.sessions.store import SessionStore
 from pi_daemon.tasks.store import TicketStore
 
-ENTRY = os.path.join(REPO, "pi", "service", "pi-daemon")
+ENTRY = os.path.join(REPO, "pi", "bin", "pi-daemon-migrate")
 SCRATCH = tempfile.mkdtemp(prefix="pi-migration-")
 
 
@@ -113,7 +113,7 @@ class LegacyFixture:
 
     def run(self, *args, **extra):
         completed = subprocess.run(
-            [sys.executable, ENTRY, "migrate"] + list(args),
+            [sys.executable, ENTRY] + list(args),
             env=self.environment(**extra), capture_output=True, text=True)
         plan = json.loads(completed.stdout) if completed.stdout.strip() else None
         return completed.returncode, plan, completed.stderr

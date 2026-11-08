@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Translate the legacy state root into the new layout, once.
+
+The verb belongs to the installed library, not to the daemon entry (which
+takes no arguments) and not to `pi-rc` (a client that must speak to both
+servers and never writes server state). It runs from the same generation
+as the daemon, so an install and its migration are the same code."""
+
+import os
+import sys
+
+LIB = os.path.abspath(os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+sys.path.insert(0, LIB)
+
+from pi_daemon.environment import EntryEnvironment
+from pi_daemon.migration.command import MigrateCommand
+
+
+def main(argv=None):
+    try:
+        environment = EntryEnvironment().resolve()
+    except ValueError as failure:
+        print("pi-daemon-migrate: %s" % failure, file=sys.stderr)
+        return 2
+    return MigrateCommand.from_environment(environment).run(
+        sys.argv[1:] if argv is None else argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

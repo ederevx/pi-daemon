@@ -30,7 +30,7 @@ class MigrateCommand:
     def run(self, argv, stdout=None, stderr=None):
         stdout = sys.stdout if stdout is None else stdout
         stderr = sys.stderr if stderr is None else stderr
-        parser = argparse.ArgumentParser(prog="pi-daemon migrate")
+        parser = argparse.ArgumentParser(prog="pi-daemon-migrate")
         parser.add_argument("--dry-run", action="store_true",
                             help="print the plan as JSON, write nothing")
         parser.add_argument("--force", action="store_true",
@@ -43,12 +43,12 @@ class MigrateCommand:
             else:
                 plan = migration.apply(options.force)
         except MigrationError as failure:
-            print(f"pi-daemon: migrate: {failure.message}", file=stderr)
+            print(f"pi-daemon-migrate: {failure.message}", file=stderr)
             return failure.code
         print(json.dumps(plan.to_dict(options.dry_run), sort_keys=True,
                          indent=2), file=stdout)
         if plan.refusal() is not None:
             code, message = plan.refusal_status()
-            print(f"pi-daemon: migrate: {message}", file=stderr)
+            print(f"pi-daemon-migrate: {message}", file=stderr)
             return code
         return 0

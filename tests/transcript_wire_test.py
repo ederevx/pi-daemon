@@ -51,18 +51,20 @@ class WireDaemon:
         self.agent = os.path.join(self.scratch, "agent")
         for path in (self.runtime, self.state, self.agent):
             os.makedirs(path, exist_ok=True)
-        self.sock_path = os.path.join(self.runtime, "pi-pty-host.sock")
+        self.sock_path = os.path.join(self.runtime, "control.json")
         self.store = os.path.join(self.agent, "sessions")
         self.env = dict(os.environ)
         self.env.update({
             "XDG_RUNTIME_DIR": self.runtime,
             "XDG_STATE_HOME": self.state,
+            "PI_DAEMON_STATE_DIR": self.state,
+            "PI_DAEMON_RUNTIME_DIR": self.runtime,
             "PI_CODING_AGENT_DIR": self.agent,
             # This boots a real daemon, which publishes a provider
             # descriptor; on Windows the services root ignores
             # XDG_RUNTIME_DIR, so pin it before it reaches the live root.
             "PI_SERVICES_DIR": os.path.join(self.scratch, "services"),
-            "PI_PTYD_TRANSCRIPT_INDEX_INTERVAL": "0",
+            "PI_DAEMON_TRANSCRIPT_INDEX_INTERVAL": "0",
         })
         self.proc = None
         self.file = None

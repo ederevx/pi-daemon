@@ -10,8 +10,16 @@ Environment=HOME=%h
 # carries neither ~/.local/bin nor the node bin dir, so the real pi's
 # directory is substituted at install time (@PI_BIN_DIR@).
 Environment=PATH=@PI_BIN_DIR@:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=%h/.local/bin/pi-daemon
-ExecStop=%h/.local/bin/pi-rc daemon-stop
+# The service's two roots, rendered at install time to the exact values
+# defaults.json and the migration used: one install, one set of paths,
+# never a unit that disagrees with the code it starts. They are quoted
+# because a home directory may contain spaces.
+Environment="PI_DAEMON_STATE_DIR=@STATE_DIR@"
+Environment="PI_DAEMON_RUNTIME_DIR=@RUNTIME_DIR@"
+ExecStart="@LAUNCHER@"
+# The client stops exactly this daemon: its stop endpoint is the runtime
+# root the unit declares, never one discovered from another install.
+ExecStop="@LAUNCHER_RC@" --endpoint "@ENDPOINT@" daemon-stop
 Restart=on-failure
 RestartSec=2
 

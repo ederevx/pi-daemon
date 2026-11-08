@@ -195,7 +195,26 @@ import pi_services
 LAYOUT = pi_platform.RuntimeLayout()
 PROCESS = pi_platform.ProcessControl()
 STATE_HOME = LAYOUT.state_home()
-LOG_PATH = LAYOUT.daemon_log_path()
+
+
+def daemon_log_path():
+	# The service's own log lives in the state root the entry resolves:
+	# the generation's installed defaults over this environment. A
+	# checkout has no defaults file and no explicit roots, so it keeps the
+	# legacy path and stays runnable from the repo.
+	try:
+		from pi_daemon.environment import EntryEnvironment
+		from pi_daemon.runtime_layout import RuntimeLayout
+
+		environment = EntryEnvironment().resolve()
+		layout = RuntimeLayout(environment["PI_DAEMON_STATE_DIR"],
+							   environment["PI_DAEMON_RUNTIME_DIR"])
+		return layout.daemon_log_path()
+	except (ImportError, ValueError):
+		return LAYOUT.daemon_log_path()
+
+
+LOG_PATH = daemon_log_path()
 
 DEFAULT_COLS = 120
 DEFAULT_ROWS = 40

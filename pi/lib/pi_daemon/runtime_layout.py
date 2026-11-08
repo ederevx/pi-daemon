@@ -70,6 +70,11 @@ class RuntimeLayout:
         """The record of a completed translation; absent until one runs."""
         return os.path.join(self._state_root, "migration.json")
 
+    def daemon_log_path(self):
+        """Where a daemon whose stderr is closed still records why it died."""
+        os.makedirs(self._state_root, exist_ok=True)
+        return os.path.join(self._state_root, "daemon.log")
+
     def instance_lock_path(self):
         return os.path.join(self._runtime_root, "instance.lock")
 

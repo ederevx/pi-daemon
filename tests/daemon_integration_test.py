@@ -30,7 +30,7 @@ os.makedirs(STATE, exist_ok=True)
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DAEMON_PATH = os.path.join(REPO, "pi", "daemon", "pi-daemon")
 PI_RC = os.path.join(REPO, "pi", "bin", "pi-rc")
-SOCK = os.path.join(RUNTIME, "pi-pty-host.sock")
+SOCK = os.path.join(RUNTIME, "control.json")
 # Isolation regression: the daemon publishes its provider descriptor
 # under PI_SERVICES_DIR. On Windows the services root ignores
 # XDG_RUNTIME_DIR and falls back to %TEMP%\pi-services, so without an
@@ -45,8 +45,8 @@ ENV = dict(os.environ)
 AGENT = os.path.join(SCRATCH, "agent")
 os.makedirs(AGENT, exist_ok=True)
 ENV.update({"XDG_RUNTIME_DIR": RUNTIME, "XDG_STATE_HOME": STATE,
-            "PI_CODING_AGENT_DIR": AGENT, "PI_SERVICES_DIR": SERVICES,
-            "PI_PTYD_TICKET_TTL_HOURS": "1", "PI_PTYD_GC": "3600"})
+            "PI_DAEMON_STATE_DIR": STATE, "PI_DAEMON_RUNTIME_DIR": RUNTIME,
+            "PI_CODING_AGENT_DIR": AGENT, "PI_SERVICES_DIR": SERVICES})
 
 FAIL = []
 
