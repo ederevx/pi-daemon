@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The unified service: configuration, tasks, framing and the endpoint."""
 
+import base64
 import json
 import os
 import shutil
@@ -19,9 +20,11 @@ from daemon_service.atomic_state_file import AtomicStateFile
 from daemon_service.config import ServiceConfig
 from daemon_service.lifecycle.instance_coordinator import InstanceCoordinator
 from daemon_service.runtime_layout import RuntimeLayout
+from daemon_service.tasks.error import TaskError
 from daemon_service.tasks.runner import TicketRunner
 from daemon_service.tasks.service import TaskService
 from daemon_service.tasks.store import TicketStore
+from daemon_service.transport.control_handshake import ControlHandshake
 from daemon_service.transport.endpoint_file import EndpointFile
 from daemon_service.transport.endpoint_probe import EndpointProbe
 from daemon_service.transport.json_line_stream import JsonLineStream
@@ -135,16 +138,27 @@ class InstanceTests(unittest.TestCase):
 
 
 class WireTests(unittest.TestCase):
-    def test_hello_uses_the_existing_contract(self):
-        codec = WireCodec("secret", ["ticket-submit"])
-        greeting = codec.greet({"op": "hello", "token": "secret"})
-        self.assertEqual(greeting["srv"], "pi-pty-host")
+    def test_hello_uses_the_published_contract(self):
+        handshake = ControlHandshake("secret", ["ticket-submit"])
+        greeting = handshake.authorize({"cmd": "hello", "token": "secret"})
+        self.assertEqual(greeting["srv"], "pi-daemon")
         self.assertEqual(greeting["proto"], 1)
+        self.assertEqual(greeting["caps"], [])
+        self.assertEqual(greeting["index"], 1)
         self.assertEqual(greeting["commands"], ["ticket-submit"])
         with self.assertRaises(PermissionError):
-            codec.greet({"op": "hello", "token": "wrong"})
+            handshake.authorize({"cmd": "hello", "token": "wrong"})
         with self.assertRaises(PermissionError):
-            codec.greet({"op": "ticket-list"})
+            handshake.authorize({"op": "hello", "token": "secret"})
+
+    def test_the_codec_encodes_and_decodes_one_frame(self):
+        codec = WireCodec()
+        frame = codec.encode(codec.hello_request("secret"))
+        self.assertTrue(frame.endswith(b"\n"))
+        self.assertEqual(codec.decode(frame),
+                         {"cmd": "hello", "token": "secret"})
+        with self.assertRaises(ValueError):
+            codec.decode(b"not json")
 
     def test_frames_are_kept_across_one_packet(self):
         left, right = socket.socketpair()
@@ -172,113 +186,136 @@ class WireTests(unittest.TestCase):
 class StoreTests(unittest.TestCase):
     def test_snapshots_are_detached(self):
         service, store, _ = tasks_service()
-        snapshot = service.submit("pi-1", SCRATCH, "printf 'a'")
+        snapshot, _ = service.submit("pi-1", SCRATCH, "printf 'a'")
         snapshot["status"] = "tampered"
-        self.assertEqual(store.snapshot_one(snapshot["ticket_id"])["status"],
+        self.assertEqual(store.snapshot_one(snapshot["id"])["status"],
                          "running")
 
     def test_a_running_match_is_replayed_not_duplicated(self):
         service, _, _ = tasks_service()
-        first = service.submit("pi-1", SCRATCH, "sleep 1")
-        second = service.submit("pi-1", SCRATCH, "sleep 1")
-        self.assertEqual(first["ticket_id"], second["ticket_id"])
-        service.cancel(first["ticket_id"])
+        first, _ = service.submit("pi-1", SCRATCH, "sleep 1")
+        second, _ = service.submit("pi-1", SCRATCH, "sleep 1")
+        self.assertEqual(first["id"], second["id"])
+        service.cancel(first["id"])
 
     def test_ids_are_monotonic_across_a_reload(self):
         service, store, config = tasks_service()
-        first = service.submit("pi-1", SCRATCH, "true")
-        service.wait(first["ticket_id"], 5)
-        reloaded = TicketStore(store.log_path(first["ticket_id"]).replace(
-            "logs" + os.sep + first["ticket_id"] + ".log", "tickets.json"),
-            os.path.dirname(store.log_path(first["ticket_id"])), config)
+        first, _ = service.submit("pi-1", SCRATCH, "true")
+        service.wait(first["id"], 5)
+        reloaded = TicketStore(store.log_path(first["id"]).replace(
+            "logs" + os.sep + first["id"] + ".log", "tickets.json"),
+            os.path.dirname(store.log_path(first["id"])), config)
         reloaded.load()
         second = reloaded.reserve("pi-1", SCRATCH, "true", 0)[0]
-        self.assertNotEqual(first["ticket_id"], second["ticket_id"])
+        self.assertNotEqual(first["id"], second["id"])
 
     def test_running_records_become_interrupted_after_a_reload(self):
         service, store, config = tasks_service()
-        ticket = service.submit("pi-1", SCRATCH, "sleep 2")
-        reloaded = TicketStore(store.log_path(ticket["ticket_id"]).replace(
-            "logs" + os.sep + ticket["ticket_id"] + ".log", "tickets.json"),
-            os.path.dirname(store.log_path(ticket["ticket_id"])), config)
+        ticket, _ = service.submit("pi-1", SCRATCH, "sleep 2")
+        reloaded = TicketStore(store.log_path(ticket["id"]).replace(
+            "logs" + os.sep + ticket["id"] + ".log", "tickets.json"),
+            os.path.dirname(store.log_path(ticket["id"])), config)
         reloaded.load()
-        record = reloaded.snapshot_one(ticket["ticket_id"])
+        record = reloaded.snapshot_one(ticket["id"])
         self.assertEqual(record["status"], "failed")
         self.assertIn("interrupted", record["error"])
-        service.cancel(ticket["ticket_id"])
+        service.cancel(ticket["id"])
 
     def test_finished_records_are_capped_with_their_logs(self):
         service, store, _ = tasks_service(record_cap=2)
         ids = []
         for _ in range(4):
-            ticket = service.submit("s", SCRATCH, f"printf '{time.time()}'")
-            service.wait(ticket["ticket_id"], 5)
-            ids.append(ticket["ticket_id"])
+            ticket, _ = service.submit("s", SCRATCH, f"printf '{time.time()}'")
+            service.wait(ticket["id"], 5)
+            ids.append(ticket["id"])
         self.assertEqual(len(service.tickets()), 2)
         self.assertIsNone(store.snapshot_one(ids[0]))
         self.assertFalse(os.path.exists(store.log_path(ids[0])))
 
     def test_a_running_ticket_cannot_be_removed(self):
         service, _, _ = tasks_service()
-        ticket = service.submit("pi-1", SCRATCH, "sleep 2")
-        with self.assertRaises(RuntimeError):
-            service.remove(ticket["ticket_id"])
-        service.cancel(ticket["ticket_id"])
+        ticket, _ = service.submit("pi-1", SCRATCH, "sleep 2")
+        with self.assertRaises(TaskError):
+            service.remove(ticket["id"])
+        service.cancel(ticket["id"])
 
 
 class RunnerTests(unittest.TestCase):
     def test_a_ticket_runs_and_keeps_its_output(self):
         service, _, _ = tasks_service()
-        ticket = service.submit("pi-1", SCRATCH, "printf 'hello'")
-        done = service.wait(ticket["ticket_id"], 10)
+        ticket, _ = service.submit("pi-1", SCRATCH, "printf 'hello'")
+        done = service.wait(ticket["id"], 10)
         self.assertEqual(done["status"], "done")
-        self.assertEqual(done["exit_code"], 0)
-        result = service.output(ticket["ticket_id"])
-        self.assertEqual(result["output"], "hello")
+        self.assertEqual(done["exit"], 0)
+        result = service.output(ticket["id"])
+        self.assertEqual(result["data"], b"hello")
+        self.assertEqual(result["size"], 5)
 
     def test_a_failure_is_kept_not_lost(self):
         service, _, _ = tasks_service()
-        ticket = service.submit("pi-1", SCRATCH, "exit 3")
-        done = service.wait(ticket["ticket_id"], 10)
+        ticket, _ = service.submit("pi-1", SCRATCH, "exit 3")
+        done = service.wait(ticket["id"], 10)
         self.assertEqual(done["status"], "failed")
-        self.assertEqual(done["exit_code"], 3)
+        self.assertEqual(done["exit"], 3)
 
     def test_a_timeout_is_a_failure_that_says_timed_out(self):
         service, _, _ = tasks_service()
-        ticket = service.submit("pi-1", SCRATCH, "sleep 5", 0.3)
-        done = service.wait(ticket["ticket_id"], 10)
+        ticket, _ = service.submit("pi-1", SCRATCH, "sleep 5", 0.3)
+        done = service.wait(ticket["id"], 10)
         self.assertEqual(done["status"], "failed")
         self.assertIn("timed out", done["error"])
 
     def test_cancel_stops_the_child(self):
         service, _, _ = tasks_service()
-        ticket = service.submit("pi-1", SCRATCH, "sleep 5")
-        cancelled = service.cancel(ticket["ticket_id"])
+        ticket, _ = service.submit("pi-1", SCRATCH, "sleep 5")
+        cancelled = service.cancel(ticket["id"])
         self.assertEqual(cancelled["status"], "cancelled")
 
     def test_zero_timeout_polls_instead_of_waiting(self):
         service, _, _ = tasks_service()
-        ticket = service.submit("pi-1", SCRATCH, "sleep 2")
+        ticket, _ = service.submit("pi-1", SCRATCH, "sleep 2")
         started = time.time()
-        record = service.wait(ticket["ticket_id"], 0)
+        record = service.wait(ticket["id"], 0)
         self.assertLess(time.time() - started, 1.0)
         self.assertEqual(record["status"], "running")
-        service.cancel(ticket["ticket_id"])
+        service.cancel(ticket["id"])
 
-    def test_output_offsets_page_the_log(self):
+    def test_output_offsets_page_raw_bytes(self):
         service, _, _ = tasks_service()
-        ticket = service.submit("pi-1", SCRATCH, "printf 'abcdef'")
-        service.wait(ticket["ticket_id"], 10)
-        first = service.output(ticket["ticket_id"], 0)
-        second = service.output(ticket["ticket_id"], 3)
-        self.assertEqual(first["output"], "abcdef")
-        self.assertEqual(second["output"], "def")
-        self.assertEqual(second["offset"], 6)
+        ticket, _ = service.submit("pi-1", SCRATCH, "printf 'abcdef'")
+        service.wait(ticket["id"], 10)
+        first = service.output(ticket["id"], 0)
+        second = service.output(ticket["id"], 3)
+        self.assertEqual(first["data"], b"abcdef")
+        self.assertEqual(second["data"], b"def")
+        self.assertEqual(second["next"], 6)
+        self.assertEqual(second["size"], 6)
 
-    def test_a_missing_directory_fails_the_ticket(self):
+    def test_a_multibyte_output_is_paged_without_decoding(self):
         service, _, _ = tasks_service()
-        ticket = service.submit("pi-1", os.path.join(SCRATCH, "absent"), "true")
-        self.assertEqual(ticket["status"], "failed")
+        script = "import sys;sys.stdout.buffer.write(bytes([99,97,102,195,169]))"
+        ticket, _ = service.submit("pi-1", SCRATCH,
+                                f'{sys.executable} -c "{script}"')
+        service.wait(ticket["id"], 10)
+        whole = service.output(ticket["id"])
+        self.assertEqual(whole["data"], b"caf\xc3\xa9")
+        paged = service.output(ticket["id"], 3)
+        self.assertEqual(paged["data"], b"\xc3\xa9")
+        self.assertEqual(paged["size"], 5)
+
+    def test_the_environment_is_applied_to_the_child(self):
+        service, _, _ = tasks_service()
+        ticket, _ = service.submit("pi-1", SCRATCH, "printf '%s' \"$PI_SMOKE\"",
+                                0.0, {"PI_SMOKE": "transient"})
+        service.wait(ticket["id"], 10)
+        self.assertEqual(service.output(ticket["id"])["data"], b"transient")
+
+    def test_a_missing_directory_is_a_spawn_failure(self):
+        service, _, _ = tasks_service()
+        with self.assertRaises(TaskError) as caught:
+            service.submit("pi-1", os.path.join(SCRATCH, "absent"), "true")
+        self.assertEqual(caught.exception.code, "spawn-failed")
+        self.assertEqual(service.tickets(), [])
 
 
 class EndpointTests(unittest.TestCase):
@@ -288,6 +325,7 @@ class EndpointTests(unittest.TestCase):
             "PI_DAEMON_RUNTIME_DIR": roots()[1],
         }).start()
         self.coordinates = EndpointFile(self.app.endpoint_path()).read()
+        self.codec = WireCodec()
         self.connection = None
 
     def tearDown(self):
@@ -300,51 +338,131 @@ class EndpointTests(unittest.TestCase):
             self.connection = socket.create_connection(
                 (self.coordinates["host"], self.coordinates["port"]), 2)
             self.stream = JsonLineStream(self.connection, 65536, 8192)
-            self.stream.write({"op": "hello", "token": self.coordinates["token"]})
+            self.stream.write(self.codec.encode(
+                self.codec.hello_request(self.coordinates["token"])))
             self.greeting = json.loads(self.stream.read())
-        self.stream.write(request)
+        self.stream.write(self.codec.encode(request))
         return json.loads(self.stream.read())
 
     def test_the_descriptor_names_its_instance_and_is_restricted(self):
         self.assertEqual(self.coordinates["instance"], self.app._instance)
-        self.assertEqual(self.coordinates["srv"], "pi-pty-host")
+        self.assertEqual(self.coordinates["srv"], "pi-daemon")
         if os.name != "nt":
             mode = os.stat(self.app.endpoint_path()).st_mode & 0o777
             self.assertEqual(mode, 0o600)
 
     def test_a_ticket_round_trip_over_the_wire(self):
-        greeting = self.talk({"op": "hello", "token": self.coordinates["token"]}) \
-            if False else None
-        submitted = self.talk({"op": "ticket-submit", "session": "pi-1",
+        submitted = self.talk({"cmd": "ticket-submit", "session": "pi-1",
                                "cwd": SCRATCH, "command": "printf 'wire'"})
         self.assertTrue(submitted["ok"])
-        ticket_id = submitted["ticket"]["ticket_id"]
-        waited = self.talk({"op": "ticket-wait", "ticket_id": ticket_id,
+        self.assertTrue(submitted["id"].startswith("t-"))
+        ticket_id = submitted["id"]
+        waited = self.talk({"cmd": "ticket-wait", "id": ticket_id,
                             "timeout": 10})
         self.assertEqual(waited["ticket"]["status"], "done")
-        output = self.talk({"op": "ticket-output", "ticket_id": ticket_id})
+        self.assertEqual(waited["ticket"]["exit"], 0)
+        self.assertIsNotNone(waited["ticket"]["finished"])
+        output = self.talk({"cmd": "ticket-output", "id": ticket_id})
         self.assertEqual(output["output"], "wire")
-        self.assertIsNone(greeting)
+        self.assertEqual(output["exit"], 0)
+        self.assertEqual(output["status"], "done")
+        paged = self.talk({"cmd": "ticket-output", "id": ticket_id,
+                           "offset": 2})
+        self.assertEqual(base64.b64decode(paged["data"]), b"re")
+        self.assertEqual(paged["offset"], 2)
+        self.assertEqual(paged["next"], 4)
+        self.assertEqual(paged["size"], 4)
+
+    def test_the_environment_is_transient_over_the_wire(self):
+        submitted = self.talk({"cmd": "ticket-submit", "session": "pi-1",
+                               "cwd": SCRATCH, "env": {"PI_WIRE": "yes"},
+                               "command": "printf '%s' \"$PI_WIRE\""})
+        self.talk({"cmd": "ticket-wait", "id": submitted["id"], "timeout": 10})
+        output = self.talk({"cmd": "ticket-output", "id": submitted["id"]})
+        self.assertEqual(output["output"], "yes")
+        listed = self.talk({"cmd": "ticket-list"})
+        self.assertNotIn("env", listed["tickets"][0])
 
     def test_an_unknown_command_is_answered_not_fatal(self):
-        self.talk({"op": "hello", "token": self.coordinates["token"]})
-        reply = self.talk({"op": "ticket-nope"})
+        reply = self.talk({"cmd": "ticket-nope"})
         self.assertFalse(reply["ok"])
-        self.assertIn("unknown", reply["error"])
+        self.assertEqual(reply["error"], "bad-request")
+
+    def test_the_greeting_announces_the_published_capabilities(self):
+        self.talk({"cmd": "ticket-list"})
+        self.assertTrue(self.greeting["ok"])
+        self.assertEqual(self.greeting["srv"], "pi-daemon")
+        self.assertEqual(self.greeting["proto"], 1)
+        self.assertEqual(self.greeting["index"], 1)
+        self.assertIn("ticket-submit", self.greeting["commands"])
+
+    def test_a_malformed_request_is_bad_request(self):
+        self.talk({"cmd": "ticket-list"})
+        self.assertEqual(self.talk({"cmd": "ticket-submit"})["error"],
+                         "bad-request")
+        self.assertEqual(self.talk({"cmd": "ticket-submit", "session": "pi-1",
+                                    "cwd": "relative", "command": "true"})
+                         ["error"], "bad-request")
+        self.assertEqual(self.talk({"cmd": "ticket-submit", "session": "pi-1",
+                                    "cwd": SCRATCH, "command": "true",
+                                    "timeout": 0})["error"], "bad-request")
+        self.assertEqual(self.talk({"cmd": "ticket-submit", "session": "pi-1",
+                                    "cwd": SCRATCH, "command": "true",
+                                    "env": {"A": 1}})["error"],
+                         "bad-request")
+
+    def test_an_unknown_ticket_is_no_ticket(self):
+        self.talk({"cmd": "ticket-list"})
+        self.assertEqual(self.talk({"cmd": "ticket-wait", "id": "t-nope"})
+                         ["error"], "no-ticket")
+        self.assertEqual(self.talk({"cmd": "ticket-output", "id": "t-nope"})
+                         ["error"], "no-ticket")
+        self.assertEqual(self.talk({"cmd": "ticket-cancel", "id": "t-nope"})
+                         ["error"], "no-ticket")
+        self.assertEqual(self.talk({"cmd": "ticket-remove", "id": "t-nope"})
+                         ["error"], "no-ticket")
+
+    def test_removing_a_running_ticket_is_refused(self):
+        self.talk({"cmd": "ticket-list"})
+        submitted = self.talk({"cmd": "ticket-submit", "session": "pi-1",
+                               "cwd": SCRATCH, "command": "sleep 30"})
+        self.assertEqual(self.talk({"cmd": "ticket-remove",
+                                    "id": submitted["id"]})["error"],
+                         "running")
+        self.assertTrue(self.talk({"cmd": "ticket-cancel",
+                                   "id": submitted["id"]})["ok"])
+
+    def test_an_identical_running_submission_is_reused(self):
+        self.talk({"cmd": "ticket-list"})
+        request = {"cmd": "ticket-submit", "session": "pi-1",
+                   "cwd": SCRATCH, "command": "sleep 30"}
+        first = self.talk(request)
+        second = self.talk(request)
+        self.assertEqual(first["id"], second["id"])
+        self.assertTrue(second["reused"])
+        self.talk({"cmd": "ticket-cancel", "id": first["id"]})
+
+    def test_tickets_reset_reports_its_counts(self):
+        self.talk({"cmd": "ticket-list"})
+        self.talk({"cmd": "ticket-submit", "session": "pi-1",
+                   "cwd": SCRATCH, "command": "printf 'x'"})
+        reset = self.talk({"cmd": "tickets-reset"})
+        self.assertEqual(reset["removed"], 1)
+        self.assertIn("cancelled", reset)
 
     def test_a_wrong_token_is_refused(self):
         connection = socket.create_connection(
             (self.coordinates["host"], self.coordinates["port"]), 2)
         stream = JsonLineStream(connection, 65536, 8192)
         try:
-            stream.write({"op": "hello", "token": "wrong"})
+            stream.write(self.codec.encode({"cmd": "hello", "token": "wrong"}))
             self.assertFalse(json.loads(stream.read())["ok"])
         finally:
             stream.close()
 
     def test_the_probe_finds_a_live_service(self):
-        probe = EndpointProbe(2, 2, 65536, 8192)
-        self.assertEqual(probe.probe(self.coordinates)["srv"], "pi-pty-host")
+        probe = EndpointProbe(WireCodec(), 2, 2, 65536, 8192)
+        self.assertEqual(probe.probe(self.coordinates)["srv"], "pi-daemon")
         self.assertIsNone(probe.probe({"host": "127.0.0.1", "port": 1,
                                        "token": "x"}))
 

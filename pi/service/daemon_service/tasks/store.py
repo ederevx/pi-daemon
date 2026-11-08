@@ -5,6 +5,8 @@ import threading
 import time
 
 from ..atomic_state_file import AtomicStateFile
+from ..wire import TICKET_RUNNING
+from .error import TaskError
 from .model import CANCELLED, DONE, FAILED, RUNNING, Ticket
 
 
@@ -116,6 +118,11 @@ class TicketStore:
                     if self._records[tid].session == session] if session \
                 else [self._records[tid].to_dict() for tid in self._order]
 
+    def running_count(self):
+        with self._lock:
+            return sum(1 for ticket in self._records.values()
+                       if ticket.status == RUNNING)
+
     def running_ids(self):
         with self._lock:
             return [tid for tid in self._order
@@ -145,19 +152,32 @@ class TicketStore:
             return len(chunk)
 
     def output(self, ticket_id, offset=0):
+        """Raw bytes from one offset, with the next offset and the size."""
         with self._lock:
             ticket = self._records.get(ticket_id)
             if ticket is None:
                 raise LookupError(f"unknown ticket: {ticket_id}")
-            limit = ticket.output_bytes
-        offset = max(0, min(int(offset or 0), limit))
+            size = ticket.output_bytes
+        offset = max(0, min(int(offset or 0), size))
         try:
             with open(self.log_path(ticket_id), "rb") as handle:
                 handle.seek(offset)
-                data = handle.read()
+                data = handle.read(size - offset)
         except FileNotFoundError:
             data = b""
-        return data.decode("utf-8", "replace"), offset + len(data)
+        return data, offset + len(data), size
+
+    def discard(self, ticket_id):
+        """Drop a reservation that never became a run."""
+        with self._lock:
+            ticket = self._records.pop(ticket_id, None)
+            if ticket is None:
+                return False
+            if ticket_id in self._order:
+                self._order.remove(ticket_id)
+            self._save_locked()
+            self._discard_log(ticket_id)
+            return True
 
     def remove(self, ticket_id):
         with self._lock:
@@ -165,7 +185,7 @@ class TicketStore:
             if ticket is None:
                 raise LookupError(f"unknown ticket: {ticket_id}")
             if ticket.status == RUNNING:
-                raise RuntimeError(f"ticket is still running: {ticket_id}")
+                raise TaskError(TICKET_RUNNING)
             self._records.pop(ticket_id, None)
             if ticket_id in self._order:
                 self._order.remove(ticket_id)

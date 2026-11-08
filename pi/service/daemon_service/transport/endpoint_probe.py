@@ -8,8 +8,9 @@ from .json_line_stream import JsonLineStream
 class EndpointProbe:
     """A probe establishes readiness; it never establishes ownership."""
 
-    def __init__(self, connect_timeout, probe_timeout, frame_bytes,
+    def __init__(self, codec, connect_timeout, probe_timeout, frame_bytes,
                  read_chunk_bytes):
+        self._codec = codec
         self._connect_timeout = connect_timeout
         self._probe_timeout = probe_timeout
         self._frame_bytes = frame_bytes
@@ -28,15 +29,10 @@ class EndpointProbe:
         connection.settimeout(self._probe_timeout)
         stream = JsonLineStream(connection, self._frame_bytes, self._chunk)
         try:
-            stream.write({"op": "hello", "token": coordinates.get("token", "")})
-            return _decode(stream.read())
+            stream.write(self._codec.encode(
+                self._codec.hello_request(coordinates.get("token", ""))))
+            return self._codec.decode(stream.read())
         except (OSError, ValueError, ConnectionError):
             return None
         finally:
             stream.close()
-
-
-def _decode(frame):
-    import json
-
-    return json.loads(frame.decode("utf-8"))

@@ -1,6 +1,5 @@
 """Bounded JSON-line framing that never loses bytes between frames."""
 
-import json
 import socket
 
 
@@ -32,8 +31,8 @@ class JsonLineStream:
                 return frame
             self._buffer += chunk
 
-    def write(self, message):
-        self._connection.sendall(json.dumps(message).encode("utf-8") + b"\n")
+    def write(self, frame):
+        self._connection.sendall(frame)
 
     def close(self):
         try:
