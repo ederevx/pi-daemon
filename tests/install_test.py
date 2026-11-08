@@ -37,14 +37,21 @@ class ScratchHome:
         self.fakebin = self.root / "fakebin"
         self.fakebin.mkdir()
         self._write_exe("pi")
-        # `is-active` answers what a stopped unit answers; every other
-        # systemctl question succeeds.
-        self._write_exe("systemctl", 'case "$*" in *is-active*) exit 3 ;; esac\n')
+        # The unit question is answered the way systemd answers it: `show
+        # -p FragmentPath` names the unit file actually loaded, and
+        # `is-active` answers what a stopped unit answers. A case overrides
+        # either through the environment.
+        self._write_exe("systemctl", (
+            'case "$*" in\n'
+            '  *show*) printf \'%s\\n\' "${FAKE_SYSTEMCTL_FRAGMENT:-}" ;;\n'
+            '  *is-active*) exit "${FAKE_SYSTEMCTL_ACTIVE:-3}" ;;\n'
+            'esac\n'))
         self._write_exe("loginctl")
         self.runtime_dir = self.root / "xdg-runtime"
         self.runtime_dir.mkdir()
         self.state_home = self.root / "xdg-state"
         self.state_home.mkdir()
+        self.env_extra = {}
 
     def _write_exe(self, name, extra=""):
         path = self.fakebin / name
@@ -52,10 +59,15 @@ class ScratchHome:
         path.chmod(0o755)
 
     def clone(self):
-        """A copy of this package to install from, so a case can edit it."""
+        """A copy of this package to install from, so a case can edit it.
+
+        One clone per case: a second install of the same case reuses it, so
+        an edit a case made is still there.
+        """
         target = self.root / "pi-daemon"
-        shutil.copytree(ROOT / "pi", target / "pi")
-        shutil.copytree(ROOT / "scripts", target / "scripts")
+        if not target.is_dir():
+            shutil.copytree(ROOT / "pi", target / "pi")
+            shutil.copytree(ROOT / "scripts", target / "scripts")
         return target
 
     def env(self):
@@ -70,6 +82,7 @@ class ScratchHome:
         env["PI_DAEMON_STATE_DIR"] = str(self.root / "daemon-state")
         env["PI_DAEMON_RUNTIME_DIR"] = str(self.root / "daemon-runtime")
         env.pop("PI_DAEMON_BASH", None)
+        env.update({key: str(value) for key, value in self.env_extra.items()})
         return env
 
     def run(self, *args, install=None, cwd=None):
@@ -318,12 +331,9 @@ class InstallScriptTests(unittest.TestCase):
             self.scratch.path(".local/bin/pi-daemon").is_file())
         self.assertFalse(lock.exists())
 
-    def test_install_refuses_beside_a_serving_daemon(self):
+    def test_install_refuses_beside_a_serving_endpoint(self):
         # A legacy install still running would fight the translation of its
         # own state, so the installer stops before writing anything.
-        legacy = self.scratch.path(".local/state/pi-daemon")
-        legacy.mkdir(parents=True)
-        (legacy / "tickets.json").write_text('{"tickets": []}')
         endpoint = self.scratch.runtime_dir / "pi-pty-host" / "control.json"
         endpoint.parent.mkdir()
         listening = socket.socket()
@@ -355,6 +365,44 @@ class InstallScriptTests(unittest.TestCase):
         self.assertFalse(
             self.scratch.path(".pi/agent/.pi-daemon/manifest.json").exists())
         self.assertFalse(self.scratch.path(".local/bin/pi-daemon").exists())
+
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "no unix sockets here")
+    def test_install_refuses_beside_a_serving_socket(self):
+        # The legacy daemon publishes a unix socket, which no `-f` test sees:
+        # the endpoint probe has to reach it as a socket.
+        endpoint = self.scratch.runtime_dir / "pi-pty-host.sock"
+        listening = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listening.bind(str(endpoint))
+        listening.listen(1)
+        self.addCleanup(listening.close)
+        result = self.scratch.package()
+        self.assertEqual(result.returncode, 76, result.stdout + result.stderr)
+        self.assertFalse(self.scratch.path(".local/bin/pi-daemon").exists())
+
+    def test_install_refuses_beside_an_active_unit(self):
+        # A legacy unit declares neither new root, so the question is which
+        # unit file systemd loaded, not what that file says.
+        unit = self.scratch.path(".config/systemd/user/pi-daemon.service")
+        unit.parent.mkdir(parents=True)
+        unit.write_text("[Service]\nExecStart=%h/.local/bin/pi-daemon\n")
+        self.scratch.env_extra = {"FAKE_SYSTEMCTL_FRAGMENT": unit,
+                                  "FAKE_SYSTEMCTL_ACTIVE": "0"}
+        result = self.scratch.package()
+        self.assertEqual(result.returncode, 76, result.stdout + result.stderr)
+        self.assertIn("systemctl --user stop", result.stderr)
+        self.assertFalse(self.scratch.path(".local/bin/pi-daemon").exists())
+
+    def test_install_ignores_a_unit_from_another_home(self):
+        # Another home's unit is not this install's daemon: its daemon keeps
+        # running and this install proceeds.
+        self.scratch.env_extra = {
+            "FAKE_SYSTEMCTL_FRAGMENT": self.scratch.path(
+                "other-home/.config/systemd/user/pi-daemon.service"),
+            "FAKE_SYSTEMCTL_ACTIVE": "0",
+        }
+        result = self.scratch.package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
 
 
 if __name__ == "__main__":

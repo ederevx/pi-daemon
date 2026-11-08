@@ -164,28 +164,49 @@ PY
 # -- refusals before anything public changes ----------------------------
 
 # `systemctl --user` answers for the whole user manager, not for the home this
-# install targets, so the question is narrowed first: is the unit this install
-# owns on disk, and does it declare the two roots this run resolves? A unit
-# rendered for other roots - another home, an isolated test tree - is not
-# serving this install, and its daemon must not stop an install here.
+# install targets, so the unit systemd actually loaded is compared with the one
+# this install owns. A unit rendered for another home or an isolated tree is not
+# serving this install, and its daemon must not stop an install here; a legacy
+# unit at this path is, because it is the daemon the switch replaces.
 service_active() {
-  local unit="$systemd_dir/pi-daemon.service"
-  [[ -f "$unit" ]] || return 1
-  grep -Fqx "Environment=\"PI_DAEMON_STATE_DIR=$new_state\"" "$unit" || return 1
-  grep -Fqx "Environment=\"PI_DAEMON_RUNTIME_DIR=$new_runtime\"" "$unit" || return 1
   command -v systemctl >/dev/null 2>&1 || return 1
+  local unit="$systemd_dir/pi-daemon.service" loaded
+  [[ -f "$unit" ]] || return 1
+  loaded="$(systemctl --user show -p FragmentPath --value pi-daemon.service \
+    2>/dev/null)" || return 1
+  [[ "$loaded" == "$unit" ]] || return 1
   systemctl --user is-active --quiet pi-daemon.service >/dev/null 2>&1
 }
 
+# The descriptor answers on the wire, whether the two implementations publish a
+# socket (the legacy one) or a host and port (this one). A file that is not a
+# socket and not a readable descriptor is not an endpoint.
 endpoint_answers() {
-  [[ -f "$1" ]] || return 1
+  [[ -e "$1" ]] || return 1
   python3 - "$1" <<'PY'
 import json
+import os
 import socket
+import stat
 import sys
 
+path = sys.argv[1]
 try:
-    with open(sys.argv[1], encoding="utf-8") as handle:
+    mode = os.stat(path).st_mode
+except OSError:
+    sys.exit(1)
+if stat.S_ISSOCK(mode):
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(1.0)
+        probe.connect(path)
+    except OSError:
+        sys.exit(1)
+    finally:
+        probe.close()
+    sys.exit(0)
+try:
+    with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
     host, port = str(data["host"]), int(data["port"])
 except Exception:
@@ -219,19 +240,30 @@ maintenance() {
   exit 76
 }
 
-refuse_while_serving() {
+# Why a daemon is serving this host, or nothing when none is.
+serving_reason() {
   local endpoint
   if service_active; then
-    maintenance "pi-daemon.service is active (systemctl --user stop pi-daemon.service)"
+    echo "pi-daemon.service is active (systemctl --user stop pi-daemon.service)"
+    return 0
   fi
   while IFS= read -r endpoint; do
     if endpoint_answers "$endpoint"; then
-      maintenance "a daemon is serving $endpoint"
+      echo "a daemon is serving $endpoint"
+      return 0
     fi
   done < <(legacy_endpoint || true)
   if endpoint_answers "$new_runtime/control.json"; then
-    maintenance "a daemon is serving $new_runtime/control.json"
+    echo "a daemon is serving $new_runtime/control.json"
+    return 0
   fi
+  return 1
+}
+
+refuse_while_serving() {
+  local reason
+  reason="$(serving_reason)" || return 0
+  maintenance "$reason"
 }
 
 # -- one published generation -------------------------------------------
@@ -344,8 +376,7 @@ PY
 
 # -- the run -------------------------------------------------------------
 
-mkdir -p "$local_bin" "$systemd_dir" "$state_dir" "$releases" \
-  "$new_state" "$new_runtime"
+mkdir -p "$local_bin" "$systemd_dir" "$state_dir" "$releases"
 
 # One installer at a time: every session start reconciles provisioning, and
 # hosted sessions respawn together after a reload, so concurrent runs must
@@ -398,12 +429,14 @@ migrate_env=(env "PI_DAEMON_STATE_DIR=$new_state" \
   "PI_DAEMON_RUNTIME_DIR=$new_runtime" "PI_CODING_AGENT_DIR=$pi_home" \
   PYTHONDONTWRITEBYTECODE=1)
 plan="$state_dir/migration-plan.$$"
-if ! "${migrate_env[@]}" "$candidate/bin/pi-daemon-migrate" --dry-run \
-    > "$plan" 2>"$plan.err"; then
+preview=0
+"${migrate_env[@]}" "$candidate/bin/pi-daemon-migrate" --dry-run \
+  > "$plan" 2>"$plan.err" || preview=$?
+if [[ $preview -ne 0 ]]; then
   cat "$plan.err" >&2 || true
   # A held instance lock (3) means a new daemon is running: that is the
   # maintenance case, not a broken translation.
-  if grep -q "instance lock" "$plan.err" 2>/dev/null; then
+  if [[ $preview -eq 3 ]]; then
     rm -f "$plan" "$plan.err"
     maintenance "the new daemon holds the instance lock"
   fi
@@ -428,6 +461,7 @@ if [[ "$action" == "translate" ]]; then
   # writes the new stores and refuses beside a live instance.
   refuse_while_serving
 fi
+mkdir -p "$new_state" "$new_runtime"
 if ! output="$("${migrate_env[@]}" "$candidate/bin/pi-daemon-migrate" 2>&1)"; then
   printf '%s\n' "$output" >&2
   die "migration failed; nothing was installed or started"
