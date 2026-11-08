@@ -320,7 +320,9 @@ a link or worker exists.
 
 The tunnel is one ssh child in its own process group, in the
 foreground, so the process the daemon started is the forward it can
-stop; it is given the destination and both ports, never a shell. The
+stop. It is given the destination and both ports as argv, and the
+daemon runs no shell of its own: ssh's own `LocalCommand` carries
+nothing but the readiness marker. The
 credential it reads lives in the comms domain's peer-credentials
 directory, must be a regular file of the daemon's own user with no
 group or other permission bits, and is opened without following a
