@@ -50,7 +50,13 @@ class SessionOperations:
     # -- reads -------------------------------------------------------------
 
     def list(self, request):
-        return {"ok": True, "sessions": self._service.sessions()}
+        include = request.get("all", False)
+        if not isinstance(include, bool):
+            raise ValueError("all must be a boolean")
+        reply = {"ok": True, "sessions": self._service.sessions(include)}
+        if not include:
+            reply["stopped"] = self._service.stopped_count()
+        return reply
 
     def which(self, request):
         return {"ok": True, **self._service.which(_file(request))}
@@ -258,9 +264,13 @@ class SessionOperations:
 
 def _attach_failure(service, name, failure):
     reply = error_reply(failure.code)
-    recorded = service.recorded_file(name)
-    if recorded:
-        reply["file"] = recorded
+    recorded = service.recorded(name)
+    if recorded is not None:
+        reply["recorded"] = recorded["name"]
+        if recorded["file"]:
+            reply["file"] = recorded["file"]
+        if recorded["dir"]:
+            reply["dir"] = recorded["dir"]
     return reply
 
 

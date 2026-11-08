@@ -55,10 +55,12 @@
 #                                       (Ctrl-\ inside an attached session
 #                                       detaches your terminal the same way
 #                                       without touching the hosted pi)
-#   pi-rc ls [--here]                   list hosted sessions; --here keeps
+#   pi-rc ls [--here] [--all]          list hosted sessions; --here keeps
 #                                       only those whose directory is this
 #                                       process's own cwd (compared natively,
-#                                       never by the caller's path spelling)
+#                                       never by the caller's path spelling);
+#                                       --all adds the stopped records, which
+#                                       are resumed by name with attach
 #   pi-rc owned                         print the directory's daemon-owned
 #                                       session: this cwd, newest real
 #                                       conversation file, busy preferred on
@@ -689,17 +691,42 @@ class AttachFlow:
 		if resp is None or not resp.get("ok"):
 			error = (resp or {}).get("error") if resp else "no response"
 			if error == "no-session" and not self.fresh_new:
-				# The daemon hands back the conversation file this name
-				# last backed, so a re-attach resumes that conversation
+				# The daemon hands back what this name left behind: its
+				# recorded conversation, its directory and the spelling it
+				# is stored under, so a re-attach resumes that conversation
 				# instead of guessing the directory's latest.
+				recorded = (resp or {}).get("recorded")
 				file_ = (resp or {}).get("file")
-				if file_:
-					# A recorded file means a record exists: reopen that
-					# record, not a second one under the spelling typed.
+				if recorded:
+					# A stored record exists: reopen that record, not a
+					# second one under the spelling typed.
+					self.session = recorded
+				elif file_:
 					self.session = self._recorded_name(sock)
+				dir_ = (resp or {}).get("dir")
+				if dir_ and os.path.isdir(dir_):
+					# Revive where the record ran, not where this command ran.
+					self.dir_ = dir_
+				if recorded or file_:
+					self._resumable(file_)
 				return self._recreate(sock, file_)
 			die("attach failed: %s" % error)
 		return resp, rest
+
+	def _resumable(self, file_):
+		# A revive either resumes a conversation or refuses; it never
+		# starts a fresh one under a name that promised the old one.
+		if not file_:
+			die("'%s' never recorded a conversation (it ran without the "
+				"daemon extension, e.g. --no-extensions); nothing to resume. "
+				"Start fresh: pi-rc start --fresh %s"
+				% (short_name(self.session), short_name(self.session)))
+		if not os.path.isfile(file_):
+			die("'%s' recorded %s, which no message ever saved or which was "
+				"deleted; nothing to resume. Start fresh: "
+				"pi-rc start --fresh %s"
+				% (short_name(self.session), file_,
+				   short_name(self.session)))
 
 	def _recorded_name(self, sock):
 		# The daemon answers run-state with the spelling it stored a name
@@ -954,32 +981,59 @@ def cmd_ls(args, client):
 	# --here filters to this process's own directory using the same
 	# native realpath comparison the daemon uses, so no caller ever
 	# compares path spellings itself (a shell may report "/c/..." where
-	# the daemon recorded "C:\..." on Windows).
-	here = False
+	# the daemon recorded "C:\..." on Windows). --all adds the records
+	# whose run ended: they are resumed by name, so the name has to be
+	# printable somewhere.
+	here = show_all = False
 	for arg in args:
 		if arg == "--here":
 			here = True
+		elif arg == "--all":
+			show_all = True
 		else:
-			usage_error("ls takes only --here")
-	resp = client.control({"cmd": "list"})
+			usage_error("ls takes only --here and --all")
+	resp = client.control({"cmd": "list", "all": show_all})
 	sessions = resp.get("sessions") or []
 	if here:
 		cwd = os.getcwd()
 		sessions = [s for s in sessions
-					if same_dir(s.get("dir", ""), cwd)]
+					if same_dir(s.get("dir") or "", cwd)]
 	if not sessions:
 		print("pi-rc: no hosted sessions", file=sys.stderr)
 		return
 	for s in sessions:
+		file = s.get("file") or "-"
+		if s.get("phase") == "exited":
+			# A stopped record has no process to report; what matters is
+			# whether the name still has a conversation to resume.
+			state = "stopped:%s" % _revive_status(s)
+			if s.get("desired") == "running":
+				state += ":unfinished"
+			print("%s\t%s\t-\tdetached\t%s\t%s"
+				  % (short_name(s.get("name", "")), s.get("dir") or "-",
+					 state, file))
+			continue
 		marker = "attached" if s.get("attached") else "detached"
 		nclients = s.get("clients") or 0
 		if nclients > 1:
 			marker += " x%d" % nclients
 		state = s.get("state") or "idle"
-		file = s.get("file") or "-"
 		print("%s\t%s\tpid %d\t%s\t%s\t%s"
 			  % (short_name(s.get("name", "")), s.get("dir", ""),
 				 s.get("pid", 0), marker, state, file))
+	if not show_all and resp.get("stopped"):
+		print("pi-rc: %d stopped session(s) not shown (pi-rc ls --all; "
+			  "resume one by name: pi-rc attach <name>)"
+			  % resp["stopped"], file=sys.stderr)
+
+
+def _revive_status(view):
+	# What `pi-rc attach <name>` would find of a stopped record's run.
+	if not view.get("file"):
+		return "no-conversation"
+	if view.get("fileExists", True):
+		return "resumable"
+	return "file-missing"
 
 
 def pick_owned_session(sessions, cwd):
