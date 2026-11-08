@@ -14,11 +14,12 @@ STATES = ("busy", "idle", "waiting")
 class SessionService:
     """Operations speak names; the runner owns processes and the relay owns IO."""
 
-    def __init__(self, store, runner, relay, config):
+    def __init__(self, store, runner, relay, config, carry=None):
         self._store = store
         self._runner = runner
         self._relay = relay
         self._config = config
+        self._carry = carry
 
     # -- hosting -----------------------------------------------------------
 
@@ -86,6 +87,11 @@ class SessionService:
         self._store.set_clients(plan["name"],
                                 self._relay.viewer_count(plan["key"]))
         return attached
+
+    def carry(self, name, to=None, argv=None):
+        """/new without termination: move the viewers to a new conversation
+        and leave this one running headless."""
+        return self._carry.carry(name, to, argv)
 
     def detach(self, name):
         record = self._record(name)

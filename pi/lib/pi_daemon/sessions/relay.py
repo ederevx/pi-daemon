@@ -8,6 +8,10 @@ import uuid
 
 from .relay_session import RelaySession
 
+# A carried viewer repaints from a cleared screen: the old conversation's
+# queued output is dropped and the clear sequence leads the new one.
+CLEAR_SEQ = b"\x1b[H\x1b[2J\x1b[m"
+
 
 class SessionRelay:
     """All PTY traffic crosses one thread; every request is a ticket."""
@@ -77,6 +81,18 @@ class SessionRelay:
     def move_viewers(self, source_key, target_key):
         return self._call(
             lambda: self._move_viewers(source_key, target_key))
+
+    def carry_viewers(self, source_key, source_generation, target_key,
+                      target_generation, cols, rows):
+        """Move every viewer to another conversation, repainting it.
+
+        Both generations are checked on the relay thread, so a name
+        reused under the same key is never carried into.
+        """
+        return self._call(
+            lambda: self._carry_viewers(source_key, source_generation,
+                                        target_key, target_generation,
+                                        cols, rows))
 
     # -- tickets -----------------------------------------------------------
 
@@ -186,6 +202,26 @@ class SessionRelay:
             target.pending[viewer_id] = pending
             moved += 1
         return moved
+
+    def _carry_viewers(self, source_key, source_generation, target_key,
+                       target_generation, cols, rows):
+        source = self._sessions.get(source_key)
+        target = self._sessions.get(target_key)
+        if source is None or target is None or target.closing:
+            return None
+        if source.generation != source_generation \
+                or target.generation != target_generation:
+            return None
+        moved = 0
+        for viewer_id in list(source.viewers):
+            connection = source.viewers.pop(viewer_id)
+            source.pending.pop(viewer_id, None)
+            target.viewers[viewer_id] = connection
+            target.pending[viewer_id] = bytearray(CLEAR_SEQ)
+            moved += 1
+        if moved and self._backend is not None:
+            self._backend.resize(target.master, cols, rows)
+        return {"moved": moved}
 
     def _complete(self, key):
         session = self._sessions.pop(key, None)

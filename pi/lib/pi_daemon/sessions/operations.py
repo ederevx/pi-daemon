@@ -26,6 +26,7 @@ class SessionOperations:
             "whichall": self.whichall,
             "start": self.start,
             "attach": self.attach,
+            "carry": self.carry,
             "detach": self.detach,
             "stop": self.stop,
             "input": self.input,
@@ -99,6 +100,15 @@ class SessionOperations:
         if recorded:
             reply["file"] = recorded
         return ControlAction(reply=reply, upgrade=upgrade)
+
+    def carry(self, request):
+        to = request.get("to")
+        if to is not None and not isinstance(to, str):
+            raise ValueError("to must be a session name")
+        argv = request.get("argv")
+        if argv is not None:
+            argv = _argv(request)
+        return self._project(self._service.carry, _name(request), to, argv)
 
     def detach(self, request):
         return self._project(self._service.detach, _name(request))

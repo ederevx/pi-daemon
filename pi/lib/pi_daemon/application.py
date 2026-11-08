@@ -20,8 +20,10 @@ from .config import ServiceConfig
 from .lifecycle.instance_coordinator import InstanceCoordinator
 from .runtime_layout import RuntimeLayout
 from .sessions.identity import ProcessIdentity
+from .sessions.carry import SessionCarry
 from .sessions.launcher import SessionLauncher
 from .sessions.operations import SessionOperations
+from .sessions.pi_command import PiCommand
 from .sessions.pty_backend import PosixPtyBackend, service_root
 from .sessions.relay import SessionRelay
 from .sessions.runner import SessionRunner
@@ -47,7 +49,7 @@ class DaemonApplication:
     """It composes collaborators and nothing else; domains own their state."""
 
     def __init__(self, layout, config, services_root=None,
-                 session_store_root=None):
+                 session_store_root=None, environment=None):
         # An empty root is not "no store": pi_transcript reads it as no
         # containment at all, so an unresolvable root is refused here
         # rather than served from anywhere on the disk.
@@ -58,6 +60,7 @@ class DaemonApplication:
         self._config = config
         self._services_root = services_root
         self._session_store_root = os.path.abspath(root)
+        self._environment = dict(environment or {})
         self._stopping = threading.Event()
         self._mode = "shutdown"
         self._coordinator = InstanceCoordinator(layout.instance_lock_path())
@@ -98,7 +101,7 @@ class DaemonApplication:
         # embedder's agent home is the one it reads.
         store_root = config.session_store_root or os.path.join(
             pi_platform.RuntimeLayout(environment).agent_home(), "sessions")
-        return cls(layout, config, services_root, store_root)
+        return cls(layout, config, services_root, store_root, environment)
 
     def config(self):
         return self._config
@@ -156,7 +159,9 @@ class DaemonApplication:
         runner = SessionRunner(store, relay, self._config, backend, owner)
         runner.recover()
         self._session_runner = runner
-        return SessionService(store, runner, relay, self._config)
+        carry = SessionCarry(store, runner, relay,
+                             PiCommand(self._environment))
+        return SessionService(store, runner, relay, self._config, carry)
 
     def _compose_transcripts(self, sessions):
         """The conversation index reads pi's own store; the root was

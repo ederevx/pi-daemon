@@ -17,10 +17,12 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
 from pi_daemon.config import ServiceConfig
+from pi_daemon.sessions.carry import SessionCarry
 from pi_daemon.sessions.error import SessionError
 from pi_daemon.sessions.identity import ProcessIdentity
 from pi_daemon.sessions.model import SessionRecord
 from pi_daemon.sessions.operations import SessionOperations
+from pi_daemon.sessions.pi_command import PiCommand
 from pi_daemon.sessions.pty_backend import PosixPtyBackend, service_root
 from pi_daemon.sessions.relay import SessionRelay
 from pi_daemon.sessions.runner import SessionRunner
@@ -433,6 +435,19 @@ class OperationsTests(unittest.TestCase):
         self.assertEqual(reply["handoff"]["name"], "pi-b")
         self.assertNotIsInstance(reply, ControlAction)
 
+    def test_a_carry_is_projected_and_named(self):
+        reply = self.operations().carry(
+            {"cmd": "carry", "name": "pi-a", "to": "pi-b"})
+        self.assertEqual(reply["name"], "pi-a")
+        self.assertTrue(reply["ok"])
+        self.assertEqual(self.service.calls,
+                         [("carry", ("pi-a", "pi-b", None))])
+
+    def test_a_carry_to_a_non_name_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.operations().carry(
+                {"cmd": "carry", "name": "pi-a", "to": 7})
+
     def test_an_unknown_run_state_is_refused(self):
         with self.assertRaises(ValueError):
             self.operations().state({"cmd": "state", "name": "pi-a",
@@ -550,6 +565,30 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(self.relay.viewer_count("k"), 0)
         viewer.close()
 
+    def test_a_carried_viewer_repaints_a_cleared_screen(self):
+        self.spawn("printf 'X\\n'; sleep 5")
+        other = self.spawn_second("printf 'T\\n'; sleep 5")
+        time.sleep(0.3)
+        viewer = self.attach()
+        self.assertIn(b"X", self.read_until(viewer, b"X"))
+        moved = self.relay.carry_viewers("k", "g", other, "g2", 100, 40)
+        self.assertEqual(moved, {"moved": 1})
+        seen = self.read_until(viewer, b"T")
+        self.assertIn(b"\x1b[2J", seen)
+        self.assertEqual(self.relay.viewer_count("k"), 0)
+        viewer.close()
+
+    def test_a_carry_across_a_replaced_generation_is_refused(self):
+        self.spawn("printf 'X\\n'; sleep 5")
+        other = self.spawn_second()
+        time.sleep(0.3)
+        viewer = self.attach()
+        self.assertIn(b"X", self.read_until(viewer, b"X"))
+        self.assertIsNone(
+            self.relay.carry_viewers("k", "g-stale", other, "g2", 80, 24))
+        self.assertEqual(self.relay.viewer_count("k"), 1)
+        viewer.close()
+
     def spawn_second(self, script="sleep 5"):
         second = self.backend.spawn(["sh", "-c", script], REPO,
                                     dict(os.environ), 80, 24)
@@ -557,6 +596,121 @@ class RelayTests(unittest.TestCase):
         self.addCleanup(lambda: (second.terminate(grace=0.2), second.close()))
         self.relay.register("k2", "g2", second.disown_master())
         return "k2"
+
+
+class CarryRelay:
+    """A relay that records the transfer instead of moving sockets."""
+
+    def __init__(self, result=None):
+        self.result = {"moved": 1} if result is None else result
+        self.calls = []
+
+    def carry_viewers(self, *arguments):
+        self.calls.append(arguments)
+        return self.result
+
+
+class CarryRunner:
+    """A runner that reserves the target instead of spawning a process."""
+
+    def __init__(self, store, created=True):
+        self.store = store
+        self.created = created
+        self.started = []
+        self.stopped = []
+
+    def start(self, name, dir_, argv, cols, rows, env=None, env_once=None):
+        self.started.append((name, dir_, argv, cols, rows))
+        if not self.created:
+            return {"name": name}, False
+        record, _ = self.store.reserve(name, dir_, argv, cols, rows, None,
+                                       None, argv, owner())
+        return record.view(), True
+
+    def stop_run(self, key, generation, reason="stop"):
+        self.stopped.append((key, generation))
+        return True
+
+
+class CarryTests(unittest.TestCase):
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="pi-carry-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.store, self.config = store_for(roots())
+        self.source, _ = reserve(self.store, "pi-a")
+        self.relay = CarryRelay()
+        self.runner = CarryRunner(self.store)
+        self.carry = SessionCarry(self.store, self.runner, self.relay,
+                                  PiCommand({}))
+
+    def test_carry_to_an_existing_session_moves_the_viewers(self):
+        target, _ = reserve(self.store, "pi-b")
+        reply = self.carry.carry("pi-a", to="pi-b")
+        self.assertEqual(reply, {"name": "pi-b"})
+        self.assertEqual(self.runner.started, [])
+        self.assertEqual(self.relay.calls, [(
+            self.source.id, self.source.generation, target.id,
+            target.generation, self.source.cols, self.source.rows)])
+        self.assertTrue(self.store.get("pi-a").live())
+
+    def test_a_fresh_target_is_spawned_beside_the_source(self):
+        reply = self.carry.carry("pi-a", argv=["pi", "--continue"])
+        name = reply["name"]
+        self.assertTrue(name.startswith("pi-"), name)
+        self.assertNotEqual(name, "pi-a")
+        spawned = self.runner.started[0]
+        self.assertEqual(spawned[0], name)
+        self.assertEqual(spawned[1], self.source.dir)
+        self.assertEqual((spawned[3], spawned[4]),
+                         (self.source.cols, self.source.rows))
+        self.assertEqual(spawned[2][-1], "--continue")
+        self.assertIn("pi", spawned[2])
+        self.assertTrue(self.store.get("pi-a").live())
+
+    def test_a_rejected_transfer_drops_only_the_target_it_created(self):
+        self.relay.result = None
+        with self.assertRaises(SessionError) as caught:
+            self.carry.carry("pi-a")
+        self.assertEqual(caught.exception.code, "no-session")
+        self.assertEqual(len(self.runner.stopped), 1)
+        self.assertFalse(self.store.get("pi-a").generation ==
+                         self.runner.stopped[0][1])
+
+    def test_a_rejected_transfer_never_stops_an_existing_target(self):
+        reserve(self.store, "pi-b")
+        self.relay.result = None
+        with self.assertRaises(SessionError):
+            self.carry.carry("pi-a", to="pi-b")
+        self.assertEqual(self.runner.stopped, [])
+        self.assertTrue(self.store.get("pi-b").live())
+
+    def test_a_lost_name_race_is_name_taken(self):
+        self.runner.created = False
+        with self.assertRaises(SessionError) as caught:
+            self.carry.carry("pi-a")
+        self.assertEqual(caught.exception.code, "name-taken")
+
+    def test_a_name_cannot_carry_into_itself(self):
+        with self.assertRaises(SessionError) as caught:
+            self.carry.carry("pi-a", to="pi-a")
+        self.assertEqual(caught.exception.code, "no-session")
+
+    def test_an_unknown_source_is_no_session(self):
+        with self.assertRaises(SessionError) as caught:
+            self.carry.carry("pi-absent")
+        self.assertEqual(caught.exception.code, "no-session")
+
+    def test_the_pi_seam_keeps_an_explicit_argv_and_shims_a_bare_pi(self):
+        command = PiCommand({})
+        self.assertEqual(command.fresh(["sh", "-c", "true"]),
+                         ["sh", "-c", "true"])
+        self.assertEqual(command.fresh([])[-1], "pi")
+        self.assertEqual(command.fresh(["pi", "--x"])[-1], "--x")
+        self.assertIn("pi", command.fresh(["pi", "--x"]))
+        hosted, durable = command.resume("/conv.jsonl", message="carry on")
+        self.assertIn("/conv.jsonl", hosted)
+        self.assertIn("carry on", hosted)
+        self.assertNotIn("carry on", durable)
 
 
 class DaemonTests(unittest.TestCase):

@@ -95,6 +95,19 @@ class SessionRunner:
         child.terminate()
         return {"queued": True, "alive": True, "state": "stopping"}
 
+    def stop_run(self, key, generation, reason="stop"):
+        """End exactly the run this caller created, never a successor."""
+        record = self._store.get(self._store.name_of(key))
+        if record is None or record.id != key \
+                or record.generation != generation or not record.live():
+            return False
+        self._store.request_stop(key, reason)
+        with self._lock:
+            child = self._children.get(key)
+        if child is not None:
+            child.terminate()
+        return True
+
     def send(self, name, data):
         record = self._store.get(name)
         if record is None or not record.live():
@@ -208,6 +221,11 @@ class SessionRunner:
     def _environment(self, name, record, env_once):
         environment = dict(os.environ)
         environment.update(record.env)
+        # A hosted child is told who it is: the extension keys its
+        # reload signals and its hosted-only behaviour off these, so they
+        # are set after the caller's overrides and cannot be forged.
+        environment["PI_HOSTED"] = "1"
+        environment["PI_HOSTED_SESSION"] = name
         environment["PI_DAEMON_SESSION"] = name
         if env_once:
             environment.update(env_once)
