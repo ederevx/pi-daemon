@@ -354,9 +354,9 @@ the dedupe markers are capped per source node, so a busy peer fills its
 own share and is told `capacity` rather than starving the others. A
 marker is kept only until the sender's own expiry plus the clock skew
 and one request timeout, which is all the margin a last in-flight retry
-needs, so the table cannot hold a day of traffic. An answer that does not carry the delivery it names,
-with a message id and a sequence this node can use, is not recorded as
-an outcome.
+needs, so the table cannot hold a day of traffic. An answer that does
+not carry the delivery it names, with a message id and a sequence this
+node can use, is not recorded as an outcome.
 
 A foreign address is routed under the store's own lock, so a removal
 cannot slip between the routing decision and the commit, and mail left

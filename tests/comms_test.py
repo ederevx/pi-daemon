@@ -1590,13 +1590,16 @@ class PeerBoundTests(PeerCase):
         self.store.reserve("b")
         delivery = self.delivery("d1", expires=self.now + 60)
         self.store.accept_peer(NODE_B, delivery)
-        self.now += 61
-        # Past its expiry the sender may still retry once: that is a replay.
+        skew = self.config.comms_peer_clock_skew
+        flight = self.config.comms_peer_request_timeout
+        self.assertGreater(min(skew, flight), 0.1)
+        self.now += 60 + skew + flight - 0.1
+        # Past the skew alone but inside a retry still in flight: a replay,
+        # so dropping either margin fails here.
         self.assertEqual(self.store.accept_peer(NODE_B, delivery)
                          ["outcome"]["status"], "accepted")
-        self.now += (self.config.comms_peer_clock_skew +
-                     self.config.comms_peer_request_timeout + 1)
-        # Past the skew the marker is gone, so the same body is stale mail.
+        self.now += 1
+        # Past both margins the marker is gone, so the same body is stale.
         self.assertEqual(self.store.accept_peer(NODE_B, delivery)
                          ["outcome"]["status"], "expired")
 
