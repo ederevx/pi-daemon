@@ -15,6 +15,10 @@
  *   ssh-exec    - a remote command that is not transfer-only
  *   headless-pi - a pi agent run that is not a management subcommand
  *
+ * A heredoc body is data, not command positions, unless a shell on that
+ * line reads its standard input as a program; an unquoted body still runs
+ * the substitutions it carries.
+ *
  * This is a guard, not a sandbox: a command built at runtime (a script
  * written first, an interpreter, eval of a variable) is not seen.
  */
@@ -26,6 +30,21 @@ export type RemoteVerdict =
 	| "ssh-shell"
 	| "ssh-exec"
 	| "headless-pi";
+
+/** A heredoc whose body starts after the newline of its own line. */
+type PendingHeredoc = {
+	delimiter: string;
+	quoted: boolean;
+	stripTabs: boolean;
+	/** Segments already collected for the declaring command. */
+	lineStart: number;
+	/** How much of that command's text came before the declaration. */
+	offset: number;
+	/** The descriptor the body was written to; empty means standard input. */
+	descriptor: string;
+	/** The rest of the command's own text, where later redirections sit. */
+	rest: string;
+};
 
 /** Owns the verdicts for a command string; stateless. */
 export class RemoteWorkClassifier {
@@ -284,13 +303,18 @@ export class RemoteWorkClassifier {
 	/** Split into command positions and collect substitution bodies. */
 	private scan(text: string): { segments: string[]; nested: string[] } {
 		const segments: string[] = [];
+		const bounds: string[] = [];
 		const nested: string[] = [];
 		let current = "";
 		let quote: string | null = null;
+		let pending: PendingHeredoc[] = [];
 		let index = 0;
-		const push = (): void => {
+		const push = (bound: string): void => {
 			const segment = current.trim();
-			if (segment !== "") segments.push(segment);
+			if (segment !== "") {
+				segments.push(segment);
+				bounds.push(bound);
+			}
 			current = "";
 		};
 		while (index < text.length) {
@@ -350,26 +374,642 @@ export class RemoteWorkClassifier {
 				index = end + 1;
 				continue;
 			}
+			if (char === "<" && text.slice(index, index + 3) === "<<<") {
+				// A here-string takes one word, not a body, but its expansions run.
+				const operand = this.redirectionOperand(text.slice(index + 3));
+				const source = text.slice(index + 3, index + 3 + operand.end);
+				nested.push(...this.wordExpansions(source));
+				const span = 3 + operand.end;
+				current += text.slice(index, index + span);
+				index += span;
+				continue;
+			}
+			if (char === "<" && text[index + 1] === "<"
+				&& text[index + 2] !== "<") {
+				const declared = this.heredocWord(text, index + 2);
+				if (declared !== undefined) {
+					const descriptor = /(?:^|\s)(\d*)$/.exec(current)?.[1] ?? "";
+					current = current.slice(0, current.length - descriptor.length);
+					pending.push({
+						delimiter: declared.delimiter,
+						quoted: declared.quoted,
+						stripTabs: declared.stripTabs,
+						lineStart: segments.length,
+						offset: current.trim().length,
+						descriptor,
+						rest: this.commandRest(text, declared.end),
+					});
+					index = declared.end;
+					continue;
+				}
+			}
 			if (char === ";" || char === "\n") {
-				push();
+				push(char);
 				index += 1;
+				if (char === "\n" && pending.length > 0) {
+					index = this.consumeHeredocs(
+						text, index, pending, segments, bounds, nested);
+					pending = [];
+				}
 				continue;
 			}
 			if (char === "(" || char === ")") {
-				push();
+				push(char);
 				index += 1;
 				continue;
 			}
-			if (char === "&" || char === "|") {
-				push();
-				index += text[index + 1] === char ? 2 : 1;
+			// `<&3` copies a descriptor; only a bare `&` backgrounds the command.
+			if ((char === "&" && !/[<>]/.test(text[index - 1] ?? ""))
+				|| char === "|") {
+				const doubled = text[index + 1] === char;
+				push(doubled ? char + char : char);
+				index += doubled ? 2 : 1;
 				continue;
 			}
 			current += char;
 			index += 1;
 		}
-		push();
+		push("");
+		if (pending.length > 0) {
+			this.consumeHeredocs(text, index, pending, segments, bounds, nested);
+		}
 		return { segments, nested };
+	}
+
+	/** The `<<` operand: an optional `-`, the delimiter, and its end. */
+	private heredocWord(
+		text: string,
+		start: number,
+	): {
+		delimiter: string;
+		quoted: boolean;
+		stripTabs: boolean;
+		end: number;
+	} | undefined {
+		let index = start;
+		const stripTabs = text[index] === "-";
+		if (stripTabs) index += 1;
+		while (text[index] === " " || text[index] === "\t") index += 1;
+		let delimiter = "";
+		let quoted = false;
+		let quote: string | null = null;
+		while (index < text.length) {
+			const char = text[index];
+			if (quote === null) {
+				if (char === "$" && text[index + 1] === "'") {
+					quoted = true;
+					const inner = this.ansiQuoted(text.slice(index + 2));
+					delimiter += inner.word;
+					index += 2 + inner.consumed;
+					continue;
+				}
+				if (char === "'" || char === '"') {
+					quoted = true;
+					quote = char;
+					index += 1;
+					continue;
+				}
+				if (char === "\\") {
+					// A backslash-newline continues the line and quotes nothing.
+					const escaped = text[index + 1] ?? "";
+					if (escaped !== "\n") {
+						quoted = true;
+						delimiter += escaped;
+					}
+					index += 2;
+					continue;
+				}
+				if (/[\s;|&<>()]/.test(char)) break;
+				delimiter += char;
+				index += 1;
+				continue;
+			}
+			if (char === quote) {
+				quote = null;
+				index += 1;
+				continue;
+			}
+			if (quote === '"' && char === "\\") {
+				// A backslash-newline vanishes; otherwise only these are special.
+				const escaped = text[index + 1] ?? "";
+				if (escaped !== "\n") {
+					delimiter += /[$`"\\]/.test(escaped) ? escaped : "\\" + escaped;
+				}
+				index += 2;
+				continue;
+			}
+			delimiter += char;
+			index += 1;
+		}
+		return delimiter === "" && !quoted ? undefined
+			: { delimiter, quoted, stripTabs, end: index };
+	}
+
+	/** Take the queued bodies, routing each by the command that reads it. */
+	private consumeHeredocs(
+		text: string,
+		start: number,
+		pending: PendingHeredoc[],
+		segments: string[],
+		bounds: string[],
+		nested: string[],
+	): number {
+		let index = start;
+		for (let at = 0; at < pending.length; at++) {
+			const entry = pending[at];
+			const body = this.heredocBody(text, index, entry);
+			index = body.end;
+			// The declaring command, and the commands a pipe feeds from it.
+			const command = [segments[entry.lineStart] ?? ""];
+			for (let later = entry.lineStart + 1; later < segments.length
+				&& bounds[later - 1] === "|"; later++) {
+				// A command that redirects its own stdin does not read the pipe.
+				const declared = pending
+					.filter((other) => other.lineStart === later)
+					.map((other) => ({ at: other.offset, to: other.descriptor }));
+				if (!this.readsPipeline(segments[later] ?? "", declared)) break;
+				command.push(segments[later]);
+			}
+			const program = this.suppliesStdin(entry)
+				&& this.commandRunsStdin(command);
+			if (program) nested.push(body.text);
+			// An unquoted body expands even when a shell reads it as a program,
+			// and an escaped substitution is left for that shell to resolve.
+			if (!entry.quoted) nested.push(...this.expansions(body.raw));
+		}
+		return index;
+	}
+
+	/** The body up to its delimiter line, as the command receives it. */
+	private heredocBody(
+		text: string,
+		start: number,
+		entry: PendingHeredoc,
+	): { raw: string; text: string; end: number } {
+		const lines: string[] = [];
+		let index = start;
+		while (index < text.length) {
+			let line = this.heredocLine(text, index, entry);
+			index = line.end;
+			// A trailing backslash joins the next line to this one, and the
+			// line the join forms may carry the delimiter at its end.
+			while (!entry.quoted && this.continues(line.text)) {
+				line.text = line.text.slice(0, -1);
+				const next = this.heredocLine(text, index, entry);
+				line = { text: line.text + next.text, end: next.end };
+				index = line.end;
+			}
+			if (line.text === entry.delimiter) {
+				return this.heredocResult(lines, entry, index);
+			}
+			lines.push(line.text);
+		}
+		return this.heredocResult(lines, entry, text.length);
+	}
+
+	/** One raw line of a body, its tabs stripped when `<<-` asked for it. */
+	private heredocLine(
+		text: string,
+		start: number,
+		entry: PendingHeredoc,
+	): { text: string; end: number } {
+		const stop = text.indexOf("\n", start);
+		const end = stop < 0 ? text.length : stop;
+		const raw = text.slice(start, end);
+		return {
+			text: entry.stripTabs ? raw.replace(/^\t+/, "") : raw,
+			end: Math.min(end + 1, text.length),
+		};
+	}
+
+	/** True when the line ends in an unescaped backslash. */
+	private continues(line: string): boolean {
+		const trailing = /\\+$/.exec(line)?.[0].length ?? 0;
+		return trailing % 2 === 1;
+	}
+
+	/** The body as written, and as delivered: an unquoted one loses its escapes. */
+	private heredocResult(
+		lines: string[],
+		entry: PendingHeredoc,
+		end: number,
+	): { raw: string; text: string; end: number } {
+		const raw = lines.join("\n");
+		return {
+			raw,
+			text: entry.quoted ? raw : raw.replace(/\\([$`\\])/g, "$1"),
+			end,
+		};
+	}
+
+	/** Substitution bodies an unquoted heredoc still runs. */
+	private expansions(text: string): string[] {
+		const bodies: string[] = [];
+		let index = 0;
+		while (index < text.length) {
+			if (text[index] === "\\") {
+				index += 2;
+				continue;
+			}
+			if (text[index] === "$" && text[index + 1] === "(") {
+				const inner = this.balanced(text, index + 2, "(", ")");
+				bodies.push(inner.body);
+				index = inner.end;
+				continue;
+			}
+			if (text[index] === "`") {
+				const close = text.indexOf("`", index + 1);
+				const end = close < 0 ? text.length : close;
+				bodies.push(text.slice(index + 1, end));
+				index = end + 1;
+				continue;
+			}
+			index += 1;
+		}
+		return bodies;
+	}
+
+	/** The substitutions a word runs, which quoting can leave literal. */
+	private wordExpansions(text: string): string[] {
+		const bodies: string[] = [];
+		let quote: string | null = null;
+		let index = 0;
+		while (index < text.length) {
+			const char = text[index] ?? "";
+			if (char === "\\" && quote !== "'") {
+				index += 2;
+				continue;
+			}
+			if (quote === null && (char === "'" || char === '"')) {
+				quote = char;
+				index += 1;
+				continue;
+			}
+			if (char === quote) {
+				quote = null;
+				index += 1;
+				continue;
+			}
+			if (quote !== "'" && char === "$" && text[index + 1] === "(") {
+				const inner = this.balanced(text, index + 2, "(", ")");
+				bodies.push(inner.body);
+				index = inner.end;
+				continue;
+			}
+			if (quote !== "'" && char === "`") {
+				const close = text.indexOf("`", index + 1);
+				const end = close < 0 ? text.length : close;
+				bodies.push(text.slice(index + 1, end));
+				index = end + 1;
+				continue;
+			}
+			index += 1;
+		}
+		return bodies;
+	}
+
+	/** True when a command in the pipeline reads stdin as a shell program. */
+	private commandRunsStdin(segments: string[]): boolean {
+		return segments.some((segment) => {
+			const words = this.commandWords(this.words(segment));
+			return words.length > 0 && this.stdinProgram(words);
+		});
+	}
+
+	/** The rest of the declaring command, up to the next `;` or pipe. */
+	private commandRest(text: string, start: number): string {
+		let quote: string | null = null;
+		for (let index = start; index < text.length; index++) {
+			const char = text[index];
+			if (char === "\\") {
+				index += 1;
+				continue;
+			}
+			if (quote !== null) {
+				if (char === quote) quote = null;
+				continue;
+			}
+			if (char === "'" || char === "\"") {
+				quote = char;
+				continue;
+			}
+			if ((char === "$" || char === "<" || char === ">")
+				&& text[index + 1] === "(") {
+				// A separator inside a substitution belongs to that command.
+				index = this.substitutionEnd(text, index + 1);
+				continue;
+			}
+			if (char === "`") {
+				const end = text.indexOf("`", index + 1);
+				index = end < 0 ? text.length : end;
+				continue;
+			}
+			if (char === "#" && (index === start || /\s/.test(text[index - 1] ?? ""))) {
+				return text.slice(start, index);
+			}
+			if (char === ";" || char === "|" || char === "\n") {
+				return text.slice(start, index);
+			}
+			if (char === "&" && text[index - 1] !== "<" && text[index - 1] !== ">") {
+				return text.slice(start, index);
+			}
+		}
+		return text.slice(start);
+	}
+
+	/** True when the redirections leave stdin reading the body itself. */
+	private suppliesStdin(entry: PendingHeredoc): boolean {
+		const read = new Map<string, string>([[this.descriptorKey(entry.descriptor), "body"]]);
+		this.applyRedirections(entry.rest, read);
+		return read.get("0") === "body";
+	}
+
+	/** A descriptor spelled one way, so `03` and `3` are the same stream. */
+	private descriptorKey(digits: string | undefined): string {
+		return String(Number(digits || "0"));
+	}
+
+	/** True when a command keeps the stdin a pipe hands it. */
+	private readsPipeline(
+		text: string,
+		declared: Array<{ at: number; to: string }>,
+	): boolean {
+		const read = new Map<string, string>([["0", "pipe"]]);
+		this.applyRedirections(text, read, declared);
+		return read.get("0") === "pipe";
+	}
+
+	/**
+	 * Follow a command's redirections, recording what each descriptor reads.
+	 * A heredoc's own redirection is missing from the text, so `declared` puts
+	 * it back where it stood.
+	 */
+	private applyRedirections(
+		text: string,
+		read: Map<string, string>,
+		declared: Array<{ at: number; to: string }> = [],
+	): void {
+		const where = (digits: string | undefined, fallback: string): string =>
+			this.descriptorKey(digits || fallback);
+		let quote: string | null = null;
+		// Where the operand of the previous redirection ended.
+		let consumed = -1;
+		for (let index = 0; index <= text.length; index++) {
+			for (const heredoc of declared) {
+				if (heredoc.at === index) read.set(where(heredoc.to, "0"), "other");
+			}
+			const char = text[index] ?? "";
+			if (char === "\\") {
+				index += 1;
+				continue;
+			}
+			if (quote !== null) {
+				if (char === quote) quote = null;
+				continue;
+			}
+			if (char === "'" || char === "\"") {
+				quote = char;
+				continue;
+			}
+			if (char === "#" && (index === 0 || /\s/.test(text[index - 1] ?? ""))) {
+				// A word that starts with `#` begins a comment, which runs to the
+				// end of the line and carries no redirection of its own.
+				const end = text.indexOf("\n", index);
+				index = end < 0 ? text.length : end;
+				continue;
+			}
+			if (char === "$" && text[index + 1] === "(") {
+				index = this.substitutionEnd(text, index + 1);
+				continue;
+			}
+			if (char === "`") {
+				const end = text.indexOf("`", index + 1);
+				index = end < 0 ? text.length : end;
+				continue;
+			}
+			if (char !== "<" && char !== ">") continue;
+			const target = where(this.descriptorNumber(text, index, consumed),
+				char === "<" ? "0" : "1");
+			const next = text.slice(index + 1);
+			if (next.startsWith("(")) {
+				index = this.substitutionEnd(text, index + 1);
+				continue;
+			}
+			if (next.startsWith(char)) {
+				consumed = index + 2 + this.redirectionOperand(next.slice(1)).end;
+				index += 1;
+				read.set(target, "other");
+				continue;
+			}
+			if (next.startsWith("&")) {
+				const operand = this.descriptorOperand(next.slice(1));
+				const moved = operand.value;
+				consumed = index + 2 + operand.end;
+				const digits = moved.replace(/-$/, "");
+				if (digits === "") {
+					read.set(target, "other");
+					continue;
+				}
+				const source = where(digits, "0");
+				read.set(target, read.get(source) ?? "other");
+				if (moved !== digits) read.set(source, "other");
+				continue;
+			}
+			consumed = index + 1 + this.redirectionOperand(next).end;
+			read.set(target, "other");
+		}
+	}
+
+	/** The index of the parenthesis closing the substitution at `start`. */
+	private substitutionEnd(text: string, start: number): number {
+		let depth = 0;
+		let quote: string | null = null;
+		for (let index = start; index < text.length; index++) {
+			const char = text[index] ?? "";
+			if (char === "\\") {
+				index += 1;
+				continue;
+			}
+			if (quote !== null) {
+				if (char === quote) quote = null;
+				continue;
+			}
+			if (char === "'" || char === "\"") {
+				quote = char;
+				continue;
+			}
+			if (char === "(") depth += 1;
+			if (char === ")" && --depth === 0) return index;
+		}
+		return text.length;
+	}
+
+	/** The digits a duplication's operand names, after quote removal. */
+	/** The descriptor written as its own token before a redirection operator. */
+	private descriptorNumber(text: string, index: number, consumed: number): string | undefined {
+		let at = index;
+		while (at > consumed && /\d/.test(text[at - 1] ?? "")) at -= 1;
+		if (at === index) return undefined;
+		// A number glued to a word is part of that word, as in `>out3`.
+		const before = text[at - 1];
+		if (before !== undefined && !/[\s;&|()<>]/.test(before)) return undefined;
+		return text.slice(at, index);
+	}
+
+	/** The word a redirection takes, and where it ends in the source. */
+	private redirectionOperand(text: string): { word: string; end: number } {
+		let word = "";
+		let end = text.length;
+		for (let index = 0; index < text.length; index++) {
+			const char = text[index] ?? "";
+			if (char === "\\") {
+				index += 1;
+				// A backslash-newline continues the word and leaves nothing behind.
+				if (text[index] !== "\n") word += text[index] ?? "";
+				continue;
+			}
+			if (char === "$" && text[index + 1] === "'") {
+				const quoted = this.ansiQuoted(text.slice(index + 2));
+				word += quoted.word;
+				index += 1 + quoted.consumed;
+				continue;
+			}
+			if (char === "'" || char === "\"") {
+				const close = text.indexOf(char, index + 1);
+				word += this.quotedWord(
+					text.slice(index + 1, close < 0 ? text.length : close), char);
+				index = close < 0 ? text.length : close;
+				continue;
+			}
+			if (word === "" && /\s/.test(char)) continue;
+			if (/[\s;|&<>()]/.test(char)) {
+				end = index;
+				break;
+			}
+			word += char;
+		}
+		return { word, end };
+	}
+
+	/** An ANSI-C quoted word's value and the source it spans. */
+	private ansiQuoted(text: string): { word: string; consumed: number } {
+		let word = "";
+		for (let index = 0; index < text.length; index++) {
+			const char = text[index];
+			if (char === "'") return { word: this.beforeNul(word), consumed: index + 1 };
+			if (char !== "\\") {
+				word += char;
+				continue;
+			}
+			index += 1;
+			const slice = text.slice(index, index + 9);
+			const code = /^u([0-9a-fA-F]{1,4})/.exec(slice)?.[1]
+				?? /^U([0-9a-fA-F]{1,8})/.exec(slice)?.[1];
+			const point = code === undefined ? -1 : parseInt(code, 16);
+			if (point >= 0 && point <= 0x10ffff) {
+				index += code.length;
+				word += String.fromCodePoint(point);
+				continue;
+			}
+			const octal = /^[0-7]{1,3}/.exec(text.slice(index, index + 3))?.[0];
+			if (octal !== undefined) {
+				index += octal.length - 1;
+				word += String.fromCharCode(parseInt(octal, 8));
+				continue;
+			}
+			const hex = /^x([0-9a-fA-F]{1,2})/.exec(text.slice(index, index + 3))?.[1];
+			if (hex !== undefined) {
+				index += hex.length;
+				word += String.fromCharCode(parseInt(hex, 16));
+				continue;
+			}
+			const escaped = text[index] ?? "";
+			word += /['"\\?]/.test(escaped) ? escaped : "\\" + escaped;
+		}
+		return { word: this.beforeNul(word), consumed: text.length };
+	}
+
+	/** Bash cannot hold a NUL, so a value ends at the first one. */
+	private beforeNul(word: string): string {
+		const nul = word.indexOf("\u0000");
+		return nul < 0 ? word : word.slice(0, nul);
+	}
+
+	/** A quoted word's value: single quotes are literal, double quotes decode. */
+	private quotedWord(content: string, quote: string): string {
+		if (quote === "'") return content;
+		let word = "";
+		for (let index = 0; index < content.length; index++) {
+			const char = content[index];
+			if (char !== "\\") {
+				word += char;
+				continue;
+			}
+			const escaped = content[index + 1] ?? "";
+			index += 1;
+			// A backslash-newline continues the word and leaves nothing behind.
+			if (escaped === "\n") continue;
+			// Inside double quotes a backslash is special only before these.
+			word += /[$`"\\]/.test(escaped) ? escaped : "\\" + escaped;
+		}
+		return word;
+	}
+
+	/** The descriptor an `&` copy reads by name, if it is one. */
+	private descriptorOperand(text: string): { value: string; end: number } {
+		const { word, end } = this.redirectionOperand(text);
+		return { value: /^\d+-?$/.test(word) ? word : "", end };
+	}
+
+	/** A shell with no script operand runs the program on its stdin. */
+	private stdinProgram(words: string[]): boolean {
+		if (!RemoteWorkClassifier.SHELL_NAMES.has(this.basename(words[0]))) {
+			return false;
+		}
+		// Options are read in order; the first operand names a script unless
+		// `-s` already asked for the program on stdin.
+		let stdin = false;
+		let rest = false;
+		const args = words.slice(1);
+		for (let at = 0; at < args.length; at++) {
+			const arg = args[at];
+			// Quotes are marked in `arg`; the value a shell passes carries none.
+			const value = arg.replace(/\u0001/g, "");
+			if (rest) {
+				// After `--` every word is an operand, but one that may vanish
+				// cannot stand for a script.
+				if (!this.mayVanish(arg)) return stdin;
+				continue;
+			}
+			if (value === "--") {
+				rest = true;
+				continue;
+			}
+			if (value === "-") continue;
+			if (value.startsWith("--")) {
+				if (/^--(rcfile|init-file)$/.test(value)) at += 1;
+				continue;
+			}
+			if (!/^[-+][A-Za-z]/.test(value)) {
+				// A substitution may expand to nothing, leaving no operand at all.
+				if (this.mayVanish(arg)) continue;
+				return stdin;
+			}
+			// Short-option bundles are read a letter at a time, and a leading `+`
+			// turns an option off instead of on.
+			const enabled = value[0] === "-";
+			const flags = value.slice(1).split("");
+			for (let flag = 0; flag < flags.length; flag++) {
+				if (flags[flag] === "c") return false;
+				if (flags[flag] === "s") stdin = enabled;
+				if (flags[flag] !== "o" && flags[flag] !== "O") continue;
+				// `-o` names an option, and the rest of the bundle or the next
+				// word is its value.
+				if (flag + 1 === flags.length) at += 1;
+				break;
+			}
+		}
+		return true;
 	}
 
 	/** The body of a balanced `$(...)` with the index just past it. */
@@ -436,12 +1076,41 @@ export class RemoteWorkClassifier {
 			}
 			if (char === "'" || char === '"') {
 				quote = char;
+				current += "\u0001";
 				index += 1;
 				continue;
 			}
+			if (char === "#" && current === "") {
+				// A word that starts with `#` begins a comment, which runs to the
+				// end of the line and carries no syntax of its own.
+				const end = segment.indexOf("\n", index);
+				index = end < 0 ? segment.length : end;
+				continue;
+			}
 			if (char === "\\") {
-				current += segment[index + 1] ?? "";
+				// A backslash-newline continues the word and leaves nothing behind.
+				if (segment[index + 1] !== "\n") current += segment[index + 1] ?? "";
 				index += 2;
+				continue;
+			}
+			if ((char === "$" || char === "<" || char === ">")
+				&& segment[index + 1] === "(") {
+				const end = this.substitutionEnd(segment, index + 1) + 1;
+				current += segment.slice(index, end);
+				index = end;
+				continue;
+			}
+			if (segment.startsWith("<<<", index)) {
+				// A here-string takes one word, and neither is a command word.
+				if (!/^\d*$/.test(current)) flush();
+				current = "";
+				index += 3 + this.redirectionOperand(segment.slice(index + 3)).end;
+				continue;
+			}
+			if (char === "`") {
+				const end = segment.indexOf("`", index + 1) + 1;
+				current += segment.slice(index, end === 0 ? segment.length : end);
+				index = end === 0 ? segment.length : end;
 				continue;
 			}
 			if (/\s/.test(char)) {
@@ -456,12 +1125,31 @@ export class RemoteWorkClassifier {
 		return this.withoutRedirections(words);
 	}
 
+	/** True when the whole word can expand to nothing at all. */
+	private mayVanish(word: string): boolean {
+		let index = 0;
+		while (index < word.length) {
+			if (!word.startsWith("$(", index) && word[index] !== "`") return false;
+			const end = word[index] === "`"
+				? word.indexOf("`", index + 1)
+				: this.substitutionEnd(word, index + 1);
+			if (end < 0) return false;
+			index = end + 1;
+		}
+		return word.length > 0;
+	}
+
 	private withoutRedirections(words: string[]): string[] {
 		const kept: string[] = [];
 		for (let index = 0; index < words.length; index++) {
 			const word = words[index];
 			if (/^\d*(>>?|<<?)(&\d+)?$/.test(word)) {
 				if (/^\d*(>>?|<<?)$/.test(word)) index += 1;
+				continue;
+			}
+			if (/^\d*(>>?|<<?)&$/.test(word)) {
+				// `3<& 3` names its source in the next word.
+				index += 1;
 				continue;
 			}
 			if (/^\d*(>>?|<<?).+/.test(word)) continue;
@@ -581,6 +1269,6 @@ export class RemoteWorkClassifier {
 
 	private basename(word: string): string {
 		const parts = word.split(/[\\/]/);
-		return parts[parts.length - 1] ?? "";
+		return (parts[parts.length - 1] ?? "").replace(/\u0001/g, "");
 	}
 }
