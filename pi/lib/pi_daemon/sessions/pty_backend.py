@@ -3,12 +3,6 @@
 import os
 import struct
 import subprocess
-import time
-
-# How long a repaint holds the toggled size before restoring it. pi's
-# redraw is driven by the change event, and two changes in the same
-# instant coalesce into none; the legacy seam uses the same pause.
-REPAINT_TICK = 0.05
 
 from .pty_child import PtyChild
 from .pty_exec import PtyExec
@@ -49,16 +43,25 @@ class PosixPtyBackend:
     def resize(self, master, cols, rows):
         self._window(master, cols, rows)
 
-    def repaint(self, master, cols, rows):
-        """Force a full-frame repaint at the current size.
+    def nudge(self, master, cols, rows):
+        """Step the PTY one size away from the real one, and answer the
+        size it was stepped to.
 
         A carried viewer sees a cleared screen, and pi redraws only when
-        the size really changes, so one row is dropped and restored.
+        the size really changes, so the caller restores the real size
+        after a pause. Restoring is its own step: the relay loop owns the
+        pause, so the terminal is never held by a sleeping thread.
         """
-        self._window(master, cols, max(int(rows) - 1, 1) if int(rows) > 1
-                     else int(rows))
-        time.sleep(REPAINT_TICK)
-        self._window(master, cols, rows)
+        cols, rows = int(cols), int(rows)
+        if rows > 1:
+            temporary = (cols, rows - 1)
+        elif cols > 1:
+            # A one-row terminal still needs a size that differs.
+            temporary = (cols - 1, rows)
+        else:
+            temporary = (cols, rows + 1)
+        self._window(master, temporary[0], temporary[1])
+        return temporary
 
     def close(self, descriptor):
         if descriptor is None or descriptor < 0:

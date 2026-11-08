@@ -624,6 +624,11 @@ class RelayTests(unittest.TestCase):
         seen = self.read_until(viewer, b"T")
         self.assertIn(b"\x1b[2J", seen)
         self.assertEqual(self.relay.viewer_count("k"), 0)
+        # The nudge is restored by the loop, not by a sleeping caller.
+        deadline = time.monotonic() + 5
+        while self.relay._repaints and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.relay._repaints, {})
         viewer.close()
 
     def test_a_carry_across_a_replaced_generation_is_refused(self):
@@ -644,6 +649,34 @@ class RelayTests(unittest.TestCase):
         self.addCleanup(lambda: (second.terminate(grace=0.2), second.close()))
         self.relay.register("k2", "g2", second.disown_master())
         return "k2"
+
+
+class NudgeTests(unittest.TestCase):
+    """A repaint nudge always steps to a size the child has never had."""
+
+    def setUp(self):
+        self.backend = PosixPtyBackend(ServiceConfig(), service_root())
+        self.master, self.slave = os.openpty()
+        self.addCleanup(os.close, self.master)
+        self.addCleanup(os.close, self.slave)
+
+    def size(self):
+        import fcntl
+        import struct
+        import termios
+
+        packed = fcntl.ioctl(self.master, termios.TIOCGWINSZ, b"\0" * 8)
+        rows, cols = struct.unpack("HH", packed[:4])
+        return cols, rows
+
+    def test_every_terminal_steps_away_and_returns(self):
+        for cols, rows in ((80, 24), (80, 1), (1, 1)):
+            self.backend.resize(self.master, cols, rows)
+            temporary = self.backend.nudge(self.master, cols, rows)
+            self.assertNotEqual(temporary, (cols, rows))
+            self.assertEqual(self.size(), temporary)
+            self.backend.resize(self.master, cols, rows)
+            self.assertEqual(self.size(), (cols, rows))
 
 
 class CarryRelay:

@@ -72,6 +72,9 @@ class ServiceConfig:
     master_chunk_bytes: int = 65536
     relay_buffer_bytes: int = 262144
     relay_tick: float = 0.05
+    # A repaint nudge holds the off-size this long: pi's redraw follows the
+    # change event, and two changes in one instant coalesce into none.
+    repaint_tick: float = 0.05
     settle_grace: float = 1.0
     history_limit: int = 4
     session_store_root: str = ""

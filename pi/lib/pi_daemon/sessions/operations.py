@@ -9,6 +9,7 @@ from .error import SessionError
 from .service import STATES
 
 NAME_LIMIT = 200
+# The legacy daemon's handover wire limit, measured in characters.
 MESSAGE_LIMIT = 8192
 DIMENSION_LIMIT = 65535
 
@@ -136,7 +137,6 @@ class SessionOperations:
         message = request.get("message")
         if message is not None and not (isinstance(message, str)
                                         and 0 < len(message) <= MESSAGE_LIMIT):
-            # The wire limit the legacy daemon enforced.
             raise ValueError("a message of 1 to %d characters is allowed"
                              % MESSAGE_LIMIT)
         if not os.path.isdir(dir_):

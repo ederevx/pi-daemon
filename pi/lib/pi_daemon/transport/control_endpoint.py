@@ -104,7 +104,10 @@ class ControlEndpoint:
             pass
         finally:
             stream.close()
-            if on_close is not None and not self._stopping.is_set():
+            # A transferred socket now belongs to the relay: its close is
+            # an ordinary detach, not the exit that was parked on.
+            if on_close is not None and not transferred \
+                    and not self._stopping.is_set():
                 self._closed(on_close)
             with self._lock:
                 self._connections.discard(connection)

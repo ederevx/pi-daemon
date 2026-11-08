@@ -24,6 +24,9 @@ class SessionRelay:
         self._wake_read = -1
         self._wake_write = -1
         self._sessions = {}
+        # A nudged size still owes its restore: keyed by session, so a
+        # session that ends drops the debt with it.
+        self._repaints = {}
         self._thread = None
         self._stopping = threading.Event()
 
@@ -222,11 +225,42 @@ class SessionRelay:
         if moved and self._backend is not None:
             # pi redraws only on a real size change, so the carried
             # viewer would otherwise stare at the cleared screen until
-            # the target happens to print.
-            self._backend.repaint(target.master, cols, rows)
+            # the target happens to print. The size is stepped here and
+            # restored from the loop, which owns the pause: this thread
+            # serves every conversation and must not sleep.
+            if self._backend.nudge(target.master, cols, rows) is not None:
+                self._repaints[target_key] = (
+                    target.generation, cols, rows,
+                    time.monotonic() + self._config.repaint_tick)
         return {"moved": moved}
 
+    def _restore_repaints(self):
+        """Give back every size a nudge stepped away from, once the child
+        has had time to see the change."""
+        now = time.monotonic()
+        for key, (generation, cols, rows, deadline) in list(
+                self._repaints.items()):
+            if deadline > now:
+                continue
+            del self._repaints[key]
+            session = self._sessions.get(key)
+            if session is None or session.generation != generation:
+                # The run that was nudged has already gone.
+                continue
+            self._backend.resize(session.master, cols, rows)
+
+    def _timeout(self):
+        """The nearest repaint restore bounds the wait, so it is never
+        late by a whole tick."""
+        timeout = self._config.relay_tick
+        if self._repaints:
+            soonest = min(deadline for _, _, _, deadline
+                          in self._repaints.values())
+            timeout = min(timeout, max(0.0, soonest - time.monotonic()))
+        return timeout
+
     def _complete(self, key):
+        self._repaints.pop(key, None)
         session = self._sessions.pop(key, None)
         if session is None:
             return False
@@ -246,6 +280,7 @@ class SessionRelay:
             self._complete(key)
 
     def _pump(self):
+        self._restore_repaints()
         readable = [self._wake_read]
         writable = []
         watched = list(self._sessions.values())
@@ -260,7 +295,7 @@ class SessionRelay:
                     writable.append(connection)
         try:
             ready_read, ready_write, _ = select.select(readable, writable, [],
-                                                       self._config.relay_tick)
+                                                       self._timeout())
         except (OSError, ValueError):
             # One closed descriptor must not stall every conversation.
             self._prune()

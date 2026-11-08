@@ -26,6 +26,8 @@ from pi_daemon.tasks.model import DONE, Ticket
 from pi_daemon.tasks.runner import TicketRunner
 from pi_daemon.tasks.service import TaskService
 from pi_daemon.tasks.store import TicketStore
+from pi_daemon.transport.control_action import ControlAction
+from pi_daemon.transport.control_endpoint import ControlEndpoint
 from pi_daemon.transport.control_handshake import ControlHandshake
 from pi_daemon.transport.endpoint_file import EndpointFile
 from pi_daemon.transport.endpoint_probe import EndpointProbe
@@ -558,6 +560,101 @@ class RunnerTests(unittest.TestCase):
             service.submit("pi-1", os.path.join(SCRATCH, "absent"), "true")
         self.assertEqual(caught.exception.code, "spawn-failed")
         self.assertEqual(service.tickets(), [])
+
+
+class CloseCallbackTests(unittest.TestCase):
+    """A close callback belongs to the exit it was parked on: a transfer
+    to the relay is not one, a reset or a dead reply still is."""
+
+    class Layout:
+        def __init__(self, path):
+            self.path = path
+
+        def endpoint_path(self):
+            return self.path
+
+    class Handshake:
+        @staticmethod
+        def authorize(hello):
+            return {}
+
+    class Router:
+        def __init__(self, make):
+            self.make = make
+
+        def dispatch(self, request, connection=None):
+            return self.make(connection)
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(dir=SCRATCH)
+        self.config = ServiceConfig()
+        self.codec = WireCodec()
+        self.calls = []
+
+    def serve(self, make):
+        layout = self.Layout(os.path.join(self.root, "control.json"))
+        endpoint = ControlEndpoint(layout, self.config, self.Handshake(),
+                                   self.Router(make), self.codec, "inst",
+                                   "token")
+        endpoint.start()
+        self.addCleanup(endpoint.stop)
+        coordinates = EndpointFile(layout.endpoint_path()).read()
+        client = socket.create_connection(
+            (coordinates["host"], coordinates["port"]), 2)
+        self.addCleanup(client.close)
+        stream = JsonLineStream(client, 65536, 8192)
+        stream.write(self.codec.encode(
+            self.codec.hello_request(coordinates["token"])))
+        json.loads(stream.read())
+        return client, stream
+
+    def answer(self, stream):
+        stream.write(self.codec.encode({"cmd": "handover"}))
+        return json.loads(stream.read())
+
+    def wait_for(self, count):
+        deadline = time.monotonic() + 5
+        while len(self.calls) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    def counted(self):
+        return lambda: self.calls.append("closed")
+
+    def test_a_transfer_to_the_relay_is_not_a_close(self):
+        client, stream = self.serve(lambda connection: ControlAction(
+            reply={"ok": True}, on_close=self.counted(),
+            upgrade=lambda socket_, initial: socket_.close()))
+        self.assertEqual(self.answer(stream), {"ok": True})
+        time.sleep(0.3)
+        self.assertEqual(self.calls, [])
+
+    def test_an_end_of_file_runs_the_callback_once(self):
+        client, stream = self.serve(lambda connection: ControlAction(
+            reply={"ok": True}, on_close=self.counted()))
+        self.answer(stream)
+        client.close()
+        self.wait_for(1)
+        self.assertEqual(self.calls, ["closed"])
+        time.sleep(0.2)
+        self.assertEqual(self.calls, ["closed"])
+
+    def test_a_reply_that_cannot_be_sent_still_runs_the_callback(self):
+        import struct
+
+        def slow(connection):
+            # The request is read and dispatched; the reply finds the
+            # peer gone, which is a close like any other.
+            time.sleep(0.2)
+            return ControlAction(reply={"ok": True},
+                                 on_close=self.counted())
+
+        client, stream = self.serve(slow)
+        stream.write(self.codec.encode({"cmd": "handover"}))
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                          struct.pack("ii", 1, 0))
+        client.close()
+        self.wait_for(1)
+        self.assertEqual(self.calls, ["closed"])
 
 
 class EndpointTests(unittest.TestCase):
