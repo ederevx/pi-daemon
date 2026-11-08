@@ -30,6 +30,20 @@ pi/service/daemon_service/tasks/store.py    TicketStore
 pi/service/daemon_service/tasks/runner.py   TicketRunner
 pi/service/daemon_service/tasks/service.py  TaskService
 pi/service/daemon_service/tasks/operations.py   TaskOperations
+pi/service/daemon_service/sessions/error.py      SessionError
+pi/service/daemon_service/sessions/identity.py   ProcessIdentity
+pi/service/daemon_service/sessions/model.py      SessionRecord
+pi/service/daemon_service/sessions/run_outcome.py RunOutcome
+pi/service/daemon_service/sessions/store.py      SessionStore
+pi/service/daemon_service/sessions/service.py    SessionService
+pi/service/daemon_service/sessions/operations.py SessionOperations
+pi/service/daemon_service/sessions/runner.py     SessionRunner
+pi/service/daemon_service/sessions/relay.py      SessionRelay
+pi/service/daemon_service/sessions/relay_session.py RelaySession
+pi/service/daemon_service/sessions/pty_backend.py PosixPtyBackend
+pi/service/daemon_service/sessions/pty_child.py  PtyChild
+pi/service/daemon_service/sessions/pty_exec.py   PtyExec
+pi/service/daemon_service/transport/control_action.py ControlAction
 ```
 
 Each file owns one cohesive responsibility and one primary class. The
@@ -37,10 +51,11 @@ entry point only bootstraps: it requires `PI_DAEMON_STATE_DIR` and
 `PI_DAEMON_RUNTIME_DIR`, composes `DaemonApplication`, and runs it. The
 staging entry never falls back to the live roots.
 
-`DaemonApplication` starts the instance lock, the tasks domain and the
-control endpoint in that order, and stops them in reverse: close
-admission, stop accepting, cancel and join children, persist, remove
-the owned descriptor, release the lock.
+`DaemonApplication` starts the instance lock, the tasks domain, the
+sessions domain and the control endpoint in that order, and stops them
+in reverse: close admission, stop accepting, settle sessions, cancel and
+join children, persist both stores, remove the owned descriptor, release
+the lock.
 
 ## The control contract
 
@@ -101,6 +116,106 @@ transient per submission and is never stored in a record.
 * A paged read clamps an offset past the end and reports the clamped
   offset, so `offset`, `next` and `size` always agree.
 
+## The sessions domain
+
+The domain hosts conversations, not transports. `SessionStore` owns
+names, generations, conversation bindings, handoffs and run records;
+`SessionRunner` is the only owner of a child process; `SessionRelay` and
+its single thread own every PTY byte; `SessionService` is the surface
+the operations call; `SessionOperations` validates the wire and
+projects errors.
+
+### The served contract
+
+```
+list | which | whichall | start | attach | detach | stop | input |
+resize | state | run-state | announce | resume | handoff-target |
+gc-reap-ack | daemon-purge | daemon-restart | shutdown
+```
+
+* `list` answers the published session view: `name`, `dir`, `pid`,
+  `attached`, `clients`, `file`, `state`, `argv`.
+* `start` answers `created` (a live name is replayed, never replaced);
+  the child environment is `os.environ` plus the stored `env`, plus
+  `PI_DAEMON_SESSION`, plus the transient `env_once` overlay.
+* `attach` answers first and then hands the socket to the relay: the
+  greeting and the reply are one JSON line, everything after it is raw
+  PTY bytes in both directions. A failed attach carries the recorded
+  conversation `file`, so a stale name still resumes its own
+  conversation. An attach to a name that handed its viewers elsewhere
+  answers `handoff` instead of taking the socket.
+* `state` publishes `busy`, `idle` or `waiting` with optional `seq`,
+  `pid` and `aborted`; the record accepts it only from the live
+  generation, only forward in `seq`, and only from the recorded `pid`.
+* `run-state` answers the durable record even when the name is no longer
+  hosted, with `name`, `open`, `state`, `run`, `seq`, `ended`, `history`
+  and `file`.
+* `announce` binds a name to a conversation; with `takeover` a duplicate
+  hands its viewers to the busier holder (`handoff`) or takes the other
+  holder over (`tookOver`), and always names `alsoLive`.
+* `resume` moves a session's viewers to the live holder of a
+  conversation; with no live holder it answers `no-session` (a fresh
+  resume is the client's own `start`, which pi-rc already performs).
+* `detach` closes every viewer and leaves the child running; `stop`
+  asks the child to end and answers `queued`, `alive`, `state`.
+* `daemon-purge` stops idle sessions with no viewer; `daemon-restart`
+  and `shutdown` answer before the application stops.
+
+Deferred to the next increment, and answered `bad-request` today:
+`carry`, `extensions-reload`, `handover`, the transcript commands and
+the comms capabilities. Each needs either the transcript index or the
+comms domain; none of them is faked.
+
+### Durable records
+
+`<state>/sessions/sessions.json` holds the names and one record per
+name: `id`, `generation`, `dir`, `argv`, `resume_argv`, `env`, `file`,
+`cols`, `rows`, `desired`, `phase`, `owner`, `child`, `created`,
+`started`, plus the conversation bindings and handoffs. `<state>/sessions/runs/<id>.json`
+holds one run's `state`, `run`, `seq`, `seen`, `changed`, `opened`,
+`open`, `ended` and `history`; the two writes are separate, so a torn
+registry can never invent a verdict.
+
+A verdict is decided in one place, `RunOutcome.seal`, and the order is
+the contract: daemon stop, then explicit stop, then reload death, then
+lost ownership, then a death mid-run (a signal or a non-zero exit) or
+an exit mid-run, then a crash at the prompt, then an aborted run, then
+settled, and `unknown` when the run never announced itself. A reopen
+carries the earlier seals into `history`, so a death and a revive never
+erase the death.
+
+### Process identity
+
+A PID alone proves nothing. `ProcessIdentity` records the boot id and
+the `/proc` start tick, and `classify` answers `same`, `gone` or
+`unknown`; only `same` permits signalling, `gone` refuses it, and
+`unknown` blocks recovery rather than guessing. A child is recorded
+before it execs: the helper holds a gate until the parent has written
+the record and registered the PTY, then `execvpe`s in place, so the
+recorded PID is the conversation's PID. An exec failure travels back
+through the error pipe and the start is refused as `spawn-failed`
+with the child reaped.
+
+### The relay
+
+One thread selects over every master and viewer. Each viewer has its
+own bounded queue and is dropped, not blocked on, when it falls behind.
+Output produced while nobody watches is kept in one bounded backlog and
+handed to the next viewer as its first chunk, so an attach never opens
+on a half-drawn screen. Viewer input and resizes are queued commands, so
+the request threads never touch a descriptor. `finish` drains until EOF
+or a grace deadline, then closes the viewers; `move_viewers` transfers
+sockets and their queues between sessions without a byte loss.
+
+### Recovery and shutdown
+
+A new instance owns no child, so every record another instance left
+`running` is marked exited and its open run is sealed `lost-mid-run` or
+`lost-at-prompt`; names and conversations survive, the process does not.
+Shutdown marks every record `stopped`, terminates each child, lets each
+watcher seal its run, drains the relay, then persists both stores. A
+`reboot` mode keeps `desired: running` for the next instance.
+
 ## Configuration
 
 Every operational value is a `ServiceConfig` field, resolved once from
@@ -136,7 +251,10 @@ Order matters, and each step is reversible on its own:
 3. Add the remaining domains against the same composition: sessions
    (session hosting, run state, revive, transcripts), then comms
    (registry, relay, mailbox, waits, peers) as the `agent-comms`
-   capability over `pi-rpc/1` on its own listener.
+   capability over `pi-rpc/1` on its own listener. Hosting, run state,
+   attach/detach, announce/handoff and recovery are in place; revive
+   by name is the client's own `start`, and transcripts plus the
+   deferred operations above are the remaining work in this step.
 4. Ship the new client beside the old one and rewire `pi-rc` and the
    extensions to it, keeping it compatible with both servers, then
    remove the legacy aliases from the migration translator.

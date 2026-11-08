@@ -30,6 +30,8 @@ def main():
                    [sys.executable, "tests/oop_lint.py"])
     all_ok &= step("unified service tests",
                    [sys.executable, "tests/service_test.py"])
+    all_ok &= step("sessions domain tests",
+                   [sys.executable, "tests/session_test.py"])
     all_ok &= step("extension tests (TS)",
                    ["node", "--experimental-strip-types",
                     "--experimental-transform-types", "tests/ts/run.ts"])

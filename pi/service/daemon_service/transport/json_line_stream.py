@@ -32,10 +32,25 @@ class JsonLineStream:
             self._buffer += chunk
 
     def write(self, frame):
+        self._require()
         self._connection.sendall(frame)
 
+    def release(self):
+        """Hand the socket to another owner, with its unread tail."""
+        self._require()
+        connection, self._connection = self._connection, None
+        buffered, self._buffer = self._buffer, b""
+        return connection, buffered
+
     def close(self):
+        connection, self._connection = self._connection, None
+        if connection is None:
+            return
         try:
-            self._connection.close()
+            connection.close()
         except OSError:
             pass
+
+    def _require(self):
+        if self._connection is None:
+            raise OSError("the stream no longer owns a connection")

@@ -8,6 +8,11 @@ NO_TICKET = "no-ticket"
 TICKET_RUNNING = "running"
 TOO_BUSY = "too-busy"
 SPAWN_FAILED = "spawn-failed"
+NO_SESSION = "no-session"
+NO_DIR = "no-dir"
+NO_FILE = "no-file"
+NAME_TAKEN = "name-taken"
+WRITE_FAILED = "write-failed"
 
 
 def error_reply(code):
