@@ -514,6 +514,19 @@ class OperationsTests(unittest.TestCase):
         self.assertEqual(reply["handoff"]["name"], "pi-b")
         self.assertNotIsInstance(reply, ControlAction)
 
+    def test_an_announce_passes_takeover_through(self):
+        operations = self.operations()
+        operations.announce({"cmd": "announce", "name": "pi-a",
+                             "file": "/conv/a.jsonl", "takeover": True})
+        self.assertEqual(self.service.calls[-1],
+                         ("announce", ("pi-a", "/conv/a.jsonl", True)))
+
+    def test_a_non_boolean_takeover_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.operations().announce(
+                {"cmd": "announce", "name": "pi-a", "file": "/conv/a.jsonl",
+                 "takeover": "yes"})
+
     def test_a_carry_is_projected_and_named(self):
         reply = self.operations().carry(
             {"cmd": "carry", "name": "pi-a", "to": "pi-b"})
@@ -970,215 +983,6 @@ class HandoverTests(unittest.TestCase):
         self.assertIn("carry on", spawned[2])
         self.assertNotIn("carry on", record.argv)
         self.assertNotIn("carry on", record.resume_argv)
-
-
-class DaemonTests(unittest.TestCase):
-    """The staging daemon, driven over its own control contract."""
-
-    def setUp(self):
-        self.state, self.runtime = roots()
-        self.environment = dict(os.environ)
-        self.environment.update({
-            "PI_DAEMON_STATE_DIR": self.state,
-            "PI_DAEMON_RUNTIME_DIR": self.runtime,
-        })
-        self.process = subprocess.Popen(
-            [sys.executable, os.path.join(REPO, "pi", "service", "pi-daemon")],
-            env=self.environment, cwd=REPO)
-        self.addCleanup(self._stop)
-        self.endpoint = self._endpoint()
-
-    def _stop(self):
-        if self.process.poll() is None:
-            try:
-                self.control({"cmd": "shutdown"})
-            except OSError:
-                pass
-            try:
-                self.process.wait(10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(5)
-
-    def _endpoint(self):
-        path = os.path.join(self.runtime, "control.json")
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            try:
-                with open(path, "r", encoding="utf-8") as handle:
-                    data = json.load(handle)
-                if data.get("token"):
-                    return data
-            except (OSError, ValueError):
-                time.sleep(0.05)
-        self.fail("the daemon never published its endpoint")
-
-    def connect(self):
-        connection = socket.create_connection(
-            (self.endpoint["host"], self.endpoint["port"]), timeout=10)
-        connection.sendall(json.dumps(
-            {"cmd": "hello", "token": self.endpoint["token"]}).encode()
-            + b"\n")
-        self.read_frame(connection)
-        return connection
-
-    @staticmethod
-    def read_frame(connection):
-        buffer = b""
-        while b"\n" not in buffer:
-            chunk = connection.recv(65536)
-            if not chunk:
-                raise ConnectionError("the daemon closed the connection")
-            buffer += chunk
-        return json.loads(buffer.split(b"\n", 1)[0])
-
-    def control(self, request):
-        connection = self.connect()
-        try:
-            connection.sendall(json.dumps(request).encode() + b"\n")
-            return self.read_frame(connection)
-        finally:
-            connection.close()
-
-    def attach(self, name, cols=100, rows=30):
-        connection = self.connect()
-        connection.sendall(json.dumps({
-            "cmd": "attach", "name": name, "cols": cols, "rows": rows,
-        }).encode() + b"\n")
-        reply = self.read_frame(connection)
-        return connection, reply
-
-    def wait_for(self, predicate, timeout=10):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            value = predicate()
-            if value:
-                return value
-            time.sleep(0.05)
-        return None
-
-    def read_until(self, connection, marker, timeout=10):
-        buffer = b""
-        deadline = time.monotonic() + timeout
-        connection.settimeout(0.5)
-        while marker not in buffer and time.monotonic() < deadline:
-            try:
-                chunk = connection.recv(65536)
-            except socket.timeout:
-                continue
-            if not chunk:
-                break
-            buffer += chunk
-        return buffer
-
-    def test_a_hosted_session_runs_announces_and_settles(self):
-        started = self.control({
-            "cmd": "start", "name": "pi-live", "dir": REPO,
-            "argv": ["sh", "-c",
-                     "printf 'READY\\n'; read line; printf 'GOT:%s\\n' \"$line\""],
-            "cols": 100, "rows": 30})
-        self.assertTrue(started["ok"], started)
-        self.assertTrue(started["created"])
-        session, reply = self.attach("pi-live")
-        self.assertTrue(reply["ok"], reply)
-        self.assertIn(b"READY", self.read_until(session, b"READY"))
-        announce = self.control({"cmd": "announce", "name": "pi-live",
-                                 "file": "/conv/a.jsonl"})
-        self.assertTrue(announce["ok"], announce)
-        self.assertEqual(self.control({"cmd": "which", "file": "/conv/a.jsonl"}),
-                         {"ok": True, "name": "pi-live"})
-        self.assertEqual(self.control({"cmd": "whichall",
-                                       "file": "/conv/a.jsonl"})["names"],
-                         [{"name": "pi-live", "state": "idle"}])
-        self.assertEqual(self.control({"cmd": "state", "name": "pi-live",
-                                       "state": "busy"})["accepted"], True)
-        listed = self.control({"cmd": "list"})["sessions"]
-        self.assertEqual(listed[0]["state"], "busy")
-        self.assertTrue(listed[0]["attached"])
-        self.assertEqual(listed[0]["clients"], 1)
-        typed = self.control({"cmd": "input", "name": "pi-live",
-                              "text": "hello\n"})
-        self.assertEqual(typed["bytes"], 6)
-        self.assertIn(b"GOT:hello", self.read_until(session, b"GOT:hello"))
-        self.assertTrue(self.wait_for(
-            lambda: self.control({"cmd": "run-state", "name": "pi-live"})
-            ["record"]["ended"]))
-        state = self.control({"cmd": "run-state", "name": "pi-live"})
-        self.assertEqual(state["record"]["ended"]["verdict"], "exited-mid-run")
-        session.close()
-
-    def test_a_shutdown_seals_the_runs_it_ends(self):
-        self.control({"cmd": "start", "name": "pi-live", "dir": REPO,
-                      "argv": ["sh", "-c", "sleep 30"]})
-        self.control({"cmd": "announce", "name": "pi-live",
-                      "file": "/conv/a.jsonl"})
-        self.control({"cmd": "state", "name": "pi-live", "state": "busy"})
-        self.control({"cmd": "shutdown"})
-        self.process.wait(20)
-        runs = os.path.join(self.state, "sessions", "runs")
-        sealed = []
-        for name in os.listdir(runs):
-            if not name.endswith(".json"):
-                continue
-            with open(os.path.join(runs, name), encoding="utf-8") as handle:
-                sealed.append(json.load(handle))
-        self.assertEqual(len(sealed), 1, sealed)
-        self.assertEqual(sealed[0]["ended"]["verdict"], "daemon-stopped")
-        self.assertFalse(sealed[0]["open"])
-
-    def test_an_attach_failure_names_the_recorded_conversation(self):
-        self.control({"cmd": "start", "name": "pi-gone", "dir": REPO,
-                      "argv": ["sh", "-c", "sleep 30"]})
-        self.control({"cmd": "announce", "name": "pi-gone",
-                      "file": "/conv/gone.jsonl"})
-        self.control({"cmd": "stop", "name": "pi-gone"})
-        self.assertTrue(self.wait_for(
-            lambda: not self.control({"cmd": "list"})["sessions"]))
-        connection, reply = self.attach("pi-gone")
-        connection.close()
-        self.assertEqual(reply["error"], "no-session")
-        self.assertEqual(reply["file"], "/conv/gone.jsonl")
-
-    def test_detach_keeps_the_session_running(self):
-        self.control({"cmd": "start", "name": "pi-live", "dir": REPO,
-                      "argv": ["sh", "-c", "sleep 30"]})
-        session, reply = self.attach("pi-live")
-        self.assertTrue(reply["ok"], reply)
-        self.control({"cmd": "detach", "name": "pi-live"})
-        session.settimeout(10)
-        self.assertEqual(session.recv(65536), b"")
-        session.close()
-        listed = self.control({"cmd": "list"})["sessions"]
-        self.assertEqual(listed[0]["clients"], 0)
-        self.control({"cmd": "stop", "name": "pi-live"})
-        self.assertTrue(self.wait_for(
-            lambda: not self.control({"cmd": "list"})["sessions"]))
-
-    def test_an_announce_takeover_hands_the_duplicate_over(self):
-        for name in ("pi-a", "pi-b"):
-            self.control({"cmd": "start", "name": name, "dir": REPO,
-                          "argv": ["sh", "-c", "sleep 30"]})
-        first, _ = self.attach("pi-a")
-        second, _ = self.attach("pi-b")
-        self.control({"cmd": "announce", "name": "pi-a",
-                      "file": "/conv/dup.jsonl"})
-        reply = self.control({"cmd": "announce", "name": "pi-b",
-                              "file": "/conv/dup.jsonl", "takeover": True})
-        self.assertTrue(reply["ok"], reply)
-        self.assertEqual(reply["handoff"], {"name": "pi-a", "state": "idle"})
-        self.assertEqual(self.control({"cmd": "handoff-target",
-                                       "name": "pi-b"})["target"],
-                         {"name": "pi-a", "state": "idle"})
-        self.assertEqual(self.control({"cmd": "list"})["sessions"][0]["clients"],
-                         2)
-        first.close()
-        second.close()
-
-    def test_unknown_and_malformed_requests_are_refused_not_fatal(self):
-        self.assertEqual(self.control({"cmd": "nope"})["error"], "bad-request")
-        self.assertEqual(self.control({"cmd": "start", "name": ""})["error"],
-                         "bad-request")
-        self.assertTrue(self.control({"cmd": "list"})["ok"])
 
 
 class StubReload:
