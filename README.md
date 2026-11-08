@@ -14,8 +14,9 @@ reattachment, background command tickets, and transcript retrieval.
 - **`daemon` extension** - `/bg` detaches instantly inside a hosted
   session or hands a plain session over, without aborting in-flight
   work.
-- **Extension reload watch** - polls extension roots and reloads
-  hosted sessions in place on change.
+- **Explicit extension reload** - `pi-rc extensions-reload` reloads
+  eligible idle hosted sessions in place; nothing watches extension
+  roots on its own.
 - **Command offloading** - `bash` becomes a daemon-owned ticket, with
   `daemon_tasks` for result, watch, status, cancel, and remove.
 - **Transcript retrieval** - `transcript_read` serves indexed
@@ -40,10 +41,11 @@ pi install git:github.com/ederevx/pi-daemon@v2.9.59
 
 `npm install` runs `scripts/postinstall.mjs` on a fresh install, and the
 package's `provision` extension reconciles on every session start: when
-the clone's sources differ from what the install manifest recorded, it
-re-runs `scripts/install.sh --package` in the background. Together they
-provision the systemd user unit, the `pi-rc` and `pi-comms` clients, the
-`pi` wrapper, the daemon, and the seam modules to the agent-home paths.
+the clone's sources differ from the inventory the install manifest
+recorded (an edited module, or an added or removed one) it re-runs
+`scripts/install.sh --package` in the background. Together they provision
+the systemd user unit, the public launchers (`pi-daemon`, `pi-rc`,
+`pi-comms`, `pi-daemon-migrate`, `pi`), and one release directory.
 pi skips `npm install` when an updated pin resolves to the commit already
 checked out, so the session-start reconciliation is what applies such an
 update. Provisioning removes extension copies a prior install owned
@@ -51,6 +53,41 @@ so only one loader source remains; if a leftover copy aborts sessions with
 tool-conflict errors before that can happen, run
 `bash scripts/install.sh --package`. Adopt a new daemon binary with
 `/daemon-reload`.
+
+### How an install is laid out
+
+Each install builds one generation whole under
+`~/.local/lib/pi-daemon/releases/<id>/` (`bin/`, `daemon/`, `lib/`,
+`extensions/`, `defaults.json`) and publishes it by replacing the manifest
+`<agent-dir>/.pi-daemon/manifest.json` (format 3): the active generation,
+the retained ones, every source digest and the per-tree digests. The
+public files in `~/.local/bin` are small dispatchers that read the
+manifest, so an upgrade is a pointer swap: a running daemon keeps the
+release it started from, a new command runs the active one, and nothing
+is ever rewritten inside a published release (the launchers and the
+daemon turn off bytecode writing for exactly that reason).
+
+Re-running the installer with an unchanged clone republishes the same
+generation; an edited clone publishes a new one and keeps the previous
+release on disk for as long as a process has it open.
+
+### Upgrading from the pre-generation install
+
+The installer translates legacy state once, from inside the new
+generation, and only when the new state root has none yet:
+
+```bash
+bash scripts/install.sh --package            # refuses (76) while a daemon serves
+pi-daemon-migrate --dry-run                  # what it would translate
+pi-daemon-migrate                            # translate now
+```
+
+Because a legacy daemon owns the state and the endpoint it is reading,
+the installer refuses to translate beside it: stop the unit
+(`systemctl --user stop pi-daemon.service`) and re-run; nothing is
+changed when it refuses. A held install lock exits 75. `bash` is
+required (on Windows, Git Bash): the installer, the launchers it renders
+and the shell tickets all run through it.
 
 ## Agent comms
 
@@ -74,10 +111,9 @@ and `peers`, behind the `pre_daemon` gate, and shells out to
 The client finds the service by capability, not by path: it reads the
 `agent-comms` descriptor from the services root (`PI_SERVICES_DIR`,
 otherwise the user runtime directory, otherwise the temp directory), and
-reports "no service" when nothing published one. The installed daemon is
-still the previous implementation, so until the service entry point
-switches, `pi-comms` and the comms tools answer `no service` unless a
-staging service runs with explicit roots.
+reports "no service" when nothing published one. The installed daemon
+serves the `agent-comms` capability on its own listener, so `pi-comms`
+and the comms tools answer as soon as the daemon is up.
 
 ## Uninstall
 
@@ -106,7 +142,11 @@ pi/
   bin/pi-rc              # client: tickets, bridge, input, reload,
                          # start/attach/detach/announce/ls/which/stop
   bin/pi-comms           # agent-comms client: mail, waits, launches, peers
-  daemon/pi-daemon       # stdlib Python PTY host + shell ticket runners
+  daemon/pi-daemon       # stdlib Python thin bootstrap: lib/pi_daemon
+  lib/pi_daemon/         # the daemon package: entry, application,
+                         # transport/, sessions/, tasks/, transcripts/,
+                         # comms/, lifecycle/, migration/
+  bin/pi-daemon-migrate  # the one-shot state translation verb
   lib/pi_platform.py     # transport, process, PTY, terminal seams
   lib/pi_services.py     # service descriptors: discovery, publish, sweep
   lib/pi_rpc_client.py   # pi-rpc/1 socket client: discover, greet, call
@@ -115,8 +155,8 @@ pi/
   lib/pi_transcript.py   # conversation index + read-only body serving
   systemd/pi-daemon.service
 scripts/
-  install.sh             # manifest-owned install into the agent home
-  uninstall.sh
+  install.sh             # generation install: build, translate, publish
+  uninstall.sh           # removes the launchers and every generation
 tests/                   # zero-dependency validation + OOP-enforcement suite
 ```
 
@@ -137,10 +177,6 @@ with the built-in default as the fallback.
 | `reloadSignalGraceSeconds` | `2.0` | Wait for an in-session reload signal before typing `/reload`. |
 | `ticketTtlHours` | `72` | Finished tickets expire after this many hours. |
 | `ticketGcSeconds` | `60` | Ticket garbage-collection cadence. |
-| `extWatch` | `true` | Watch extension roots and reload hosted sessions on change. |
-| `extWatchIntervalSeconds` | `3.0` | Extension-root poll cadence. |
-| `extWatchDebounceSeconds` | `4.0` | Minimum gap between reload bursts. |
-| `extWatchRoots` | agent `extensions`/`npm`/`git` + `settings.json` | Roots to watch. |
 | `transcriptIndex` | `true` | Keep a positional `.jsonl.idx` sidecar beside each cold conversation so a reader can resolve entry metadata without a full parse. |
 | `transcriptIndexIntervalSeconds` | `3.0` | Conversation-index poll cadence. |
 | `transcriptIndexMaxMb` | `4` | Reject and rebuild an index larger than this. |
@@ -153,9 +189,8 @@ with the built-in default as the fallback.
 Environment overrides: `PI_DAEMON_GC_IDLE_HOURS`,
 `PI_DAEMON_IDLE_TIMEOUT_HOURS`, `PI_PTYD_MIN_REVIVE_LIFE`,
 `PI_PTYD_RELOAD_GUARD_GRACE`, `PI_PTYD_RELOAD_SIGNAL_GRACE`,
-`PI_PTYD_TICKET_TTL_HOURS`, `PI_PTYD_TICKET_GC`, `PI_PTYD_EXT_WATCH`,
-`PI_PTYD_EXT_WATCH_INTERVAL`, `PI_PTYD_EXT_WATCH_DEBOUNCE`,
-`PI_PTYD_EXT_WATCH_ROOTS`, `PI_PTYD_TRANSCRIPT_INDEX`,
+`PI_PTYD_TICKET_TTL_HOURS`, `PI_PTYD_TICKET_GC`,
+`PI_PTYD_TRANSCRIPT_INDEX`,
 `PI_PTYD_TRANSCRIPT_INDEX_INTERVAL`, `PI_PTYD_TRANSCRIPT_INDEX_MAX_MB`,
 `PI_PTYD_TRANSCRIPT_INDEX_MAX_LINE_MB`, `PI_PTYD_RUN_STATE_RETENTION_HOURS`,
 `PI_PTYD_RUN_BEAT`, `PI_PTYD_RUN_BEAT_STALE`, and `PI_OFFLOAD`.
@@ -177,8 +212,14 @@ file mode. A row whose environment variable is set is marked
 `Restore default configuration` action deletes the whole `piDaemon`
 namespace after a confirmation, returning every option to its built-in
 default while env-pinned options still win. Daemon-owned values
-apply on the next daemon restart; `offload.*` applies after the automatic
-extension reload.
+apply on the next daemon restart; `offload.enabled` is read on each
+offload decision, so a change applies to the next `bash` call.
+
+Automatic extension-root watching is no longer provided. Legacy
+`extWatch*` settings and `PI_PTYD_EXT_WATCH*` variables are ignored.
+After changing resources, use `/reload` in a session, or
+`pi-rc extensions-reload` for eligible idle hosted sessions: busy
+sessions are skipped, so repeat the request when they are idle.
 
 The GC reaper windows (`gcIdleHours`,
 `daemonIdleTimeoutHours`, `ticketTtlHours`) are configured in hours;
@@ -221,9 +262,10 @@ attached and busy sessions are never purged.
 - **`transcript_read`** - read the current or a named conversation
   through the daemon's positional index (`stat`, `path`, `entries`,
   `tree`, `range`); read-only, nothing appended.
-- **Reload watch** - the daemon reloads hosted sessions in place when
-  extension roots change; a busy session stays owed and is retried, and
-  a session that dies during a reload is not respawned.
+- **Reload** - `pi-rc extensions-reload` reloads every eligible idle
+  hosted session in place, once; a busy session is skipped and stays
+  owed nothing, so run it again when the session is idle, and a session
+  that dies during a reload is not respawned.
 - **`pi-rc run-state <name>`** - how that session's last run ended:
   `verdict`, `cause`, `state`. The daemon, not the session, keeps the
   record (`run-state/<name>.json`), and it is written from the wire

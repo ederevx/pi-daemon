@@ -331,7 +331,12 @@ There are no legacy names, no `PI_PTYD_*` fallbacks and no pi-teams
 aliases: the new service only reads its own names. Legacy configuration is
 not translated automatically: a `piDaemon` key - a ticket TTL, an
 extension watch or an idle window - has no counterpart here, and
-`migrate` translates none of it. The conversation index is configured by
+`migrate` translates none of it. Automatic extension-root watching is
+not provided either: the settings surface no longer offers `extWatch*`,
+those legacy keys and the `PI_PTYD_EXT_WATCH*` variables are ignored,
+and a reload is explicit - `/reload` in a session, or
+`pi-rc extensions-reload` for eligible idle hosted sessions, with a busy
+session skipped rather than owed. The conversation index is configured by
 `session_store_root`, `transcript_index`, `transcript_index_interval`,
 `transcript_index_max_bytes` and `transcript_index_max_line`. An empty
 `session_store_root` means the `sessions` directory of the agent home in
@@ -624,13 +629,26 @@ Order matters, and each step is reversible on its own:
    deleted in the same commit. No standalone broker exists in this
    tree. No adapter is written between old and new code, so the switch
    is the last commit that can be rolled back without a client change.
+   Done: the bootstrap imports `pi_daemon` from `lib/` beside it and
+   turns off bytecode writing, because the library it runs lives in a
+   release nothing may write to.
 7. Update the installer for the private tree (`lib/`, `bin/`,
    `daemon/`, `extensions/`), the unit files and the docs. Done: the
    installer provisions `pi-comms` and `pi_rpc_client.py` beside `pi-rc`,
    records manifest format 2 (with `scripts/install.sh` among its sources,
    so an installer-only advance re-provisions), and manual mode is gone -
-   the package is the only install and a bare run writes nothing. The
-   private tree and the unit's environment land with step 6.
+   the package is the only install and a bare run writes nothing.
+   Done with step 6: each install builds one generation under
+   `~/.local/lib/pi-daemon/releases/<id>/` and publishes it by replacing
+   manifest format 3 (active generation, retained ones, every source
+   digest, per-tree digests); `~/.local/bin` holds only dispatchers that
+   read the manifest, so an upgrade is a pointer swap and a running
+   daemon keeps its release. The installer asks itself (`--sources`) for
+   the inventory the provisioning stamp compares against, so an added or
+   removed module re-provisions as well as an edited one. The migration
+   runs from the candidate generation before any public file changes and
+   refuses (76) while a daemon serves the old state or endpoint, and a
+   held install lock exits 75.
 
 ## Cutover
 
@@ -737,8 +755,10 @@ share a runtime directory.
   schedule are in place on top of the mailbox, relay, waits, spawn and
   the `agent-comms` listener, so only the `peer-control` frame that
   carries a launch across the link remains.
-* Step 6: the entry switch, the private tree in the installer, the unit's
-  two roots, and the installer's call to `migrate`.
+* The unit's two roots and the installer's call to `migrate` shipped with
+  step 6; what remains there is the maintenance cutover on a host whose
+  legacy daemon is running, which the installer now refuses (76) instead
+  of attempting.
 * Discovery activation: the descriptor publishes `pi-rc daemon-start`
   and the client reports a missing service, but nothing yet starts one;
   the CLI's binding is explicit, so a second entry is never dialed.
