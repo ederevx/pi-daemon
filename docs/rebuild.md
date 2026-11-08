@@ -50,16 +50,26 @@ field against the installed clients:
 ```
 client → {"cmd": "hello", "token": "<from descriptor>"}
 server → {"ok": true, "srv": "pi-daemon", "proto": 1, "caps": [],
-          "index": 1, "commands": ["ticket-cancel", ...]}
+          "index": 1}
 client → {"cmd": "<command>", ...}
 server → {"ok": true, ...} | {"ok": false, "error": "<name>"}
 ```
 
-The error names are the published ones: `bad-handshake`,
-`bad-request`, `no-ticket`, `running`, `too-busy`, `spawn-failed`.
-The greeting advertises only capability this build serves, so `caps`
-stays empty until the transcript commands land; `commands` names the
-dispatch table.
+The greeting carries exactly those keys: a malformed frame or a hello
+that is not `cmd: hello` with the descriptor's token is answered
+`bad-handshake`. The error names are the published ones:
+`bad-handshake`, `bad-request`, `no-ticket`, `running`, `too-busy`,
+`spawn-failed`, and every failure reply is built by `error_reply` in
+`wire.py`, the single owner of the shape. The greeting advertises only
+capability this build serves, so `caps` stays empty until the
+transcript commands land; `index` stays at the published `1`.
+
+Request coercion matches the published server, because the installed
+clients rely on it: `timeout` and `offset` accept numbers and their
+string forms (a `null` wait timeout is `bad-request`), `ticket-list`
+accepts an empty session filter and answers the whole list, and an
+unknown command is answered `bad-request` without closing the
+connection.
 
 The ticket records use the published field names: `id` (never
 `ticket_id`), `exit` (never `exit_code`), `finished` (never `ended`),
@@ -81,7 +91,10 @@ transient per submission and is never stored in a record.
 * A ticket that exceeds its timeout ends `failed` with `timed out`,
   never a new status.
 * A running ticket that matches a new submission is replayed, not
-  started twice.
+  started twice, and that replay is decided before the running cap, so
+  a re-sent identical command never fails `too-busy`.
+* A paged read clamps an offset past the end and reports the clamped
+  offset, so `offset`, `next` and `size` always agree.
 
 ## Configuration
 

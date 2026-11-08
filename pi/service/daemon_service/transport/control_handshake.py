@@ -9,13 +9,13 @@ from ..wire import WireCodec
 class ControlHandshake:
     """Authorization and the greeting are decided once per connection.
 
-    The greeting advertises only capabilities this build really serves:
-    the command table it dispatches and the transcript index it keeps.
+    The greeting carries exactly the published keys; `caps` names only
+    capabilities this build really serves, so it stays empty until the
+    transcript commands land.
     """
 
-    def __init__(self, token, commands, capabilities=()):
+    def __init__(self, token, capabilities=()):
         self._token = token
-        self._commands = sorted(commands)
         self._capabilities = list(capabilities)
 
     def authorize(self, request):
@@ -30,5 +30,4 @@ class ControlHandshake:
             "proto": WireCodec.PROTOCOL,
             "caps": list(self._capabilities),
             "index": WireCodec.INDEX,
-            "commands": list(self._commands),
         }
