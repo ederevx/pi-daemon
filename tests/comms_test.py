@@ -1594,7 +1594,8 @@ class PeerBoundTests(PeerCase):
         # Past its expiry the sender may still retry once: that is a replay.
         self.assertEqual(self.store.accept_peer(NODE_B, delivery)
                          ["outcome"]["status"], "accepted")
-        self.now += self.config.comms_peer_clock_skew + 1
+        self.now += (self.config.comms_peer_clock_skew +
+                     self.config.comms_peer_request_timeout + 1)
         # Past the skew the marker is gone, so the same body is stale mail.
         self.assertEqual(self.store.accept_peer(NODE_B, delivery)
                          ["outcome"]["status"], "expired")

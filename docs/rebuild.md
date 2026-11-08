@@ -352,9 +352,9 @@ The remote proposes, this node disposes: an inbound expiry is clamped
 to our own maximum TTL, agent ids and kinds are held to our limits, and
 the dedupe markers are capped per source node, so a busy peer fills its
 own share and is told `capacity` rather than starving the others. A
-marker is kept only until the sender's own expiry plus the clock skew,
-which is all the margin a last retry needs, so the table cannot hold a
-day of traffic. An answer that does not carry the delivery it names,
+marker is kept only until the sender's own expiry plus the clock skew
+and one request timeout, which is all the margin a last in-flight retry
+needs, so the table cannot hold a day of traffic. An answer that does not carry the delivery it names,
 with a message id and a sequence this node can use, is not recorded as
 an outcome.
 

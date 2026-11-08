@@ -7,7 +7,6 @@ outbound link reads. It never holds a credential's contents.
 
 import json
 import threading
-import time
 import uuid
 
 from ..atomic_state_file import AtomicStateFile

@@ -61,7 +61,11 @@ class MailboxStore:
         self._peer_retention = config.comms_peer_retention
         self._outbox_records = config.comms_peer_outbox_records
         self._inbound_records = config.comms_peer_inbound_records
-        self._skew = config.comms_peer_clock_skew
+        # A last retry leaves just before the sender's own expiry and may
+        # take one request timeout to arrive, so the marker must outlive
+        # both or an accepted delivery would be answered as expired.
+        self._skew = (config.comms_peer_clock_skew +
+                      config.comms_peer_request_timeout)
         self._agent_limit = config.comms_agent_id_limit
         self._kind_limit = config.comms_kind_limit
         self._node_id = node_id
@@ -599,9 +603,9 @@ class MailboxStore:
                                "messageId": envelope["messageId"],
                                "sequence": envelope["sequence"]}
             inbound = dict(self._peer_deliveries)
-            # A marker only has to outlive the sender's retries, and those
-            # stop at the expiry the sender chose: the clock skew past it is
-            # all the margin a duplicate needs.
+            # A marker only has to outlive the sender's retries: the expiry
+            # the sender chose, the skew between the clocks, and one request
+            # in flight is all the margin a last duplicate needs.
             inbound[key] = {"digest": digest, "expiresAt": expires_at,
                             "retainUntil": expires_at + self._skew,
                             "outcome": self._detach(outcome)}
