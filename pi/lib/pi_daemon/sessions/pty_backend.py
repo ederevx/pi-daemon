@@ -3,6 +3,12 @@
 import os
 import struct
 import subprocess
+import time
+
+# How long a repaint holds the toggled size before restoring it. pi's
+# redraw is driven by the change event, and two changes in the same
+# instant coalesce into none; the legacy seam uses the same pause.
+REPAINT_TICK = 0.05
 
 from .pty_child import PtyChild
 from .pty_exec import PtyExec
@@ -41,6 +47,17 @@ class PosixPtyBackend:
                         self._config)
 
     def resize(self, master, cols, rows):
+        self._window(master, cols, rows)
+
+    def repaint(self, master, cols, rows):
+        """Force a full-frame repaint at the current size.
+
+        A carried viewer sees a cleared screen, and pi redraws only when
+        the size really changes, so one row is dropped and restored.
+        """
+        self._window(master, cols, max(int(rows) - 1, 1) if int(rows) > 1
+                     else int(rows))
+        time.sleep(REPAINT_TICK)
         self._window(master, cols, rows)
 
     def close(self, descriptor):

@@ -110,56 +110,55 @@ class SessionOperations:
             raise ValueError("to must be a session name")
         argv = request.get("argv")
         if argv is not None:
-            argv = _argv(request)
+            # A carry argv is passed to pi as it stands: unlike a start,
+            # the protocol has always allowed an empty entry here.
+            if not isinstance(argv, list) or not argv:
+                raise ValueError("an argv list is required")
+            if not all(isinstance(argument, str) for argument in argv):
+                raise ValueError("every argv entry must be a string")
+            argv = list(argv)
         return self._project(self._service.carry, _name(request), to, argv)
 
     def handover(self, request, connection):
         """Host a conversation a pi hands over as it exits.
 
-        A holding client keeps its connection open until that pi exits, so
-        the close - never a pid probe - is the signal to host.
+        A holding client simply keeps its connection open until that pi
+        exits; the close - never a pid probe - is the signal to host, so
+        the connection is parked by registering its close, not by reading
+        it: the endpoint keeps answering it as usual.
         """
-        try:
-            dir_ = _directory(request)
-        except SessionError as failure:
-            return error_reply(failure.code)
-        file_ = _path(request, "file")
-        after_pid = _optional_int(request.get("afterPid"), "afterPid")
-        hold = request.get("hold", False)
-        if not isinstance(hold, bool):
-            raise ValueError("hold must be a boolean")
+        file_ = _given(request, "file")
+        dir_ = _given(request, "dir")
+        after_pid = request.get("afterPid")
+        if after_pid is not None and not isinstance(after_pid, int):
+            raise ValueError("afterPid must be an integer")
+        hold = bool(request.get("hold"))
         message = request.get("message")
         if message is not None and not (isinstance(message, str)
                                         and 0 < len(message) <= MESSAGE_LIMIT):
-            raise ValueError("a message must be 1 to %d characters"
+            # The wire limit the legacy daemon enforced.
+            raise ValueError("a message of 1 to %d characters is allowed"
                              % MESSAGE_LIMIT)
+        if not os.path.isdir(dir_):
+            return error_reply(NO_DIR)
         plan = self._service.handover(dir_, file_)
         reply = {"ok": True, "verdict": plan["verdict"]}
         if plan["hosted"]:
             return reply
+        target = plan["target"]
 
         def host():
-            self._service.host_handover(dir_, file_, message)
+            # Off the connection's thread: the settle and the spawn must
+            # not hold the worker that is closing.
+            threading.Thread(
+                target=self._service.host_handover,
+                args=(target, dir_, file_, message),
+                name="handover-host", daemon=True).start()
 
         if connection is not None and (hold or after_pid is not None):
-            return ControlAction(
-                reply=reply,
-                after_send=lambda: self._hold(connection, host))
-        # No held connection: host now, off this connection's thread.
-        threading.Thread(target=host, name="handover-host",
-                         daemon=True).start()
-        return reply
-
-    @staticmethod
-    def _hold(connection, host):
-        """Park on the connection until the handing-over pi closes it."""
-        try:
-            connection.settimeout(None)
-            while connection.recv(4096):
-                pass
-        except OSError:
-            pass
+            return ControlAction(reply=reply, on_close=host)
         host()
+        return reply
 
     def detach(self, request):
         return self._project(self._service.detach, _name(request))
@@ -284,11 +283,14 @@ def _dimension(value, default):
     return value
 
 
-def _path(request, key):
+def _given(request, key):
+    """A path exactly as the client spelled it: the target name and the
+    conversation digest are derived from it, so normalizing it here would
+    change the names a client is promised."""
     value = request.get(key)
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value:
         raise ValueError("a %s is required" % key)
-    return os.path.abspath(os.path.expanduser(value))
+    return value
 
 
 def _optional_int(value, label):

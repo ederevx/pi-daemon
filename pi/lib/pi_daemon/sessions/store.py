@@ -287,9 +287,29 @@ class SessionStore:
                 self._write_run_state(key, state)
             self._write_document()
 
+    def stop_run(self, key, generation, reason="stop"):
+        """Record a stop for exactly this run, or refuse a successor.
+
+        The generation check and the stop are one locked step, so a run
+        that replaced this one between them is never asked to end.
+        """
+        with self._lock:
+            record = self._by_id(key)
+            if record is None or record.generation != generation \
+                    or not record.live():
+                return False
+            record.desired = "stopped"
+            state = self._run_states.get(key)
+            if state is not None:
+                state["stop_reason"] = reason
+                self._write_run_state(key, state)
+            self._write_document()
+            return True
+
     def stop_reason(self, key):
-        state = self._run_states.get(key) or {}
-        return state.get("stop_reason")
+        with self._lock:
+            state = self._run_states.get(key) or {}
+            return state.get("stop_reason")
 
     def set_clients(self, name, clients):
         with self._lock:
@@ -398,8 +418,9 @@ class SessionStore:
             return projection
 
     def name_of(self, key):
-        record = self._by_id(key)
-        return record.name if record is not None else None
+        with self._lock:
+            record = self._by_id(key)
+            return record.name if record is not None else None
 
     def _by_id(self, key):
         for record in self._sessions.values():

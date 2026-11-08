@@ -37,24 +37,23 @@ class SessionHandover:
         holder = self._live(target)
         return holder is not None and not _holds(holder, dir_)
 
-    def host(self, dir_, file, message=None):
-        """Host the conversation; None when it cannot be hosted."""
+    def host(self, target, dir_, file, message=None):
+        """Host the conversation under the promised target, or not at all."""
         time.sleep(self._settle)
         if not os.path.isfile(file):
             return None
-        target = self.target(dir_, file)
         if self._live(target) is not None:
             # Hosted between the request and the exit, or a second
             # handover won the name: hosting twice would diverge.
             return None
-        argv, _durable = self._command.resume(file, message)
+        argv, durable = self._command.resume(file, message)
         try:
-            view, created = self._runner.start(
+            record, created = self._runner.start(
                 target, dir_, argv, self._config.default_cols,
-                self._config.default_rows, file=file)
+                self._config.default_rows, file=file, durable_argv=durable)
         except SessionError:
             return None
-        return view["name"] if created else None
+        return record.name if created else None
 
     def _live(self, name):
         canonical = self._store.resolve(name)

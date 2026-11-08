@@ -25,16 +25,25 @@ class SessionRunner:
         self._closed = False
 
     def start(self, name, dir_, argv, cols, rows, env=None, env_once=None,
-              file=None):
-        """Reserve the name, spawn, record, register with the relay, exec."""
+              file=None, durable_argv=None):
+        """Reserve the name, spawn, record, register with the relay, exec.
+
+        It returns the reservation itself, not a view: a caller that must
+        end or move what it started needs this run's id and generation,
+        and re-reading the name could hand it a successor's.
+        """
+        # The record keeps the durable command only: a one-shot argument
+        # (a handover's message) is what this launch carries, not what a
+        # later revive may replay.
+        durable = list(durable_argv or argv)
         with self._lock:
             if self._closed:
                 raise SessionError(SPAWN_FAILED)
             record, created = self._store.reserve(
-                name, dir_, argv, cols, rows, env, file or self._store.file_of(name),
-                argv, self._owner)
+                name, dir_, durable, cols, rows, env,
+                file or self._store.file_of(name), durable, self._owner)
             if not created:
-                return record.view(), False
+                return record, False
             environment = self._environment(name, record, env_once)
         try:
             child = self._backend.spawn(argv, dir_, environment, cols, rows)
@@ -70,8 +79,7 @@ class SessionRunner:
         if closed or record.desired == "stopped":
             # A stop that landed before the start recorded the child.
             child.terminate()
-        started = self._store.get(record.name)
-        return started.view(), True
+        return record, True
 
     def stop(self, name, reason="stop"):
         """Ask one session to end; the watcher seals it."""
@@ -98,11 +106,8 @@ class SessionRunner:
 
     def stop_run(self, key, generation, reason="stop"):
         """End exactly the run this caller created, never a successor."""
-        record = self._store.get(self._store.name_of(key))
-        if record is None or record.id != key \
-                or record.generation != generation or not record.live():
+        if not self._store.stop_run(key, generation, reason):
             return False
-        self._store.request_stop(key, reason)
         with self._lock:
             child = self._children.get(key)
         if child is not None:
@@ -220,14 +225,14 @@ class SessionRunner:
         self._store.discard(key)
 
     def _environment(self, name, record, env_once):
+        # The legacy order: the hosted markers first, then the durable
+        # environment a caller passed, then the one-shot additions. A
+        # respawn reconstitutes a child from the durable record, so the
+        # markers there must already be in place.
         environment = dict(os.environ)
-        environment.update(record.env)
-        # A hosted child is told who it is: the extension keys its
-        # reload signals and its hosted-only behaviour off these, so they
-        # are set after the caller's overrides and cannot be forged.
         environment["PI_HOSTED"] = "1"
         environment["PI_HOSTED_SESSION"] = name
-        environment["PI_DAEMON_SESSION"] = name
+        environment.update(record.env)
         if env_once:
             environment.update(env_once)
         return environment

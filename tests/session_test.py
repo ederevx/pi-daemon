@@ -453,7 +453,8 @@ class OperationsTests(unittest.TestCase):
         service = StubService()
         hosted = []
         service.handover = lambda dir_, file: {"verdict": "target:pi-x",
-                                               "hosted": False}
+                                               "hosted": False,
+                                               "target": "pi-x"}
         service.host_handover = lambda *arguments: hosted.append(arguments)
         operations = self.operations(service)
         client, server = socket.socketpair()
@@ -465,16 +466,21 @@ class OperationsTests(unittest.TestCase):
         self.assertIsInstance(action, ControlAction)
         self.assertEqual(action.reply, {"ok": True, "verdict": "target:pi-x"})
         self.assertEqual(hosted, [])
+        self.assertIsNone(action.after_send)
         client.close()
-        action.after_send()
-        self.assertEqual(hosted, [(directory, "/conv.jsonl", None)])
+        action.on_close()
+        deadline = time.monotonic() + 5
+        while not hosted and time.monotonic() < deadline:
+            threading.Event().wait(0.01)
+        self.assertEqual(hosted, [("pi-x", directory, "/conv.jsonl", None)])
         server.close()
 
     def test_a_hosted_conversation_is_not_hosted_again(self):
         service = StubService()
         hosted = []
         service.handover = lambda dir_, file: {"verdict": "hosted:pi-x",
-                                               "hosted": True}
+                                               "hosted": True,
+                                               "target": "pi-x"}
         service.host_handover = lambda *arguments: hosted.append(arguments)
         directory = tempfile.mkdtemp(prefix="handover-")
         self.addCleanup(shutil.rmtree, directory, True)
@@ -662,13 +668,17 @@ class CarryRunner:
         self.stopped = []
 
     def start(self, name, dir_, argv, cols, rows, env=None, env_once=None,
-              file=None):
+              file=None, durable_argv=None):
         self.started.append((name, dir_, argv, cols, rows, file))
         if not self.created:
-            return {"name": name}, False
-        record, _ = self.store.reserve(name, dir_, argv, cols, rows, None,
-                                       None, argv, owner())
-        return record.view(), True
+            record, _ = self.store.reserve(name, dir_, argv, cols, rows, None,
+                                           None, argv, owner())
+            self.store.finish(record.id, "done", None)
+            return self.store.get(name), False
+        durable = durable_argv or argv
+        record, _ = self.store.reserve(name, dir_, durable, cols, rows, None,
+                                       file, durable, owner())
+        return record, True
 
     def stop_run(self, key, generation, reason="stop"):
         self.stopped.append((key, generation))
@@ -790,8 +800,8 @@ class HandoverTests(unittest.TestCase):
                          "pi-" + self.base)
         self.assertFalse(self.handover.taken("pi-" + self.base, self.dir))
 
-    def test_hosting_resumes_the_file_under_its_target(self):
-        name = self.handover.host(self.dir, self.file)
+    def test_hosting_resumes_the_file_under_its_promised_target(self):
+        name = self.handover.host("pi-" + self.base, self.dir, self.file)
         self.assertEqual(name, "pi-" + self.base)
         spawned = self.runner.started[0]
         self.assertEqual(spawned[0], name)
@@ -803,14 +813,31 @@ class HandoverTests(unittest.TestCase):
 
     def test_a_gone_conversation_is_not_hosted(self):
         os.unlink(self.file)
-        self.assertIsNone(self.handover.host(self.dir, self.file))
+        self.assertIsNone(
+            self.handover.host("pi-" + self.base, self.dir, self.file))
         self.assertEqual(self.runner.started, [])
 
     def test_a_name_hosted_meanwhile_is_not_hosted_twice(self):
         self.store.reserve("pi-" + self.base, self.dir, ["sh"], 80, 24,
                            None, self.file, ["sh"], owner())
-        self.assertIsNone(self.handover.host(self.dir, self.file))
+        self.assertIsNone(
+            self.handover.host("pi-" + self.base, self.dir, self.file))
         self.assertEqual(self.runner.started, [])
+
+    def test_the_promised_name_wins_over_a_newly_busy_primary(self):
+        self.store.reserve("pi-" + self.base, "/elsewhere", ["sh"], 80, 24,
+                           None, None, ["sh"], owner())
+        name = self.handover.host("pi-elsewhere", self.dir, self.file)
+        self.assertEqual(name, "pi-elsewhere")
+
+    def test_the_message_is_launched_but_never_remembered(self):
+        self.handover.host("pi-" + self.base, self.dir, self.file, "carry on")
+        spawned = self.runner.started[0]
+        self.assertEqual(spawned[5], self.file)
+        record = self.store.get("pi-" + self.base)
+        self.assertIn("carry on", spawned[2])
+        self.assertNotIn("carry on", record.argv)
+        self.assertNotIn("carry on", record.resume_argv)
 
 
 class DaemonTests(unittest.TestCase):

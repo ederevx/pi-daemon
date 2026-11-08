@@ -8,6 +8,8 @@ from ..wire import NAME_TAKEN, NO_SESSION, SPAWN_FAILED
 from .error import SessionError
 
 NO_FREE_NAME = "no-free-name"
+# How many random names one carry tries before it gives up and answers
+# `no-free-name`; the legacy daemon names a fresh target the same way.
 ATTEMPTS = 8
 
 
@@ -49,7 +51,7 @@ class SessionCarry:
         return record
 
     def _target(self, source, to, argv):
-        if to:
+        if to is not None:
             target = self._live(to)
             if target.id == source.id:
                 raise SessionError(NO_SESSION)
@@ -58,7 +60,7 @@ class SessionCarry:
         if name is None:
             raise SessionError(NO_FREE_NAME)
         try:
-            view, created = self._runner.start(
+            record, created = self._runner.start(
                 name, source.dir, self._command.fresh(argv),
                 source.cols, source.rows)
         except SessionError as failure:
@@ -66,10 +68,9 @@ class SessionCarry:
         if not created:
             # Another spawn won the name between the scan and the reserve.
             raise SessionError(NAME_TAKEN)
-        started = self._store.get(view["name"])
-        if started is None:
-            raise SessionError(NAME_TAKEN)
-        return started, True
+        # The reservation itself, not the name: a rollback must end this
+        # run and never whatever holds the name by then.
+        return record, True
 
     def _free_name(self, dir_, exclude):
         """A unique `pi-<dirbase>-<4hex>`, as the legacy daemon names one."""

@@ -76,6 +76,7 @@ class ControlEndpoint:
         stream = JsonLineStream(connection, self._config.frame_bytes,
                                 self._config.read_chunk_bytes)
         transferred = False
+        on_close = None
         try:
             try:
                 hello = self._codec.decode(stream.read())
@@ -87,6 +88,10 @@ class ControlEndpoint:
                 action = self._answer(self._codec.decode(stream.read()),
                                       connection)
                 if isinstance(action, ControlAction):
+                    # Registered before the reply goes out: a peer that
+                    # resets mid-reply still gets its close callback.
+                    if action.on_close is not None:
+                        on_close = action.on_close
                     transferred = self._apply(stream, action)
                     if transferred:
                         return
@@ -99,6 +104,8 @@ class ControlEndpoint:
             pass
         finally:
             stream.close()
+            if on_close is not None and not self._stopping.is_set():
+                self._closed(on_close)
             with self._lock:
                 self._connections.discard(connection)
                 self._workers = [worker for worker in self._workers
@@ -129,6 +136,14 @@ class ControlEndpoint:
             return self._router.dispatch(request, connection)
         except (LookupError, ValueError, KeyError):
             return error_reply(BAD_REQUEST)
+
+    @staticmethod
+    def _closed(callback):
+        """A close callback must never take the worker down with it."""
+        try:
+            callback()
+        except Exception:
+            pass
 
     @staticmethod
     def _close(socket_):

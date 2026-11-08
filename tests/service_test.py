@@ -621,6 +621,28 @@ class EndpointTests(unittest.TestCase):
                              "transcriptId": "t-nope"})
         self.assertEqual(missing["error"], "no-such-transcript")
 
+    def test_a_held_handover_keeps_serving_until_its_client_leaves(self):
+        directory = tempfile.mkdtemp(dir=SCRATCH)
+        gone = os.path.join(directory, "gone.jsonl")
+        reply = self.talk({"cmd": "handover", "dir": directory,
+                           "file": gone, "hold": True})
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(reply["verdict"].startswith("target:pi-"), reply)
+        # Parked, not blocked: the same connection still answers.
+        self.assertTrue(self.talk({"cmd": "list"})["ok"])
+        self.connection.close()
+        self.connection = None
+        # The close is the signal to host; the conversation is gone, so
+        # nothing is hosted and nothing is left behind.
+        time.sleep(0.8)
+        listed = self.talk({"cmd": "list"})
+        self.assertEqual(listed["sessions"], [])
+
+    def test_a_handover_without_a_directory_is_refused(self):
+        reply = self.talk({"cmd": "handover", "dir": "/does/not/exist",
+                           "file": "/tmp/gone.jsonl"})
+        self.assertEqual(reply["error"], "no-dir")
+
     def test_a_ticket_round_trip_over_the_wire(self):
         submitted = self.talk({"cmd": "ticket-submit", "session": "pi-1",
                                "cwd": SCRATCH, "command": "printf 'wire'"})

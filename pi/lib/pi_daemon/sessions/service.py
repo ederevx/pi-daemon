@@ -26,9 +26,10 @@ class SessionService:
     # -- hosting -----------------------------------------------------------
 
     def start(self, name, dir_, argv, cols, rows, env=None, env_once=None):
-        view, created = self._runner.start(name, dir_, argv, cols, rows,
-                                           env, env_once)
-        return {"name": view["name"], "created": created, "session": view}
+        record, created = self._runner.start(name, dir_, argv, cols, rows,
+                                             env, env_once)
+        return {"name": record.name, "created": created,
+                "session": record.view()}
 
     def sessions(self):
         views = self._store.snapshot()
@@ -96,14 +97,20 @@ class SessionService:
         return self._carry.carry(name, to, argv)
 
     def handover(self, dir_, file):
-        """Where a conversation an exiting pi leaves behind would be hosted."""
+        """Where a conversation an exiting pi leaves behind would be hosted.
+
+        The target is decided once, here: the name the client is promised
+        is the name the exit hosts, whatever the table does meanwhile.
+        """
         target = self._handover.target(dir_, file)
         if self._handover.taken(target, dir_):
-            return {"verdict": "hosted:" + target, "hosted": True}
-        return {"verdict": "target:" + target, "hosted": False}
+            return {"target": target, "verdict": "hosted:" + target,
+                    "hosted": True}
+        return {"target": target, "verdict": "target:" + target,
+                "hosted": False}
 
-    def host_handover(self, dir_, file, message=None):
-        return self._handover.host(dir_, file, message)
+    def host_handover(self, target, dir_, file, message=None):
+        return self._handover.host(target, dir_, file, message)
 
     def detach(self, name):
         record = self._record(name)

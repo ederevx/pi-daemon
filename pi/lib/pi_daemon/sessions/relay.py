@@ -220,7 +220,10 @@ class SessionRelay:
             target.pending[viewer_id] = bytearray(CLEAR_SEQ)
             moved += 1
         if moved and self._backend is not None:
-            self._backend.resize(target.master, cols, rows)
+            # pi redraws only on a real size change, so the carried
+            # viewer would otherwise stare at the cleared screen until
+            # the target happens to print.
+            self._backend.repaint(target.master, cols, rows)
         return {"moved": moved}
 
     def _complete(self, key):
