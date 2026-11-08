@@ -7,6 +7,8 @@ import subprocess
 import threading
 import time
 
+from ..wire import SPAWN_FAILED, TOO_BUSY
+from .error import TaskError
 from .model import CANCELLED, DONE, FAILED
 
 
@@ -26,24 +28,26 @@ class TicketRunner:
         self._shell = config.shell or (
             "cmd" if os.name == "nt" else (shutil.which("sh") or "/bin/sh"))
 
-    def submit(self, session, cwd, command, timeout=0.0):
+    def submit(self, session, cwd, command, timeout=0.0, env=None):
         with self._lock:
             if self._closed:
-                raise RuntimeError("the service is shutting down")
+                raise TaskError(TOO_BUSY)
+            if self._store.running_count() >= self._config.max_running:
+                raise TaskError(TOO_BUSY)
             snapshot, created = self._store.reserve(session, cwd, command,
                                                     timeout)
-            ticket_id = snapshot["ticket_id"]
+            ticket_id = snapshot["id"]
             if not created:
-                return snapshot
+                return snapshot, True
             event = threading.Event()
             self._events[ticket_id] = event
             self._timeouts[ticket_id] = snapshot["timeout"]
         try:
-            child = self._spawn(snapshot)
-        except (OSError, ValueError) as exc:
-            self._store.finish(ticket_id, FAILED, None, str(exc))
+            child = self._spawn(snapshot, env)
+        except (OSError, ValueError):
+            self._store.discard(ticket_id)
             self._release(ticket_id)
-            return self._store.snapshot_one(ticket_id)
+            raise TaskError(SPAWN_FAILED) from None
         with self._lock:
             self._children[ticket_id] = child
         self._store.mark_running(ticket_id, child.pid, time.time())
@@ -54,21 +58,27 @@ class TicketRunner:
         drain.start()
         threading.Thread(target=self._watch, name="ticket-watch", daemon=True,
                          args=(ticket_id, child)).start()
-        return self._store.snapshot_one(ticket_id)
+        return self._store.snapshot_one(ticket_id), False
 
     def wait(self, ticket_id, timeout=0.0):
         with self._lock:
             event = self._events.get(ticket_id)
         if event is not None and timeout is not None and timeout > 0:
             event.wait(timeout)
-        return self._store.snapshot_one(ticket_id)
+        snapshot = self._store.snapshot_one(ticket_id)
+        if snapshot is None:
+            raise LookupError(f"unknown ticket: {ticket_id}")
+        return snapshot
 
     def cancel(self, ticket_id):
         with self._lock:
             child = self._children.get(ticket_id)
             event = self._events.get(ticket_id)
         if child is None:
-            raise LookupError(f"no running ticket: {ticket_id}")
+            snapshot = self._store.snapshot_one(ticket_id)
+            if snapshot is None:
+                raise LookupError(f"unknown ticket: {ticket_id}")
+            return snapshot
         with self._lock:
             self._cancelled.add(ticket_id)
         self._terminate(child)
@@ -98,7 +108,7 @@ class TicketRunner:
         for drain in drains:
             drain.join(self._config.stop_grace)
 
-    def _spawn(self, snapshot):
+    def _spawn(self, snapshot, env=None):
         cwd = snapshot["cwd"]
         if not os.path.isdir(cwd):
             raise ValueError(f"no such directory: {cwd}")
@@ -110,10 +120,12 @@ class TicketRunner:
             args = [self._shell, "-c", snapshot["command"]]
             flags = 0
             session = True
+        environment = dict(os.environ)
+        environment.update(env or {})
         return subprocess.Popen(
-            args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, start_new_session=session,
-            creationflags=flags,
+            args, cwd=cwd, env=environment, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            start_new_session=session, creationflags=flags,
         )
 
     def _drain(self, ticket_id, pipe):

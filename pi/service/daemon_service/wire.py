@@ -1,18 +1,21 @@
-"""The control contract: pi-pty-host/1 framing, greeting and errors."""
+"""The control contract: names, framing, greeting and errors."""
 
-import hmac
 import json
+
+BAD_HANDSHAKE = "bad-handshake"
+BAD_REQUEST = "bad-request"
+NO_TICKET = "no-ticket"
+TICKET_RUNNING = "running"
+TOO_BUSY = "too-busy"
+SPAWN_FAILED = "spawn-failed"
 
 
 class WireCodec:
-    """One owner of the published protocol and its vocabulary."""
+    """One owner of the published protocol and its error vocabulary."""
 
-    SERVER = "pi-pty-host"
+    SERVER = "pi-daemon"
     PROTOCOL = 1
-
-    def __init__(self, token, commands):
-        self._token = token
-        self._commands = sorted(commands)
+    INDEX = 1
 
     def decode(self, line):
         try:
@@ -26,19 +29,8 @@ class WireCodec:
     def encode(self, message):
         return (json.dumps(message) + "\n").encode("utf-8")
 
-    def greet(self, request):
-        """The existing handshake: op hello, then the shared token."""
-        if request.get("op") != "hello":
-            raise PermissionError("a hello is required first")
-        supplied = str(request.get("token") or "")
-        if not hmac.compare_digest(supplied, self._token):
-            raise PermissionError("the token is not accepted")
-        return {
-            "ok": True,
-            "srv": self.SERVER,
-            "proto": self.PROTOCOL,
-            "commands": list(self._commands),
-        }
+    def hello_request(self, token):
+        return {"cmd": "hello", "token": token}
 
-    def error(self, message):
-        return {"ok": False, "error": message}
+    def error(self, code):
+        return {"ok": False, "error": code}

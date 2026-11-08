@@ -58,9 +58,9 @@ class DaemonApplication:
             tasks = TaskService(store, runner)
             handlers = TaskOperations(tasks).handlers()
             token = secrets.token_hex(16)
-            codec = WireCodec(token, handlers)
+            codec = WireCodec()
             endpoint = ControlEndpoint(
-                self._layout, self._config, ControlHandshake(codec),
+                self._layout, self._config, ControlHandshake(token, handlers),
                 ControlRouter(handlers), codec, self._instance, token,
             )
             endpoint.start()
