@@ -23,6 +23,8 @@ class ServiceConfig:
     drain_grace: float = 2.0
     cancel_grace: float = 2.0
     stop_grace: float = 5.0
+    max_running: int = 32
+    max_wait: float = 600.0
     record_cap: int = 200
     output_cap: int = 1048576
     file_mode: int = 0o600

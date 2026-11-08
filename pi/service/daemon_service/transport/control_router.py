@@ -11,7 +11,7 @@ class ControlRouter:
         return sorted(self._handlers)
 
     def dispatch(self, request):
-        operation = request.get("op")
+        operation = request.get("cmd")
         if not isinstance(operation, str) or not operation:
             raise ValueError("an operation name is required")
         handler = self._handlers.get(operation)
