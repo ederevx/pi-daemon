@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 from pi_daemon.config import ServiceConfig
 from pi_daemon.sessions.carry import SessionCarry
 from pi_daemon.sessions.error import SessionError
+from pi_daemon.sessions.handover import SessionHandover
 from pi_daemon.sessions.identity import ProcessIdentity
 from pi_daemon.sessions.model import SessionRecord
 from pi_daemon.sessions.operations import SessionOperations
@@ -448,6 +449,47 @@ class OperationsTests(unittest.TestCase):
             self.operations().carry(
                 {"cmd": "carry", "name": "pi-a", "to": 7})
 
+    def test_a_held_handover_hosts_only_after_the_client_leaves(self):
+        service = StubService()
+        hosted = []
+        service.handover = lambda dir_, file: {"verdict": "target:pi-x",
+                                               "hosted": False}
+        service.host_handover = lambda *arguments: hosted.append(arguments)
+        operations = self.operations(service)
+        client, server = socket.socketpair()
+        directory = tempfile.mkdtemp(prefix="handover-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        action = operations.handover(
+            {"cmd": "handover", "dir": directory, "file": "/conv.jsonl",
+             "hold": True}, server)
+        self.assertIsInstance(action, ControlAction)
+        self.assertEqual(action.reply, {"ok": True, "verdict": "target:pi-x"})
+        self.assertEqual(hosted, [])
+        client.close()
+        action.after_send()
+        self.assertEqual(hosted, [(directory, "/conv.jsonl", None)])
+        server.close()
+
+    def test_a_hosted_conversation_is_not_hosted_again(self):
+        service = StubService()
+        hosted = []
+        service.handover = lambda dir_, file: {"verdict": "hosted:pi-x",
+                                               "hosted": True}
+        service.host_handover = lambda *arguments: hosted.append(arguments)
+        directory = tempfile.mkdtemp(prefix="handover-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        reply = self.operations(service).handover(
+            {"cmd": "handover", "dir": directory, "file": "/conv.jsonl",
+             "hold": True}, None)
+        self.assertEqual(reply, {"ok": True, "verdict": "hosted:pi-x"})
+        self.assertEqual(hosted, [])
+
+    def test_a_handover_outside_a_directory_is_no_dir(self):
+        reply = self.operations().handover(
+            {"cmd": "handover", "dir": "/does/not/exist",
+             "file": "/conv.jsonl"}, None)
+        self.assertEqual(reply["error"], "no-dir")
+
     def test_an_unknown_run_state_is_refused(self):
         with self.assertRaises(ValueError):
             self.operations().state({"cmd": "state", "name": "pi-a",
@@ -619,8 +661,9 @@ class CarryRunner:
         self.started = []
         self.stopped = []
 
-    def start(self, name, dir_, argv, cols, rows, env=None, env_once=None):
-        self.started.append((name, dir_, argv, cols, rows))
+    def start(self, name, dir_, argv, cols, rows, env=None, env_once=None,
+              file=None):
+        self.started.append((name, dir_, argv, cols, rows, file))
         if not self.created:
             return {"name": name}, False
         record, _ = self.store.reserve(name, dir_, argv, cols, rows, None,
@@ -711,6 +754,63 @@ class CarryTests(unittest.TestCase):
         self.assertIn("/conv.jsonl", hosted)
         self.assertIn("carry on", hosted)
         self.assertNotIn("carry on", durable)
+
+
+class HandoverTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="work:", dir=SCRATCH)
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.file = os.path.join(self.dir, "conversation.jsonl")
+        with open(self.file, "w", encoding="utf-8") as handle:
+            handle.write("{}\n")
+        self.store, self.config = store_for(roots())
+        self.runner = CarryRunner(self.store)
+        self.handover = SessionHandover(self.store, self.runner,
+                                       PiCommand({}), self.config,
+                                       settle=0)
+        self.base = os.path.basename(self.dir).replace(":", "_")
+
+    def test_a_free_directory_names_the_primary_target(self):
+        self.assertEqual(self.handover.target(self.dir, self.file),
+                         "pi-" + self.base)
+
+    def test_another_directory_holding_the_name_gets_a_digest(self):
+        self.store.reserve("pi-" + self.base, "/elsewhere", ["sh"], 80, 24,
+                           None, None, ["sh"], owner())
+        target = self.handover.target(self.dir, self.file)
+        self.assertTrue(target.startswith("pi-%s-" % self.base), target)
+        self.assertEqual(len(target.rsplit("-", 1)[1]), 6)
+        self.assertTrue(self.handover.taken("pi-" + self.base, self.dir))
+        self.assertFalse(self.handover.taken(target, self.dir))
+
+    def test_the_same_directory_keeps_the_primary_target(self):
+        self.store.reserve("pi-" + self.base, self.dir, ["sh"], 80, 24,
+                           None, self.file, ["sh"], owner())
+        self.assertEqual(self.handover.target(self.dir, self.file),
+                         "pi-" + self.base)
+        self.assertFalse(self.handover.taken("pi-" + self.base, self.dir))
+
+    def test_hosting_resumes_the_file_under_its_target(self):
+        name = self.handover.host(self.dir, self.file)
+        self.assertEqual(name, "pi-" + self.base)
+        spawned = self.runner.started[0]
+        self.assertEqual(spawned[0], name)
+        self.assertEqual(spawned[1], self.dir)
+        self.assertIn("--session", spawned[2])
+        self.assertIn(self.file, spawned[2])
+        self.assertEqual(spawned[5], self.file)
+        self.assertTrue(self.store.get(name).live())
+
+    def test_a_gone_conversation_is_not_hosted(self):
+        os.unlink(self.file)
+        self.assertIsNone(self.handover.host(self.dir, self.file))
+        self.assertEqual(self.runner.started, [])
+
+    def test_a_name_hosted_meanwhile_is_not_hosted_twice(self):
+        self.store.reserve("pi-" + self.base, self.dir, ["sh"], 80, 24,
+                           None, self.file, ["sh"], owner())
+        self.assertIsNone(self.handover.host(self.dir, self.file))
+        self.assertEqual(self.runner.started, [])
 
 
 class DaemonTests(unittest.TestCase):

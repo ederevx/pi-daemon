@@ -1,6 +1,7 @@
 """The sessions domain's control operations, validation and error projection."""
 
 import os
+import threading
 
 from ..wire import NO_DIR, error_reply
 from ..transport.control_action import ControlAction
@@ -8,6 +9,7 @@ from .error import SessionError
 from .service import STATES
 
 NAME_LIMIT = 200
+MESSAGE_LIMIT = 8192
 DIMENSION_LIMIT = 65535
 
 
@@ -36,6 +38,7 @@ class SessionOperations:
             "announce": self.announce,
             "resume": self.resume,
             "handoff-target": self.handoff_target,
+            "handover": self.handover,
             "gc-reap-ack": self.gc_reap_ack,
             "daemon-purge": self.daemon_purge,
             "daemon-restart": self.daemon_restart,
@@ -109,6 +112,54 @@ class SessionOperations:
         if argv is not None:
             argv = _argv(request)
         return self._project(self._service.carry, _name(request), to, argv)
+
+    def handover(self, request, connection):
+        """Host a conversation a pi hands over as it exits.
+
+        A holding client keeps its connection open until that pi exits, so
+        the close - never a pid probe - is the signal to host.
+        """
+        try:
+            dir_ = _directory(request)
+        except SessionError as failure:
+            return error_reply(failure.code)
+        file_ = _path(request, "file")
+        after_pid = _optional_int(request.get("afterPid"), "afterPid")
+        hold = request.get("hold", False)
+        if not isinstance(hold, bool):
+            raise ValueError("hold must be a boolean")
+        message = request.get("message")
+        if message is not None and not (isinstance(message, str)
+                                        and 0 < len(message) <= MESSAGE_LIMIT):
+            raise ValueError("a message must be 1 to %d characters"
+                             % MESSAGE_LIMIT)
+        plan = self._service.handover(dir_, file_)
+        reply = {"ok": True, "verdict": plan["verdict"]}
+        if plan["hosted"]:
+            return reply
+
+        def host():
+            self._service.host_handover(dir_, file_, message)
+
+        if connection is not None and (hold or after_pid is not None):
+            return ControlAction(
+                reply=reply,
+                after_send=lambda: self._hold(connection, host))
+        # No held connection: host now, off this connection's thread.
+        threading.Thread(target=host, name="handover-host",
+                         daemon=True).start()
+        return reply
+
+    @staticmethod
+    def _hold(connection, host):
+        """Park on the connection until the handing-over pi closes it."""
+        try:
+            connection.settimeout(None)
+            while connection.recv(4096):
+                pass
+        except OSError:
+            pass
+        host()
 
     def detach(self, request):
         return self._project(self._service.detach, _name(request))
@@ -231,6 +282,13 @@ def _dimension(value, default):
     if not 1 <= value <= DIMENSION_LIMIT:
         raise ValueError("a terminal dimension is out of range")
     return value
+
+
+def _path(request, key):
+    value = request.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("a %s is required" % key)
+    return os.path.abspath(os.path.expanduser(value))
 
 
 def _optional_int(value, label):

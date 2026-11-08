@@ -14,12 +14,14 @@ STATES = ("busy", "idle", "waiting")
 class SessionService:
     """Operations speak names; the runner owns processes and the relay owns IO."""
 
-    def __init__(self, store, runner, relay, config, carry=None):
+    def __init__(self, store, runner, relay, config, carry=None,
+                 handover=None):
         self._store = store
         self._runner = runner
         self._relay = relay
         self._config = config
         self._carry = carry
+        self._handover = handover
 
     # -- hosting -----------------------------------------------------------
 
@@ -92,6 +94,16 @@ class SessionService:
         """/new without termination: move the viewers to a new conversation
         and leave this one running headless."""
         return self._carry.carry(name, to, argv)
+
+    def handover(self, dir_, file):
+        """Where a conversation an exiting pi leaves behind would be hosted."""
+        target = self._handover.target(dir_, file)
+        if self._handover.taken(target, dir_):
+            return {"verdict": "hosted:" + target, "hosted": True}
+        return {"verdict": "target:" + target, "hosted": False}
+
+    def host_handover(self, dir_, file, message=None):
+        return self._handover.host(dir_, file, message)
 
     def detach(self, name):
         record = self._record(name)

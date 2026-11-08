@@ -21,6 +21,7 @@ from .lifecycle.instance_coordinator import InstanceCoordinator
 from .runtime_layout import RuntimeLayout
 from .sessions.identity import ProcessIdentity
 from .sessions.carry import SessionCarry
+from .sessions.handover import SessionHandover
 from .sessions.launcher import SessionLauncher
 from .sessions.operations import SessionOperations
 from .sessions.pi_command import PiCommand
@@ -159,9 +160,11 @@ class DaemonApplication:
         runner = SessionRunner(store, relay, self._config, backend, owner)
         runner.recover()
         self._session_runner = runner
-        carry = SessionCarry(store, runner, relay,
-                             PiCommand(self._environment))
-        return SessionService(store, runner, relay, self._config, carry)
+        command = PiCommand(self._environment)
+        carry = SessionCarry(store, runner, relay, command)
+        handover = SessionHandover(store, runner, command, self._config)
+        return SessionService(store, runner, relay, self._config, carry,
+                              handover)
 
     def _compose_transcripts(self, sessions):
         """The conversation index reads pi's own store; the root was

@@ -24,13 +24,14 @@ class SessionRunner:
         self._threads = {}
         self._closed = False
 
-    def start(self, name, dir_, argv, cols, rows, env=None, env_once=None):
+    def start(self, name, dir_, argv, cols, rows, env=None, env_once=None,
+              file=None):
         """Reserve the name, spawn, record, register with the relay, exec."""
         with self._lock:
             if self._closed:
                 raise SessionError(SPAWN_FAILED)
             record, created = self._store.reserve(
-                name, dir_, argv, cols, rows, env, self._store.file_of(name),
+                name, dir_, argv, cols, rows, env, file or self._store.file_of(name),
                 argv, self._owner)
             if not created:
                 return record.view(), False
