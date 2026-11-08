@@ -29,6 +29,10 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FAILURES: list[str] = []
 
+# The unified service: one file per cohesive owner, no monoliths.
+SERVICE_PACKAGE = os.path.join("pi", "service", "daemon_service")
+SERVICE_MAX_LINES = 1200
+
 
 def fail(path: str, message: str) -> None:
     FAILURES.append(f"{path}: {message}")
@@ -183,6 +187,36 @@ def check_extension_format(root: str) -> None:
                 fail(path, "extension module must declare a default export")
 
 
+def _service_files(root: str) -> list[str]:
+    """Repo-relative files of the unified service package."""
+    base = os.path.join(root, SERVICE_PACKAGE)
+    found = []
+    for dirpath, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for name in sorted(files):
+            if name.endswith(".py"):
+                full = os.path.join(dirpath, name)
+                found.append(os.path.relpath(full, root).replace(os.sep, "/"))
+    return sorted(found)
+
+
+def check_service_shape(root: str) -> None:
+    """One cohesive owner per file: at most one top-level class, and no
+    file past the reviewable size. A function-only module is a function
+    library, not a second owner."""
+    for rel in _service_files(root):
+        with open(os.path.join(root, rel), "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        if len(lines) > SERVICE_MAX_LINES:
+            fail(rel, f"file is {len(lines)} lines (cap {SERVICE_MAX_LINES})")
+        classes = [line for line in lines if re.match(r"^class ", line)]
+        if rel.endswith("__init__.py"):
+            if classes:
+                fail(rel, "an __init__ declares a class; give it its own file")
+        elif len(classes) > 1:
+            fail(rel, f"{len(classes)} top-level classes in one file")
+
+
 def _extension_ts_files(root: str) -> list[str]:
     """Repo-relative .ts paths under pi/extensions, support dirs included."""
     ext_dir = os.path.join(root, "pi", "extensions")
@@ -207,12 +241,15 @@ def main() -> int:
     # Glob so a newly added extension or support module is covered without
     # editing this list; the two extension-less scripts are explicit.
     ts_files = _extension_ts_files(REPO)
-    py_files = (["pi/daemon/pi-daemon", "pi/bin/pi-rc"]
-                + _relative_files("pi/lib", ".py"))
+    py_files = (["pi/daemon/pi-daemon", "pi/bin/pi-rc",
+                 "pi/service/pi-daemon"]
+                + _relative_files("pi/lib", ".py")
+                + _service_files(REPO))
     for rel in ts_files:
         check_typescript(os.path.join(REPO, rel))
     for rel in py_files:
         check_python(os.path.join(REPO, rel))
+    check_service_shape(REPO)
     check_extension_format(REPO)
     check_no_subagent_residue(REPO)
     if FAILURES:
