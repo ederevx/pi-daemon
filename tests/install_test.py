@@ -448,6 +448,24 @@ class InstallScriptTests(unittest.TestCase):
         self.assertFalse((seams / "pi_platform.py").exists())
         self.assertEqual(self.scratch.manifest()["version"], 3)
 
+    def test_a_mutated_generation_is_rebuilt_rather_than_reused(self):
+        # A release is trusted by the content its name digests, so a tree
+        # changed after it was published is not published again.
+        clone = self.scratch.clone()
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        active = pathlib.Path(self.scratch.manifest()["active_root"])
+        with open(active / "lib" / "pi_services.py", "a",
+                  encoding="utf-8") as handle:
+            handle.write("\n# not ours\n")
+        with open(clone / "pi" / "lib" / "pi_services.py", "r",
+                  encoding="utf-8") as handle:
+            pristine = handle.read()
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        self.assertEqual(self.scratch.manifest()["active_root"], str(active),
+                         "the published content keeps its name")
+        self.assertEqual((active / "lib" / "pi_services.py").read_text(),
+                         pristine, "the mutated tree is rebuilt")
+
     def test_recovery_keeps_a_generation_it_did_not_create(self):
         # A publish that reuses an existing release created nothing, so an
         # interrupted run has nothing of its own to drop.

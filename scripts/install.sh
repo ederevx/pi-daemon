@@ -469,11 +469,15 @@ mkdir -p "$stage"
 build_tree "$stage"
 candidate="$releases/$(content_id "$stage")"
 created=0
-if [[ -d "$candidate" ]]; then
+if [[ -d "$candidate" \
+      && "$(content_id "$candidate")" == "$(basename "$candidate")" ]]; then
   rm -rf "$stage"
 else
   # Same filesystem, so the rename publishes a complete generation or
-  # nothing: no launcher can see a half-copied release.
+  # nothing: no launcher can see a half-copied release. A directory whose
+  # content is not the content its name digests was changed after it was
+  # published, so it is not reused.
+  rm -rf "$candidate"
   mv "$stage" "$candidate"
   created=1
 fi
