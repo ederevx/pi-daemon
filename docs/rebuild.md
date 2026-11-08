@@ -322,7 +322,10 @@ The tunnel is one ssh child in its own process group, in the
 foreground, so the process the daemon started is the forward it can
 stop. It is given the destination and both ports as argv, and the
 daemon runs no shell of its own: ssh's own `LocalCommand` carries
-nothing but the readiness marker. The
+nothing but the readiness marker. The argv does not override
+`ForkAfterAuthentication`, so a user's own ssh config must not turn the
+fork back on for this destination; the daemon's child is the forward it
+stops. The
 credential it reads lives in the comms domain's peer-credentials
 directory, must be a regular file of the daemon's own user with no
 group or other permission bits, and is opened without following a
@@ -347,10 +350,13 @@ verifier, or whose credential does not match it, is refused at
 
 The remote proposes, this node disposes: an inbound expiry is clamped
 to our own maximum TTL, agent ids and kinds are held to our limits, and
-the dedupe markers are bounded in count, so one peer cannot make mail
-or markers outlive our policy or fill the store. An answer that does
-not carry the delivery it names, with a message id and a sequence this
-node can use, is not recorded as an outcome.
+the dedupe markers are capped per source node, so a busy peer fills its
+own share and is told `capacity` rather than starving the others. A
+marker is kept only until the sender's own expiry plus the clock skew,
+which is all the margin a last retry needs, so the table cannot hold a
+day of traffic. An answer that does not carry the delivery it names,
+with a message id and a sequence this node can use, is not recorded as
+an outcome.
 
 A foreign address is routed under the store's own lock, so a removal
 cannot slip between the routing decision and the commit, and mail left
@@ -365,8 +371,10 @@ because this node cannot promise the remote mailbox did not take it.
 The answer reports both counts, and adding the peer again mints a new
 generation, so mail queued for the removed one can never be delivered
 as mail for the new one. A connection still bound to the removed
-generation is refused at `comms.peer.ping` with `peer-stale`, which
-sends its worker back to a fresh `rpc.hello` instead of wedging it.
+generation is refused at `comms.peer.ping` and at `comms.peer.deliver`
+with `peer-stale`, which sends its worker back to a fresh `rpc.hello`
+instead of wedging it: a steady stream of sends cannot keep a dead
+generation's link alive.
 
 The message envelope is bounded by the frame, not only by the payload
 limit, so a notification always fits the connection that carries it. A

@@ -1209,7 +1209,7 @@ class FakeTunnel:
         self.closed = 0
         self._address = ("127.0.0.1", 4242)
 
-    def start(self, peer):
+    def start(self, peer, cancel=None):
         self.started += 1
         if self._failure is not None:
             raise self._failure
@@ -1572,6 +1572,32 @@ class PeerBoundTests(PeerCase):
         # The replay of the accepted one is still answered, not refused.
         self.assertEqual(store.accept_peer(NODE_B, self.delivery("d1", text="one"))
                          ["outcome"]["status"], "accepted")
+
+    def test_the_inbound_marker_cap_is_per_source_node(self):
+        store = self._peer_store(comms_peer_inbound_records=1)
+        store.reserve("b")
+        store.accept_peer(NODE_B, self.delivery("d1", text="one"))
+        other = self.delivery("d2", text="two")
+        other["from"]["nodeId"] = NODE_C
+        accepted = store.accept_peer(NODE_C, other)
+        self.assertEqual(accepted["outcome"]["status"], "accepted")
+        # One node's full table is its own: a second peer still gets in.
+        with self.assertRaises(CommsError) as caught:
+            store.accept_peer(NODE_B, self.delivery("d3", text="three"))
+        self.assertEqual(caught.exception.code, "busy")
+
+    def test_a_marker_outlives_the_retries_it_must_absorb_and_no_more(self):
+        self.store.reserve("b")
+        delivery = self.delivery("d1", expires=self.now + 60)
+        self.store.accept_peer(NODE_B, delivery)
+        self.now += 61
+        # Past its expiry the sender may still retry once: that is a replay.
+        self.assertEqual(self.store.accept_peer(NODE_B, delivery)
+                         ["outcome"]["status"], "accepted")
+        self.now += self.config.comms_peer_clock_skew + 1
+        # Past the skew the marker is gone, so the same body is stale mail.
+        self.assertEqual(self.store.accept_peer(NODE_B, delivery)
+                         ["outcome"]["status"], "expired")
 
     def test_an_inbound_delivery_is_bounded_by_our_own_limits(self):
         self.store.reserve("b")

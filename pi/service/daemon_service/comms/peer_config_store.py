@@ -17,19 +17,16 @@ from .mailbox_store import BAD_REQUEST, STORE_CORRUPT
 SCHEMA = 1
 ACTIVE = "active"
 REMOVING = "removing"
-FIELDS = ("nodeId", "sshTarget", "remotePort", "localPort",
-          "outboundCredentialFile", "inboundCredentialSha256")
 
 
 class PeerConfigStore:
     """Configuration changes commit before any link or worker exists."""
 
-    def __init__(self, path, config, clock=None):
+    def __init__(self, path, config):
         self._file = AtomicStateFile(path, config.file_mode,
                                      config.write_retries,
                                      config.write_retry_delay)
         self._cap = config.comms_peer_cap
-        self._clock = clock or time.time
         self._lock = threading.RLock()
         self._peers = {}
 

@@ -36,12 +36,16 @@ class PeerTunnel:
         self._local_port = 0
         self._stopping = threading.Event()
 
-    def start(self, peer):
+    def start(self, peer, cancel=None):
         """Launch the forward and wait for its readiness marker."""
         with self._lock:
             if self._process is not None:
                 raise TunnelError("already-started")
             self._stopping.clear()
+            if cancel is not None and cancel.is_set():
+                # The worker stopped between its own check and this call: no
+                # child may be born into a session nobody will join.
+                raise TunnelError("tunnel-stopped")
             port = int(peer.get("localPort") or 0) or self._free_port()
             nonce = secrets.token_hex(8)
             argv = self._argv(peer, port, nonce)
@@ -58,7 +62,7 @@ class PeerTunnel:
             self._stderr = bytearray()
             self._start_reader(process.stdout, self._scan_stdout, nonce)
             self._start_reader(process.stderr, self._scan_stderr, None)
-            self._await_ready(process)
+            self._await_ready(process, cancel)
             if not self._ready.is_set():
                 detail = self.stderr_text()
                 self._shutdown()
@@ -73,11 +77,12 @@ class PeerTunnel:
                 raise TunnelError(f"{reason}: {detail}".strip())
             return ("127.0.0.1", port)
 
-    def _await_ready(self, process):
+    def _await_ready(self, process, cancel=None):
         """Wait for the marker in slices: a dead child or a stop ends it."""
         deadline = time.monotonic() + self._config.comms_peer_ready_timeout
         while not self._ready.is_set():
-            if self._stopping.is_set() or process.poll() is not None:
+            if self._stopping.is_set() or process.poll() is not None or \
+                    (cancel is not None and cancel.is_set()):
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:

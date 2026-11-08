@@ -145,7 +145,7 @@ class FakeTunnel:
         self.closed = 0
         self._address = ("127.0.0.1", 1)
 
-    def start(self, _peer):
+    def start(self, _peer, cancel=None):
         self.started += 1
         return self._address
 
@@ -996,7 +996,9 @@ class PeerWireTests(SocketCase):
                                                    {"nodeId": self.NODE_B})
         self.assertEqual(removed["status"], "removed")
         answer = peer.call("comms.peer.deliver", {"delivery": self.delivery()})
-        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+        # Gone generation means greet again, not a bad request the worker
+        # would retry forever against a link that can never succeed.
+        self.assertEqual(answer["error"]["code"], UNAUTHORIZED)
         self.assertEqual(self.harness.client("b").result(
             "comms.replay", {})["messages"], [])
 
@@ -1052,6 +1054,19 @@ class PeerWireTests(SocketCase):
                            "kind": "text", "payload": {"n": 1}})
         self.assertEqual(answer, {"status": "undeliverable",
                                   "reason": "no-such-peer"})
+
+    def test_a_delivery_on_a_stale_connection_also_says_greet_again(self):
+        self.configure()
+        peer = self.peer_client()
+        self.harness.client("op").result("comms.peer.remove",
+                                        {"nodeId": self.NODE_B})
+        self.configure()
+        answer = peer.call("comms.peer.deliver",
+                           {"delivery": self.delivery()})
+        # The same answer ping gives, so a worker's steady sends cannot keep
+        # a removed generation's link wedged.
+        self.assertEqual(answer["error"]["code"], UNAUTHORIZED)
+        self.assertIn("peer-stale", answer["error"]["message"])
 
     def test_a_connection_whose_generation_is_gone_must_greet_again(self):
         self.configure()

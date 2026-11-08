@@ -61,6 +61,7 @@ class MailboxStore:
         self._peer_retention = config.comms_peer_retention
         self._outbox_records = config.comms_peer_outbox_records
         self._inbound_records = config.comms_peer_inbound_records
+        self._skew = config.comms_peer_clock_skew
         self._agent_limit = config.comms_agent_id_limit
         self._kind_limit = config.comms_kind_limit
         self._node_id = node_id
@@ -512,6 +513,11 @@ class MailboxStore:
                 "expiresAt": expires_at, "peerNodeId": peer["nodeId"],
                 "receipt": self._detach(receipt)}
 
+    def _inbound_count_locked(self, peer_node_id):
+        """The markers one source node holds; the key names it first."""
+        return sum(1 for key in self._peer_deliveries
+                   if json.loads(key)[0] == peer_node_id)
+
     def accept_peer(self, peer_node_id, delivery):
         """The remote node's one envelope, or the refusal it must learn.
 
@@ -551,7 +557,10 @@ class MailboxStore:
                     raise CommsError(REQUEST_CONFLICT)
                 return {"outcome": self._detach(stored["outcome"]),
                         "envelope": None}
-            if len(self._peer_deliveries) >= self._inbound_records:
+            # The markers are per source node: one busy peer fills its own
+            # share and is told capacity, never every peer's.
+            if self._inbound_count_locked(peer_node_id) >= \
+                    self._inbound_records:
                 raise CommsError(BUSY)
             if now >= expires_at:
                 return {"outcome": {"status": EXPIRED,
@@ -590,8 +599,11 @@ class MailboxStore:
                                "messageId": envelope["messageId"],
                                "sequence": envelope["sequence"]}
             inbound = dict(self._peer_deliveries)
+            # A marker only has to outlive the sender's retries, and those
+            # stop at the expiry the sender chose: the clock skew past it is
+            # all the margin a duplicate needs.
             inbound[key] = {"digest": digest, "expiresAt": expires_at,
-                            "retainUntil": expires_at + self._dedupe_ttl,
+                            "retainUntil": expires_at + self._skew,
                             "outcome": self._detach(outcome)}
             self._commit_locked(candidate, self._receipts, self._outbox,
                                 inbound)

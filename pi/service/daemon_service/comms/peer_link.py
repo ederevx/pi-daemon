@@ -106,10 +106,6 @@ class PeerLink:
                 raise RpcError(code, str(error.get("message") or "refused"))
             return message.get("result")
 
-    def frame_limit(self):
-        """The frame the remote daemon accepts, learned from its greeting."""
-        return self._frame_limit
-
     def interrupt(self):
         """Break a request that is waiting, without taking the lock."""
         connection = self._socket
@@ -161,7 +157,11 @@ class PeerLink:
             raise PeerLinkError("missing-method")
         frame = greeting.get("maxFrameBytes")
         if isinstance(frame, bool) or not isinstance(frame, int) or \
-                frame > self._config.frame_bytes:
+                frame > self._config.frame_bytes or \
+                frame < self._config.comms_payload_bytes + \
+                self._config.comms_frame_margin:
+            # Too small a frame would refuse every delivery, so a greeting
+            # that cannot hold a payload plus its envelope is no peer.
             raise PeerLinkError("frame-limit")
         server_time = greeting.get("serverTime")
         if isinstance(server_time, (int, float)) and \

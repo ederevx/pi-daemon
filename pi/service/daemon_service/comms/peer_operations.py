@@ -30,7 +30,7 @@ CODES = {
     STORE_CORRUPT: UNAVAILABLE,
     STORE_FAILED: UNAVAILABLE,
     CLOSING: UNAVAILABLE,
-    STALE_PEER: INVALID_PARAMS,
+    STALE_PEER: UNAUTHORIZED,
     CONFIG_CONFLICT: INVALID_PARAMS,
 }
 
@@ -68,6 +68,8 @@ class PeerOperations:
         if not isinstance(params, dict) or \
                 not isinstance(params.get("delivery"), dict):
             raise RpcError(INVALID_PARAMS, "a delivery object is required")
+        # A worker whose generation is gone is told to greet again, the same
+        # answer ping gives, so a removed peer's link cannot stay wedged.
         return self._call(self._manager.deliver, peer["nodeId"],
                           peer["generation"], params["delivery"])
 

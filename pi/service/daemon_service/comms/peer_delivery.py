@@ -89,7 +89,7 @@ class PeerDelivery:
 
     def _connect(self):
         try:
-            address = self._tunnel.start(self._peer)
+            address = self._tunnel.start(self._peer, cancel=self._stop)
             credential = self._credentials.outbound_credential(self._peer)
             self._link.open(address, self._peer, credential,
                             self._config.comms_peer_request_timeout)
