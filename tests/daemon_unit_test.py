@@ -65,7 +65,7 @@ def load(name, path):
     return SourceFileLoader(name, path).load_module()
 
 
-daemon = load("pi_daemon", os.path.join(REPO, "pi", "daemon", "pi-daemon"))
+daemon = load("legacy_daemon", os.path.join(REPO, "pi", "daemon", "pi-daemon"))
 pi_rc = load("pi_rc", os.path.join(REPO, "pi", "bin", "pi-rc"))
 
 PASS = 0

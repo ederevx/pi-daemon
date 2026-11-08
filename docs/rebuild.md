@@ -540,11 +540,12 @@ Order matters, and each step is reversible on its own:
    tested there; only its call from the installer waits for step 6,
    because until the swap the root it reads keeps changing.
 6. Switch the entry point only after the clients and the installer
-   land: `pi/daemon/pi-daemon` becomes the thin bootstrap, the staging
-   entry in `pi/service/` is deleted, and the old monolith and the
-   standalone broker are deleted in the same commit. No
-   adapter is written between old and new code, so the switch is the
-   last commit that can be rolled back without a client change.
+   land: `pi/daemon/pi-daemon` becomes the thin bootstrap, replacing
+   the legacy monolith, and the staging entry in `pi/service/` is
+   deleted in the same commit. No standalone broker exists in this
+   tree, so nothing beyond the monolith is removed. No adapter is
+   written between old and new code, so the switch is the last commit
+   that can be rolled back without a client change.
 7. Update the installer for the private tree (`lib/`, `bin/`,
    `daemon/`, `extensions/`), the unit files and the docs. Done: the
    installer provisions `pi-comms` and `pi_rpc_client.py` beside `pi-rc`,
