@@ -43,10 +43,10 @@ package's `provision` extension reconciles on every session start: when
 the clone's sources differ from what the install manifest recorded, it
 re-runs `scripts/install.sh --package` in the background. Together they
 provision the systemd user unit, the `pi-rc` and `pi-comms` clients, the
-`pi` wrapper, the daemon, and the seam modules to the same manual paths.
+`pi` wrapper, the daemon, and the seam modules to the agent-home paths.
 pi skips `npm install` when an updated pin resolves to the commit already
 checked out, so the session-start reconciliation is what applies such an
-update. Provisioning removes extension copies a prior manual install owned
+update. Provisioning removes extension copies a prior install owned
 so only one loader source remains; if a leftover copy aborts sessions with
 tool-conflict errors before that can happen, run
 `bash scripts/install.sh --package`. Adopt a new daemon binary with
@@ -55,14 +55,15 @@ tool-conflict errors before that can happen, run
 ## Agent comms
 
 ```bash
-pi-comms node                       # this node's identity and endpoints
-pi-comms send --to reviewer --text "the rebuild branch is green"
-pi-comms wait --timeout-ms 600000   # the next mail for my identity
+pi-comms --agent me node               # identity and what the service answers
+pi-comms --agent me send reviewer --text "the rebuild branch is green"
+pi-comms --agent me wait --timeout-ms 600000   # the next mail for me
 ```
 
 The identity is `--agent` or `PI_COMMS_AGENT_ID`; there is no default,
-because binding an identity creates its mailbox. Exit codes: 0 ok, 1
-usage, 2 the service declined, 3 the wait timed out, 4 no service
+because binding an identity creates its mailbox. `--agent` is an option of
+the program, so it precedes the command. Exit codes: 0 ok, 1 usage,
+2 the service declined, 3 the wait timed out, 4 no service
 (nothing was sent), 5 a JSON-RPC error, 6 the token was refused, 7 the
 request may have been acted on (retry with the same `--request-id`). The
 extension exposes the same surface as
@@ -81,7 +82,7 @@ staging service runs with explicit roots.
 ## Uninstall
 
 ```bash
-pi remove github.com/ederevx/pi-daemon
+pi remove git:github.com/ederevx/pi-daemon
 bash scripts/uninstall.sh
 ```
 

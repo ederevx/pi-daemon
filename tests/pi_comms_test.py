@@ -236,6 +236,12 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 1, completed.stderr)
         self.assertIn("agent id", completed.stderr)
 
+    def test_an_unknown_option_is_a_usage_error(self):
+        # Exit 2 is the service declining, so a typo must not borrow it.
+        completed = self.fixture.run("send", "--to", "bob", "hi")
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertIn("error", completed.stderr)
+
     def test_peer_list_speaks_json(self):
         completed = self.fixture.run("peer", "list")
         self.assertEqual(completed.returncode, 0, completed.stderr)

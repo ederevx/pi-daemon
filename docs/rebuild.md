@@ -548,9 +548,12 @@ other's lock, registry or descriptor:
 |---|---|---|
 | state | `$XDG_STATE_HOME/pi-pty-host/` | `PI_DAEMON_STATE_DIR` |
 | | `tickets.json`, `tickets/` | `tasks/tickets.json`, `tasks/logs/` |
-| | `sessions.json`, `session-files.json` | `sessions/sessions.json` |
+| | `sessions.json` | `sessions/sessions.json` |
+| | `session-files.json` (a transcript-file index) | none: dropped |
 | | `run-state/<name>.json` | `sessions/runs/<key>.json` |
-| | `piDaemon` keys in `settings.json` | `PI_DAEMON_*` (`settings.json`) |
+| | the `piDaemon` keys of the agent home's `settings.json` | |
+| | | `<state>/settings.json`, an optional `daemon` section |
+| | | `PI_DAEMON_<FIELD>`, which overrides a field |
 | runtime | `$XDG_RUNTIME_DIR/pi-pty-host.sock` | `PI_DAEMON_RUNTIME_DIR` |
 
 `migrate` is the new entry's own subcommand, never `pi-rc` (a client that
@@ -568,10 +571,17 @@ is not a merge; a run while the new instance lock is held refuses
 outright. The legacy root is never written, which is what makes rollback
 independent of the new code.
 
-The order is: stop the unit, `migrate --dry-run`, `migrate`, swap the
-entry point, start the unit. The installer runs the translation, not
-`ExecStartPre`: with `Restart=on-failure` and `StartLimitIntervalSec=0` a
-failing pre-start command would restart every two seconds forever.
+The order follows from `migrate` belonging to the new entry, which only
+exists after the swap. Stop the unit, then install the new release with
+`PI_DAEMON_STATE_DIR` and `PI_DAEMON_RUNTIME_DIR` exported to the values
+the unit will use. That installer replaces the launcher and the unit, runs
+`migrate --dry-run` and then `migrate`, and only afterwards runs
+`systemctl --user enable --now`; a failed translation starts nothing,
+because a started service would take the instance lock and the next
+`migrate` would refuse on it. The installer runs the translation rather
+than `ExecStartPre`: with `Restart=on-failure` and
+`StartLimitIntervalSec=0` a failing pre-start command would restart every
+two seconds forever.
 
 ## Rollback
 
@@ -581,13 +591,20 @@ written:
 1. `systemctl --user stop pi-daemon.service`.
 2. `pi install git:github.com/ederevx/pi-daemon@<the previous tag>`: its
    postinstall restores the previous `pi-daemon` launcher and unit.
-3. `systemctl --user start pi-daemon.service`.
+3. `rm -f ~/.local/bin/pi-comms ~/.local/bin/pi_rpc_client.py`: the
+   previous release's manifest does not own them, so its `uninstall.sh`
+   would leave them behind.
+4. `systemctl --user start pi-daemon.service`, unless step 2 already did:
+   the postinstall runs `enable --now`, so this step only matters where
+   systemd is absent and that call did nothing.
 
-The new state root stays in place as evidence, and `migration.json` is
-what says it was already translated, so a later attempt re-adopts it
-instead of translating twice. The instance lock and the runtime
-descriptor are per-root, so the two implementations never share a runtime
-directory.
+The new state root stays in place as evidence. A rollback moves the
+legacy state again, because the legacy daemon keeps writing it, so the
+next `migrate` refuses on the changed hashes; `--force` is what
+retranslates it, and it replaces the new root rather than merging into it,
+which is why the marker never re-adopts a translated root silently. The
+instance lock and the runtime descriptor are per-root, so the two
+implementations never share a runtime directory.
 
 ## Open work
 

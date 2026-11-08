@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * Provision a fresh pi package install to the manual paths.
+ * Provision a fresh pi package install to the agent-home paths.
  *
  * `pi install` runs `npm install` in the clone, which runs this script. It
  * invokes `scripts/install.sh --package` so the systemd unit, pi-rc client,
- * pi wrapper, daemon, and seam modules land in the same locations the
- * manual installer uses, while the extensions keep loading from the package
+ * pi wrapper, daemon, and seam modules land in the same locations a manual
+ * install used, while the extensions keep loading from the package
  * itself. pi skips `npm install` when an updated pin resolves to the commit
  * already checked out, so this hook only covers a fresh install: the
  * session-start reconciliation in `pi/extensions/provision.ts` provisions
@@ -14,7 +14,7 @@
  * This must never fail the enclosing `npm install`: pi's git installer
  * deletes a freshly cloned package when `npm install` exits nonzero, so a
  * provisioning problem is reported as a warning and the install still
- * succeeds. The manual installer remains available for a retry.
+ * succeeds. Re-running the installer by hand retries it.
  */
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";

@@ -377,8 +377,20 @@ def _explain_decline(result):
               file=sys.stderr)
 
 
+class _Parser(argparse.ArgumentParser):
+    """A parse failure is a usage error, never argparse's own exit 2.
+
+    Exit 2 already means the service declined, and a caller that reads it
+    that way would report a typo as a refusal.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, "%s: error: %s\n" % (self.prog, message))
+
+
 def _parser():
-    parser = argparse.ArgumentParser(prog="pi-comms", usage=USAGE)
+    parser = _Parser(prog="pi-comms", usage=USAGE)
     parser.add_argument("--agent", metavar="ID",
                         help="the identity to bind (default PI_COMMS_AGENT_ID)")
     parser.add_argument("--endpoint", metavar="FILE",

@@ -72,6 +72,17 @@ def winform(path):
         text = text[1].upper() + ":" + text[2:]
     return os.path.normpath(text)
 
+def msysform(path):
+    """The form the bash installer writes into a manifest: its own $var.
+
+    A seeded manifest has to speak that form, because the cleanup compares
+    the recorded text against the destination as bash sees it, not against
+    what pathlib reports."""
+    text = winform(path).replace("\\", "/")
+    if len(text) > 1 and text[1] == ":":
+        text = "/" + text[0].lower() + text[2:]
+    return text
+
 
 @unittest.skipUnless(BASH, "no bash interpreter available")
 class InstallScriptTests(unittest.TestCase):
@@ -134,14 +145,14 @@ class InstallScriptTests(unittest.TestCase):
         ext_dir.mkdir(parents=True)
         for name in ("daemon.ts", "offload.ts"):
             dst = ext_dir / name
-            shutil.copyfile(ROOT / "pi" / "extensions" / name, dst)
             dst.write_text("// an older install's copy\n")
         state = self.scratch.path(".pi/agent/.pi-daemon")
         state.mkdir(parents=True)
         (state / "manifest.json").write_text(json.dumps({
             "version": 1,
             "mode": "manual",
-            "owned": [str(ext_dir / name) for name in ("daemon.ts", "offload.ts")],
+            "owned": [msysform(ext_dir / name)
+                      for name in ("daemon.ts", "offload.ts")],
             "hashes": {},
             "sources": {},
         }))

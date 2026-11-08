@@ -73,8 +73,8 @@ export class ProvisionStamp {
 	}
 }
 
-/** Invokes the manual installer's package mode, which owns every
- *  destination path and the atomic replacement of each file. */
+/** Invokes the installer's package mode, which owns every destination
+ *  path and the atomic replacement of each file. */
 export class PackageProvisioner {
 	constructor(repoRoot) {
 		this.repoRoot = repoRoot;
