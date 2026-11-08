@@ -268,14 +268,15 @@ class SessionStore:
                 return None
             state = self._run_states.get(key) \
                 or self._run_state_for(key) or {}
+            if record.phase == "exited" or state.get("ended"):
+                return state.get("ended")
             state.setdefault("state", "idle")
             state.setdefault("seq", 0)
             verdict = RunOutcome.seal(
                 {"aborted": state.get("aborted")}, state.get("state"),
                 _announced(state), reason, returncode, now)
-            history = list(state.get("history") or [])
-            history.append(verdict)
-            state["history"] = history[-int(self._config.history_limit):]
+            # The verdict is `ended`; history only ever holds past runs, so
+            # a reopen can carry the seal forward without repeating it.
             state["ended"] = verdict
             state["open"] = False
             state["changed"] = now
@@ -306,8 +307,12 @@ class SessionStore:
             return record if record is not None and record.phase == "running" \
                 else None
 
-    def recover(self, instance, now=None):
-        """A new instance owns no child: seal what the last one left open."""
+    def recover(self, instance, skip=(), now=None):
+        """A new instance owns no child: seal what the last one left open.
+
+        A record whose process cannot be proven gone is named in `skip`: its
+        name is released, its run stays open as unsealed evidence.
+        """
         now = time.time() if now is None else now
         with self._lock:
             settled = 0
@@ -322,15 +327,11 @@ class SessionStore:
                 record.child = {"state": state.get("state") or "idle",
                                 "clients": 0}
                 record.started = None
-                if state.get("open"):
+                if state.get("open") and record.id not in set(skip):
                     state["ended"] = RunOutcome.seal(
                         {"aborted": state.get("aborted")},
                         state.get("state"), _announced(state), "lost", None,
                         now)
-                    history = list(state.get("history") or [])
-                    history.append(state["ended"])
-                    state["history"] = \
-                        history[-int(self._config.history_limit):]
                     state["open"] = False
                     state["changed"] = now
                     self._write_run_state(record.id, state)
