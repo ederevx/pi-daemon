@@ -47,11 +47,10 @@ class SessionRunner:
             child.identity = identity
             self._store.mark_started(record.id, child.pid, identity)
             master = child.disown_master()
-            try:
-                self._relay.register(record.id, record.generation, master)
-            except BaseException:
-                _close(master)
-                raise
+            # The queue runs in order, so a registration that timed out is
+            # still ahead of the close that `_abandon` queues behind it;
+            # the relay is the only owner that closes the master.
+            self._relay.register(record.id, record.generation, master)
             child.release()
         except (OSError, LookupError, TimeoutError) as exc:
             self._abandon(record.id, child)
@@ -61,10 +60,14 @@ class SessionRunner:
                                    name="session-watch", daemon=True)
         with self._lock:
             self._threads[record.id] = watcher
-            stopping = self._closed
+            closed = self._closed
         watcher.start()
-        if stopping:
-            # Shutdown started while this child was being recorded.
+        if closed:
+            # Shutdown started while this child was being recorded, before
+            # the snapshot that names its run.
+            self._store.request_stop(record.id, "shutdown")
+        if closed or record.desired == "stopped":
+            # A stop that landed before the start recorded the child.
             child.terminate()
         started = self._store.get(record.name)
         return started.view(), True
@@ -172,7 +175,10 @@ class SessionRunner:
                 pass
             self._store.finish(key, self._reason(key), returncode)
         finally:
-            self._relay.close(key)
+            try:
+                self._relay.close(key)
+            except Exception:
+                pass
             child.close()
             with self._lock:
                 self._children.pop(key, None)
@@ -206,15 +212,6 @@ class SessionRunner:
         if env_once:
             environment.update(env_once)
         return environment
-
-
-def _close(descriptor):
-    if descriptor is None or descriptor < 0:
-        return
-    try:
-        os.close(descriptor)
-    except OSError:
-        pass
 
 
 def _end_group(pid, grace):

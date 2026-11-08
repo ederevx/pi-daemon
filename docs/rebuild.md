@@ -188,7 +188,7 @@ A verdict is decided in one place, `RunOutcome.seal`, and the order is
 the contract: daemon stop, then explicit stop, then reload death, then
 lost ownership, then a death mid-run (a signal or a non-zero exit) or
 an exit mid-run, then a crash at the prompt, then an aborted run, then
-settled, and finally `unknown` for a run that never announced itself.
+`unknown` for a run that never announced itself, and otherwise settled.
 `ended` is the current run's verdict and `history` holds only earlier
 runs: a reopen moves the previous `ended` into `history`, so a death
 and a revive never erase the death and never repeat it. A run is sealed
@@ -301,7 +301,16 @@ the two implementations never share a runtime directory.
 
 ## Open work
 
-* Sessions, run state, revive, handoff and transcripts.
+* Transcripts and the deferred session operations (`carry`,
+  `extensions-reload`, `handover`, `daemon-restart`).
+* The relay uses `select()`, so a descriptor numbered 1024 or higher
+  would stall it; move to `selectors` before that is reachable.
+* Shutdown terminates children serially, one `cancel_grace` per child
+  that ignores SIGTERM; send SIGTERM to all of them first when the
+  session count grows.
+* A name whose last run was left unsealed (`unknown` identity) is
+  reachable by `run-state` only until the name is reserved again; a
+  record's run files should be found by id, not by the name's key.
 * Native comms: registry, relay, mailbox, waits, peers, and the
   `agent-comms` RPC listener.
 * Extension and `pi-rc` rewiring; installer and migration tooling.
