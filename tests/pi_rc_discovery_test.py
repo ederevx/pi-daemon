@@ -6,6 +6,8 @@ resolved path is one a client could dial; discovery itself never
 connects.
 """
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -182,6 +184,53 @@ class EndpointOptionTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised:
             pi_rc.endpoint_option(["--endpoint"])
         self.assertEqual(raised.exception.code, pi_rc.EXIT_USAGE)
+
+
+class SessionNameTests(unittest.TestCase):
+    def test_a_prefixed_name_is_not_prefixed_again(self):
+        self.assertEqual(pi_rc.session_name("pi-ederevx-9580"),
+                         "pi-ederevx-9580")
+        self.assertEqual(pi_rc.session_name("ederevx-9580"),
+                         "pi-ederevx-9580")
+        self.assertEqual(pi_rc.session_name("sfworkload-owner"),
+                         "pi-sfworkload-owner")
+
+    def test_a_revive_reopens_the_record_the_daemon_resolved(self):
+        replies = iter([
+            {"ok": False, "error": "no-session", "file": "/s/legacy.jsonl"},
+            {"ok": True, "name": "sfworkload-owner"},
+            {"ok": True, "created": True},
+            {"ok": True, "name": "sfworkload-owner", "state": "idle"},
+        ])
+        sent = []
+        flow = pi_rc.AttachFlow(None, pi_rc.session_name("sfworkload-owner"),
+                                80, 24, dir_="/tmp")
+        with mock.patch.object(pi_rc, "send_json",
+                               lambda sock, obj: sent.append(obj)), \
+                mock.patch.object(pi_rc, "read_json_line",
+                                  lambda sock: (next(replies), b"")), \
+                mock.patch.object(pi_rc.PROCESS, "pi_argv",
+                                  lambda args=(): ["pi"] + list(args)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            flow.handshake(None)
+        start = [request for request in sent
+                 if request["cmd"] == "start"][0]
+        self.assertEqual(start["name"], "sfworkload-owner")
+        self.assertEqual(start["argv"],
+                         ["pi", "--session", "/s/legacy.jsonl"])
+
+    def test_stopping_a_session_that_is_not_running_says_so(self):
+        client = mock.Mock()
+        client.control.return_value = {"ok": True, "name": "pi-x",
+                                       "queued": False, "alive": False,
+                                       "state": "idle"}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pi_rc.cmd_stop(["pi-x"], client)
+        self.assertIn("'pi-x' was not running", out.getvalue())
+        self.assertNotIn("stopped", out.getvalue())
+        client.control.assert_called_once_with({"cmd": "stop",
+                                                "name": "pi-x"})
 
 
 if __name__ == "__main__":

@@ -276,8 +276,12 @@ def session_base(name):
 
 
 def session_name(name):
-	# an explicit name is normalized exactly like a dir-basename one
-	return "pi-" + session_base(name)
+	# an explicit name is normalized exactly like a dir-basename one; a
+	# name that already carries the hosted prefix is not prefixed again
+	# (the daemon resolves exact, then the pi- variant, so a bare legacy
+	# record is still reached through its pi- form)
+	base = session_base(name)
+	return base if base.startswith("pi-") else "pi-" + base
 
 
 def session_for(explicit, dir_):
@@ -688,9 +692,23 @@ class AttachFlow:
 				# The daemon hands back the conversation file this name
 				# last backed, so a re-attach resumes that conversation
 				# instead of guessing the directory's latest.
-				return self._recreate(sock, (resp or {}).get("file"))
+				file_ = (resp or {}).get("file")
+				if file_:
+					# A recorded file means a record exists: reopen that
+					# record, not a second one under the spelling typed.
+					self.session = self._recorded_name(sock)
+				return self._recreate(sock, file_)
 			die("attach failed: %s" % error)
 		return resp, rest
+
+	def _recorded_name(self, sock):
+		# The daemon answers run-state with the spelling it stored a name
+		# under, which is what a revive must reopen.
+		send_json(sock, {"cmd": "run-state", "name": self.session})
+		resp, _ = read_json_line(sock)
+		if resp and resp.get("ok") and resp.get("name"):
+			return resp["name"]
+		return self.session
 
 	def _recreate(self, sock, file_=None):
 		argv = (PROCESS.pi_argv(["--session", file_]) if file_
@@ -1126,7 +1144,12 @@ def cmd_stop(args, client):
 	resp = client.control({"cmd": "stop", "name": session})
 	if not resp.get("ok"):
 		die("stop failed: %s" % resp.get("error"))
-	print("pi-rc: stopped '%s'" % session)
+	name = resp.get("name") or session
+	if resp.get("queued"):
+		print("pi-rc: stopped '%s'" % name)
+	else:
+		# already ended (or reaped): stopping it again is a no-op
+		print("pi-rc: '%s' was not running; nothing to stop" % name)
 
 
 def cmd_gc_reap_ack(args, client):
