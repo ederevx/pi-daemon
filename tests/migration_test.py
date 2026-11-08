@@ -11,13 +11,13 @@ import tempfile
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO, "pi", "service"))
+sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
-from daemon_service.config import ServiceConfig
-from daemon_service.lifecycle.instance_coordinator import InstanceCoordinator
-from daemon_service.runtime_layout import RuntimeLayout
-from daemon_service.sessions.store import SessionStore
-from daemon_service.tasks.store import TicketStore
+from pi_daemon.config import ServiceConfig
+from pi_daemon.lifecycle.instance_coordinator import InstanceCoordinator
+from pi_daemon.runtime_layout import RuntimeLayout
+from pi_daemon.sessions.store import SessionStore
+from pi_daemon.tasks.store import TicketStore
 
 ENTRY = os.path.join(REPO, "pi", "service", "pi-daemon")
 SCRATCH = tempfile.mkdtemp(prefix="pi-migration-")

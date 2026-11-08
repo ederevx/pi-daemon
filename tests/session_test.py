@@ -14,19 +14,19 @@ import time
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO, "pi", "service"))
+sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
-from daemon_service.config import ServiceConfig
-from daemon_service.sessions.error import SessionError
-from daemon_service.sessions.identity import ProcessIdentity
-from daemon_service.sessions.model import SessionRecord
-from daemon_service.sessions.operations import SessionOperations
-from daemon_service.sessions.pty_backend import PosixPtyBackend, service_root
-from daemon_service.sessions.relay import SessionRelay
-from daemon_service.sessions.runner import SessionRunner
-from daemon_service.sessions.run_outcome import RunOutcome
-from daemon_service.sessions.store import SessionStore
-from daemon_service.transport.control_action import ControlAction
+from pi_daemon.config import ServiceConfig
+from pi_daemon.sessions.error import SessionError
+from pi_daemon.sessions.identity import ProcessIdentity
+from pi_daemon.sessions.model import SessionRecord
+from pi_daemon.sessions.operations import SessionOperations
+from pi_daemon.sessions.pty_backend import PosixPtyBackend, service_root
+from pi_daemon.sessions.relay import SessionRelay
+from pi_daemon.sessions.runner import SessionRunner
+from pi_daemon.sessions.run_outcome import RunOutcome
+from pi_daemon.sessions.store import SessionStore
+from pi_daemon.transport.control_action import ControlAction
 
 SCRATCH = tempfile.mkdtemp(prefix="pi-sessions-")
 

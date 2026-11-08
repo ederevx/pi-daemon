@@ -16,25 +16,25 @@ import unittest
 from collections import deque
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO, "pi", "service"))
+sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
-from daemon_service.comms.mailbox_store import MailboxStore
-from daemon_service.comms.peer_auth import PeerAuthenticator
-from daemon_service.comms.peer_config_store import PeerConfigStore
-from daemon_service.comms.peer_manager import PeerManager
-from daemon_service.comms.service import CommsService
-from daemon_service.comms.spawn_ledger import SpawnLedger
-from daemon_service.config import ServiceConfig
-from daemon_service.runtime_layout import RuntimeLayout
-from daemon_service.sessions.error import SessionError
-from daemon_service.sessions.launcher import SessionLauncher
-from daemon_service.transport.json_line_stream import JsonLineStream
-from daemon_service.transport.rpc_codec import (CAPACITY, INVALID_PARAMS,
+from pi_daemon.comms.mailbox_store import MailboxStore
+from pi_daemon.comms.peer_auth import PeerAuthenticator
+from pi_daemon.comms.peer_config_store import PeerConfigStore
+from pi_daemon.comms.peer_manager import PeerManager
+from pi_daemon.comms.service import CommsService
+from pi_daemon.comms.spawn_ledger import SpawnLedger
+from pi_daemon.config import ServiceConfig
+from pi_daemon.runtime_layout import RuntimeLayout
+from pi_daemon.sessions.error import SessionError
+from pi_daemon.sessions.launcher import SessionLauncher
+from pi_daemon.transport.json_line_stream import JsonLineStream
+from pi_daemon.transport.rpc_codec import (CAPACITY, INVALID_PARAMS,
                                                 INVALID_REQUEST,
                                                 METHOD_NOT_FOUND,
                                                 PARSE_ERROR, UNAUTHORIZED,
                                                 UNAVAILABLE, RpcCodec)
-from daemon_service.transport.rpc_listener import RpcListener
+from pi_daemon.transport.rpc_listener import RpcListener
 
 TOKEN = "test-token"
 NODE = "local"

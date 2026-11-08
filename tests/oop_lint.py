@@ -29,8 +29,10 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FAILURES: list[str] = []
 
-# The unified service: one file per cohesive owner, no monoliths.
-SERVICE_PACKAGE = os.path.join("pi", "service", "daemon_service")
+# The unified service: one file per cohesive owner, no monoliths. It
+# lives in pi/lib beside the seam modules, so the installed tree and the
+# clone share one shape: daemon/pi-daemon imports lib/pi_daemon.
+SERVICE_PACKAGE = os.path.join("pi", "lib", "pi_daemon")
 SERVICE_MAX_LINES = 1200
 
 
@@ -245,6 +247,7 @@ def main() -> int:
                  "pi/service/pi-daemon"]
                 + _relative_files("pi/lib", ".py")
                 + _service_files(REPO))
+
     for rel in ts_files:
         check_typescript(os.path.join(REPO, rel))
     for rel in py_files:

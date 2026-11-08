@@ -8,49 +8,51 @@ installed clients keep working when the entry point switches.
 
 ## What exists now
 
-The staging tree lives beside the installed one until the switch:
+The unified service's package lives in `pi/lib/pi_daemon/`, beside the
+seam modules the clients already import; only its staging entry sits in
+`pi/service/` until the switch:
 
 ```
 pi/service/pi-daemon                     staging entry (bootstrap only)
-pi/service/daemon_service/application.py  DaemonApplication
-pi/service/daemon_service/config.py       ServiceConfig
-pi/service/daemon_service/runtime_layout.py     RuntimeLayout
-pi/service/daemon_service/atomic_state_file.py  AtomicStateFile
-pi/service/daemon_service/wire.py               WireCodec (pi-daemon/1)
-pi/service/daemon_service/lifecycle/instance_coordinator.py
-pi/service/daemon_service/transport/json_line_stream.py
-pi/service/daemon_service/transport/endpoint_file.py
-pi/service/daemon_service/transport/endpoint_probe.py
-pi/service/daemon_service/transport/control_handshake.py
-pi/service/daemon_service/transport/control_endpoint.py
-pi/service/daemon_service/transport/control_router.py
-pi/service/daemon_service/tasks/error.py    TaskError
-pi/service/daemon_service/tasks/model.py    Ticket
-pi/service/daemon_service/tasks/store.py    TicketStore
-pi/service/daemon_service/tasks/runner.py   TicketRunner
-pi/service/daemon_service/tasks/service.py  TaskService
-pi/service/daemon_service/tasks/operations.py   TaskOperations
-pi/service/daemon_service/sessions/error.py      SessionError
-pi/service/daemon_service/sessions/identity.py   ProcessIdentity
-pi/service/daemon_service/sessions/model.py      SessionRecord
-pi/service/daemon_service/sessions/run_outcome.py RunOutcome
-pi/service/daemon_service/sessions/store.py      SessionStore
-pi/service/daemon_service/sessions/service.py    SessionService
-pi/service/daemon_service/sessions/operations.py SessionOperations
-pi/service/daemon_service/sessions/runner.py     SessionRunner
-pi/service/daemon_service/sessions/relay.py      SessionRelay
-pi/service/daemon_service/sessions/relay_session.py RelaySession
-pi/service/daemon_service/sessions/pty_backend.py PosixPtyBackend
-pi/service/daemon_service/sessions/pty_child.py  PtyChild
-pi/service/daemon_service/sessions/pty_exec.py   PtyExec
-pi/service/daemon_service/transport/control_action.py ControlAction
-pi/service/daemon_service/migration/error.py       MigrationError
-pi/service/daemon_service/migration/legacy_root.py LegacyRoot
-pi/service/daemon_service/migration/translator.py  LegacyTranslator
-pi/service/daemon_service/migration/plan.py        MigrationPlan
-pi/service/daemon_service/migration/marker.py      MigrationMarker
-pi/service/daemon_service/migration/migration.py   Migration
-pi/service/daemon_service/migration/command.py     MigrateCommand
+pi/lib/pi_daemon/application.py           DaemonApplication
+pi/lib/pi_daemon/config.py                ServiceConfig
+pi/lib/pi_daemon/runtime_layout.py        RuntimeLayout
+pi/lib/pi_daemon/atomic_state_file.py     AtomicStateFile
+pi/lib/pi_daemon/wire.py                  WireCodec (pi-daemon/1)
+pi/lib/pi_daemon/lifecycle/instance_coordinator.py
+pi/lib/pi_daemon/transport/json_line_stream.py
+pi/lib/pi_daemon/transport/endpoint_file.py
+pi/lib/pi_daemon/transport/endpoint_probe.py
+pi/lib/pi_daemon/transport/control_handshake.py
+pi/lib/pi_daemon/transport/control_endpoint.py
+pi/lib/pi_daemon/transport/control_router.py
+pi/lib/pi_daemon/tasks/error.py           TaskError
+pi/lib/pi_daemon/tasks/model.py           Ticket
+pi/lib/pi_daemon/tasks/store.py           TicketStore
+pi/lib/pi_daemon/tasks/runner.py          TicketRunner
+pi/lib/pi_daemon/tasks/service.py         TaskService
+pi/lib/pi_daemon/tasks/operations.py      TaskOperations
+pi/lib/pi_daemon/sessions/error.py        SessionError
+pi/lib/pi_daemon/sessions/identity.py     ProcessIdentity
+pi/lib/pi_daemon/sessions/model.py        SessionRecord
+pi/lib/pi_daemon/sessions/run_outcome.py RunOutcome
+pi/lib/pi_daemon/sessions/store.py        SessionStore
+pi/lib/pi_daemon/sessions/service.py      SessionService
+pi/lib/pi_daemon/sessions/operations.py SessionOperations
+pi/lib/pi_daemon/sessions/runner.py       SessionRunner
+pi/lib/pi_daemon/sessions/relay.py        SessionRelay
+pi/lib/pi_daemon/sessions/relay_session.py RelaySession
+pi/lib/pi_daemon/sessions/pty_backend.py PosixPtyBackend
+pi/lib/pi_daemon/sessions/pty_child.py    PtyChild
+pi/lib/pi_daemon/sessions/pty_exec.py     PtyExec
+pi/lib/pi_daemon/transport/control_action.py ControlAction
+pi/lib/pi_daemon/migration/error.py       MigrationError
+pi/lib/pi_daemon/migration/legacy_root.py LegacyRoot
+pi/lib/pi_daemon/migration/translator.py  LegacyTranslator
+pi/lib/pi_daemon/migration/plan.py        MigrationPlan
+pi/lib/pi_daemon/migration/marker.py      MigrationMarker
+pi/lib/pi_daemon/migration/migration.py   Migration
+pi/lib/pi_daemon/migration/command.py     MigrateCommand
 ```
 
 Each file owns one cohesive responsibility and one primary class. The
@@ -516,7 +518,8 @@ delivery receipts only - never membership, spawn or session control.
 
 Order matters, and each step is reversible on its own:
 
-1. Ship the new package beside the installed one (`pi/service/`), with
+1. Ship the new package beside the installed one (`pi/lib/pi_daemon/`,
+   driven by the staging entry in `pi/service/`), with
    tests in `tests/run.py`. Nothing installed changes.
 2. Bring up the staging entry with explicit roots and verify the
    control contract, tickets, restart recovery and clean shutdown.
@@ -537,9 +540,9 @@ Order matters, and each step is reversible on its own:
    tested there; only its call from the installer waits for step 6,
    because until the swap the root it reads keeps changing.
 6. Switch the entry point only after the clients and the installer
-   land: `pi/daemon/pi-daemon` becomes the thin bootstrap, the
-   implementation moves to `pi/lib/pi_daemon/`, and the old monolith
-   and the standalone broker are deleted in the same commit. No
+   land: `pi/daemon/pi-daemon` becomes the thin bootstrap, the staging
+   entry in `pi/service/` is deleted, and the old monolith and the
+   standalone broker are deleted in the same commit. No
    adapter is written between old and new code, so the switch is the
    last commit that can be rolled back without a client change.
 7. Update the installer for the private tree (`lib/`, `bin/`,

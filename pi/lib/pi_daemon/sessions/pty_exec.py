@@ -5,7 +5,7 @@ import os
 import sys
 
 BOOTSTRAP = ("import sys;sys.path.insert(0,{root!r});"
-             "from daemon_service.sessions.pty_exec import PtyExec;"
+             "from pi_daemon.sessions.pty_exec import PtyExec;"
              "PtyExec.main()")
 
 
@@ -19,7 +19,7 @@ class PtyExec:
     @classmethod
     def helper_argv(cls, root, gate, error, cwd, argv):
         """The helper inherits the PTY as stdin, stdout and stderr."""
-        return [sys.executable, "-I", "-c", BOOTSTRAP.format(root=root),
+        return [sys.executable, "-I", "-B", "-c", BOOTSTRAP.format(root=root),
                 str(gate), str(error), cwd, json.dumps(argv)]
 
     @classmethod

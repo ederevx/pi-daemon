@@ -14,26 +14,26 @@ import unittest
 from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO, "pi", "service"))
+sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
-from daemon_service.application import DaemonApplication
-from daemon_service.atomic_state_file import AtomicStateFile
-from daemon_service.config import ServiceConfig
-from daemon_service.lifecycle.instance_coordinator import InstanceCoordinator
-from daemon_service.runtime_layout import RuntimeLayout
-from daemon_service.tasks.error import TaskError
-from daemon_service.tasks.model import DONE, Ticket
-from daemon_service.tasks.runner import TicketRunner
-from daemon_service.tasks.service import TaskService
-from daemon_service.tasks.store import TicketStore
-from daemon_service.transport.control_handshake import ControlHandshake
-from daemon_service.transport.endpoint_file import EndpointFile
-from daemon_service.transport.endpoint_probe import EndpointProbe
-from daemon_service.transport.json_line_stream import JsonLineStream
-from daemon_service.transport.rpc_codec import CAPACITY, RpcCodec
-from daemon_service.transport.rpc_error import RpcError
-from daemon_service.transport.rpc_writer import RpcWriter
-from daemon_service.wire import WireCodec
+from pi_daemon.application import DaemonApplication
+from pi_daemon.atomic_state_file import AtomicStateFile
+from pi_daemon.config import ServiceConfig
+from pi_daemon.lifecycle.instance_coordinator import InstanceCoordinator
+from pi_daemon.runtime_layout import RuntimeLayout
+from pi_daemon.tasks.error import TaskError
+from pi_daemon.tasks.model import DONE, Ticket
+from pi_daemon.tasks.runner import TicketRunner
+from pi_daemon.tasks.service import TaskService
+from pi_daemon.tasks.store import TicketStore
+from pi_daemon.transport.control_handshake import ControlHandshake
+from pi_daemon.transport.endpoint_file import EndpointFile
+from pi_daemon.transport.endpoint_probe import EndpointProbe
+from pi_daemon.transport.json_line_stream import JsonLineStream
+from pi_daemon.transport.rpc_codec import CAPACITY, RpcCodec
+from pi_daemon.transport.rpc_error import RpcError
+from pi_daemon.transport.rpc_writer import RpcWriter
+from pi_daemon.wire import WireCodec
 
 SCRATCH = tempfile.mkdtemp(prefix="pi-service-")
 

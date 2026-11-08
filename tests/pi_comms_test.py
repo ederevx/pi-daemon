@@ -13,19 +13,18 @@ import time
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO, "pi", "service"))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
-from daemon_service.application import DaemonApplication
-from daemon_service.config import ServiceConfig
-from daemon_service.runtime_layout import RuntimeLayout
-from daemon_service.transport.endpoint_file import EndpointFile
-from daemon_service.transport.rpc_codec import RpcCodec
-from daemon_service.transport.rpc_listener import RpcListener
-from daemon_service.transport.service_descriptor import ServiceDescriptor
+from pi_daemon.application import DaemonApplication
+from pi_daemon.config import ServiceConfig
+from pi_daemon.runtime_layout import RuntimeLayout
+from pi_daemon.transport.endpoint_file import EndpointFile
+from pi_daemon.transport.rpc_codec import RpcCodec
+from pi_daemon.transport.rpc_listener import RpcListener
+from pi_daemon.transport.service_descriptor import ServiceDescriptor
 
-from daemon_service.comms.mailbox_store import MailboxStore
-from daemon_service.comms.service import CommsService
+from pi_daemon.comms.mailbox_store import MailboxStore
+from pi_daemon.comms.service import CommsService
 
 CLI = os.path.join(REPO, "pi", "bin", "pi-comms")
 

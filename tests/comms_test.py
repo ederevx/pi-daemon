@@ -16,30 +16,30 @@ import unittest
 from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO, "pi", "service"))
+sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
-from daemon_service.comms.error import CommsError
-from daemon_service.comms.peer_auth import PeerAuthenticator
-from daemon_service.comms.peer_config_store import PeerConfigStore
-from daemon_service.comms.peer_delivery import PeerDelivery
-from daemon_service.comms.peer_link import PeerLink
-from daemon_service.comms.peer_link_error import PeerLinkError
-from daemon_service.comms.peer_manager import PeerManager
-from daemon_service.comms.peer_operations import PeerOperations
-from daemon_service.comms.peer_tunnel import PeerTunnel
-from daemon_service.comms.peer_tunnel_error import TunnelError
-from daemon_service.atomic_state_file import AtomicStateFile
-from daemon_service.comms.mailbox_store import ALL_TARGET, MailboxStore
-from daemon_service.comms.service import CommsService
-from daemon_service.comms.node_identity import NodeIdentity
-from daemon_service.comms.spawn_ledger import SpawnLedger
-from daemon_service.comms.wait_registry import WaitRegistry
-from daemon_service.config import ServiceConfig
-from daemon_service.runtime_layout import RuntimeLayout
-from daemon_service.transport.json_line_stream import JsonLineStream
-from daemon_service.transport.rpc_codec import (INVALID_PARAMS,
+from pi_daemon.comms.error import CommsError
+from pi_daemon.comms.peer_auth import PeerAuthenticator
+from pi_daemon.comms.peer_config_store import PeerConfigStore
+from pi_daemon.comms.peer_delivery import PeerDelivery
+from pi_daemon.comms.peer_link import PeerLink
+from pi_daemon.comms.peer_link_error import PeerLinkError
+from pi_daemon.comms.peer_manager import PeerManager
+from pi_daemon.comms.peer_operations import PeerOperations
+from pi_daemon.comms.peer_tunnel import PeerTunnel
+from pi_daemon.comms.peer_tunnel_error import TunnelError
+from pi_daemon.atomic_state_file import AtomicStateFile
+from pi_daemon.comms.mailbox_store import ALL_TARGET, MailboxStore
+from pi_daemon.comms.service import CommsService
+from pi_daemon.comms.node_identity import NodeIdentity
+from pi_daemon.comms.spawn_ledger import SpawnLedger
+from pi_daemon.comms.wait_registry import WaitRegistry
+from pi_daemon.config import ServiceConfig
+from pi_daemon.runtime_layout import RuntimeLayout
+from pi_daemon.transport.json_line_stream import JsonLineStream
+from pi_daemon.transport.rpc_codec import (INVALID_PARAMS,
                                                  UNAUTHORIZED, RpcCodec)
-from daemon_service.transport.rpc_error import RpcError
+from pi_daemon.transport.rpc_error import RpcError
 
 
 class StoreCase(unittest.TestCase):
@@ -640,7 +640,7 @@ def failing_writes(after=0):
             raise OSError("disk")
         return real(store, data)
 
-    return mock.patch("daemon_service.atomic_state_file.AtomicStateFile"
+    return mock.patch("pi_daemon.atomic_state_file.AtomicStateFile"
                       ".write_dict", write)
 
 
@@ -655,7 +655,7 @@ def failing_mailbox_writes(after=0):
             raise OSError("disk")
         return real(store, text)
 
-    return mock.patch("daemon_service.atomic_state_file.AtomicStateFile"
+    return mock.patch("pi_daemon.atomic_state_file.AtomicStateFile"
                       ".write", write)
 
 
