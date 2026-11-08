@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""pi-daemon: the unified service entry point.
+
+The process is a pure daemon; every control command lives in the client
+(`pi-rc`). Arguments are refused so a probe cannot accidentally become a
+second service.
+"""
+
+import os
+import signal
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from daemon_service.app import Service  # noqa: E402
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv:
+        try:
+            sys.stderr.write("pi-daemon: takes no arguments (got %r); "
+                             "control commands live in pi-rc\n" % (argv,))
+        except Exception:
+            pass
+        return 2
+    service = Service()
+    signal.signal(signal.SIGTERM, lambda *_args: service.stop())
+    signal.signal(signal.SIGINT, lambda *_args: service.stop())
+    return service.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
