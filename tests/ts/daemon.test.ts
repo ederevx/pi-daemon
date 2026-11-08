@@ -707,6 +707,32 @@ test("daemon: reload signal is a no-op outside hosting", async () => {
   });
 });
 
+test("daemon: the signal follows the state root of the hosting daemon", async () => {
+  const legacy = join(scratchDir(), "legacy-state");
+  const service = join(scratchDir(), "service-state");
+  await hosted("pi-servicetest", async () => {
+    await withEnv({ XDG_STATE_HOME: legacy, PI_DAEMON_STATE_DIR: service },
+      async () => {
+        assertEq(reloadSignalPath(),
+          join(service, "extensions-reload", "pi-servicetest.json"),
+          "the service's root wins over the legacy one");
+        const pi = new MockPi();
+        factory(pi as never);
+        await pi.sessionStarters[0]({ reason: "startup" });
+        const sig = join(service, "extensions-reload",
+          "pi-servicetest.json");
+        writeFileSync(sig, JSON.stringify({ token: "round-1" }));
+        await waitFor(() => pi.messages.length === 1, "queued reload command");
+        const stale = join(legacy, "pi-pty-host", "extensions-reload");
+        mkdirSync(stale, { recursive: true });
+        writeFileSync(join(stale, "pi-servicetest.json"),
+          JSON.stringify({ token: "round-1" }));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        assertEq(pi.messages.length, 1, "the legacy root is not watched");
+      });
+  });
+});
+
 test("daemon: hasServiceUnit probes the unit only on POSIX", async () => {
   const installed = new ExecScript([{ code: 0, stdout: "pi-daemon.service enabled enabled\n" }]);
   const linux = new RcBackground(

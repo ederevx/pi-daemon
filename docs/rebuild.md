@@ -188,13 +188,30 @@ gc-reap-ack | daemon-purge | daemon-restart | shutdown
   resume is the client's own `start`, which pi-rc already performs).
 * `detach` closes every viewer and leaves the child running; `stop`
   asks the child to end and answers `queued`, `alive`, `state`.
-* `daemon-purge` stops idle sessions with no viewer; `shutdown`
-  answers before the application stops and carries the same `mode` the
-  run ends with.
+* `daemon-purge` stops idle sessions with no viewer; `extensions-reload`
+  asks hosted conversations to reload in place; `shutdown` answers
+  before the application stops and carries the same `mode` the run ends
+  with.
+
+`extensions-reload` is one round with no memory. It targets the live
+sessions that announced a conversation and carry no `--no-session`
+(`skipped` says `not-reloadable` otherwise), and it leaves a session
+whose turn or blocking daemon wait is open alone (`not-idle`), because
+pi would deny the reload there; a busy session is skipped and nothing
+retries it, so the caller runs the command again. Nothing is started,
+respawned or revived, so a broken update cannot become a spawn storm.
+The request is a file under the state root,
+`<state root>/extensions-reload/<name>.json`, written whole and
+carrying a fresh round token. The hosted extension's watcher consumes
+it by deleting it and queues pi's own `/daemon-reload`; a session that
+has not consumed it within the grace runs an older extension, so the
+daemon clears the file and types `/reload` into its PTY instead. A token
+consumed in one round never fires in the next, and a startup purges
+whatever a previous run left behind. The reply carries `reloaded`,
+`skipped` (`id` and `reason`) and `deferred`.
 
 Deferred to the next increment, and answered `bad-request` today:
-`carry`, `extensions-reload`, `handover`, `daemon-restart`, the
-transcript commands and the comms capabilities. A restart is a handover
+`carry`, `handover`, `daemon-restart`. A restart is a handover
 to a successor process, so promising it before a successor exists would
 leave pi-rc waiting for an endpoint that never comes.
 
@@ -665,8 +682,8 @@ share a runtime directory.
 
 ## Open work
 
-* The deferred session operations (`carry`, `extensions-reload`,
-  `handover`, `daemon-restart`). Transcripts are served: the seven
+* The deferred session operations (`carry`, `handover`,
+  `daemon-restart`). Transcripts are served: the seven
   `transcript-*` verbs, the `transcript.v1` capability and the sweep.
 * The relay uses `select()`, so a descriptor numbered 1024 or higher
   would stall it; move to `selectors` before that is reachable.

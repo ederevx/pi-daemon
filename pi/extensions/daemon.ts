@@ -150,21 +150,34 @@ export function stateHome(platform: string = process.platform): string {
 	return join(process.env.HOME || homedir(), ".local", "state");
 }
 
-/** The daemon's per-session reload-signal file, mirroring the daemon's
- *  EXT_RELOAD_SIGNAL_DIR (REG_DIR/extensions-reload/<name>.json). Empty
+/** The daemon's state root as this session's daemon publishes it. The
+ *  service passes PI_DAEMON_STATE_DIR to every child it starts, so a
+ *  hosted session reads the root of the daemon hosting it rather than
+ *  assuming where that daemon keeps its state; the legacy path is the
+ *  fallback for the daemon that never set the variable. */
+export function daemonStateDir(
+	platform: string = process.platform,
+): string {
+	return process.env.PI_DAEMON_STATE_DIR
+		|| join(stateHome(platform), "pi-pty-host");
+}
+
+/** The daemon's per-session reload-signal file, mirroring the service's
+ *  SessionReload (state root/extensions-reload/<name>.json). Empty
  *  outside hosting: only hosted sessions are ever signaled. */
 export function reloadSignalPath(
 	session: string = process.env.PI_HOSTED_SESSION || "",
 	platform: string = process.platform,
 ): string {
 	if (!session) return "";
-	return join(stateHome(platform), "pi-pty-host", "extensions-reload",
+	return join(daemonStateDir(platform), "extensions-reload",
 		`${session}.json`);
 }
 
-/** The daemon's per-session GC reap-request file, mirroring the
- *  daemon's GC_REAP_REQUEST_DIR (REG_DIR/gc-reap/<name>.json). Empty
- *  outside hosting: only hosted sessions are ever asked. */
+/** The daemon's per-session GC reap-request file, mirroring the legacy
+ *  daemon's GC_REAP_REQUEST_DIR (REG_DIR/gc-reap/<name>.json); the new
+ *  service writes no reap request yet. Empty outside hosting: only
+ *  hosted sessions are ever asked. */
 export function gcReapRequestPath(
 	session: string = process.env.PI_HOSTED_SESSION || "",
 	platform: string = process.platform,
@@ -485,7 +498,7 @@ interface ReloadSignal {
  *  flow, without the daemon ever typing "/reload" into this TUI.
  *
  *  The daemon (extensions_reload) writes
- *  <state>/pi-pty-host/extensions-reload/<session>.json carrying a
+ *  <state>/extensions-reload/<session>.json carrying a
  *  fresh round token, then waits briefly for the file to disappear.
  *  This class watches the directory: on the signal it records the
  *  token and queues the extension's own /daemon-reload command, whose

@@ -25,9 +25,11 @@ from pi_daemon.sessions.model import SessionRecord
 from pi_daemon.sessions.operations import SessionOperations
 from pi_daemon.sessions.pi_command import PiCommand
 from pi_daemon.sessions.pty_backend import PosixPtyBackend, service_root
+from pi_daemon.sessions.reload import SessionReload
 from pi_daemon.sessions.relay import SessionRelay
 from pi_daemon.sessions.runner import SessionRunner
 from pi_daemon.sessions.run_outcome import RunOutcome
+from pi_daemon.sessions.service import SessionService
 from pi_daemon.sessions.store import SessionStore
 from pi_daemon.transport.control_action import ControlAction
 
@@ -1101,6 +1103,150 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(self.control({"cmd": "start", "name": ""})["error"],
                          "bad-request")
         self.assertTrue(self.control({"cmd": "list"})["ok"])
+
+
+class StubReload:
+    def __init__(self, consumed=(), write_failed=()):
+        self.signals = []
+        self.cleared = []
+        self.consumed = list(consumed)
+        self.write_failed = set(write_failed)
+
+    def token(self):
+        return "tok"
+
+    def signal(self, name, token):
+        if name in self.write_failed:
+            return False
+        self.signals.append((name, token))
+        return True
+
+    def await_consumed(self, names):
+        return [name for name in names if name in self.consumed]
+
+    def clear(self, name):
+        self.cleared.append(name)
+
+
+class StubSender:
+    def __init__(self, failing=()):
+        self.sent = []
+        self.failing = set(failing)
+
+    def send(self, name, data):
+        if name in self.failing:
+            raise SessionError("write-failed")
+        self.sent.append((name, data))
+        return len(data)
+
+
+class SignalTests(unittest.TestCase):
+    def setUp(self):
+        self.state, _runtime = roots()
+        self.reload = SessionReload(self.state, grace=0.0, sleep=lambda _s: None)
+
+    def test_a_signal_carries_the_token_the_extension_reads(self):
+        self.assertTrue(self.reload.signal("pi-a", "tok-1"))
+        with open(self.reload.path("pi-a"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["token"], "tok-1")
+        self.assertEqual(os.listdir(os.path.dirname(self.reload.path("pi-a"))),
+                         ["pi-a.json"])
+
+    def test_each_round_carries_a_fresh_token(self):
+        self.assertNotEqual(self.reload.token(), self.reload.token())
+
+    def test_consumption_is_the_deletion_of_the_file(self):
+        self.reload.signal("pi-a", "tok-1")
+        self.assertFalse(self.reload.consumed("pi-a"))
+        self.assertEqual(self.reload.await_consumed(["pi-a"]), [])
+        self.reload.clear("pi-a")
+        self.assertTrue(self.reload.consumed("pi-a"))
+        self.assertEqual(self.reload.await_consumed(["pi-a"]), ["pi-a"])
+
+    def test_a_name_the_directory_cannot_hold_is_refused(self):
+        self.assertFalse(self.reload.signal("../pi-a", "tok"))
+        self.assertFalse(self.reload.signal("", "tok"))
+
+    def test_a_purge_drops_what_a_previous_run_left(self):
+        self.reload.signal("pi-a", "tok")
+        self.reload.signal("pi-b", "tok")
+        self.reload.purge()
+        self.assertEqual(self.reload.await_consumed(["pi-a", "pi-b"]),
+                         ["pi-a", "pi-b"])
+
+
+class ReloadRoundTests(unittest.TestCase):
+    def setUp(self):
+        self.base = roots()
+        self.store, self.config = store_for(self.base)
+        reserve(self.store, "pi-idle", file="/conv/idle.jsonl")
+        reserve(self.store, "pi-busy", file="/conv/busy.jsonl")
+        busier, _ = reserve(self.store, "pi-waiting", file="/conv/wait.jsonl")
+        self.store.mark_started(busier.id, os.getpid(),
+                               ProcessIdentity.current(os.getpid()))
+        self.store.publish("pi-busy", "busy")
+        self.store.publish("pi-waiting", "waiting")
+        headless, _ = reserve(self.store, "pi-headless")
+        shell, _ = reserve(self.store, "pi-shell")
+        self.store.finish(shell.id, "stop", 0)
+
+    def service(self, reload, sender=None):
+        return SessionService(self.store, sender or StubSender(), None,
+                              self.config, None, None, reload)
+
+    def test_an_idle_session_that_consumes_its_signal_is_reloaded(self):
+        reload = StubReload(consumed=["pi-idle"])
+        reply = self.service(reload).reload()
+        self.assertEqual(reply["reloaded"], ["pi-idle"])
+        self.assertNotIn({"id": "pi-idle", "reason": "not-idle"},
+                         reply["skipped"])
+        self.assertEqual(reload.signals, [("pi-idle", "tok")])
+
+    def test_a_busy_session_is_skipped_and_nothing_retries_it(self):
+        reload = StubReload(consumed=["pi-idle"])
+        reply = self.service(reload).reload()
+        self.assertTrue(reply["deferred"])
+        self.assertIn({"id": "pi-busy", "reason": "not-idle"},
+                      reply["skipped"])
+        self.assertIn({"id": "pi-waiting", "reason": "not-idle"},
+                      reply["skipped"])
+        self.assertEqual(reply["reloaded"], ["pi-idle"])
+        self.assertEqual([name for name, _token in reload.signals],
+                         ["pi-idle"])
+
+    def test_a_session_without_a_conversation_is_not_reloadable(self):
+        reply = self.service(StubReload(consumed=["pi-idle"])).reload()
+        self.assertIn({"id": "pi-headless", "reason": "not-reloadable"},
+                      reply["skipped"])
+
+    def test_an_unconsumed_signal_falls_back_to_typing_the_command(self):
+        reload = StubReload()
+        sender = StubSender()
+        reply = self.service(reload, sender).reload()
+        self.assertEqual(reload.cleared, ["pi-idle"])
+        self.assertEqual(sender.sent, [("pi-idle", b"/reload\r")])
+        self.assertEqual(reply["reloaded"], ["pi-idle"])
+
+    def test_a_failed_fallback_is_reported_not_raised(self):
+        reply = self.service(StubReload(), StubSender(["pi-idle"])).reload()
+        self.assertEqual(reply["reloaded"], [])
+        self.assertIn({"id": "pi-idle", "reason": "write-failed"},
+                      reply["skipped"])
+
+    def test_an_unwritable_signal_is_reported_and_never_typed_into(self):
+        sender = StubSender()
+        reply = self.service(StubReload(write_failed=["pi-idle"]),
+                             sender).reload()
+        self.assertEqual(sender.sent, [])
+        self.assertIn({"id": "pi-idle", "reason": "write-failed"},
+                      reply["skipped"])
+
+    def test_a_named_round_touches_only_the_names_given(self):
+        reserve(self.store, "pi-other", file="/conv/other.jsonl")
+        reply = self.service(StubReload()).reload(["pi-other"])
+        self.assertEqual(reply["reloaded"], ["pi-other"])
+        self.assertEqual(reply["skipped"], [])
+        self.assertFalse(reply["deferred"])
 
 
 if __name__ == "__main__":

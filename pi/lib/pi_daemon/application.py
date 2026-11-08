@@ -26,6 +26,7 @@ from .sessions.launcher import SessionLauncher
 from .sessions.operations import SessionOperations
 from .sessions.pi_command import PiCommand
 from .sessions.pty_backend import PosixPtyBackend, service_root
+from .sessions.reload import SessionReload
 from .sessions.relay import SessionRelay
 from .sessions.runner import SessionRunner
 from .sessions.service import SessionService
@@ -163,8 +164,11 @@ class DaemonApplication:
         command = PiCommand(self._environment)
         carry = SessionCarry(store, runner, relay, command)
         handover = SessionHandover(store, runner, command, self._config)
+        reload = SessionReload(self._layout.state_root())
+        # A request a previous run left behind names a session that is gone.
+        reload.purge()
         return SessionService(store, runner, relay, self._config, carry,
-                              handover)
+                              handover, reload)
 
     def _compose_transcripts(self, sessions):
         """The conversation index reads pi's own store; the root was

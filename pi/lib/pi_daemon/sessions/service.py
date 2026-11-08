@@ -9,19 +9,32 @@ from .identity import ProcessIdentity
 PROJECTED = ("state", "run", "seq", "opened", "changed", "ended", "history",
              "file", "child_pid", "open")
 STATES = ("busy", "idle", "waiting")
+# The command a pi older than the reload watcher still understands.
+FALLBACK = "/reload\r"
+
+
+def _reloadable(record):
+    """A hosted pi that announced a conversation file reloads in place.
+
+    A `--no-session` run has no TUI to reload, and a `start`ed session's
+    live argv carries no conversation, so the announced file is the
+    reliable marker of an interactive session.
+    """
+    return bool(record.file) and "--no-session" not in record.argv
 
 
 class SessionService:
     """Operations speak names; the runner owns processes and the relay owns IO."""
 
     def __init__(self, store, runner, relay, config, carry=None,
-                 handover=None):
+                 handover=None, reload=None):
         self._store = store
         self._runner = runner
         self._relay = relay
         self._config = config
         self._carry = carry
         self._handover = handover
+        self._reload = reload
 
     # -- hosting -----------------------------------------------------------
 
@@ -234,6 +247,56 @@ class SessionService:
     def acknowledge_reap(self, name):
         record = self._record(name)
         return {"name": record.name, "acknowledged": True}
+
+    def reload(self, names=None):
+        """Ask hosted sessions to reload their resources in place, once.
+
+        One round, no memory: a session that is mid-turn or parked on a
+        blocking daemon wait has its turn open, so pi would deny the
+        reload - it is reported as skipped and nothing retries it here.
+        Only sessions that already exist are touched; nothing is started,
+        respawned or revived, so a broken update cannot become a spawn
+        storm. The extension deletes its signal to accept; a session whose
+        extension never does runs an older extension and gets "/reload"
+        typed into its PTY instead.
+        """
+        if self._reload is None:
+            raise SessionError(NO_SESSION)
+        targets, skipped = [], []
+        for record in self._store.live():
+            if names is not None and record.name not in names:
+                continue
+            if not _reloadable(record):
+                skipped.append({"id": record.name, "reason": "not-reloadable"})
+                continue
+            if record.state() != "idle":
+                skipped.append({"id": record.name, "reason": "not-idle"})
+                continue
+            targets.append(record.name)
+        token = self._reload.token()
+        pending = []
+        for name in targets:
+            if self._reload.signal(name, token):
+                pending.append(name)
+            else:
+                skipped.append({"id": name, "reason": "write-failed"})
+        consumed = self._reload.await_consumed(pending)
+        reloaded = list(consumed)
+        for name in pending:
+            if name in consumed:
+                continue
+            # Unconsumed: an extension without the watcher never picked the
+            # signal up, so clear it and type the command the old way.
+            self._reload.clear(name)
+            try:
+                self._runner.send(name, FALLBACK.encode("utf-8"))
+            except SessionError:
+                skipped.append({"id": name, "reason": "write-failed"})
+            else:
+                reloaded.append(name)
+        deferred = any(entry["reason"] == "not-idle" for entry in skipped)
+        return {"reloaded": reloaded, "skipped": skipped,
+                "deferred": deferred}
 
     def begin_shutdown(self, mode):
         self._runner.begin_shutdown(mode)

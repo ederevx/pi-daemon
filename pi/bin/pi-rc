@@ -133,16 +133,16 @@
 #   pi-rc input <name> <text...>        type raw text into a hosted
 #                                       session's PTY master (e.g. a slash
 #                                       command)
-#   pi-rc extensions-reload [--force]   re-scan extensions, skills,
+#   pi-rc extensions-reload            ask every hosted conversation
+#                                       session to reload in place, so pi
+#                                       re-scans extensions, skills,
 #                                       prompts, themes and context files
-#                                       in every hosted conversation
-#                                       session (in-place reload, signaled
-#                                       to the in-session extension
-#                                       directly with a PTY-typing
-#                                       fallback); the
-#                                       file-level diff is relayed to each
-#                                       agent once it settles; --force
-#                                       reloads even without changes
+#                                       (the daemon leaves a signal its
+#                                       in-session extension consumes, with
+#                                       a PTY-typing fallback); busy
+#                                       sessions are skipped and nothing
+#                                       retries them, and no change is
+#                                       reported back to the agent
 #   pi-rc handover <file> [dir]         host a specific pi session file in a
 #                                       new detached session; used by /bg
 #                                       outside the host to hand a live
@@ -1223,17 +1223,14 @@ def cmd_extensions_reload(args, client):
 	resp = client.control(req)
 	if not resp.get("ok"):
 		die("extensions-reload failed: %s" % resp.get("error"))
-	if resp.get("unchanged"):
-		print("pi-rc: extension roots unchanged; nothing to reload")
-		return
-	diff = resp.get("diff") or {}
 	reloaded = resp.get("reloaded") or []
 	if reloaded:
 		print("pi-rc: reloaded %s" % ", ".join(reloaded))
 	else:
 		print("pi-rc: reloaded no sessions")
 	if resp.get("deferred"):
-		print("pi-rc: reload deferred for busy session(s); the watch retries them")
+		print("pi-rc: busy session(s) were not reloaded; run this again "
+			  "when they are idle")
 	if resp.get("skipped"):
 		kids = []
 		for entry in resp["skipped"]:
@@ -1242,12 +1239,6 @@ def cmd_extensions_reload(args, client):
 			else:
 				kids.append(str(entry))
 		print("pi-rc: skipped %s" % ", ".join(kids))
-	for p in diff.get("added") or []:
-		print("pi-rc: + %s" % p)
-	for p in diff.get("changed") or []:
-		print("pi-rc: ~ %s" % p)
-	for p in diff.get("removed") or []:
-		print("pi-rc: - %s" % p)
 
 
 def handover_check(client, dir_, file):

@@ -41,6 +41,7 @@ class SessionOperations:
             "handoff-target": self.handoff_target,
             "handover": self.handover,
             "gc-reap-ack": self.gc_reap_ack,
+            "extensions-reload": self.extensions_reload,
             "daemon-purge": self.daemon_purge,
             "daemon-restart": self.daemon_restart,
             "shutdown": self.shutdown,
@@ -208,6 +209,27 @@ class SessionOperations:
 
     def daemon_purge(self, request):
         return {"ok": True, "purged": self._service.purge()}
+
+    def extensions_reload(self, request):
+        """One manual reload round: every hosted session that can take it.
+
+        `sessions` narrows the round; `force` is accepted because the
+        client has always sent it and a manual round reloads regardless of
+        whether anything on disk appears to have changed.
+        """
+        force = request.get("force", False)
+        if not isinstance(force, bool):
+            raise ValueError("force must be a boolean")
+        only = request.get("sessions")
+        if only is not None:
+            if not isinstance(only, list) \
+                    or not all(isinstance(name, str) for name in only):
+                raise ValueError("sessions must be a list of names")
+            only = list(only)
+        reply = self._service.reload(only)
+        return {"ok": True, "reloaded": reply["reloaded"],
+                "skipped": reply["skipped"],
+                "deferred": reply["deferred"]}
 
     def daemon_restart(self, request):
         # Deferred: a restart hands the endpoint to a successor; without
