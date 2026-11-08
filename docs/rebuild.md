@@ -9,11 +9,14 @@ installed clients keep working when the entry point switches.
 ## What exists now
 
 The unified service's package lives in `pi/lib/pi_daemon/`, beside the
-seam modules the clients already import; only its staging entry sits in
-`pi/service/` until the switch:
+seam modules the clients already import, and the installed entry is the
+bootstrap in the same tree; the one verb that runs before an install is
+its own command:
 
 ```
-pi/service/pi-daemon                     staging entry (bootstrap only)
+pi/daemon/pi-daemon                     the entry (bootstrap only)
+pi/bin/pi-daemon-migrate                 MigrateCommand, the one-time
+                                         translation
 pi/lib/pi_daemon/application.py           DaemonApplication
 pi/lib/pi_daemon/config.py                ServiceConfig
 pi/lib/pi_daemon/runtime_layout.py        RuntimeLayout
@@ -59,9 +62,9 @@ pi/lib/pi_daemon/migration/command.py     MigrateCommand
 
 Each file owns one cohesive responsibility and one primary class. The
 entry point only bootstraps: it requires `PI_DAEMON_STATE_DIR` and
-`PI_DAEMON_RUNTIME_DIR`, dispatches its one verb (`migrate`) or composes
-`DaemonApplication`, and runs it. The staging entry never falls back to
-the live roots.
+`PI_DAEMON_RUNTIME_DIR`, composes `DaemonApplication` and runs it, and it
+takes no arguments. `pi-daemon-migrate` bootstraps the same way and runs
+`MigrateCommand`; neither falls back to the live roots.
 
 `DaemonApplication` starts the instance lock, the tasks domain, the
 sessions domain, the transcripts domain and the control endpoint in that
@@ -603,9 +606,9 @@ delivery receipts only - never membership, spawn or session control.
 Order matters, and each step is reversible on its own:
 
 1. Ship the new package beside the installed one (`pi/lib/pi_daemon/`,
-   driven by the staging entry in `pi/service/`), with
+   driven by its bootstrap `pi/daemon/pi-daemon`), with
    tests in `tests/run.py`. Nothing installed changes.
-2. Bring up the staging entry with explicit roots and verify the
+2. Bring up the bootstrap entry with explicit roots and verify the
    control contract, tickets, restart recovery and clean shutdown.
 3. Add the remaining domains against the same composition: sessions
    (session hosting, run state, revive, transcripts), then comms
@@ -617,16 +620,16 @@ Order matters, and each step is reversible on its own:
 4. Ship the new client beside the old one and rewire `pi-rc` and the
    extensions to it, keeping it compatible with both servers, then
    remove the legacy aliases from the migration translator.
-5. Translate state once, after step 4 and before step 6: the `migrate`
-   subcommand of the new entry reads the legacy root and writes the new
+5. Translate state once, after step 4 and before step 6: the
+   `pi-daemon-migrate` command reads the legacy root and writes the new
    layout, leaving the legacy files untouched for one release. Its
-   contract is below. The verb ships with the staging entry and is
+   contract is below. The verb ships with the candidate generation and is
    tested there; only its call from the installer waits for step 6,
    because until the swap the root it reads keeps changing.
 6. Switch the entry point only after the clients and the installer
    land: `pi/daemon/pi-daemon` becomes the thin bootstrap, replacing
-   the legacy monolith, and the staging entry in `pi/service/` is
-   deleted in the same commit. No standalone broker exists in this
+   the legacy monolith, and the staging entry is deleted in the same
+   commit. No standalone broker exists in this
    tree. No adapter is written between old and new code, so the switch
    is the last commit that can be rolled back without a client change.
    Done: the bootstrap imports `pi_daemon` from `lib/` beside it and
@@ -648,7 +651,9 @@ Order matters, and each step is reversible on its own:
    removed module re-provisions as well as an edited one. The migration
    runs from the candidate generation before any public file changes and
    refuses (76) while a daemon serves the old state or endpoint, and a
-   held install lock exits 75.
+   held install lock exits 75. A generation no manifest names is swept
+   under the lock, and a retained one is dropped once no daemon serves it,
+   so a crash leaves no orphan release and the directory stays bounded.
 
 ## Cutover
 
@@ -668,13 +673,13 @@ other's lock, registry or descriptor:
 | | | `PI_DAEMON_<FIELD>`, which overrides a field |
 | runtime | `$XDG_RUNTIME_DIR/pi-pty-host.sock` | `PI_DAEMON_RUNTIME_DIR` |
 
-`migrate` is the new entry's own subcommand, never `pi-rc` (a client that
+`pi-daemon-migrate` is the installed verb, never `pi-rc` (a client that
 must speak to both servers and must never write server state) and never a
 one-shot script (which would duplicate the stores' layout). It reads the
 legacy root read-only and writes the new one:
 
-    pi-daemon migrate --dry-run        # print the plan as JSON, write nothing
-    pi-daemon migrate                  # translate, then record a marker
+    pi-daemon-migrate --dry-run        # print the plan as JSON, write nothing
+    pi-daemon-migrate                  # translate, then record a marker
 
 `migration.json` in the new state root holds the sha256 of every legacy
 file it read. A rerun whose hashes still match does nothing; a rerun whose
@@ -694,20 +699,16 @@ stores through their owners and records the marker last, with the digests
 of the files it actually read; a file that moved in between exits 4
 without a marker, and the next run then refuses as untranslated state.
 
-The order follows from `migrate` belonging to the new entry, which only
-exists after the swap. `migrate` lives in the staging entry and is tested
-there; the installer's call to it lands with step 6, because a root the
-legacy daemon still serves keeps moving and every later install would
-refuse. Stop the unit, then install the new release with
-`PI_DAEMON_STATE_DIR` and `PI_DAEMON_RUNTIME_DIR` exported to the values
-the unit will use. That installer replaces the launcher and the unit, runs
-`migrate --dry-run` and then `migrate`, and only afterwards runs
-`systemctl --user enable --now`; a failed translation starts nothing,
-because a started service would take the instance lock and the next
-`migrate` would refuse on it. The installer runs the translation rather
-than `ExecStartPre`: with `Restart=on-failure` and
-`StartLimitIntervalSec=0` a failing pre-start command would restart every
-two seconds forever.
+The order follows from the generation being built before anything public
+changes: the installer builds the candidate release, runs
+`pi-daemon-migrate --dry-run` and then `pi-daemon-migrate` from inside it
+with the roots the unit will declare, and only afterwards replaces the
+launchers and the unit and runs `systemctl --user enable --now`. A failed
+translation starts nothing, because a started service would take the
+instance lock and the next translation would refuse on it. The installer
+runs the translation rather than `ExecStartPre`: with
+`Restart=on-failure` and `StartLimitIntervalSec=0` a failing pre-start
+command would restart every two seconds forever.
 
 ## Rollback
 
@@ -717,16 +718,19 @@ written:
 1. `systemctl --user stop pi-daemon.service`.
 2. `pi install git:github.com/ederevx/pi-daemon@<the previous tag>`: its
    postinstall restores the previous `pi-daemon` launcher and unit.
-3. `rm -f ~/.local/bin/pi-comms ~/.local/bin/pi_rpc_client.py`: the
+4. `rm -f ~/.local/bin/pi-comms ~/.local/bin/pi-daemon-migrate
+   ~/.local/bin/pi-daemon-migrate.cmd ~/.local/bin/pi_rpc_client.py`: the
    previous release's manifest does not own them, so its `uninstall.sh`
-   would leave them behind.
-4. `systemctl --user start pi-daemon.service`, unless step 2 already did:
+   would leave them behind, and the previous install kept no generation
+   under `~/.local/lib/pi-daemon/`, which that install also stops
+   maintaining.
+5. `systemctl --user start pi-daemon.service`, unless step 2 already did:
    the postinstall runs `enable --now`, so this step only matters where
    systemd is absent and that call did nothing.
 
 The new state root stays in place as evidence. A rollback moves the
 legacy state again, because the legacy daemon keeps writing it, so the
-next `migrate` refuses on the changed hashes; `--force` is what
+next `pi-daemon-migrate` refuses on the changed hashes; `--force` is what
 retranslates it, and a forced run replaces the ticket and session stores
 while leaving `comms/` (the node identity, the mailbox, the peers) and
 `settings.json` alone. Because a rerun is decided by the recorded hashes,
@@ -755,10 +759,10 @@ share a runtime directory.
   schedule are in place on top of the mailbox, relay, waits, spawn and
   the `agent-comms` listener, so only the `peer-control` frame that
   carries a launch across the link remains.
-* The unit's two roots and the installer's call to `migrate` shipped with
-  step 6; what remains there is the maintenance cutover on a host whose
-  legacy daemon is running, which the installer now refuses (76) instead
-  of attempting.
+* The unit's two roots and the installer's call to the translation
+  shipped with step 6; what remains there is the maintenance cutover on a
+  host whose legacy daemon is running, which the installer refuses (76)
+  instead of attempting.
 * Discovery activation: the descriptor publishes `pi-rc daemon-start`
   and the client reports a missing service, but nothing yet starts one;
   the CLI's binding is explicit, so a second entry is never dialed.
