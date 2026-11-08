@@ -162,10 +162,21 @@ def _read_settings(path):
 
 
 def _coerce(name, value, default):
+    if isinstance(default, bool):
+        # A flag has two values: the JSON booleans, or their spellings in
+        # an environment variable. Anything else is not a second truthy
+        # string, it is a mistake, so it falls through to the next source.
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            spelling = value.strip().lower()
+            if spelling in ("true", "1"):
+                return True
+            if spelling in ("false", "0"):
+                return False
+        raise ValueError(f"{name}: a boolean is required")
     if isinstance(value, bool):
         raise ValueError(f"{name}: a boolean is not a value")
-    if isinstance(default, bool):
-        return bool(value)
     if isinstance(default, int):
         number = _finite(value, name)
         if number != int(number):

@@ -69,6 +69,47 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(loaded.output_cap, 4096)
         self.assertEqual(loaded.frame_bytes, ServiceConfig().frame_bytes)
 
+    def test_a_flag_takes_the_two_boolean_spellings_only(self):
+        for spelling, expected in (("false", False), ("0", False),
+                                   ("true", True), ("1", True),
+                                   (" FALSE ", False)):
+            loaded = ServiceConfig.load(environ={
+                "PI_DAEMON_TRANSCRIPT_INDEX": spelling})
+            self.assertIs(loaded.transcript_index, expected, spelling)
+        misspelled = ServiceConfig.load(environ={
+            "PI_DAEMON_TRANSCRIPT_INDEX": "banana"})
+        self.assertIs(misspelled.transcript_index, True)
+
+    def test_a_json_boolean_is_a_flag_value(self):
+        directory = tempfile.mkdtemp(dir=SCRATCH)
+        settings = os.path.join(directory, "settings.json")
+        with open(settings, "w", encoding="utf-8") as handle:
+            json.dump({"daemon": {"transcript_index": False}}, handle)
+        loaded = ServiceConfig.load(settings, environ={})
+        self.assertIs(loaded.transcript_index, False)
+        beaten = ServiceConfig.load(settings, environ={
+            "PI_DAEMON_TRANSCRIPT_INDEX": "true"})
+        self.assertIs(beaten.transcript_index, True)
+
+    def test_the_conversation_store_follows_the_given_environment(self):
+        base = tempfile.mkdtemp(dir=SCRATCH)
+        agent = os.path.join(base, "agent")
+        app = DaemonApplication.from_environment({
+            "PI_DAEMON_STATE_DIR": os.path.join(base, "state"),
+            "PI_DAEMON_RUNTIME_DIR": os.path.join(base, "run"),
+            "PI_CODING_AGENT_DIR": agent,
+        })
+        self.assertEqual(app._session_store_root,
+                         os.path.join(agent, "sessions"))
+        named = DaemonApplication.from_environment({
+            "PI_DAEMON_STATE_DIR": os.path.join(base, "state2"),
+            "PI_DAEMON_RUNTIME_DIR": os.path.join(base, "run2"),
+            "PI_CODING_AGENT_DIR": agent,
+            "PI_DAEMON_SESSION_STORE_ROOT": os.path.join(base, "store"),
+        })
+        self.assertEqual(named._session_store_root,
+                         os.path.join(base, "store"))
+
     def test_invalid_values_fall_through_and_zero_is_kept(self):
         loaded = ServiceConfig.load(environ={
             "PI_DAEMON_RECORD_CAP": "many",

@@ -117,7 +117,11 @@ conversation is resolved through the session store. `transcript-stat`
 drops `file`. The rejections are `no-such-transcript`, `bad-transcript`,
 `no-index`, `bad-cursor` and `bad-request`, and a reply echoes the
 request's `id`. The daemon never serves a path outside the conversation
-store, and the sweep skips every conversation a live session backs.
+store, and the sweep skips every conversation a live session backs: its
+announced file and any `--session` argument, for as long as its record is
+live. The `session` form also resolves a name whose record is no longer
+live, where the legacy daemon answered only for a hosted session; that is
+additive, and the file it names is still checked against the store.
 
 * Frames are one JSON object per line, bounded by `frame_bytes`, and a
   connection's buffer survives between frames.
@@ -263,17 +267,23 @@ instance.
 
 Every operational value is a `ServiceConfig` field, resolved once from
 environment (`PI_DAEMON_<FIELD>`) over the settings file over the
-default, and invalid values fall through to the next source. Booleans
-and non-finite numbers are refused, and zero is a value, not "unset".
+default, and invalid values fall through to the next source. A numeric
+field refuses booleans and non-finite numbers, and zero is a value, not
+"unset". A flag takes only the two boolean spellings - a JSON boolean, or
+`true`/`false` or `1`/`0` in an environment variable or the settings file
+- and any other spelling falls through, so `PI_DAEMON_X=false` is false
+and `PI_DAEMON_X=0` is not a truthy string.
 
 There are no legacy names, no `PI_PTYD_*` fallbacks and no pi-teams
-aliases: the new service only reads its own names. No legacy
-`piDaemon` key has a service field - a ticket TTL, an extension watch or
-an idle window has no counterpart here - so `migrate` translates no
-configuration. The conversation index is configured by
-`session_store_root` (empty means the agent home's `sessions`),
-`transcript_index`, `transcript_index_interval`,
-`transcript_index_max_bytes` and `transcript_index_max_line`.
+aliases: the new service only reads its own names. Legacy configuration is
+not translated automatically: a `piDaemon` key - a ticket TTL, an
+extension watch or an idle window - has no counterpart here, and
+`migrate` translates none of it. The conversation index is configured by
+`session_store_root`, `transcript_index`, `transcript_index_interval`,
+`transcript_index_max_bytes` and `transcript_index_max_line`. An empty
+`session_store_root` means the `sessions` directory of the agent home in
+the environment this application was given (`PI_CODING_AGENT_DIR`), never
+the process's own.
 
 A comms setting whose zero would stop mail rather than disable a
 feature is refused, so it falls through to its next source. The comms

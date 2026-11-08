@@ -46,10 +46,12 @@ from .wire import CAPABILITIES, WireCodec
 class DaemonApplication:
     """It composes collaborators and nothing else; domains own their state."""
 
-    def __init__(self, layout, config, services_root=None):
+    def __init__(self, layout, config, services_root=None,
+                 session_store_root=None):
         self._layout = layout
         self._config = config
         self._services_root = services_root
+        self._session_store_root = session_store_root or config.session_store_root
         self._stopping = threading.Event()
         self._mode = "shutdown"
         self._coordinator = InstanceCoordinator(layout.instance_lock_path())
@@ -85,7 +87,12 @@ class DaemonApplication:
                                     environ=environment)
         if services_root is None:
             services_root = environment.get("PI_SERVICES_DIR")
-        return cls(layout, config, services_root)
+        # The conversation store is resolved from the environment this
+        # application was given, never from the process's own, so an
+        # embedder's agent home is the one it reads.
+        store_root = config.session_store_root or os.path.join(
+            pi_platform.RuntimeLayout(environment).agent_home(), "sessions")
+        return cls(layout, config, services_root, store_root)
 
     def config(self):
         return self._config
@@ -146,11 +153,10 @@ class DaemonApplication:
         return SessionService(store, runner, relay, self._config)
 
     def _compose_transcripts(self, sessions):
-        """The conversation index reads pi's own store, so its root is the
-        agent home's `sessions` unless a field names another."""
-        root = self._config.session_store_root or os.path.join(
-            pi_platform.RuntimeLayout().agent_home(), "sessions")
-        service = TranscriptService(self._config, root, sessions.live_files,
+        """The conversation index reads pi's own store; the root was
+        resolved once, from the environment this application was given."""
+        service = TranscriptService(self._config, self._session_store_root,
+                                    sessions.live_files,
                                     sessions.recorded_file)
         service.start()
         return service

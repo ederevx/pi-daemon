@@ -98,12 +98,21 @@ class SessionStore:
                     if record.live()]
 
     def live_files(self):
-        """Conversation files a live hosted session backs: its announced
-        file, so the transcript sweep leaves a live conversation alone."""
+        """Conversation files a live hosted session backs: the announced
+        file plus any `--session` argument, so a session spawned straight
+        onto a conversation is protected before it announces, and a
+        conversation whose session ended is swept again."""
         with self._lock:
-            files = [record.file for record in self._sessions.values()
-                     if record.live() and record.file]
-            return files + list(self._files.values())
+            files = set()
+            for record in self._sessions.values():
+                if not record.live():
+                    continue
+                if record.file:
+                    files.add(record.file)
+                named = _named_file(record.argv)
+                if named:
+                    files.add(named)
+            return files
 
     def file_of(self, name):
         with self._lock:
@@ -473,3 +482,12 @@ class SessionStore:
 
 def _announced(state):
     return bool(state.get("announced")) or int(state.get("seq") or 0) > 0
+
+
+def _named_file(argv):
+    """The conversation file a spawn's `--session` argument names."""
+    arguments = list(argv or [])
+    for index, arg in enumerate(arguments[:-1]):
+        if arg == "--session":
+            return arguments[index + 1]
+    return None

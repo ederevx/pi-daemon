@@ -19,6 +19,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
 from pi_daemon.config import ServiceConfig
+from pi_daemon.sessions.store import SessionStore
 from pi_daemon.transcripts.operations import TranscriptOperations
 from pi_daemon.transcripts.service import TranscriptService
 
@@ -202,6 +203,68 @@ class TranscriptsTest(unittest.TestCase):
         open(empty, "w", encoding="utf-8").close()
         reply = self.call("transcript-stat", **{"file": empty})
         self.assertEqual(reply, {"ok": False, "error": "no-index"})
+
+
+class LiveSetTest(unittest.TestCase):
+    """The sweep must leave a live conversation alone and take a cold one
+    back. The store answers with the announced file and any `--session`
+    argument, and only for a record that is still live."""
+
+    def setUp(self):
+        self.root = root_for()
+        self.file = conversation(self.root)
+        self.state = tempfile.mkdtemp(dir=SCRATCH)
+        self.store = SessionStore(os.path.join(self.state, "sessions.json"),
+                                  os.path.join(self.state, "runs"),
+                                  ServiceConfig()).load()
+
+    def reserve(self, name="pi-a", argv=None, file=None):
+        record, _ = self.store.reserve(
+            name, "/tmp", argv or ["pi"], 80, 24, None, file, argv or ["pi"],
+            {"instance": "i-1", "pid": 1, "boot": "b", "start": "s"})
+        return record
+
+    def test_a_session_argument_protects_its_file_before_it_announces(self):
+        self.reserve(argv=["pi", "--session", self.file])
+        self.assertIn(self.file, self.store.live_files())
+
+    def test_an_announced_file_is_protected(self):
+        self.reserve()
+        self.store.announce("pi-a", self.file)
+        self.assertIn(self.file, self.store.live_files())
+
+    def test_a_finished_session_no_longer_protects_its_file(self):
+        record = self.reserve(argv=["pi", "--session", self.file])
+        self.store.announce("pi-a", self.file)
+        self.store.finish(record.id, "exit", 0)
+        self.assertNotIn(self.file, self.store.live_files())
+
+    def test_the_sweep_skips_the_live_set_and_indexes_the_rest(self):
+        cold = conversation(self.root, "cold")
+        self.reserve(argv=["pi", "--session", self.file])
+        service = service_for(self.root, live=self.store.live_files)
+        watch = service._watch
+        watch.sweep()
+        sidecar = service.reader(self.file).index.index_path
+        self.assertFalse(os.path.isfile(sidecar(self.file)))
+        self.assertTrue(os.path.isfile(sidecar(cold)))
+        service.stop()
+
+    def test_a_symlink_out_of_the_store_is_refused(self):
+        outside = os.path.join(SCRATCH, "escape-%s.jsonl" % os.getpid())
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write(HEADER)
+        link = os.path.join(self.root, "--home-wire--", "link.jsonl")
+        try:
+            os.symlink(outside, link)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are unavailable here")
+        service = service_for(self.root)
+        self.assertFalse(service.owns(link))
+        reply = TranscriptOperations(service).handlers()["transcript-open"](
+            {"file": link})
+        self.assertEqual(reply, {"ok": False, "error": "bad-transcript"})
+        service.stop()
 
 
 if __name__ == "__main__":
