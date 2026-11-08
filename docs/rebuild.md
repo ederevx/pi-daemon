@@ -543,9 +543,8 @@ Order matters, and each step is reversible on its own:
    land: `pi/daemon/pi-daemon` becomes the thin bootstrap, replacing
    the legacy monolith, and the staging entry in `pi/service/` is
    deleted in the same commit. No standalone broker exists in this
-   tree, so nothing beyond the monolith is removed. No adapter is
-   written between old and new code, so the switch is the last commit
-   that can be rolled back without a client change.
+   tree. No adapter is written between old and new code, so the switch
+   is the last commit that can be rolled back without a client change.
 7. Update the installer for the private tree (`lib/`, `bin/`,
    `daemon/`, `extensions/`), the unit files and the docs. Done: the
    installer provisions `pi-comms` and `pi_rpc_client.py` beside `pi-rc`,
