@@ -17,6 +17,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -166,6 +167,20 @@ test("stamp: an added package module is stale", () => {
   assert(
     !scratch.stamp().isCurrent(),
     "a module the manifest never recorded makes the clone stale",
+  );
+});
+
+test("stamp: a manifest whose generation is gone is stale", () => {
+  // A publish killed between its two renames leaves the record pointing at
+  // a release that is not there: nothing would repair it if the stamp
+  // compared sources alone.
+  const scratch = new ScratchPackage("missing-generation");
+  scratch.install();
+  const manifest = JSON.parse(readFileSync(scratch.manifest, "utf8"));
+  rmSync(manifest.active_root, { recursive: true, force: true });
+  assert(
+    !scratch.stamp().isCurrent(),
+    "a record whose release is gone re-provisions",
   );
 });
 

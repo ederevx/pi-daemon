@@ -82,7 +82,9 @@ export class ProvisionStamp {
 
 	/** True when the manifest is a v3 package-mode record whose sources are
 	 *  exactly the installer's current inventory; a missing, unreadable,
-	 *  manual, older, or differently-shaped record is stale. */
+	 *  manual, older, or differently-shaped record is stale, and so is one
+	 *  whose active generation is gone - an install killed between the two
+	 *  renames that swap a generation leaves exactly that. */
 	isCurrent() {
 		let manifest;
 		try {
@@ -94,6 +96,7 @@ export class ProvisionStamp {
 		if (manifest.version !== ProvisionStamp.MANIFEST_VERSION
 				|| manifest.mode !== "package"
 				|| typeof manifest.active_root !== "string"
+				|| !existsSync(manifest.active_root)
 				|| !sources || typeof sources !== "object") {
 			return false;
 		}

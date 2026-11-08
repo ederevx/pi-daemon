@@ -75,6 +75,9 @@ class ScratchHome:
         env["HOME"] = str(self.root)
         env["PATH"] = f"{self.fakebin}:{env.get('PATH', '')}"
         env.pop("PI_CODING_AGENT_DIR", None)
+        # The release's own commands are what must keep bytecode out of a
+        # published generation; an inherited setting would decide it instead.
+        env.pop("PYTHONDONTWRITEBYTECODE", None)
         # Every root the installer probes belongs to this scratch tree: the
         # live daemon on this host must never decide a test's outcome.
         env["XDG_RUNTIME_DIR"] = str(self.runtime_dir)
