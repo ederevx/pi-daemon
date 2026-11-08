@@ -91,6 +91,13 @@ class ConfigTests(unittest.TestCase):
             "PI_DAEMON_TRANSCRIPT_INDEX": "true"})
         self.assertIs(beaten.transcript_index, True)
 
+    def test_a_root_that_names_nothing_is_refused_before_startup(self):
+        base = tempfile.mkdtemp(dir=SCRATCH)
+        layout = RuntimeLayout(os.path.join(base, "state"),
+                               os.path.join(base, "runtime"))
+        with self.assertRaises(ValueError):
+            DaemonApplication(layout, ServiceConfig())
+
     def test_the_conversation_store_follows_the_given_environment(self):
         base = tempfile.mkdtemp(dir=SCRATCH)
         agent = os.path.join(base, "agent")

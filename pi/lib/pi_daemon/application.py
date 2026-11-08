@@ -48,10 +48,16 @@ class DaemonApplication:
 
     def __init__(self, layout, config, services_root=None,
                  session_store_root=None):
+        # An empty root is not "no store": pi_transcript reads it as no
+        # containment at all, so an unresolvable root is refused here
+        # rather than served from anywhere on the disk.
+        root = session_store_root or config.session_store_root
+        if not root:
+            raise ValueError("session_store_root is required")
         self._layout = layout
         self._config = config
         self._services_root = services_root
-        self._session_store_root = session_store_root or config.session_store_root
+        self._session_store_root = os.path.abspath(root)
         self._stopping = threading.Event()
         self._mode = "shutdown"
         self._coordinator = InstanceCoordinator(layout.instance_lock_path())

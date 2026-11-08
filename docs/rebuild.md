@@ -592,7 +592,7 @@ other's lock, registry or descriptor:
 | | `session-files.json` (a transcript-file index) | none: dropped |
 | | `run-state/<name>.json` | `sessions/runs/<key>.json` |
 | | `gc-reap/<name>.json` (a reap request) | none: the new side asks nothing of a session |
-| | the `piDaemon` keys of the agent home's `settings.json` | none: no key has a service field |
+| | the `piDaemon` keys of the agent home's `settings.json` | not translated; configure new-service fields explicitly |
 | | | `<state>/settings.json`, an optional `daemon` section |
 | | | `PI_DAEMON_<FIELD>`, which overrides a field |
 | runtime | `$XDG_RUNTIME_DIR/pi-pty-host.sock` | `PI_DAEMON_RUNTIME_DIR` |

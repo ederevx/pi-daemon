@@ -250,6 +250,14 @@ class LiveSetTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(sidecar(cold)))
         service.stop()
 
+    def test_an_explicit_root_still_refuses_a_file_outside_it(self):
+        outside = os.path.join(self.root, "..", "outside.jsonl")
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write(HEADER)
+        service = service_for(self.root)
+        self.assertFalse(service.owns(os.path.abspath(outside)))
+        service.stop()
+
     def test_a_symlink_out_of_the_store_is_refused(self):
         outside = os.path.join(SCRATCH, "escape-%s.jsonl" % os.getpid())
         with open(outside, "w", encoding="utf-8") as handle:

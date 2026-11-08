@@ -45,13 +45,15 @@ class Fixture:
         self.environment = {"PI_DAEMON_STATE_DIR": self.state,
                             "PI_DAEMON_RUNTIME_DIR": self.runtime,
                             "PI_SERVICES_DIR": self.services}
+        self.sessions = os.path.join(base, "sessions")
         self.layout = RuntimeLayout(self.state, self.runtime)
         self.app = None
 
     def start(self):
         config = ServiceConfig.load(overrides=FAST_STOP)
-        self.app = DaemonApplication(self.layout, config,
-                                    self.services).start()
+        self.app = DaemonApplication(
+            self.layout, config, self.services,
+            session_store_root=self.sessions).start()
         return self.app
 
     def stop(self):
@@ -244,7 +246,10 @@ class StopTests(unittest.TestCase):
         layout = RuntimeLayout(os.path.join(base, "state"),
                                os.path.join(base, "runtime"))
         services = os.path.join(base, "services")
-        app = DaemonApplication(layout, ServiceConfig.load(overrides=FAST_STOP))
+        app = DaemonApplication(layout,
+                                ServiceConfig.load(overrides=FAST_STOP),
+                                session_store_root=os.path.join(base,
+                                                                "sessions"))
         app.start()
         try:
             self.assertFalse(os.path.isdir(services))

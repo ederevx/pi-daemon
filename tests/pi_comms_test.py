@@ -46,13 +46,15 @@ class Fixture:
         self.state = os.path.join(base, "state")
         self.runtime = os.path.join(base, "runtime")
         self.services = os.path.join(base, "services")
+        self.sessions = os.path.join(base, "sessions")
         self.layout = RuntimeLayout(self.state, self.runtime)
         self.app = None
 
     def start(self):
         self.app = DaemonApplication(
             self.layout, ServiceConfig.load(overrides=FAST_STOP),
-            self.services).start()
+            self.services,
+            session_store_root=self.sessions).start()
         return self
 
     def stop(self):
