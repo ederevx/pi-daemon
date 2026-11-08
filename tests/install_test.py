@@ -2,8 +2,10 @@
 """Tests for scripts/install.sh, in particular its --package mode.
 
 Each case runs the installer against a scratch HOME with a fake `pi` and
-fake systemd tools on PATH, then inspects the files it wrote. Scratch
-lives under ~/tmp, never the system /tmp. The suite skips without bash.
+fake systemd tools on PATH, then inspects what it published. The package
+mode is exercised from a scratch clone, so a case can edit a source and
+watch a new generation appear. Scratch lives under ~/tmp, never the system
+/tmp. The suite skips without bash.
 """
 
 import hashlib
@@ -11,8 +13,10 @@ import json
 import os
 import pathlib
 import shutil
+import socket
 import subprocess
 import tempfile
+import threading
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -33,25 +37,50 @@ class ScratchHome:
         self.fakebin = self.root / "fakebin"
         self.fakebin.mkdir()
         self._write_exe("pi")
-        self._write_exe("systemctl")
+        # `is-active` answers what a stopped unit answers; every other
+        # systemctl question succeeds.
+        self._write_exe("systemctl", 'case "$*" in *is-active*) exit 3 ;; esac\n')
         self._write_exe("loginctl")
+        self.runtime_dir = self.root / "xdg-runtime"
+        self.runtime_dir.mkdir()
+        self.state_home = self.root / "xdg-state"
+        self.state_home.mkdir()
 
-    def _write_exe(self, name):
+    def _write_exe(self, name, extra=""):
         path = self.fakebin / name
-        path.write_text("#!/bin/sh\nexit 0\n")
+        path.write_text("#!/bin/sh\n" + extra + "exit 0\n")
         path.chmod(0o755)
+
+    def clone(self):
+        """A copy of this package to install from, so a case can edit it."""
+        target = self.root / "pi-daemon"
+        shutil.copytree(ROOT / "pi", target / "pi")
+        shutil.copytree(ROOT / "scripts", target / "scripts")
+        return target
 
     def env(self):
         env = dict(os.environ)
         env["HOME"] = str(self.root)
         env["PATH"] = f"{self.fakebin}:{env.get('PATH', '')}"
         env.pop("PI_CODING_AGENT_DIR", None)
+        # Every root the installer probes belongs to this scratch tree: the
+        # live daemon on this host must never decide a test's outcome.
+        env["XDG_RUNTIME_DIR"] = str(self.runtime_dir)
+        env["XDG_STATE_HOME"] = str(self.state_home)
+        env["PI_DAEMON_STATE_DIR"] = str(self.root / "daemon-state")
+        env["PI_DAEMON_RUNTIME_DIR"] = str(self.root / "daemon-runtime")
+        env.pop("PI_DAEMON_BASH", None)
         return env
 
-    def run(self, *args):
+    def run(self, *args, install=None, cwd=None):
         return subprocess.run(
-            [BASH, str(INSTALL), *args], cwd=str(ROOT), env=self.env(),
+            [BASH, str(install or INSTALL), *args],
+            cwd=str(cwd or ROOT), env=self.env(),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def package(self, clone=None):
+        """Installs from the clone and returns the completed process."""
+        return self.run("--package", install=(clone or self.clone()) / "scripts" / "install.sh")
 
     def path(self, rel):
         return self.root / rel
@@ -60,8 +89,16 @@ class ScratchHome:
         return json.loads(
             self.path(".pi/agent/.pi-daemon/manifest.json").read_text())
 
+    def releases(self):
+        return sorted((self.path(".local/lib/pi-daemon/releases")).iterdir())
+
+    def release(self, rel):
+        """A path inside the generation the manifest selects."""
+        return pathlib.Path(self.manifest()["active_root"]) / rel
+
     def cleanup(self):
         shutil.rmtree(self.root, ignore_errors=True)
+
 
 def winform(path):
     """Normalize an MSYS-style /c/... path from the bash installer to the
@@ -71,6 +108,7 @@ def winform(path):
     if len(text) > 2 and text[0] == "/" and text[2] == "/":
         text = text[1].upper() + ":" + text[2:]
     return os.path.normpath(text)
+
 
 def msysform(path):
     """The form the bash installer writes into a manifest: its own $var.
@@ -98,44 +136,103 @@ class InstallScriptTests(unittest.TestCase):
             self.scratch.path(".pi/agent/.pi-daemon/manifest.json").exists())
         self.assertFalse(self.scratch.path(".local/bin/pi-daemon").exists())
 
-    def test_package_install_skips_extensions_and_writes_service_files(self):
-        result = self.scratch.run("--package")
+    def test_package_install_publishes_one_generation(self):
+        result = self.scratch.package()
         self.assertEqual(result.returncode, 0, result.stderr)
+        for rel in (".local/bin/pi-daemon", ".local/bin/pi-rc", ".local/bin/pi",
+                    ".local/bin/pi-comms", ".local/bin/pi-daemon-migrate",
+                    ".config/systemd/user/pi-daemon.service"):
+            self.assertTrue(self.scratch.path(rel).is_file(), rel)
+        for rel in ("daemon/pi-daemon", "bin/pi-rc", "bin/pi-comms",
+                    "bin/pi-daemon-migrate", "lib/pi_services.py",
+                    "lib/pi_daemon/entry.py", "extensions/daemon.ts",
+                    "defaults.json"):
+            self.assertTrue(self.scratch.release(rel).is_file(), rel)
+        manifest = self.scratch.manifest()
+        self.assertEqual(manifest["version"], 3)
+        self.assertEqual(manifest["mode"], "package")
+        self.assertEqual(len(self.scratch.releases()), 1,
+                         "one generation is published by one install")
+        self.assertEqual(pathlib.Path(manifest["active_root"]),
+                         self.scratch.releases()[0])
+
+    def test_package_install_skips_extension_copies(self):
+        self.assertEqual(self.scratch.package().returncode, 0)
         self.assertFalse(
             self.scratch.path(".pi/agent/extensions/daemon.ts").exists())
         self.assertFalse(
             self.scratch.path(".pi/agent/extensions/offload.ts").exists())
-        for rel in (".local/bin/pi-daemon", ".local/bin/pi-rc", ".local/bin/pi",
-                    ".local/bin/pi_platform.py", ".local/bin/pi_conpty.py",
-                    ".local/bin/pi_settings.py", ".local/bin/pi_transcript.py",
-                    ".local/bin/pi_services.py", ".local/bin/pi_rpc_client.py",
-                    ".local/bin/pi-comms",
-                    ".config/systemd/user/pi-daemon.service"):
-            self.assertTrue(self.scratch.path(rel).is_file(), rel)
-        owned = self.scratch.manifest()["owned"]
-        self.assertNotIn(winform(self.scratch.path(".pi/agent/extensions/daemon.ts")), [winform(o) for o in owned])
-
-    def test_package_install_writes_comms_client(self):
-        result = self.scratch.run("--package")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        comms = self.scratch.path(".local/bin/pi-comms")
-        self.assertTrue(comms.is_file())
-        if os.name != "nt":
-            self.assertTrue(os.access(comms, os.X_OK))
         owned = [winform(o) for o in self.scratch.manifest()["owned"]]
-        for rel in (".local/bin/pi-comms", ".local/bin/pi_rpc_client.py"):
-            self.assertIn(winform(self.scratch.path(rel)), owned, rel)
+        self.assertFalse(
+            [o for o in owned if o.endswith("daemon.ts")],
+            "the extension tree is recorded nowhere under the agent home")
 
-    def test_installed_comms_client_imports_from_local_bin(self):
-        # The installed copy resolves its modules beside itself, so a
-        # missing pi_rpc_client.py fails here and nowhere else.
-        self.assertEqual(self.scratch.run("--package").returncode, 0)
+    def test_a_release_is_immutable(self):
+        # A published generation is the install for a running daemon: no
+        # bytecode may appear beside its modules.
+        self.assertEqual(self.scratch.package().returncode, 0)
+        stray = [p for p in self.scratch.releases()[0].rglob("__pycache__")]
+        self.assertEqual(stray, [], "the release was written after publishing")
+        sources = self.scratch.manifest()["sources"]
+        for rel, digest in sources.items():
+            self.assertNotIn("__pycache__", rel)
+            self.assertNotIn(".pyc", digest and rel)
+
+    def test_package_install_records_sources(self):
+        clone = self.scratch.clone()
+        result = self.scratch.package(clone)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.scratch.manifest()
+        sources = manifest["sources"]
+        for rendered in ("pi/systemd/pi-daemon.service", "pi/bin/pi-wrapper",
+                         "pi/daemon/pi-daemon", "scripts/install.sh"):
+            self.assertIn(rendered, sources)
+        for rel, digest in sources.items():
+            expected = hashlib.sha256((clone / rel).read_bytes()).hexdigest()
+            self.assertEqual(digest, expected, rel)
+        listed = subprocess.run(
+            [BASH, str(clone / "scripts" / "install.sh"), "--sources"],
+            cwd=str(clone), env=self.scratch.env(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(json.loads(listed.stdout), sources,
+                         "the recording is the inventory the installer would publish")
+
+    def test_installed_comms_client_runs_from_the_generation(self):
+        self.assertEqual(self.scratch.package().returncode, 0)
         result = subprocess.run(
             ["python3", str(self.scratch.path(".local/bin/pi-comms")), "help"],
             env=self.scratch.env(), stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("usage: pi-comms", result.stdout)
+
+    def test_a_rerun_republishes_the_same_generation(self):
+        clone = self.scratch.clone()
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        first = self.scratch.manifest()["active_root"]
+        result = self.scratch.package(clone)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.scratch.manifest()["active_root"], first,
+                         "an unchanged clone keeps its generation")
+        self.assertEqual(len(self.scratch.releases()), 1)
+
+    def test_an_edited_source_publishes_a_new_generation_and_keeps_the_old(self):
+        clone = self.scratch.clone()
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        first = self.scratch.manifest()["active_root"]
+        with open(clone / "pi" / "lib" / "pi_services.py", "a",
+                  encoding="utf-8") as handle:
+            handle.write("\n# a new build\n")
+        result = self.scratch.package(clone)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        second = self.scratch.manifest()["active_root"]
+        self.assertNotEqual(second, first, "the edit publishes a new release")
+        self.assertTrue(pathlib.Path(first).is_dir(),
+                        "a running daemon keeps the release it started from")
+        self.assertIn(first, self.scratch.manifest()["retained"])
+        self.assertIn("# a new build",
+                      (pathlib.Path(second) / "lib" / "pi_services.py").read_text())
 
     def test_package_install_removes_manifest_owned_extension_copies(self):
         # An install that predates the package-only rule recorded these as
@@ -156,7 +253,7 @@ class InstallScriptTests(unittest.TestCase):
             "hashes": {},
             "sources": {},
         }))
-        self.assertEqual(self.scratch.run("--package").returncode, 0)
+        self.assertEqual(self.scratch.package().returncode, 0)
         self.assertFalse((ext_dir / "daemon.ts").exists())
         self.assertFalse((ext_dir / "offload.ts").exists())
 
@@ -168,7 +265,7 @@ class InstallScriptTests(unittest.TestCase):
                             ext_dir / name)
         self.assertFalse(
             self.scratch.path(".pi/agent/.pi-daemon/manifest.json").exists())
-        self.assertEqual(self.scratch.run("--package").returncode, 0)
+        self.assertEqual(self.scratch.package().returncode, 0)
         self.assertFalse((ext_dir / "daemon.ts").exists())
         self.assertFalse((ext_dir / "offload.ts").exists())
 
@@ -177,7 +274,7 @@ class InstallScriptTests(unittest.TestCase):
         ext_dir.mkdir(parents=True)
         (ext_dir / "daemon.ts").write_text("// a user file\n")
         (ext_dir / "offload.ts").write_text("// a user file\n")
-        self.assertEqual(self.scratch.run("--package").returncode, 0)
+        self.assertEqual(self.scratch.package().returncode, 0)
         self.assertTrue((ext_dir / "daemon.ts").exists())
         self.assertTrue((ext_dir / "offload.ts").exists())
 
@@ -185,37 +282,26 @@ class InstallScriptTests(unittest.TestCase):
         self.assertEqual(self.scratch.run("--bogus").returncode, 2)
         self.assertIn("unexpected argument", self.scratch.run("--bogus").stderr)
 
-    def test_package_install_records_sources(self):
-        result = self.scratch.run("--package")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        manifest = self.scratch.manifest()
-        self.assertEqual(manifest["mode"], "package")
-        self.assertEqual(manifest["version"], 2)
-        sources = manifest["sources"]
-        for rendered in ("pi/systemd/pi-daemon.service", "pi/bin/pi-wrapper",
-                         "scripts/install.sh"):
-            self.assertIn(rendered, sources)
-        for rel, digest in sources.items():
-            expected = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
-            self.assertEqual(digest, expected, rel)
-
-    def test_uninstall_removes_comms_client(self):
-        self.assertEqual(self.scratch.run("--package").returncode, 0)
+    def test_uninstall_removes_the_install_and_keeps_foreign_files(self):
+        self.assertEqual(self.scratch.package().returncode, 0)
         foreign = self.scratch.path(".local/bin/other-tool")
         foreign.write_text("#!/bin/sh\nexit 0\n")
         result = subprocess.run(
             [BASH, str(UNINSTALL)], cwd=str(ROOT), env=self.scratch.env(),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(self.scratch.path(".local/bin/pi-comms").exists())
+        for rel in (".local/bin/pi-comms", ".local/bin/pi-daemon",
+                    ".local/bin/pi",
+                    ".config/systemd/user/pi-daemon.service"):
+            self.assertFalse(self.scratch.path(rel).exists(), rel)
         self.assertFalse(
-            self.scratch.path(".local/bin/pi_rpc_client.py").exists())
+            self.scratch.path(".local/lib/pi-daemon/releases").exists())
         self.assertTrue(foreign.is_file())
 
     def test_install_refuses_while_locked(self):
         lock = self.scratch.path(".pi/agent/.pi-daemon/install.lock")
         lock.mkdir(parents=True)
-        result = self.scratch.run("--package")
+        result = self.scratch.package()
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assertFalse(self.scratch.path(".local/bin/pi-daemon").exists())
         self.assertTrue(lock.is_dir())
@@ -226,11 +312,49 @@ class InstallScriptTests(unittest.TestCase):
         stale = 3600
         os.utime(lock, (lock.stat().st_mtime - stale,
                         lock.stat().st_mtime - stale))
-        result = self.scratch.run("--package")
+        result = self.scratch.package()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(
             self.scratch.path(".local/bin/pi-daemon").is_file())
         self.assertFalse(lock.exists())
+
+    def test_install_refuses_beside_a_serving_daemon(self):
+        # A legacy install still running would fight the translation of its
+        # own state, so the installer stops before writing anything.
+        legacy = self.scratch.path(".local/state/pi-daemon")
+        legacy.mkdir(parents=True)
+        (legacy / "tickets.json").write_text('{"tickets": []}')
+        endpoint = self.scratch.runtime_dir / "pi-pty-host" / "control.json"
+        endpoint.parent.mkdir()
+        listening = socket.socket()
+        listening.bind(("127.0.0.1", 0))
+        listening.listen(1)
+        self.addCleanup(listening.close)
+        endpoint.write_text(json.dumps({
+            "host": "127.0.0.1", "port": listening.getsockname()[1],
+        }))
+        accepted = threading.Event()
+        self.addCleanup(accepted.set)
+
+        def accept():
+            try:
+                listening.settimeout(5)
+                connection, _ = listening.accept()
+                connection.close()
+            except OSError:
+                pass
+            finally:
+                accepted.set()
+
+        thread = threading.Thread(target=accept, daemon=True)
+        thread.start()
+        result = self.scratch.package()
+        thread.join(5)
+        self.assertEqual(result.returncode, 76, result.stdout + result.stderr)
+        self.assertIn("nothing was changed", result.stderr)
+        self.assertFalse(
+            self.scratch.path(".pi/agent/.pi-daemon/manifest.json").exists())
+        self.assertFalse(self.scratch.path(".local/bin/pi-daemon").exists())
 
 
 if __name__ == "__main__":

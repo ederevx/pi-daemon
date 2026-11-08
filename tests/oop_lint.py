@@ -242,7 +242,7 @@ def main() -> int:
     # editing this list; the two extension-less scripts are explicit.
     ts_files = _extension_ts_files(REPO)
     py_files = (["pi/daemon/pi-daemon", "pi/bin/pi-rc",
-                 "pi/service/pi-daemon"]
+                 "pi/bin/pi-daemon-migrate"]
                 + _relative_files("pi/lib", ".py")
                 + _service_files(REPO))
     for rel in ts_files:

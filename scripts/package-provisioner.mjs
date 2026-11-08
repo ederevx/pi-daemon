@@ -12,7 +12,6 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -23,20 +22,55 @@ import {
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
+/** The bash the installer needs: an explicit override, /bin/bash on
+ *  POSIX, else `bash` from PATH (Git Bash on Windows). */
+export function installerShell() {
+	if (process.env.PI_DAEMON_BASH) return process.env.PI_DAEMON_BASH;
+	if (process.platform !== "win32" && existsSync("/bin/bash")) {
+		return "/bin/bash";
+	}
+	return "bash";
+}
+
 /** Reads what the installer recorded and answers whether this clone still
- *  matches it; the installer owns the source-to-destination map, so only
- *  the recorded sources and their hashes are interpreted here. */
+ *  matches it. The installer owns the source inventory, so the comparison
+ *  asks it (`--sources`) for the exact list it would install now: an added
+ *  or removed module is noticed as readily as an edited one. */
 export class ProvisionStamp {
-	/** install.sh's manifest format; an older record predates sources it
-	 *  did not record, so it is stale and provisions once. */
-	static MANIFEST_VERSION = 2;
+	/** install.sh's manifest format; a v2 record does not describe the
+	 *  generation tree, so it is stale and provisions once. */
+	static MANIFEST_VERSION = 3;
 
 	/** @param repoRoot this package's clone
 	 *  @param manifestPath the installer's manifest (default: the agent
-	 *  home's) */
-	constructor(repoRoot, manifestPath = ProvisionStamp.defaultManifest()) {
+	 *  home's)
+	 *  @param installer the clone's installer
+	 *  @param shell the bash that runs it */
+	constructor(repoRoot,
+		manifestPath = ProvisionStamp.defaultManifest(),
+		installer = join(repoRoot, "scripts", "install.sh"),
+		shell = installerShell()) {
 		this.repoRoot = repoRoot;
 		this.manifestPath = manifestPath;
+		this.installer = installer;
+		this.shell = shell;
+	}
+
+	/** The exact source inventory the installer would publish now, as
+	 *  path-to-sha256; null when the installer cannot answer. */
+	expectedSources() {
+		const result = spawnSync(this.shell, [this.installer, "--sources"], {
+			cwd: this.repoRoot,
+			encoding: "utf8",
+			env: process.env,
+		});
+		if (result.error || result.status !== 0 || !result.stdout) return null;
+		try {
+			const parsed = JSON.parse(result.stdout);
+			return parsed && typeof parsed === "object" ? parsed : null;
+		} catch {
+			return null;
+		}
 	}
 
 	/** The agent home's manifest location, honoring pi's config override. */
@@ -46,9 +80,9 @@ export class ProvisionStamp {
 		return join(home, ".pi-daemon", "manifest.json");
 	}
 
-	/** True when the manifest is a package-mode record whose sources all
-	 *  still hash as recorded; a missing, unreadable, manual, or older
-	 *  manifest is stale, so it provisions once. */
+	/** True when the manifest is a v3 package-mode record whose sources are
+	 *  exactly the installer's current inventory; a missing, unreadable,
+	 *  manual, older, or differently-shaped record is stale. */
 	isCurrent() {
 		let manifest;
 		try {
@@ -59,17 +93,17 @@ export class ProvisionStamp {
 		const sources = manifest.sources;
 		if (manifest.version !== ProvisionStamp.MANIFEST_VERSION
 				|| manifest.mode !== "package"
+				|| typeof manifest.active_root !== "string"
 				|| !sources || typeof sources !== "object") {
 			return false;
 		}
-		return Object.entries(sources).every(([rel, sha]) => {
-			try {
-				const bytes = readFileSync(join(this.repoRoot, rel));
-				return createHash("sha256").update(bytes).digest("hex") === sha;
-			} catch {
-				return false;
-			}
-		});
+		const expected = this.expectedSources();
+		if (!expected) return false;
+		const names = new Set([...Object.keys(expected), ...Object.keys(sources)]);
+		for (const rel of names) {
+			if (expected[rel] !== sources[rel]) return false;
+		}
+		return true;
 	}
 }
 
@@ -81,14 +115,9 @@ export class PackageProvisioner {
 		this.installer = join(repoRoot, "scripts", "install.sh");
 	}
 
-	/** The bash the installer needs: an explicit override, /bin/bash on
-	 *  POSIX, else `bash` from PATH (Git Bash on Windows). */
+	/** The bash the installer needs. */
 	shell() {
-		if (process.env.PI_DAEMON_BASH) return process.env.PI_DAEMON_BASH;
-		if (process.platform !== "win32" && existsSync("/bin/bash")) {
-			return "/bin/bash";
-		}
-		return "bash";
+		return installerShell();
 	}
 
 	/** The package-mode installer invocation, as an argv pair. */

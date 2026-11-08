@@ -60,7 +60,13 @@ class ScratchPackage {
     mkdirSync(bin, { recursive: true });
     for (const tool of ["pi", "systemctl", "loginctl"]) {
       const path = join(bin, tool);
-      writeFileSync(path, "#!/bin/sh\nexit 0\n");
+      // `is-active` must answer what a stopped unit answers: the installer
+      // refuses to translate state beside a running daemon, and the real
+      // user manager on this host would report one.
+      const body = tool === "systemctl"
+        ? "#!/bin/sh\ncase \"$*\" in *is-active*) exit 3 ;; esac\nexit 0\n"
+        : "#!/bin/sh\nexit 0\n";
+      writeFileSync(path, body);
       chmodSync(path, 0o755);
     }
     cpSync(join(REPO, "pi"), join(this.clone, "pi"), { recursive: true });
@@ -86,6 +92,12 @@ class ScratchPackage {
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: this.home };
     env.PATH = this.path();
     delete env.PI_CODING_AGENT_DIR;
+    // Every root the installer probes comes from this scratch tree: the
+    // live daemon's endpoints and unit must never decide a test's outcome.
+    env.XDG_RUNTIME_DIR = join(this.root, "xdg-runtime");
+    env.XDG_STATE_HOME = join(this.root, "xdg-state");
+    env.PI_DAEMON_STATE_DIR = join(this.root, "new-state");
+    env.PI_DAEMON_RUNTIME_DIR = join(this.root, "new-runtime");
     return env;
   }
 
@@ -144,6 +156,17 @@ test("stamp: a manifest without package-mode sources is stale", () => {
   assert(!scratch.stamp().isCurrent(), "an unreadable manifest is stale");
   writeFileSync(scratch.manifest, JSON.stringify({ version: 1, repo: scratch.clone }));
   assert(!scratch.stamp().isCurrent(), "an older manifest is stale");
+});
+
+test("stamp: an added package module is stale", () => {
+  const scratch = new ScratchPackage("added-module");
+  scratch.install();
+  writeFileSync(join(scratch.clone, "pi", "lib", "pi_daemon", "added.py"),
+    "VALUE = 1\n");
+  assert(
+    !scratch.stamp().isCurrent(),
+    "a module the manifest never recorded makes the clone stale",
+  );
 });
 
 test("stamp: a version-1 package manifest is stale", () => {
@@ -209,7 +232,8 @@ test("guard: a stale clone re-provisions the installed copies", async () => {
   assertEq(failures.length, 1, "the guard reported once");
   assertEq(failures[0], null, "provisioning succeeded");
 
-  const installed = join(scratch.home, ".local", "bin", "pi_services.py");
+  const manifest = JSON.parse(readFileSync(scratch.manifest, "utf8"));
+  const installed = join(manifest.active_root, "lib", "pi_services.py");
   const digest = (path: string) =>
     createHash("sha256").update(readFileSync(path)).digest("hex");
   assertEq(digest(installed), digest(source), "the installed copy followed");

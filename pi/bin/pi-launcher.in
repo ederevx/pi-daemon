@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Run one command of the installed pi-daemon generation.
+
+The installer renders this launcher for every public Python command and
+records the generation it selects in the manifest, so an install is a
+pointer swap: a running process keeps the release it started from, a new
+command runs the active one, and nothing is ever rewritten inside a
+published release."""
+
+import json
+import os
+import runpy
+import sys
+
+# A published release is immutable: the modules it runs are imported from
+# the generation, so nothing may drop a __pycache__ beside them.
+sys.dont_write_bytecode = True
+
+TARGET = "@TARGET@"
+
+
+def manifest_path():
+    home = os.environ.get("PI_CODING_AGENT_DIR") or os.path.join(
+        os.path.expanduser("~"), ".pi", "agent")
+    return os.path.join(home, ".pi-daemon", "manifest.json")
+
+
+def main():
+    try:
+        with open(manifest_path(), encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError):
+        raise SystemExit("pi-daemon: installation requires repair")
+    if not isinstance(manifest, dict) or manifest.get("version") != 3:
+        raise SystemExit("pi-daemon: installation requires repair")
+    root = manifest.get("active_root")
+    if not isinstance(root, str) or not root:
+        raise SystemExit("pi-daemon: installation requires repair")
+    target = os.path.join(root, TARGET)
+    if not os.path.isfile(target):
+        raise SystemExit("pi-daemon: installation requires repair")
+    sys.argv[0] = target
+    runpy.run_path(target, run_name="__main__")
+
+
+if __name__ == "__main__":
+    main()
