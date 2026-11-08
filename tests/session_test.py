@@ -279,6 +279,72 @@ class StoreTests(unittest.TestCase):
         del first, second
 
 
+class ViewerRelay:
+    """A relay stub that counts viewers per session id and records moves."""
+
+    def __init__(self, viewers=None):
+        self.viewers = dict(viewers or {})
+        self.dropped = []
+        self.moved = []
+
+    def viewer_count(self, key):
+        return self.viewers.get(key, 0)
+
+    def drop_viewers(self, key):
+        self.dropped.append(key)
+        self.viewers[key] = 0
+
+    def move_viewers(self, key, target):
+        self.moved.append((key, target))
+        self.viewers[target] = (self.viewers.get(target, 0)
+                                + self.viewers.pop(key, 0))
+
+
+class AnnounceTests(unittest.TestCase):
+    """A takeover gives the conversation to whichever holder is busiest."""
+
+    def setUp(self):
+        self.base = roots()
+        self.addCleanup(shutil.rmtree, self.base[0], True)
+        self.store, self.config = store_for(self.base)
+        self.first, _ = reserve(self.store, "pi-a", "/conv.jsonl")
+        self.second, _ = reserve(self.store, "pi-b", "/conv.jsonl")
+
+    def service(self, viewers):
+        self.relay = ViewerRelay(viewers)
+        return SessionService(self.store, None, self.relay, self.config)
+
+    def test_a_takeover_with_more_viewers_keeps_the_conversation(self):
+        service = self.service({self.first.id: 2, self.second.id: 1})
+        reply = service.announce("pi-a", "/conv.jsonl", takeover=True)
+        self.assertIsNone(reply["handoff"], "the busier holder keeps it")
+        self.assertEqual(reply["tookOver"], ["pi-b"],
+                         "the duplicate holder hands over")
+        self.assertEqual(self.store.handoff("pi-b"), {"name": "pi-a"})
+        self.assertEqual(self.relay.dropped, [self.second.id],
+                         "the other holder's viewers are dropped")
+        self.assertEqual(self.store.get("pi-b").child["clients"], 0)
+
+    def test_a_takeover_with_fewer_viewers_hands_the_conversation_over(self):
+        service = self.service({self.first.id: 0, self.second.id: 1})
+        reply = service.announce("pi-a", "/conv.jsonl", takeover=True)
+        self.assertEqual(reply["handoff"], {"name": "pi-b",
+                                            "state": self.second.state()})
+        self.assertEqual(reply["tookOver"], [])
+        self.assertEqual(self.store.handoff("pi-a"), {"name": "pi-b"})
+        self.assertEqual(self.relay.moved, [(self.first.id, self.second.id)],
+                         "its viewers follow the conversation")
+        self.assertEqual(self.store.get("pi-b").child["clients"], 1)
+        self.assertEqual(self.store.get("pi-a").child["clients"], 0)
+
+    def test_a_takeover_without_a_duplicate_holder_changes_nothing(self):
+        service = self.service({})
+        reply = service.announce("pi-a", "/other.jsonl", takeover=True)
+        self.assertIsNone(reply["handoff"])
+        self.assertEqual(reply["tookOver"], [])
+        self.assertIsNone(self.store.handoff("pi-a"))
+
+
 class SpawnGateBackend:
     """A backend whose spawn blocks, so a stop can land mid-reservation."""
 
