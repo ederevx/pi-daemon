@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -21,6 +22,7 @@ from daemon_service.sessions.identity import ProcessIdentity
 from daemon_service.sessions.operations import SessionOperations
 from daemon_service.sessions.pty_backend import PosixPtyBackend, service_root
 from daemon_service.sessions.relay import SessionRelay
+from daemon_service.sessions.runner import SessionRunner
 from daemon_service.sessions.run_outcome import RunOutcome
 from daemon_service.sessions.store import SessionStore
 from daemon_service.transport.control_action import ControlAction
@@ -251,6 +253,104 @@ class StoreTests(unittest.TestCase):
                          ["pi-b", "pi-a"])
         self.assertEqual(self.store.holders("/other.jsonl"), [])
         del first, second
+
+
+class SpawnGateBackend:
+    """A backend whose spawn blocks, so a stop can land mid-reservation."""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.opened = threading.Event()
+
+    def spawn(self, argv, cwd, env, cols, rows):
+        self.entered.set()
+        self.opened.wait(5)
+        self.child = GatedChild()
+        return self.child
+
+
+class GatedChild:
+    """It is the daemon's own pid, so identity is provable without a process."""
+
+    def __init__(self):
+        self.pid = os.getpid()
+        self.identity = None
+        self.terminated = False
+        self.closed = False
+
+    def release(self):
+        return None
+
+    def terminate(self, grace=None):
+        self.terminated = True
+
+    def close(self):
+        self.closed = True
+
+    def disown_master(self):
+        return -1
+
+
+class StubRelay:
+    def __init__(self):
+        self.closed = []
+
+    def register(self, key, generation, master):
+        return True
+
+    def close(self, key):
+        self.closed.append(key)
+
+    def finish(self, key, reason="exit"):
+        return None
+
+
+class RunnerTests(unittest.TestCase):
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="pi-runner-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.config = ServiceConfig(settle_grace=0.5, cancel_grace=0.2)
+        self.store = SessionStore(os.path.join(self.base, "sessions.json"),
+                                  os.path.join(self.base, "runs"), self.config)
+        self.backend = SpawnGateBackend()
+        self.relay = StubRelay()
+        self.runner = SessionRunner(self.store, self.relay, self.config,
+                                    self.backend, {"instance": "i-1"})
+
+    def start_in_background(self):
+        errors = []
+
+        def start():
+            try:
+                self.runner.start("pi-a", self.base, ["sh"], 80, 24)
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=start)
+        thread.start()
+        self.assertTrue(self.backend.entered.wait(5))
+        return thread, errors
+
+    def test_a_stop_during_a_spawn_still_ends_the_child(self):
+        thread, errors = self.start_in_background()
+        reply = self.runner.stop("pi-a")
+        self.assertTrue(reply["queued"], reply)
+        self.backend.opened.set()
+        thread.join(5)
+        self.assertEqual(errors, [])
+        self.assertTrue(self.backend.child.terminated)
+        record = self.store.get("pi-a")
+        self.assertEqual(self.store.stop_reason(record.id), "stop")
+
+    def test_a_shutdown_during_a_spawn_names_the_run(self):
+        thread, errors = self.start_in_background()
+        self.runner.begin_shutdown("shutdown")
+        self.backend.opened.set()
+        thread.join(5)
+        self.assertEqual(errors, [])
+        self.assertTrue(self.backend.child.terminated)
+        record = self.store.get("pi-a")
+        self.assertEqual(self.store.stop_reason(record.id), "shutdown")
 
 
 class StubService:
