@@ -51,11 +51,14 @@ class Migration:
         sessions = SessionStore(self._layout.sessions_path(),
                                 self._layout.run_state_dir(), self._config)
         sessions.replace_all(plan.sessions(), plan.run_states())
-        if self._legacy.digests() != plan.sources():
+        sources = plan.sources()
+        moved = self._legacy.verify(sources)
+        if moved:
             # The marker would name digests the stores no longer hold.
             raise MigrationError(SOURCES_MOVED,
-                                 "the legacy state moved during translation")
+                                 "the legacy state moved during "
+                                 "translation: " + ", ".join(moved))
         MigrationMarker(self._layout.migration_path(),
                         self._config).record(self._legacy.root(),
-                                             plan.sources(),
+                                             sources,
                                              plan.forced(), self._clock())

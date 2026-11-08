@@ -54,6 +54,7 @@ class MigrationPlan:
         self._run_states = {}
         self._sealed = set()
         self._dropped = []
+        self._sources = {}
         self._read()
         self._decide()
 
@@ -61,12 +62,15 @@ class MigrationPlan:
 
     def _read(self):
         self._read_legacy()
+        # Frozen here: the marker must name what this plan read, not what a
+        # concurrent legacy writer left behind afterwards.
+        self._sources = self._legacy.digests()
         marker = MigrationMarker(self._layout.migration_path(),
                                  self._config).read()
         self._marker = marker
 
     def _decide(self):
-        sources = self._legacy.digests()
+        sources = self._sources
         if self._locked:
             self._action, self._refusal = REFUSE, INSTANCE_LOCKED
             return
@@ -150,7 +154,7 @@ class MigrationPlan:
         return self._force
 
     def sources(self):
-        return self._legacy.digests()
+        return dict(self._sources)
 
     def tickets(self):
         return list(self._tickets)

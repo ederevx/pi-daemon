@@ -15,6 +15,9 @@ sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
 from pi_daemon.config import ServiceConfig
 from pi_daemon.lifecycle.instance_coordinator import InstanceCoordinator
+from pi_daemon.migration.error import MigrationError
+from pi_daemon.migration.legacy_root import LegacyRoot
+from pi_daemon.migration.migration import Migration
 from pi_daemon.runtime_layout import RuntimeLayout
 from pi_daemon.sessions.store import SessionStore
 from pi_daemon.tasks.store import TicketStore
@@ -122,6 +125,13 @@ class LegacyFixture:
         return ServiceConfig()
 
 
+class MovingLegacy(LegacyRoot):
+    """A legacy root the old daemon writes to during a translation."""
+
+    def verify(self, expected):
+        return ["tickets.json"]
+
+
 class DryRunTests(unittest.TestCase):
     def setUp(self):
         self.fixture = LegacyFixture(tempfile.mkdtemp(dir=SCRATCH))
@@ -227,6 +237,23 @@ class TranslateTests(unittest.TestCase):
                                                          "/tmp/x.jsonl"))
         self.assertEqual(store.resolve("pi-bad"), "pi-bad")
 
+    def test_the_plan_freezes_the_sources_it_read(self):
+        legacy = LegacyRoot(self.fixture.legacy)
+        plan = Migration(self.fixture.layout(), self.fixture.config(),
+                         legacy).preview(False)
+        read = plan.sources()
+        self.assertEqual(sorted(read), [
+            "run-state/pi-a.json", "sessions.json", "tickets.json",
+            "tickets/t-aa-12.log", "tickets/t-aa-13.log"])
+        # A writer at work after the read must not rewrite the plan's own
+        # account of what it read.
+        self.fixture.write_bytes("tickets/t-aa-13.log", b"rewritten\n")
+        os.remove(self.fixture.path("sessions.json"))
+        self.assertEqual(plan.sources(), read)
+        self.assertEqual(legacy.verify(read),
+                         ["sessions.json", "tickets/t-aa-13.log"])
+        self.assertEqual(legacy.digests(), read)
+
     def test_a_translated_root_is_current_on_a_rerun(self):
         code, _plan, _ = self.fixture.run()
         self.assertEqual(code, 0)
@@ -244,6 +271,17 @@ class TranslateTests(unittest.TestCase):
 class RefusalTests(unittest.TestCase):
     def setUp(self):
         self.fixture = LegacyFixture(tempfile.mkdtemp(dir=SCRATCH))
+
+    def test_apply_refuses_when_the_legacy_moves_during_translation(self):
+        before = snapshot(self.fixture.legacy)
+        with self.assertRaises(MigrationError) as raised:
+            Migration(self.fixture.layout(), self.fixture.config(),
+                      MovingLegacy(self.fixture.legacy)).apply(False)
+        self.assertEqual(raised.exception.code, 4)
+        self.assertIn("during translation", raised.exception.message)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.fixture.state, "migration.json")))
+        self.assertEqual(snapshot(self.fixture.legacy), before)
 
     def test_moved_sources_refuse_until_forced(self):
         self.assertEqual(self.fixture.run()[0], 0)

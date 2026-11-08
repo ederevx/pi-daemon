@@ -39,6 +39,19 @@ class LegacyRoot:
         return [entry for entry in entries if entry.endswith(suffix)
                 and os.path.isfile(os.path.join(directory, entry))]
 
+    def verify(self, expected):
+        """Rehash every planned source; name the ones that moved since."""
+        moved = []
+        for relative, digest in sorted(expected.items()):
+            try:
+                with open(os.path.join(self._root, relative), "rb") as handle:
+                    current = hashlib.sha256(handle.read()).hexdigest()
+            except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+                current = None
+            if current != digest:
+                moved.append(relative)
+        return moved
+
     def read_bytes(self, relative):
         try:
             with open(os.path.join(self._root, relative), "rb") as handle:
