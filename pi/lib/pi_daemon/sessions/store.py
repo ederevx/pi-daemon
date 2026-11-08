@@ -97,6 +97,14 @@ class SessionStore:
             return [record.view() for record in self._sessions.values()
                     if record.live()]
 
+    def live_files(self):
+        """Conversation files a live hosted session backs: its announced
+        file, so the transcript sweep leaves a live conversation alone."""
+        with self._lock:
+            files = [record.file for record in self._sessions.values()
+                     if record.live() and record.file]
+            return files + list(self._files.values())
+
     def file_of(self, name):
         with self._lock:
             record = self._sessions.get(name)

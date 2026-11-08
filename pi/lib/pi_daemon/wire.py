@@ -13,6 +13,14 @@ NO_DIR = "no-dir"
 NO_FILE = "no-file"
 NAME_TAKEN = "name-taken"
 WRITE_FAILED = "write-failed"
+NO_TRANSCRIPT = "no-such-transcript"
+BAD_TRANSCRIPT = "bad-transcript"
+NO_INDEX = "no-index"
+BAD_CURSOR = "bad-cursor"
+
+# Capabilities the greeting names. A client that sees transcript.v1 knows
+# the transcript commands answer, so it needs no probe request.
+CAPABILITIES = ("transcript.v1",)
 
 
 def error_reply(code):

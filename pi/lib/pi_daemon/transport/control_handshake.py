@@ -10,8 +10,8 @@ class ControlHandshake:
     """Authorization and the greeting are decided once per connection.
 
     The greeting carries exactly the published keys; `caps` names only
-    capabilities this build really serves, so it stays empty until the
-    transcript commands land.
+    capabilities the composed router really serves, so a client can rely
+    on one that it sees.
     """
 
     def __init__(self, token, capabilities=()):

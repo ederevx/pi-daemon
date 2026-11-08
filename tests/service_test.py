@@ -514,9 +514,11 @@ class RunnerTests(unittest.TestCase):
 
 class EndpointTests(unittest.TestCase):
     def setUp(self):
+        self.store = tempfile.mkdtemp(dir=SCRATCH)
         self.app = DaemonApplication.from_environment({
             "PI_DAEMON_STATE_DIR": roots()[0],
             "PI_DAEMON_RUNTIME_DIR": roots()[1],
+            "PI_DAEMON_SESSION_STORE_ROOT": self.store,
         }).start()
         self.coordinates = EndpointFile(self.app.endpoint_path()).read()
         self.codec = WireCodec()
@@ -544,6 +546,32 @@ class EndpointTests(unittest.TestCase):
         if os.name != "nt":
             mode = os.stat(self.app.endpoint_path()).st_mode & 0o777
             self.assertEqual(mode, 0o600)
+
+    def conversation(self):
+        """One indexed conversation inside the store the app was told to
+        read, so a transcript verb has something real to answer."""
+        slug = os.path.join(self.store, "--home-wire--")
+        os.makedirs(slug, exist_ok=True)
+        path = os.path.join(slug, "wire.jsonl")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write('{"type":"session","version":3,"id":"e2e-sess",'
+                         '"timestamp":"2026-01-01T00:00:00.000Z"}\n')
+            handle.write('{"type":"message","id":"m1","parentId":null,'
+                         '"timestamp":"2026-01-01T00:00:01.000Z",'
+                         '"message":{"role":"user","content":"hi"}}\n')
+        return path
+
+    def test_a_transcript_verb_answers_over_the_wire(self):
+        path = self.conversation()
+        opened = self.talk({"cmd": "transcript-open", "file": path})
+        self.assertTrue(opened.get("ok"), opened)
+        stat = self.talk({"cmd": "transcript-stat",
+                          "transcriptId": opened["transcriptId"]})
+        self.assertTrue(stat.get("ok"), stat)
+        self.assertEqual(stat["sessionId"], "e2e-sess")
+        missing = self.talk({"cmd": "transcript-stat",
+                             "transcriptId": "t-nope"})
+        self.assertEqual(missing["error"], "no-such-transcript")
 
     def test_a_ticket_round_trip_over_the_wire(self):
         submitted = self.talk({"cmd": "ticket-submit", "session": "pi-1",
@@ -588,7 +616,7 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(self.greeting["srv"], "pi-daemon")
         self.assertEqual(self.greeting["proto"], 1)
         self.assertEqual(self.greeting["index"], 1)
-        self.assertEqual(self.greeting["caps"], [])
+        self.assertEqual(self.greeting["caps"], ["transcript.v1"])
 
     def test_a_malformed_hello_is_bad_handshake(self):
         connection = socket.create_connection(

@@ -32,6 +32,8 @@ def main():
                    [sys.executable, "tests/service_test.py"])
     all_ok &= step("sessions domain tests",
                    [sys.executable, "tests/session_test.py"])
+    all_ok &= step("transcripts domain tests",
+                   [sys.executable, "tests/transcripts_test.py"])
     all_ok &= step("migration tests",
                    [sys.executable, "tests/migration_test.py"])
     all_ok &= step("comms domain tests",

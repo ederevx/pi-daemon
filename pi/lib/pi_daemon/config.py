@@ -74,6 +74,11 @@ class ServiceConfig:
     relay_tick: float = 0.05
     settle_grace: float = 1.0
     history_limit: int = 4
+    session_store_root: str = ""
+    transcript_index: bool = True
+    transcript_index_interval: float = 3.0
+    transcript_index_max_bytes: int = 4194304
+    transcript_index_max_line: int = 16777216
     comms_message_ttl: float = 120.0
     comms_result_ttl: float = 3600.0
     comms_max_ttl: float = 86400.0

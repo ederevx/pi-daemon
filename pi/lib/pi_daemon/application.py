@@ -7,6 +7,8 @@ import signal
 import sys
 import threading
 
+import pi_platform
+
 from .comms.mailbox_store import MailboxStore
 from .comms.node_identity import NodeIdentity
 from .comms.peer_auth import PeerAuthenticator
@@ -29,6 +31,8 @@ from .tasks.operations import TaskOperations
 from .tasks.runner import TicketRunner
 from .tasks.service import TaskService
 from .tasks.store import TicketStore
+from .transcripts.operations import TranscriptOperations
+from .transcripts.service import TranscriptService
 from .transport.control_endpoint import ControlEndpoint
 from .transport.control_handshake import ControlHandshake
 from .transport.control_router import ControlRouter
@@ -36,7 +40,7 @@ from .transport.endpoint_file import EndpointFile
 from .transport.rpc_codec import RpcCodec
 from .transport.rpc_listener import RpcListener
 from .transport.service_descriptor import ServiceDescriptor
-from .wire import WireCodec
+from .wire import CAPABILITIES, WireCodec
 
 
 class DaemonApplication:
@@ -57,6 +61,7 @@ class DaemonApplication:
         self._session_store = None
         self._session_runner = None
         self._relay = None
+        self._transcripts = None
         self._endpoint = None
         self._comms = None
         self._comms_store = None
@@ -106,11 +111,15 @@ class DaemonApplication:
             handlers = TaskOperations(tasks).handlers()
             handlers.update(SessionOperations(
                 sessions, self.request_stop, self._config).handlers())
+            self._transcripts = self._compose_transcripts(sessions)
+            handlers.update(
+                TranscriptOperations(self._transcripts).handlers())
             token = secrets.token_hex(16)
             self._compose_comms(token)
             codec = WireCodec()
             endpoint = ControlEndpoint(
-                self._layout, self._config, ControlHandshake(token),
+                self._layout, self._config,
+                ControlHandshake(token, CAPABILITIES),
                 ControlRouter(handlers), codec, self._instance, token,
             )
             self._endpoint = endpoint
@@ -135,6 +144,16 @@ class DaemonApplication:
         runner.recover()
         self._session_runner = runner
         return SessionService(store, runner, relay, self._config)
+
+    def _compose_transcripts(self, sessions):
+        """The conversation index reads pi's own store, so its root is the
+        agent home's `sessions` unless a field names another."""
+        root = self._config.session_store_root or os.path.join(
+            pi_platform.RuntimeLayout().agent_home(), "sessions")
+        service = TranscriptService(self._config, root, sessions.live_files,
+                                    sessions.recorded_file)
+        service.start()
+        return service
 
     def _compose_comms(self, token):
         """Every owner is held before it starts, so unwind can stop it."""
@@ -260,6 +279,8 @@ class DaemonApplication:
             self._sessions.stop_all()
         if self._tasks is not None:
             self._tasks.stop()
+        if self._transcripts is not None:
+            self._transcripts.stop()
         if self._relay is not None:
             self._relay.stop()
         if self._store is not None:
@@ -277,6 +298,7 @@ class DaemonApplication:
         self._session_store = None
         self._session_runner = None
         self._relay = None
+        self._transcripts = None
         self._comms = None
         self._comms_store = None
         self._comms_listener = None

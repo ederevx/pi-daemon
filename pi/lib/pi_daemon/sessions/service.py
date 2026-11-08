@@ -44,6 +44,9 @@ class SessionService:
         return [{"name": name, "state": state}
                 for name, state in self._holders(file)]
 
+    def live_files(self):
+        return self._store.live_files()
+
     def recorded_file(self, name):
         canonical = self._store.resolve(name)
         return self._store.file_of(canonical) if canonical else None

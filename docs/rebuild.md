@@ -45,6 +45,8 @@ pi/lib/pi_daemon/sessions/relay_session.py RelaySession
 pi/lib/pi_daemon/sessions/pty_backend.py PosixPtyBackend
 pi/lib/pi_daemon/sessions/pty_child.py    PtyChild
 pi/lib/pi_daemon/sessions/pty_exec.py     PtyExec
+pi/lib/pi_daemon/transcripts/operations.py TranscriptOperations
+pi/lib/pi_daemon/transcripts/service.py    TranscriptService
 pi/lib/pi_daemon/transport/control_action.py ControlAction
 pi/lib/pi_daemon/migration/error.py       MigrationError
 pi/lib/pi_daemon/migration/legacy_root.py LegacyRoot
@@ -62,8 +64,8 @@ entry point only bootstraps: it requires `PI_DAEMON_STATE_DIR` and
 the live roots.
 
 `DaemonApplication` starts the instance lock, the tasks domain, the
-sessions domain and the control endpoint in that order, and stops them
-in reverse: close admission, stop accepting, settle sessions, cancel and
+sessions domain, the transcripts domain and the control endpoint in that
+order, and stops them in reverse: close admission, stop accepting, settle sessions, cancel and
 join children, persist both stores, remove the owned descriptor, release
 the lock.
 
@@ -74,8 +76,8 @@ field against the installed clients:
 
 ```
 client → {"cmd": "hello", "token": "<from descriptor>"}
-server → {"ok": true, "srv": "pi-daemon", "proto": 1, "caps": [],
-          "index": 1}
+server → {"ok": true, "srv": "pi-daemon", "proto": 1,
+          "caps": ["transcript.v1"], "index": 1}
 client → {"cmd": "<command>", ...}
 server → {"ok": true, ...} | {"ok": false, "error": "<name>"}
 ```
@@ -86,8 +88,8 @@ that is not `cmd: hello` with the descriptor's token is answered
 `bad-handshake`, `bad-request`, `no-ticket`, `running`, `too-busy`,
 `spawn-failed`, and every failure reply is built by `error_reply` in
 `wire.py`, the single owner of the shape. The greeting advertises only
-capability this build serves, so `caps` stays empty until the
-transcript commands land; `index` stays at the published `1`.
+capability this build serves: `transcript.v1` since the transcript
+commands answer, and `index` stays at the published `1`.
 
 Request coercion matches the published server, because the installed
 clients rely on it: `timeout` and `offset` accept numbers and their
@@ -106,6 +108,16 @@ without `offset` it answers the whole text as `output`, with `offset`
 it answers raw bytes as base64 `data` plus `offset`, `next` and `size`,
 so a page boundary never splits or rescales a character. `env` is
 transient per submission and is never stored in a record.
+
+The transcript reads answer the published fields. `transcript-open`
+returns the conversation's metadata plus `transcriptId` (a handle) and
+`index` (the `{"state": ...}` the refresh produced); every other verb
+accepts that handle, else a `file`, else a `session` name whose announced
+conversation is resolved through the session store. `transcript-stat`
+drops `file`. The rejections are `no-such-transcript`, `bad-transcript`,
+`no-index`, `bad-cursor` and `bad-request`, and a reply echoes the
+request's `id`. The daemon never serves a path outside the conversation
+store, and the sweep skips every conversation a live session backs.
 
 * Frames are one JSON object per line, bounded by `frame_bytes`, and a
   connection's buffer survives between frames.
@@ -256,9 +268,12 @@ and non-finite numbers are refused, and zero is a value, not "unset".
 
 There are no legacy names, no `PI_PTYD_*` fallbacks and no pi-teams
 aliases: the new service only reads its own names. No legacy
-`piDaemon` key has a service field - a ticket TTL, an extension watch,
-an idle window or a transcript-index limit has no counterpart here -
-so `migrate` translates no configuration.
+`piDaemon` key has a service field - a ticket TTL, an extension watch or
+an idle window has no counterpart here - so `migrate` translates no
+configuration. The conversation index is configured by
+`session_store_root` (empty means the agent home's `sessions`),
+`transcript_index`, `transcript_index_interval`,
+`transcript_index_max_bytes` and `transcript_index_max_line`.
 
 A comms setting whose zero would stop mail rather than disable a
 feature is refused, so it falls through to its next source. The comms
@@ -271,6 +286,7 @@ the reply margin must be at least the agent-id limit plus 256 bytes.
 | Domain | Owns | Never |
 |---|---|---|
 | tasks | tickets, IDs, output logs, child execution | session, comms or peer state |
+| transcripts | the conversation index, read handles, the sweep | session records, the relay |
 | transport | framing, descriptor, accepted connections | domain records |
 | lifecycle | instance lock and generation | readiness decisions |
 | application | composition and start/stop order | domain dictionaries or locks |
@@ -639,8 +655,9 @@ share a runtime directory.
 
 ## Open work
 
-* Transcripts and the deferred session operations (`carry`,
-  `extensions-reload`, `handover`, `daemon-restart`).
+* The deferred session operations (`carry`, `extensions-reload`,
+  `handover`, `daemon-restart`). Transcripts are served: the seven
+  `transcript-*` verbs, the `transcript.v1` capability and the sweep.
 * The relay uses `select()`, so a descriptor numbered 1024 or higher
   would stall it; move to `selectors` before that is reachable.
 * Shutdown terminates children serially, one `cancel_grace` per child
