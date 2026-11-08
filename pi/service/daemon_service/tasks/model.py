@@ -1,63 +1,36 @@
-"""One command ticket: the record the store persists and the runner
-advances through its states.
-"""
+"""One ticket's record; its execution environment is never persisted."""
 
-import time
+from dataclasses import dataclass, fields
 
-QUEUED = "queued"
 RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
-TIMEOUT = "timeout"
 CANCELLED = "cancelled"
-FINISHED = (DONE, FAILED, TIMEOUT, CANCELLED)
 
 
+@dataclass
 class Ticket:
-    """The record of one offloaded command."""
-
-    def __init__(self, id, session, cwd, command, env=None, timeout=None):
-        self.id = id
-        self.session = session
-        self.cwd = cwd
-        self.command = command
-        self.env = env or {}
-        self.timeout = timeout
-        self.status = QUEUED
-        self.pid = None
-        self.exit = None
-        self.error = None
-        self.truncated = False
-        self.created = time.time()
-        self.started = None
-        self.finished = None
+    ticket_id: str
+    session: str
+    cwd: str
+    command: str
+    timeout: float = 0.0
+    status: str = RUNNING
+    created: float = 0.0
+    pid: int = None
+    started: float = None
+    ended: float = None
+    exit_code: int = None
+    output_bytes: int = 0
+    truncated: bool = False
+    error: str = ""
 
     def to_dict(self):
-        return {
-            "id": self.id, "session": self.session, "cwd": self.cwd,
-            "command": self.command, "env": self.env, "timeout": self.timeout,
-            "status": self.status, "pid": self.pid, "exit": self.exit,
-            "error": self.error, "truncated": self.truncated,
-            "created": self.created, "started": self.started,
-            "finished": self.finished,
-        }
+        return {field.name: getattr(self, field.name) for field in fields(self)}
 
     @classmethod
     def from_dict(cls, data):
-        ticket = cls(data["id"], data["session"], data["cwd"],
-                     data["command"], data.get("env"), data.get("timeout"))
-        for field in ("status", "pid", "exit", "error", "truncated",
-                      "created", "started", "finished"):
-            if field in data:
-                setattr(ticket, field, data[field])
-        return ticket
-
-    def view(self):
-        """The client-facing shape: no internal bookkeeping."""
-        return self.to_dict()
-
-    def finish(self, status, exit_code=None, error=None):
-        self.status = status
-        self.exit = exit_code
-        self.error = error
-        self.finished = time.time()
+        known = {field.name for field in fields(cls)}
+        return cls(**{key: value for key, value in data.items()
+                      if key in known and key != "ticket_id"},
+                   ticket_id=str(data["ticket_id"]))

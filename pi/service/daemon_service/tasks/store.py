@@ -1,148 +1,216 @@
-"""The ticket store: durable records and the output log of each ticket.
-
-One file holds every record; each ticket's output is its own log file so
-a large command never rewrites the index. Both are written atomically
-from this owner alone.
-"""
+"""The sole owner of ticket records, their IDs and their output logs."""
 
 import os
 import threading
+import time
 
-from .model import FINISHED, Ticket
-
-CHUNK = 256 << 10
+from ..atomic_state_file import AtomicStateFile
+from .model import CANCELLED, DONE, FAILED, RUNNING, Ticket
 
 
 class TicketStore:
-    """Owns the ticket records and their output logs."""
+    """Records leave this object as detached snapshots, never as state."""
 
-    def __init__(self, state, max_records=200, max_output_bytes=4 << 20):
-        self.state = state
-        self.path = state.tickets_path()
-        self.log_dir = state.ticket_log_dir()
-        self.max_records = max_records
-        self.max_output_bytes = max_output_bytes
-        self.lock = threading.RLock()
-        self.records = {}
-        self.counter = 0
-        self._load()
+    def __init__(self, path, logs_dir, config):
+        self._file = AtomicStateFile(path, config.file_mode,
+                                     config.write_retries,
+                                     config.write_retry_delay)
+        self._logs = logs_dir
+        self._record_cap = config.record_cap
+        self._output_cap = config.output_cap
+        self._lock = threading.RLock()
+        self._records = {}
+        self._order = []
+        self._next = 0
 
-    def _load(self):
-        data = self.state.read_json(self.path, {}) or {}
-        for tid, raw in (data.get("tickets") or {}).items():
-            try:
-                self.records[tid] = Ticket.from_dict(raw)
-            except (KeyError, TypeError):
-                continue
-        try:
-            self.counter = int(data.get("counter") or 0)
-        except (TypeError, ValueError):
-            self.counter = 0
+    def load(self):
+        with self._lock:
+            data = self._file.read_dict() or {}
+            records = {}
+            for item in data.get("tickets", []):
+                try:
+                    ticket = Ticket.from_dict(item)
+                except (TypeError, KeyError):
+                    continue
+                records[ticket.ticket_id] = ticket
+            order = [tid for tid in data.get("order", []) if tid in records]
+            order += [tid for tid in records if tid not in order]
+            for ticket in records.values():
+                if ticket.status == RUNNING:
+                    ticket.status = FAILED
+                    ticket.error = "interrupted by a restart"
+                    ticket.ended = time.time()
+            self._records = records
+            self._order = order
+            self._next = int(data.get("next", 0) or 0)
+            self._save_locked()
 
-    def _persist(self):
-        self.state.write_json(self.path, {
-            "counter": self.counter,
-            "tickets": {t.id: t.to_dict() for t in self.records.values()},
+    def save(self):
+        with self._lock:
+            self._save_locked()
+
+    def _save_locked(self):
+        self._file.write_dict({
+            "next": self._next,
+            "order": list(self._order),
+            "tickets": [self._records[tid].to_dict() for tid in self._order
+                        if tid in self._records],
         })
 
-    def alloc(self, session):
-        with self.lock:
-            self.counter += 1
-            self._persist()
-            return "t-%d" % self.counter
+    def reserve(self, session, cwd, command, timeout):
+        """One atomic operation: replay a running match or create a ticket."""
+        with self._lock:
+            for ticket_id in self._order:
+                ticket = self._records[ticket_id]
+                if (ticket.status == RUNNING and ticket.session == session
+                        and ticket.cwd == cwd and ticket.command == command):
+                    return ticket.to_dict(), False
+            self._next += 1
+            ticket = Ticket(
+                ticket_id=f"t-{os.getpid()}-{self._next}",
+                session=session,
+                cwd=cwd,
+                command=command,
+                timeout=float(timeout or 0.0),
+                created=time.time(),
+            )
+            self._records[ticket.ticket_id] = ticket
+            self._order.append(ticket.ticket_id)
+            self._save_locked()
+            return ticket.to_dict(), True
 
-    def put(self, ticket):
-        with self.lock:
-            self.records[ticket.id] = ticket
-            self._evict()
-            self._persist()
+    def mark_running(self, ticket_id, pid, started):
+        with self._lock:
+            ticket = self._owned(ticket_id)
+            ticket.pid = pid
+            ticket.started = started
+            self._save_locked()
+            return ticket.to_dict()
 
-    def _evict(self):
-        finished = [t for t in self.records.values()
-                    if t.status in FINISHED]
-        overflow = len(finished) - self.max_records
-        if overflow <= 0:
-            return
-        finished.sort(key=lambda t: t.finished or 0.0)
-        for ticket in finished[:overflow]:
-            self.records.pop(ticket.id, None)
-            self._unlink_log(ticket.id)
+    def mark_truncated(self, ticket_id):
+        with self._lock:
+            ticket = self._owned(ticket_id)
+            ticket.truncated = True
+            self._save_locked()
 
-    def get(self, tid):
-        with self.lock:
-            return self.records.get(tid)
+    def finish(self, ticket_id, status, exit_code=None, error=""):
+        with self._lock:
+            ticket = self._owned(ticket_id)
+            ticket.status = status
+            ticket.exit_code = exit_code
+            ticket.error = error
+            ticket.ended = time.time()
+            self._save_locked()
+            snapshot = ticket.to_dict()
+            self._cap_locked()
+            return snapshot
+
+    def snapshot_one(self, ticket_id):
+        with self._lock:
+            ticket = self._records.get(ticket_id)
+            return ticket.to_dict() if ticket else None
 
     def snapshot(self, session=None):
-        with self.lock:
-            tickets = [t for t in self.records.values()
-                       if session is None or t.session == session]
-        tickets.sort(key=lambda t: t.created)
-        return [t.view() for t in tickets]
+        with self._lock:
+            return [self._records[tid].to_dict() for tid in self._order
+                    if self._records[tid].session == session] if session \
+                else [self._records[tid].to_dict() for tid in self._order]
 
-    def remove(self, tid):
-        with self.lock:
-            ticket = self.records.get(tid)
+    def running_ids(self):
+        with self._lock:
+            return [tid for tid in self._order
+                    if self._records[tid].status == RUNNING]
+
+    def log_path(self, ticket_id):
+        return os.path.join(self._logs, f"{ticket_id}.log")
+
+    def append_output(self, ticket_id, data):
+        with self._lock:
+            ticket = self._records.get(ticket_id)
             if ticket is None:
-                return None
-            if ticket.status not in FINISHED:
-                raise ValueError("running")
-            self.records.pop(tid, None)
-            self._unlink_log(tid)
-            self._persist()
-            return ticket
+                return 0
+            remaining = self._output_cap - ticket.output_bytes
+            if remaining <= 0:
+                if not ticket.truncated:
+                    ticket.truncated = True
+                    self._save_locked()
+                return 0
+            chunk = data[:remaining]
+            with open(self.log_path(ticket_id), "ab") as handle:
+                handle.write(chunk)
+            ticket.output_bytes += len(chunk)
+            if len(chunk) < len(data):
+                ticket.truncated = True
+            self._save_locked()
+            return len(chunk)
+
+    def output(self, ticket_id, offset=0):
+        with self._lock:
+            ticket = self._records.get(ticket_id)
+            if ticket is None:
+                raise LookupError(f"unknown ticket: {ticket_id}")
+            limit = ticket.output_bytes
+        offset = max(0, min(int(offset or 0), limit))
+        try:
+            with open(self.log_path(ticket_id), "rb") as handle:
+                handle.seek(offset)
+                data = handle.read()
+        except FileNotFoundError:
+            data = b""
+        return data.decode("utf-8", "replace"), offset + len(data)
+
+    def remove(self, ticket_id):
+        with self._lock:
+            ticket = self._records.get(ticket_id)
+            if ticket is None:
+                raise LookupError(f"unknown ticket: {ticket_id}")
+            if ticket.status == RUNNING:
+                raise RuntimeError(f"ticket is still running: {ticket_id}")
+            self._records.pop(ticket_id, None)
+            if ticket_id in self._order:
+                self._order.remove(ticket_id)
+            self._save_locked()
+            self._discard_log(ticket_id)
+            return True
 
     def reset(self):
-        with self.lock:
-            removed = len(self.records)
-            self.records.clear()
-            for name in os.listdir(self.log_dir):
-                try:
-                    os.unlink(os.path.join(self.log_dir, name))
-                except OSError:
-                    pass
-            self._persist()
-            return removed
+        with self._lock:
+            removed = [tid for tid in self._order
+                       if self._records[tid].status != RUNNING]
+            for ticket_id in removed:
+                self._records.pop(ticket_id, None)
+                self._order.remove(ticket_id)
+                self._discard_log(ticket_id)
+            self._save_locked()
+            return len(removed)
 
-    def log_path(self, tid):
-        return os.path.join(self.log_dir, tid + ".log")
+    def reset_all(self):
+        with self._lock:
+            removed = list(self._order)
+            self._records.clear()
+            self._order.clear()
+            self._save_locked()
+            for ticket_id in removed:
+                self._discard_log(ticket_id)
+            return len(removed)
 
-    def _unlink_log(self, tid):
+    def _cap_locked(self):
+        finished = [tid for tid in self._order
+                    if self._records[tid].status != RUNNING]
+        for ticket_id in finished[:max(0, len(finished) - self._record_cap)]:
+            self._records.pop(ticket_id, None)
+            self._order.remove(ticket_id)
+            self._discard_log(ticket_id)
+        self._save_locked()
+
+    def _discard_log(self, ticket_id):
         try:
-            os.unlink(self.log_path(tid))
+            os.unlink(self.log_path(ticket_id))
         except OSError:
             pass
 
-    def append_output(self, tid, data):
-        """Append to a ticket's log, bounded; returns True once truncated."""
-        path = self.log_path(tid)
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            size = 0
-        room = self.max_output_bytes - size
-        if room <= 0:
-            return True
-        with open(path, "ab") as f:
-            f.write(data[:room])
-        return len(data) > room
-
-    def read_output(self, tid, offset):
-        path = self.log_path(tid)
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            return {"offset": offset, "next": offset, "size": 0,
-                    "data": b""}
-        with open(path, "rb") as f:
-            f.seek(min(offset, size))
-            data = f.read(CHUNK)
-        return {"offset": offset, "next": offset + len(data), "size": size,
-                "data": data}
-
-    def text_output(self, tid):
-        try:
-            with open(self.log_path(tid), "r", encoding="utf-8",
-                      errors="replace") as f:
-                return f.read()
-        except OSError:
-            return ""
+    def _owned(self, ticket_id):
+        ticket = self._records.get(ticket_id)
+        if ticket is None:
+            raise LookupError(f"unknown ticket: {ticket_id}")
+        return ticket
