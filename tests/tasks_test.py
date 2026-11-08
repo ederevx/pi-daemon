@@ -340,6 +340,24 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.store.output(snapshot["id"])[0], b"seen",
                          "a submit-time variable reaches the run")
 
+    @unittest.skipIf(os.name == "nt", "a shell script is not executable here")
+    def test_a_ticket_runs_in_the_shell_it_was_handed(self):
+        # The owner of an offloaded task resolves the shell its settings
+        # chose and passes it as PI_SHELL; the ticket runs there, not in
+        # whatever shell the service happens to find.
+        marker = os.path.join(self.base, "shell-used")
+        shell = os.path.join(self.base, "a-shell")
+        with open(shell, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nprintf '%s' \"$*\" > " + marker + "\n")
+        os.chmod(shell, 0o755)
+        snapshot, _reused = self.submit("echo ticket-command",
+                                        env={"PI_SHELL": shell})
+        settled = self.runner.wait(snapshot["id"], 10)
+        self.assertEqual(settled["status"], DONE, settled.get("error"))
+        with open(marker, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "-c echo ticket-command",
+                             "the command ran in the handed shell")
+
     def test_a_timeout_ends_the_child_and_marks_it_failed(self):
         snapshot, _reused = self.submit("sleep 30", timeout=0.3)
         settled = self.runner.wait(snapshot["id"], 10)
