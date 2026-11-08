@@ -25,8 +25,15 @@ class TicketRunner:
         self._timeouts = {}
         self._cancelled = set()
         self._closed = False
-        self._shell = config.shell or (
-            "cmd" if os.name == "nt" else (shutil.which("sh") or "/bin/sh"))
+        # A ticket command means what it means in bash: the owner of an
+        # offloaded task resolves the shell its settings chose and passes it
+        # as PI_SHELL, and the legacy daemon ran every ticket in bash. A
+        # bare `sh` would silently change `[[ ... ]]`, arrays and printf
+        # escapes, so bash is preferred and `sh` is only the last resort.
+        self._shell = config.shell or (shutil.which("bash")
+                                       or shutil.which("sh")
+                                       or ("cmd" if os.name == "nt"
+                                           else "/bin/sh"))
 
     def submit(self, session, cwd, command, timeout=0.0, env=None):
         with self._lock:
@@ -122,12 +129,15 @@ class TicketRunner:
         cwd = snapshot["cwd"]
         if not os.path.isdir(cwd):
             raise ValueError(f"no such directory: {cwd}")
+        # PI_SHELL arrives with an offloaded ticket: the owner resolved the
+        # shell its own settings chose, so the ticket runs in that one.
+        shell = (env or {}).get("PI_SHELL") or self._shell
         if os.name == "nt":
-            args = [self._shell, "/c", snapshot["command"]]
+            args = [shell, "/c", snapshot["command"]]
             flags = subprocess.CREATE_NEW_PROCESS_GROUP
             session = False
         else:
-            args = [self._shell, "-c", snapshot["command"]]
+            args = [shell, "-c", snapshot["command"]]
             flags = 0
             session = True
         environment = dict(os.environ)
