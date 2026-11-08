@@ -1,136 +1,130 @@
-# The rebuild
+# The unified service: framework and migration
 
-This branch replaces pi-daemon with one service built from a single
-unified framework. The old daemon and the pi-teams broker are not
-carried over: no module, class, or function of theirs is reused. What
-is kept is what is not theirs to change — the contracts a client sees,
-the platform primitives, and the state a migration must not lose.
+This branch builds one service from scratch: one process, one control
+contract, and every domain owned by an object instead of a module. No
+implementation from the old daemon or from pi-teams is imported; the
+existing public contract is reimplemented against the same wire, so the
+installed clients keep working when the entry point switches.
 
-## The framework
+## What exists now
 
-One process, one state root, one control endpoint, three domains.
+The staging tree lives beside the installed one until the switch:
 
 ```
-entry        pi/service/pi-daemon          argv -> Service().run()
-framework    pi/service/daemon_service/
-               app.py      Service        lifecycle, single instance, tick
-               state.py    ServiceState   every path the service writes
-               config.py   ServiceConfig  every tunable, resolved once
-               wire.py     wire           request/response shapes
-               endpoint.py Endpoint       loopback control endpoint
-               router.py   Router         command table -> domain handler
-domains      tasks/      Ticket, TicketStore, TicketRunner, TaskControl
-             sessions/   (phase 2) hosted sessions, run state, revive
-             comms/      (phase 3) agents, relay, mailbox, peers
+pi/service/pi-daemon                     staging entry (bootstrap only)
+pi/service/daemon_service/application.py  DaemonApplication
+pi/service/daemon_service/config.py       ServiceConfig
+pi/service/daemon_service/runtime_layout.py     RuntimeLayout
+pi/service/daemon_service/atomic_state_file.py  AtomicStateFile
+pi/service/daemon_service/wire.py               WireCodec (pi-pty-host/1)
+pi/service/daemon_service/lifecycle/instance_coordinator.py
+pi/service/daemon_service/transport/json_line_stream.py
+pi/service/daemon_service/transport/endpoint_file.py
+pi/service/daemon_service/transport/endpoint_probe.py
+pi/service/daemon_service/transport/control_handshake.py
+pi/service/daemon_service/transport/control_endpoint.py
+pi/service/daemon_service/transport/control_router.py
+pi/service/daemon_service/tasks/model.py    Ticket
+pi/service/daemon_service/tasks/store.py    TicketStore
+pi/service/daemon_service/tasks/runner.py   TicketRunner
+pi/service/daemon_service/tasks/service.py  TaskService
+pi/service/daemon_service/tasks/operations.py   TaskOperations
 ```
 
-Rules the code holds itself to:
+Each file owns one cohesive responsibility and one primary class. The
+entry point only bootstraps: it requires `PI_DAEMON_STATE_DIR` and
+`PI_DAEMON_RUNTIME_DIR`, composes `DaemonApplication`, and runs it. The
+staging entry never falls back to the live roots.
 
-- A domain owns its state and touches no other domain's. Cross-domain
-  work is one call on the owning object, never a shared file or dict.
-- The router is the only place that knows which owner serves a wire
-  command; a domain never learns another domain's command names.
-- The endpoint owns connections and authorization. A handler receives
-  a decoded request and returns a response; it never sees a socket.
-- Every path comes from `ServiceState`, every tunable from
-  `ServiceConfig`. Neither a port, a path, a timeout, nor a default is
-  written anywhere else.
-- A record is written exactly once from its owner, atomically, through
-  `ServiceState.write_json`.
+`DaemonApplication` starts the instance lock, the tasks domain and the
+control endpoint in that order, and stops them in reverse: close
+admission, stop accepting, cancel and join children, persist, remove
+the owned descriptor, release the lock.
 
-## Wire
+## The control contract
 
-One newline-delimited JSON object per line, loopback TCP, a per-daemon
-random token published in the runtime endpoint file (mode 0600).
+The listener speaks the existing protocol, reimplemented here:
 
-The first request on a connection is `hello`:
-
-```json
-{"cmd": "hello", "token": "...", "version": 1}
+```
+client → {"op": "hello", "token": "<from descriptor>"}
+server → {"ok": true, "srv": "pi-pty-host", "proto": 1,
+          "commands": ["ticket-cancel", ...]}
+client → {"op": "<command>", ...}
+server → {"ok": true, ...} | {"ok": false, "error": "<reason>"}
 ```
 
-answered with the service identity and the command list, so a client
-discovers what the daemon serves instead of assuming it. Every later
-request on that connection is served without repeating the token. A
-wrong token, a non-hello first request, or an unknown version closes
-the connection with `unauthorized` or `protocol-mismatch`.
+* Frames are one JSON object per line, bounded by `frame_bytes`, and a
+  connection's buffer survives between frames.
+* The token is minted per instance, published only in the runtime
+  descriptor (`control.json`, mode `0600`), and compared in constant
+  time.
+* The descriptor names its instance; only that instance removes it.
+* A ticket that exceeds its timeout ends `failed` with `timed out`,
+  never a new status.
+* A running ticket that matches a new submission is replayed, not
+  started twice.
 
-## Domains
+## Configuration
 
-- **Tasks** own command tickets: a client submits a shell command for a
-  session; the runner executes it detached from the client, the store
-  keeps the record and its output, and `wait`, `output`, `list`,
-  `cancel`, and `remove` work on it. A ticket outlives the session that
-  submitted it.
-- **Sessions** (phase 2) own hosted pi processes: spawn, attach, detach,
-  resize, revive, run-state, and the conversation index. Nothing else
-  starts or stops an agent process.
-- **Comms** (phase 3) own agents: registration, relay, mailbox, waiting,
-  and peer links. Comms reaches sessions only through the sessions
-  domain's public spawn call, so the process owner stays single.
+Every operational value is a `ServiceConfig` field, resolved once from
+environment (`PI_DAEMON_<FIELD>`) over the settings file over the
+default, and invalid values fall through to the next source. Booleans
+and non-finite numbers are refused, and zero is a value, not "unset".
 
-## Migration
+There are no legacy names, no `PI_PTYD_*` fallbacks and no pi-teams
+aliases: migration translates configuration once, in the migration
+step, and the new service only reads its own names.
 
-The cutover contract, from the installed pi-daemon v2.9.66 plus
-pi-teams v0.4.57 to this service, is unchanged in shape and stays the
-reason the old tree is kept until its replacement is proven:
+## Domain boundaries
 
-1. **Validate off-tree.** Install the branch into a scratch agent home
-   (`PI_CODING_AGENT_DIR`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`,
-   `PI_SERVICES_DIR` under one `~/tmp` directory), run the suites, then
-   a live smoke of every domain. The live daemon is never replaced in
-   this step.
-2. **Tag the validated state**; no landing before it is verified.
-3. **Back up state** by copying `pi-pty-host/` and `pi-teams/` to a
-   dated directory and leaving both originals in place.
-4. **Import comms state once**: `peers.json`, `mailbox/`, and `hosts/`
-   become the comms state; registrations are connection-based and are
-   not imported.
-5. **Restart, don't migrate, the sessions.** The swap is an ordinary
-   daemon restart: stop, reinstall the tagged release, start. Recorded
-   sessions revive from their registry, and a session that was mid-turn
-   is revived headless from its conversation like any restart.
-6. **Retire pi-teams** only after a peer round trip passes against the
-   unified service; drop the pin, restart pi sessions so no extension
-   registers with two providers.
-7. **Verify the invariants**: one comms descriptor, one relay listener,
-   no pi-teams process, every hosted session listed, no ticket lost.
+| Domain | Owns | Never |
+|---|---|---|
+| tasks | tickets, IDs, output logs, child execution | session, comms or peer state |
+| transport | framing, descriptor, accepted connections | domain records |
+| lifecycle | instance lock and generation | readiness decisions |
+| application | composition and start/stop order | domain dictionaries or locks |
 
-Rollback is a reinstall of the two tagged releases plus the dated state
-copy; the new service adds files to the existing state root and never
-rewrites an old one in place, which is what keeps the rollback a
-restore of one directory.
+Cross-domain access is through public methods that return detached
+snapshots. The store is the sole owner of ticket records: the runner
+receives IDs and keeps process bookkeeping only.
 
-## Compatibility kept
+## The migration
 
-- The control endpoint path and the loopback endpoint-file shape.
-- The `session-host` capability descriptor and its activation argv, so
-  a still-installed pi-teams release keeps spawning through it.
-- The conversation store, `run-state` records, and the state paths a
-  ticket record lives at.
-- Reaping stays a request the session answers itself, never a signal.
+Order matters, and each step is reversible on its own:
 
-## Settings
+1. Ship the new package beside the installed one (`pi/service/`), with
+   tests in `tests/run.py`. Nothing installed changes.
+2. Bring up the staging entry with explicit roots and verify the
+   control contract, tickets, restart recovery and clean shutdown.
+3. Add the remaining domains against the same composition: sessions
+   (session hosting, run state, revive, transcripts), then comms
+   (registry, relay, mailbox, waits, peers) as the `agent-comms`
+   capability over `pi-rpc/1` on its own listener.
+4. Switch the entry point: `pi/daemon/pi-daemon` becomes the thin
+   bootstrap, the implementation moves to `pi/lib/pi_daemon/`, and the
+   old monolith and the standalone broker are deleted in the same
+   commit. No adapter is written between old and new code.
+5. Translate state once: read the old ticket and session files, write
+   the new layout, and leave the old files untouched for one release.
+6. Rewire `pi-rc` and the extensions to the new client, then remove
+   the legacy aliases from the migration translator.
+7. Update the installer for the private tree (`lib/`, `bin/`,
+   `daemon/`, `extensions/`), the unit files and the docs.
 
-The one namespace is `piDaemon`; what `piTeams` holds today becomes
-`piDaemon.comms`, with every old environment name honored as a legacy
-fallback for one release and the new name winning. The full mapping is
-in the table below.
+## Rollback
 
-| Today (`piTeams`) | Rebuild (`piDaemon.comms`) | Env today | Env after |
-| --- | --- | --- | --- |
-| `host` | `comms.host` | `PI_TEAMS_HOST` | `PI_DAEMON_COMMS_HOST` |
-| `stateDir` | removed: one state root | `TEAM_ROOT` | — |
-| `binDir` | removed: `pi-rc` owns the CLI | `PI_TEAMS_BIN` | — |
-| `gcIdleHours` | `comms.gcIdleHours` | `PI_TEAMS_GC_IDLE_HOURS` | `PI_DAEMON_COMMS_GC_IDLE_HOURS` |
-| `busyGraceHours` | `comms.busyGraceHours` | `PI_TEAMS_BUSY_GRACE_HOURS` | `PI_DAEMON_COMMS_BUSY_GRACE_HOURS` |
-| `restartGraceSeconds` | `comms.restartGraceSeconds` | `PI_TEAMS_RESTART_GRACE` | `PI_DAEMON_COMMS_RESTART_GRACE` |
-| `peerGraceSeconds` | `comms.peerGraceSeconds` | `PI_TEAMS_PEER_GRACE` | `PI_DAEMON_COMMS_PEER_GRACE` |
-| `spawnWindowMs` | `comms.spawnWindowMs` | `PI_TEAMS_SPAWN_WINDOW` | `PI_DAEMON_COMMS_SPAWN_WINDOW` |
-| `waitSeconds` | `comms.waitSeconds` | `PI_TEAMS_WAIT` | `PI_DAEMON_COMMS_WAIT` |
-| `stallSeconds` | `comms.stallSeconds` | `PI_TEAMS_STALL` | `PI_DAEMON_COMMS_STALL` |
-| `remoteGuard` | `comms.remoteGuard` | `PI_TEAMS_REMOTE_GUARD` | `PI_DAEMON_COMMS_REMOTE_GUARD` |
-| `ssh` | `comms.ssh` | `PI_TEAMS_SSH` | `PI_DAEMON_COMMS_SSH` |
-| `remoteState` | removed: one state root | `PI_TEAMS_REMOTE_STATE` | — |
-| `peerSetup` | `comms.peerSetup` | `PI_TEAMS_PEER_SETUP` | `PI_DAEMON_COMMS_PEER_SETUP` |
-| `sessionsRoot` | `piDaemon.sessionsRoot` | `PI_TEAMS_SESSIONS_ROOT` | `PI_DAEMON_SESSIONS_ROOT` |
+Rollback never depends on the new code. Every step keeps the previous
+release installed and its state files in place, so rollback is: stop
+the new service, restore the previous entry point and launchers, start
+the old service, and leave the new state directory in place as
+evidence. The instance lock and the runtime descriptor are per-root, so
+the two implementations never share a runtime directory.
+
+## Open work
+
+* Sessions, run state, revive, handoff and transcripts.
+* Native comms: registry, relay, mailbox, waits, peers, and the
+  `agent-comms` RPC listener.
+* Extension and `pi-rc` rewiring; installer and migration tooling.
+* Discovery: `ServiceDirectory`, activation, binding and self
+  provisioning, which the descriptor work above prepares for.
