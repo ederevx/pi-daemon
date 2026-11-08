@@ -713,14 +713,34 @@ runs the translation rather than `ExecStartPre`: with
 `Restart=on-failure` and `StartLimitIntervalSec=0` a failing pre-start
 command would restart every two seconds forever.
 
+The one host the installer cannot serve alone is the one whose daemon
+hosts the session asking it to run: `systemctl --user stop` ends that
+session, because the unit's default `KillMode=control-group` reaches
+every process in its cgroup and a `setsid` or `nohup` child cannot leave
+it. There the install runs under `systemd-run --user`, which gives it a
+transient unit of its own, with the environment a ticket cannot supply:
+`PATH` must reach the real `pi` (`~/.pi/agent/bin/pi`, not the wrapper
+directory and not the shim), and `PI_CODING_AGENT_DIR`,
+`PI_DAEMON_STATE_DIR`, `PI_DAEMON_RUNTIME_DIR` and `TMPDIR` are named
+explicitly. The script logs outside the deployment clone, which the next
+`pi install` resets and cleans, and it decides on the installer's status:
+75 is retried while a session's background provision holds the lock, 76
+means a daemon came back and the legacy unit is still in place to start,
+and a failed migration installs nothing.
+
 ## Rollback
 
 Rollback never depends on the new code, because the legacy root was never
 written:
 
-1. `systemctl --user stop pi-daemon.service`.
-2. `pi install git:github.com/ederevx/pi-daemon@<the previous tag>`: its
-   postinstall restores the previous `pi-daemon` launcher and unit.
+1. `systemctl --user stop pi-daemon.service`, from outside the unit's
+   cgroup when a hosted session is asking (see Cutover: `systemd-run`).
+2. `pi install git:github.com/ederevx/pi-daemon@<the tag the running
+   install came from>`: its postinstall restores the previous
+   `pi-daemon` launcher and unit. The target is the tag pinned in
+   `~/.pi/agent/settings.json`, not the previous tag by number: a host
+   can run a tag the release list has moved past, and rolling back
+   below it would drop whatever that tag carried.
 3. `rm -f ~/.local/bin/pi-comms ~/.local/bin/pi-daemon-migrate
    ~/.local/bin/pi-daemon-migrate.cmd ~/.local/bin/pi_rpc_client.py`: the
    previous release's manifest does not own them, so its `uninstall.sh`

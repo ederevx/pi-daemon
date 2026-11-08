@@ -78,16 +78,26 @@ generation, and only when the new state root has none yet:
 
 ```bash
 bash scripts/install.sh --package            # refuses (76) while a daemon serves
-pi-daemon-migrate --dry-run                  # what it would translate
-pi-daemon-migrate                            # translate now
 ```
 
 Because a legacy daemon owns the state and the endpoint it is reading,
-the installer refuses to translate beside it: stop the unit
-(`systemctl --user stop pi-daemon.service`) and re-run; nothing is
-changed when it refuses. A held install lock exits 75. `bash` is
-required (on Windows, Git Bash): the installer, the launchers it renders
-and the shell tickets all run through it.
+the installer refuses to translate beside it; nothing is changed when it
+refuses. Stop the unit and re-run the same command: that run translates
+the legacy root, promotes the release and starts the unit itself.
+
+On a host whose daemon hosts the session running the install, the stop
+kills the install too: the unit's default `KillMode=control-group`
+reaches every process in its cgroup, and a `setsid` child cannot leave
+it. Such an install runs under `systemd-run --user`, which gives it a
+transient unit of its own and lets the script outlive the daemon it
+stops; it also needs the environment a ticket does not pass on, so
+name `PATH` (to the real `pi`, not the wrapper or the shim), `HOME`,
+`TMPDIR` and the root variables explicitly. `docs/rebuild.md` records
+the full form under Cutover.
+
+A held install lock exits 75. `bash` is required (on Windows, Git Bash):
+the installer, the launchers it renders and the shell tickets all run
+through it.
 
 ## Agent comms
 
