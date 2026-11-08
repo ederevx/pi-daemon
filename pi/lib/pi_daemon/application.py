@@ -158,13 +158,16 @@ class DaemonApplication:
         self._session_store, self._relay = store, relay
         owner = ProcessIdentity.current(os.getpid()).to_dict()
         owner["instance"] = self._instance
-        runner = SessionRunner(store, relay, self._config, backend, owner)
+        runner = SessionRunner(store, relay, self._config, backend, owner,
+                               state_root=self._layout.state_root())
         runner.recover()
         self._session_runner = runner
         command = PiCommand(self._environment)
         carry = SessionCarry(store, runner, relay, command)
         handover = SessionHandover(store, runner, command, self._config)
-        reload = SessionReload(self._layout.state_root())
+        reload = SessionReload(self._layout.state_root(),
+                               grace=self._config.reload_grace,
+                               poll=self._config.reload_poll)
         # A request a previous run left behind names a session that is gone.
         reload.purge()
         return SessionService(store, runner, relay, self._config, carry,

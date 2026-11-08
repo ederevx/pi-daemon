@@ -1,5 +1,6 @@
 """The sessions domain's surface: one method per published operation."""
 
+import threading
 import time
 
 from ..wire import NO_SESSION
@@ -35,6 +36,9 @@ class SessionService:
         self._carry = carry
         self._handover = handover
         self._reload = reload
+        # One round at a time: two rounds would overwrite each other's
+        # request and neither absence nor a token could tell them apart.
+        self._reload_lock = threading.Lock()
 
     # -- hosting -----------------------------------------------------------
 
@@ -256,14 +260,19 @@ class SessionService:
         reload - it is reported as skipped and nothing retries it here.
         Only sessions that already exist are touched; nothing is started,
         respawned or revived, so a broken update cannot become a spawn
-        storm. The extension deletes its signal to accept; a session whose
-        extension never does runs an older extension and gets "/reload"
-        typed into its PTY instead.
+        storm. The extension deletes its signal to accept; a session that
+        has not acknowledged by then gets "/reload" typed into its PTY
+        instead, but only if it is still the same live, idle run.
         """
         if self._reload is None:
             raise SessionError(NO_SESSION)
+        with self._reload_lock:
+            return self._round(names)
+
+    def _round(self, names):
         targets, skipped = [], []
-        for record in self._store.live():
+        live = {record.name: record for record in self._store.live()}
+        for record in live.values():
             if names is not None and record.name not in names:
                 continue
             if not _reloadable(record):
@@ -272,25 +281,47 @@ class SessionService:
             if record.state() != "idle":
                 skipped.append({"id": record.name, "reason": "not-idle"})
                 continue
-            targets.append(record.name)
+            targets.append((record.id, record.generation, record.name))
+        if names is not None:
+            # A requested name that is not live is answered, not dropped:
+            # silence would read as a reload that happened.
+            for name in names:
+                if name not in live:
+                    skipped.append({"id": name, "reason": "unknown"})
         token = self._reload.token()
         pending = []
-        for name in targets:
+        for key, generation, name in targets:
             if self._reload.signal(name, token):
-                pending.append(name)
+                pending.append((key, generation, name))
             else:
                 skipped.append({"id": name, "reason": "write-failed"})
-        consumed = self._reload.await_consumed(pending)
-        reloaded = list(consumed)
-        for name in pending:
+        consumed = set(self._reload.await_consumed(
+            [name for _key, _generation, name in pending]))
+        reloaded = [name for _key, _generation, name in pending
+                    if name in consumed]
+        for key, generation, name in pending:
             if name in consumed:
                 continue
-            # Unconsumed: an extension without the watcher never picked the
-            # signal up, so clear it and type the command the old way.
-            self._reload.clear(name)
+            try:
+                claimed = self._reload.claim(name, token)
+            except OSError:
+                skipped.append({"id": name, "reason": "write-failed"})
+                continue
+            if not claimed:
+                # The extension consumed the request while this round was
+                # deciding: the reload it queued is the acknowledgement.
+                reloaded.append(name)
+                continue
+            record = self._store.get(name)
+            if record is None or record.id != key \
+                    or not record.live() \
+                    or record.generation != generation \
+                    or record.state() != "idle":
+                skipped.append({"id": name, "reason": "not-idle"})
+                continue
             try:
                 self._runner.send(name, FALLBACK.encode("utf-8"))
-            except SessionError:
+            except (SessionError, OSError, TimeoutError):
                 skipped.append({"id": name, "reason": "write-failed"})
             else:
                 reloaded.append(name)

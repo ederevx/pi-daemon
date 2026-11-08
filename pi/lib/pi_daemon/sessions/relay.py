@@ -61,7 +61,7 @@ class SessionRelay:
         self._call(lambda: self._detach(key, viewer_id))
 
     def input(self, key, data):
-        self._call(lambda: self._input(key, data))
+        return self._call(lambda: self._input(key, data))
 
     def resize(self, key, cols, rows):
         self._call(lambda: self._resize(key, cols, rows))
@@ -157,10 +157,11 @@ class SessionRelay:
         return True
 
     def _input(self, key, data):
+        """Queue bytes for the child; False when the relay holds no such run."""
         session = self._sessions.get(key)
-        if session is not None:
-            session.feed(data)
-        return True
+        if session is None:
+            return False
+        return session.feed(data)
 
     def _resize(self, key, cols, rows):
         session = self._sessions.get(key)

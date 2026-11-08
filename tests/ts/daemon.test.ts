@@ -485,6 +485,8 @@ test("daemon: unconsumed token (daemon fallback) never double-reloads", async ()
       };
       await cmd.handler([], c);
       assertEq(reloaded, 0, "typed fallback wins, no second reload");
+      // an expired signal is inert, never the manual restart path
+      assertEq(pi.execCalls.length, 0, "no service restart was attempted");
       await pi.shutdownHandlers[0]({ reason: "quit" });
     });
   });

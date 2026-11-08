@@ -1284,8 +1284,12 @@ export default function (pi: ExtensionAPI) {
 			"Reload resources on the daemon's signal; without a pending signal, restart the pi-daemon to adopt a newly installed build (through the systemd unit where the service manager owns it, otherwise the in-daemon successor path)",
 		handler: async (_args, ctx) => {
 			const token = reloadWatcher.pendingToken;
-			if (token && reloadWatcher.consume(token)) {
-				await ctx.reload();
+			if (token) {
+				// Signal-originated, and inert once expired: a token the
+				// daemon already took back means it gave up waiting and
+				// typed the command itself, so this queued copy must never
+				// fall through to the manual restart below.
+				if (reloadWatcher.consume(token)) await ctx.reload();
 				return;
 			}
 			// Manual invocation: restart the daemon along the path the

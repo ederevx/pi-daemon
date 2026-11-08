@@ -10,6 +10,8 @@ ENV_PREFIX = "PI_DAEMON_"
 # Comms fields whose zero would stop mail rather than disable a feature;
 # every other value keeps its own semantics, including zero.
 RANGES = {
+    "reload_grace": 0.0,
+    "reload_poll": 0.0,
     "comms_message_ttl": 0.0,
     "comms_result_ttl": 0.0,
     "comms_max_ttl": 0.0,
@@ -76,6 +78,10 @@ class ServiceConfig:
     # change event, and two changes in one instant coalesce into none.
     repaint_tick: float = 0.05
     settle_grace: float = 1.0
+    # A reload round waits this long for a hosted extension to take its
+    # request, then types the command into the PTY instead.
+    reload_grace: float = 2.0
+    reload_poll: float = 0.05
     history_limit: int = 4
     session_store_root: str = ""
     transcript_index: bool = True

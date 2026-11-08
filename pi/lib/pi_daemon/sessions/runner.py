@@ -13,12 +13,17 @@ from .identity import ProcessIdentity
 class SessionRunner:
     """A child is recorded before it execs and sealed after it is reaped."""
 
-    def __init__(self, store, relay, config, backend, owner):
+    def __init__(self, store, relay, config, backend, owner,
+                 state_root=None):
         self._store = store
         self._relay = relay
         self._config = config
         self._backend = backend
         self._owner = dict(owner)
+        # The daemon's own state root, in the form it resolved, so a
+        # hosted session reads the same directory the service writes
+        # instead of re-deriving a possibly relative path from its cwd.
+        self._state_root = state_root or config.state_dir
         self._lock = threading.RLock()
         self._children = {}
         self._threads = {}
@@ -118,7 +123,10 @@ class SessionRunner:
         record = self._store.get(name)
         if record is None or not record.live():
             raise SessionError("no-session")
-        self._relay.input(record.id, data)
+        if not self._relay.input(record.id, data):
+            # Queued nowhere: the relay no longer holds this run, so the
+            # caller must not report bytes it never handed to a child.
+            raise SessionError("write-failed")
         return len(data)
 
     def resize(self, name, cols, rows):
@@ -235,6 +243,11 @@ class SessionRunner:
         environment.update(record.env)
         if env_once:
             environment.update(env_once)
+        # Last, never overlaid: the session's extension reads this to find
+        # the reload and reap signals, so it must be the root this daemon
+        # holds the instance lock for, not whatever a caller remembered.
+        if self._state_root:
+            environment["PI_DAEMON_STATE_DIR"] = self._state_root
         return environment
 
 

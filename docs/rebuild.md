@@ -156,7 +156,8 @@ projects errors.
 ```
 list | which | whichall | start | attach | detach | stop | input |
 resize | state | run-state | announce | resume | handoff-target |
-gc-reap-ack | daemon-purge | daemon-restart | shutdown
+gc-reap-ack | daemon-purge | extensions-reload | daemon-restart |
+shutdown
 ```
 
 * `list` answers the published session view: `name`, `dir`, `pid`,
@@ -167,7 +168,11 @@ gc-reap-ack | daemon-purge | daemon-restart | shutdown
   answers `names`, one `name`/`state` entry per live holder.
 * `start` answers `created` (a live name is replayed, never replaced);
   the child environment is `os.environ` plus the stored `env`, plus
-  `PI_DAEMON_SESSION`, plus the transient `env_once` overlay.
+  `PI_DAEMON_SESSION`, plus the transient `env_once` overlay, and last
+  of all - never overlaid - `PI_DAEMON_STATE_DIR`, which the daemon sets
+  to the state root it resolved, so a hosted session's extensions read
+  the reload and reap signals of the daemon that hosts them and a
+  relative root cannot drift with the child's working directory.
 * `attach` answers first and then hands the socket to the relay: the
   greeting and the reply are one JSON line, everything after it is raw
   PTY bytes in both directions. A failed attach carries the recorded
@@ -193,26 +198,45 @@ gc-reap-ack | daemon-purge | daemon-restart | shutdown
   before the application stops and carries the same `mode` the run ends
   with.
 
-`extensions-reload` is one round with no memory. It targets the live
-sessions that announced a conversation and carry no `--no-session`
-(`skipped` says `not-reloadable` otherwise), and it leaves a session
-whose turn or blocking daemon wait is open alone (`not-idle`), because
-pi would deny the reload there; a busy session is skipped and nothing
-retries it, so the caller runs the command again. Nothing is started,
-respawned or revived, so a broken update cannot become a spawn storm.
+`extensions-reload` is one round with no memory, and rounds never
+overlap: the service holds a lock for the whole round, so two callers
+can neither overwrite each other's request nor read each other's
+acknowledgement. It targets the live sessions that announced a
+conversation and carry no `--no-session` (`skipped` says
+`not-reloadable` otherwise), and it leaves a session whose turn or
+blocking daemon wait is open alone (`not-idle`), because pi would deny
+the reload there; a busy session is skipped and nothing retries it, so
+the caller runs the command again. Nothing is started, respawned or
+revived, so a broken update cannot become a spawn storm.
+
 The request is a file under the state root,
-`<state root>/extensions-reload/<name>.json`, written whole and
-carrying a fresh round token. The hosted extension's watcher consumes
-it by deleting it and queues pi's own `/daemon-reload`; a session that
-has not consumed it within the grace runs an older extension, so the
-daemon clears the file and types `/reload` into its PTY instead. A token
+`<state root>/extensions-reload/<name>.json`, written whole under a
+name that carries the round token and carrying a fresh token per round.
+The hosted extension's watcher consumes it by deleting it and queues
+pi's own `/daemon-reload`; a session that has not acknowledged within
+the grace - an older extension without the watcher, a watcher event
+that never arrived, or a scheduler that never ran the queued command -
+gets `/reload` typed into its PTY instead. That fallback is guarded
+twice: the round takes the request back only if it still carries its own
+token (a request consumed at the deadline, or a later round's file, is
+never deleted), and it types only into the same live, idle run it
+selected. The typed bytes are queued for the PTY, not proven rendered,
+and the fallback assumes the TUI is at a prompt: idle is the service's
+only evidence, so a half-typed editor is the operator's risk. A token
 consumed in one round never fires in the next, and a startup purges
-whatever a previous run left behind. The reply carries `reloaded`,
-`skipped` (`id` and `reason`) and `deferred`.
+whatever a previous run left behind, half-written temporaries included.
+
+The reply carries `reloaded` (a session whose request was taken, or
+whose PTY accepted the typed command), `skipped` (`id` and `reason`:
+`not-reloadable`, `not-idle`, `write-failed`, or `unknown` for a name
+the round was asked for that is not live - `sessions` is an
+intersection with the live set, and `[]` selects none), and `deferred`,
+which says only that some selected session was left alone because it was
+not idle; nothing is scheduled.
 
 Deferred to the next increment, and answered `bad-request` today:
-`carry`, `handover`, `daemon-restart`. A restart is a handover
-to a successor process, so promising it before a successor exists would
+`carry`, `handover`, `daemon-restart`. A restart is a handover to a
+successor process, so promising it before a successor exists would
 leave pi-rc waiting for an endpoint that never comes.
 
 ### Durable records

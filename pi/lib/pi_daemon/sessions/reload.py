@@ -5,11 +5,6 @@ import os
 import time
 
 SIGNAL_DIR = "extensions-reload"
-# The extension sees the file on its own watcher's next event; a session
-# that has not consumed it by then runs an extension without the watcher,
-# and the caller types "/reload" into the PTY instead of losing the round.
-GRACE = 2.0
-POLL = 0.05
 
 
 class SessionReload:
@@ -17,15 +12,17 @@ class SessionReload:
 
     The file itself is the contract with the in-session extension: it is
     written whole (a reader never sees half a request), it carries a fresh
-    token per round (a token already consumed can never fire twice), and
-    its deletion by the extension is the only acknowledgement.
+    token per round (a token already consumed can never fire twice, and a
+    later round never inherits an earlier one), and its deletion - by the
+    extension, or by the round that gives up on it - is the only
+    acknowledgement.
     """
 
-    def __init__(self, state_root, grace=GRACE, poll=POLL,
-                 clock=time.monotonic, sleep=time.sleep):
+    def __init__(self, state_root, grace, poll, clock=time.monotonic,
+                 sleep=time.sleep):
         self._directory = os.path.join(state_root, SIGNAL_DIR)
-        self._grace = grace
-        self._poll = poll
+        self._grace = float(grace)
+        self._poll = float(poll)
         self._clock = clock
         self._sleep = sleep
 
@@ -41,12 +38,14 @@ class SessionReload:
 
         A name with a separator is refused here rather than by the
         filesystem: the signal directory must never escape the state root.
+        The temporary file carries the token, so two rounds can never write
+        over each other's half-written request.
         """
         if not name or name in (".", "..") or os.sep in name \
                 or (os.altsep and os.altsep in name):
             return False
         path = self.path(name)
-        temporary = path + ".tmp"
+        temporary = "%s.%s.tmp" % (path, token)
         try:
             os.makedirs(self._directory, exist_ok=True)
             with open(temporary, "w", encoding="utf-8") as handle:
@@ -55,6 +54,7 @@ class SessionReload:
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
         except OSError:
+            self._remove(temporary)
             return False
         return True
 
@@ -62,11 +62,24 @@ class SessionReload:
         """The extension deletes its file once it queued pi's own reload."""
         return not os.path.exists(self.path(name))
 
-    def clear(self, name):
+    def claim(self, name, token):
+        """Take a request back before the caller falls back to typing.
+
+        True only when the file still carried this round's token and this
+        call removed it. False means the extension consumed the request
+        after the grace expired (or in the instant before this call), so
+        the reload it queued is the acknowledgement. A file carrying a
+        later round's token is left alone: this round must never delete a
+        request it did not write. A removal that fails for another reason
+        is raised, never reported as a claim.
+        """
+        if self._read_token(name) != token:
+            return False
         try:
             os.remove(self.path(name))
-        except OSError:
-            pass
+        except FileNotFoundError:
+            return False
+        return True
 
     def purge(self):
         """Drop what a previous run left: a stale request must never fire."""
@@ -76,7 +89,9 @@ class SessionReload:
             return
         for entry in entries:
             if entry.endswith(".json"):
-                self.clear(entry[:-len(".json")])
+                self._remove(self.path(entry[:-len(".json")]))
+            elif entry.endswith(".tmp"):
+                self._remove(os.path.join(self._directory, entry))
 
     def await_consumed(self, names):
         """Wait out the grace once, then answer who consumed their signal."""
@@ -86,3 +101,18 @@ class SessionReload:
             self._sleep(self._poll)
             pending = [name for name in pending if not self.consumed(name)]
         return [name for name in names if self.consumed(name)]
+
+    def _read_token(self, name):
+        try:
+            with open(self.path(name), encoding="utf-8") as handle:
+                record = json.load(handle)
+        except (OSError, ValueError):
+            return None
+        token = record.get("token") if isinstance(record, dict) else None
+        return token if isinstance(token, str) else None
+
+    def _remove(self, path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass

@@ -1106,11 +1106,19 @@ class DaemonTests(unittest.TestCase):
 
 
 class StubReload:
-    def __init__(self, consumed=(), write_failed=()):
+    """A round whose grace decides: names in `consumed` ack, the rest wait."""
+
+    def __init__(self, consumed=(), write_failed=(), claimed=False,
+                 late_consumed=()):
         self.signals = []
-        self.cleared = []
+        self.claimed = []
+        self.entries = 0
+        self.inside = 0
+        self.overlapped = False
         self.consumed = list(consumed)
+        self.late_consumed = list(late_consumed)
         self.write_failed = set(write_failed)
+        self.claimable = claimed
 
     def token(self):
         return "tok"
@@ -1122,18 +1130,32 @@ class StubReload:
         return True
 
     def await_consumed(self, names):
-        return [name for name in names if name in self.consumed]
+        self.entries += 1
+        self.inside += 1
+        if self.inside > 1:
+            self.overlapped = True
+        try:
+            return [name for name in names
+                    if name in self.consumed]
+        finally:
+            self.inside -= 1
 
-    def clear(self, name):
-        self.cleared.append(name)
+    def claim(self, name, token):
+        self.claimed.append((name, token))
+        if name in self.late_consumed:
+            return False
+        return self.claimable
 
 
 class StubSender:
-    def __init__(self, failing=()):
+    def __init__(self, failing=(), raising=()):
         self.sent = []
         self.failing = set(failing)
+        self.raising = set(raising)
 
     def send(self, name, data):
+        if name in self.raising:
+            raise TimeoutError("the relay did not answer")
         if name in self.failing:
             raise SessionError("write-failed")
         self.sent.append((name, data))
@@ -1143,7 +1165,8 @@ class StubSender:
 class SignalTests(unittest.TestCase):
     def setUp(self):
         self.state, _runtime = roots()
-        self.reload = SessionReload(self.state, grace=0.0, sleep=lambda _s: None)
+        self.reload = SessionReload(self.state, grace=0.0, poll=0.0,
+                                    sleep=lambda _s: None)
 
     def test_a_signal_carries_the_token_the_extension_reads(self):
         self.assertTrue(self.reload.signal("pi-a", "tok-1"))
@@ -1159,9 +1182,18 @@ class SignalTests(unittest.TestCase):
         self.reload.signal("pi-a", "tok-1")
         self.assertFalse(self.reload.consumed("pi-a"))
         self.assertEqual(self.reload.await_consumed(["pi-a"]), [])
-        self.reload.clear("pi-a")
+        self.assertTrue(self.reload.claim("pi-a", "tok-1"))
         self.assertTrue(self.reload.consumed("pi-a"))
         self.assertEqual(self.reload.await_consumed(["pi-a"]), ["pi-a"])
+
+    def test_a_claim_never_deletes_another_rounds_request(self):
+        self.reload.signal("pi-a", "tok-2")
+        self.assertFalse(self.reload.claim("pi-a", "tok-1"))
+        self.assertFalse(self.reload.consumed("pi-a"))
+        self.assertTrue(self.reload.claim("pi-a", "tok-2"))
+
+    def test_a_claim_of_a_consumed_request_answers_so(self):
+        self.assertFalse(self.reload.claim("pi-a", "tok-1"))
 
     def test_a_name_the_directory_cannot_hold_is_refused(self):
         self.assertFalse(self.reload.signal("../pi-a", "tok"))
@@ -1173,6 +1205,23 @@ class SignalTests(unittest.TestCase):
         self.reload.purge()
         self.assertEqual(self.reload.await_consumed(["pi-a", "pi-b"]),
                          ["pi-a", "pi-b"])
+
+    def test_a_purge_drops_a_half_written_request(self):
+        directory = os.path.dirname(self.reload.path("pi-a"))
+        os.makedirs(directory, exist_ok=True)
+        half = os.path.join(directory, "pi-a.json.tok.tmp")
+        with open(half, "w", encoding="utf-8") as handle:
+            handle.write("{")
+        self.reload.purge()
+        self.assertEqual(os.listdir(directory), [])
+
+    def test_a_signal_that_cannot_be_written_leaves_no_temporary(self):
+        blocked = os.path.join(self.state, "not-a-directory")
+        with open(blocked, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        reload = SessionReload(os.path.join(blocked, "state"), grace=0.0,
+                               poll=0.0)
+        self.assertFalse(reload.signal("pi-a", "tok"))
 
 
 class ReloadRoundTests(unittest.TestCase):
@@ -1220,15 +1269,55 @@ class ReloadRoundTests(unittest.TestCase):
                       reply["skipped"])
 
     def test_an_unconsumed_signal_falls_back_to_typing_the_command(self):
-        reload = StubReload()
+        reload = StubReload(claimed=True)
         sender = StubSender()
         reply = self.service(reload, sender).reload()
-        self.assertEqual(reload.cleared, ["pi-idle"])
+        self.assertEqual(reload.claimed, [("pi-idle", "tok")])
         self.assertEqual(sender.sent, [("pi-idle", b"/reload\r")])
         self.assertEqual(reply["reloaded"], ["pi-idle"])
 
+    def test_a_request_consumed_at_the_deadline_is_not_typed_into(self):
+        reload = StubReload(late_consumed=["pi-idle"])
+        sender = StubSender()
+        reply = self.service(reload, sender).reload()
+        self.assertEqual(sender.sent, [])
+        self.assertEqual(reply["reloaded"], ["pi-idle"])
+        self.assertNotIn("pi-idle",
+                         [entry["id"] for entry in reply["skipped"]])
+
+    def test_a_session_that_went_busy_during_the_grace_is_not_typed_into(self):
+        reload = StubReload(claimed=True)
+
+        class Busying(StubSender):
+            def __init__(self, store):
+                super().__init__()
+                self.store = store
+
+        sender = Busying(self.store)
+        original = reload.await_consumed
+
+        def await_and_busy(names):
+            self.store.publish("pi-idle", "busy")
+            return original(names)
+
+        reload.await_consumed = await_and_busy
+        reply = self.service(reload, sender).reload()
+        self.assertEqual(sender.sent, [])
+        self.assertIn({"id": "pi-idle", "reason": "not-idle"},
+                      reply["skipped"])
+        self.assertEqual(reply["reloaded"], [])
+        self.assertTrue(reply["deferred"])
+
     def test_a_failed_fallback_is_reported_not_raised(self):
-        reply = self.service(StubReload(), StubSender(["pi-idle"])).reload()
+        reply = self.service(StubReload(claimed=True),
+                             StubSender(["pi-idle"])).reload()
+        self.assertEqual(reply["reloaded"], [])
+        self.assertIn({"id": "pi-idle", "reason": "write-failed"},
+                      reply["skipped"])
+
+    def test_a_relay_that_never_answers_is_reported_not_raised(self):
+        reply = self.service(StubReload(claimed=True),
+                             StubSender(raising=["pi-idle"])).reload()
         self.assertEqual(reply["reloaded"], [])
         self.assertIn({"id": "pi-idle", "reason": "write-failed"},
                       reply["skipped"])
@@ -1243,10 +1332,54 @@ class ReloadRoundTests(unittest.TestCase):
 
     def test_a_named_round_touches_only_the_names_given(self):
         reserve(self.store, "pi-other", file="/conv/other.jsonl")
-        reply = self.service(StubReload()).reload(["pi-other"])
+        reply = self.service(StubReload(consumed=["pi-other"])).reload(
+            ["pi-other"])
         self.assertEqual(reply["reloaded"], ["pi-other"])
         self.assertEqual(reply["skipped"], [])
         self.assertFalse(reply["deferred"])
+
+    def test_an_unknown_requested_name_is_answered_not_dropped(self):
+        reply = self.service(StubReload()).reload(["pi-nowhere"])
+        self.assertEqual(reply["reloaded"], [])
+        self.assertEqual(reply["skipped"], [{"id": "pi-nowhere",
+                                             "reason": "unknown"}])
+
+    def test_two_rounds_never_overlap(self):
+        import threading
+        reload = StubReload(consumed=["pi-idle"])
+        service = self.service(reload)
+        first = threading.Thread(target=service.reload)
+        second = threading.Thread(target=service.reload)
+        first.start()
+        first.join()
+        second.start()
+        second.join()
+        self.assertFalse(reload.overlapped)
+        self.assertEqual(reload.entries, 2)
+
+    def test_a_round_that_holds_the_lock_keeps_the_other_out(self):
+        import threading
+        reload = StubReload(consumed=["pi-idle"])
+        entered = threading.Event()
+        release = threading.Event()
+        original = reload.await_consumed
+
+        def slow(names):
+            entered.set()
+            release.wait(2.0)
+            return original(names)
+
+        reload.await_consumed = slow
+        service = self.service(reload)
+        first = threading.Thread(target=service.reload)
+        second = threading.Thread(target=service.reload)
+        first.start()
+        entered.wait(2.0)
+        second.start()
+        release.set()
+        first.join()
+        second.join()
+        self.assertFalse(reload.overlapped)
 
 
 if __name__ == "__main__":

@@ -55,12 +55,14 @@ class RelaySession:
         return dropped
 
     def feed(self, data):
+        """Queue bytes for the PTY; False when no child can take them."""
         if self.closing:
-            return
+            return False
         self.inbox += data
         if len(self.inbox) > self.limit:
             excess = len(self.inbox) - self.limit
             del self.inbox[:excess]
+        return True
 
 
 def _close(connection):
