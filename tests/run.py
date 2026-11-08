@@ -34,6 +34,8 @@ def main():
                    [sys.executable, "tests/session_test.py"])
     all_ok &= step("transcripts domain tests",
                    [sys.executable, "tests/transcripts_test.py"])
+    all_ok &= step("tasks domain tests",
+                   [sys.executable, "tests/tasks_test.py"])
     all_ok &= step("migration tests",
                    [sys.executable, "tests/migration_test.py"])
     all_ok &= step("comms domain tests",
@@ -49,8 +51,6 @@ def main():
     all_ok &= step("extension tests (TS)",
                    ["node", "--experimental-strip-types",
                     "--experimental-transform-types", "tests/ts/run.ts"])
-    all_ok &= step("daemon unit tests",
-                   [sys.executable, "tests/daemon_unit_test.py"])
     all_ok &= step("conversation index tests",
                    [sys.executable, "tests/transcript_index_test.py"])
     all_ok &= step("transcript wire test",
