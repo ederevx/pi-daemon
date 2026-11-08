@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from daemon_service.application import DaemonApplication
+from daemon_service.transport.service_descriptor import ServiceDescriptor
 
 REQUIRED = ("PI_DAEMON_STATE_DIR", "PI_DAEMON_RUNTIME_DIR")
 
@@ -17,7 +18,11 @@ def main():
         print("pi-daemon: explicit roots required: " + ", ".join(missing),
               file=sys.stderr)
         return 2
-    return DaemonApplication.from_environment().run()
+    # The entry, not an embedder, publishes into the shared service
+    # directory: clients find the control wire and agent comms there.
+    application = DaemonApplication.from_environment(
+        services_root=ServiceDescriptor.root_for(os.environ))
+    return application.run()
 
 
 if __name__ == "__main__":

@@ -104,6 +104,31 @@ class ServiceDirectory:
         found = shutil.which("pi-rc")
         return [found, command] if found else ["pi-rc", command]
 
+    # -- lookup --------------------------------------------------------------
+
+    def find(self, service=DEFAULT_SERVICE, protocols=("pi-pty-host/1",)):
+        """Live descriptors for `service` speaking one of `protocols`,
+        highest version first. Clients only read; removal is the provider's."""
+        directory = os.path.join(self.root, self._component(service))
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            return []
+        found = []
+        for name in names:
+            path = os.path.join(directory, name)
+            if not name.endswith(".json") or self._stale(path):
+                continue
+            data = pi_platform.AtomicStateFile(path).read()
+            if not isinstance(data, dict):
+                continue
+            version = data.get("version")
+            if data.get("protocol") not in protocols or \
+                    isinstance(version, bool) or not isinstance(version, int):
+                continue
+            found.append(data)
+        return sorted(found, key=lambda entry: -entry["version"])
+
     # -- publish / remove ----------------------------------------------------
 
     def publish(self, endpoint_file, activation_argv,

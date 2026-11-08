@@ -2,7 +2,9 @@
 
 import os
 import secrets
+import shutil
 import signal
+import sys
 import threading
 
 from .comms.mailbox_store import MailboxStore
@@ -30,17 +32,20 @@ from .tasks.store import TicketStore
 from .transport.control_endpoint import ControlEndpoint
 from .transport.control_handshake import ControlHandshake
 from .transport.control_router import ControlRouter
+from .transport.endpoint_file import EndpointFile
 from .transport.rpc_codec import RpcCodec
 from .transport.rpc_listener import RpcListener
+from .transport.service_descriptor import ServiceDescriptor
 from .wire import WireCodec
 
 
 class DaemonApplication:
     """It composes collaborators and nothing else; domains own their state."""
 
-    def __init__(self, layout, config):
+    def __init__(self, layout, config, services_root=None):
         self._layout = layout
         self._config = config
+        self._services_root = services_root
         self._stopping = threading.Event()
         self._mode = "shutdown"
         self._coordinator = InstanceCoordinator(layout.instance_lock_path())
@@ -59,15 +64,23 @@ class DaemonApplication:
         self._comms_spawns = None
         self._comms_peers = None
         self._node_identity = None
+        self._comms_file = None
+        self._comms_descriptor = None
+        self._control_descriptor = None
 
     @classmethod
-    def from_environment(cls, environ=None):
+    def from_environment(cls, environ=None, services_root=None):
+        """A services root is published only when one is given, in
+        argument or in PI_SERVICES_DIR, so an embedder or a test never
+        writes into the directory a real client reads."""
         environment = dict(os.environ if environ is None else environ)
         layout = RuntimeLayout(environment.get("PI_DAEMON_STATE_DIR"),
                                environment.get("PI_DAEMON_RUNTIME_DIR"))
         config = ServiceConfig.load(settings_path=layout.settings_path(),
                                     environ=environment)
-        return cls(layout, config)
+        if services_root is None:
+            services_root = environment.get("PI_SERVICES_DIR")
+        return cls(layout, config, services_root)
 
     def config(self):
         return self._config
@@ -102,6 +115,7 @@ class DaemonApplication:
             )
             self._endpoint = endpoint
             endpoint.start()
+            self._publish_control()
         except BaseException:
             self._unwind()
             raise
@@ -152,7 +166,70 @@ class DaemonApplication:
         listener.start()
         host, port = listener.address()
         service.serve_at(host, port)
+        self._publish_comms(host, port, token, identity)
         return service, listener
+
+    # -- discovery ---------------------------------------------------------
+
+    def _publish_control(self):
+        """The session-host entry: clients find the control wire here."""
+        if self._services_root is None:
+            return
+        descriptor = ServiceDescriptor(
+            self._services_root, "session-host", "pi-daemon",
+            self._config.file_mode, self._config.write_retries,
+            self._config.write_retry_delay)
+        self._control_descriptor = descriptor
+        descriptor.publish("pi-pty-host/1", 1, self._layout.endpoint_path(),
+                           self._activation_argv(), self._instance,
+                           os.getpid())
+
+    def _publish_comms(self, host, port, token, identity):
+        """The comms endpoint file first, then its directory entry, so a
+        published entry always names a port that answers."""
+        endpoint = EndpointFile(
+            self._layout.comms_endpoint_path(), self._config.file_mode,
+            self._config.write_retries, self._config.write_retry_delay)
+        self._comms_file = endpoint
+        endpoint.publish({"service": "agent-comms", "proto": "pi-rpc/1",
+                          "host": host, "port": port, "token": token,
+                          "nodeId": identity.id(),
+                          "instance": self._instance, "pid": os.getpid()})
+        if self._services_root is None:
+            return
+        descriptor = ServiceDescriptor(
+            self._services_root, "agent-comms", "pi-daemon",
+            self._config.file_mode, self._config.write_retries,
+            self._config.write_retry_delay)
+        self._comms_descriptor = descriptor
+        descriptor.publish("pi-rpc/1", 1, endpoint.path(),
+                           self._activation_argv("daemon-start"),
+                           self._instance, os.getpid())
+
+    @staticmethod
+    def _activation_argv(command="daemon-start"):
+        """The client that starts a stopped service, resolved the way the
+        repository locates helper scripts: beside the entry, else PATH."""
+        entry = os.path.dirname(os.path.realpath(sys.argv[0]))
+        candidates = [os.path.join(entry, "pi-rc"),
+                      os.path.join(os.path.dirname(entry), "bin", "pi-rc")]
+        for candidate in candidates:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return [candidate, command]
+        found = shutil.which("pi-rc")
+        return [found, command] if found else ["pi-rc", command]
+
+    def _unpublish(self):
+        """Discovery goes dark first: a client never dials a closing port."""
+        for descriptor in (self._control_descriptor,
+                           self._comms_descriptor):
+            if descriptor is not None:
+                descriptor.remove_owned(self._instance, os.getpid())
+        if self._comms_file is not None:
+            self._comms_file.remove_owned(self._instance)
+        self._control_descriptor = None
+        self._comms_descriptor = None
+        self._comms_file = None
 
     def run(self):
         self.start()
@@ -168,6 +245,7 @@ class DaemonApplication:
         self._stopping.set()
 
     def stop(self):
+        self._unpublish()
         if self._tasks is not None:
             self._tasks.begin_shutdown()
         if self._sessions is not None:

@@ -306,6 +306,31 @@ reaches it the send answers `undeliverable` with reason `no-such-peer`,
 and a broadcast never leaves the node: an address it cannot reach is
 reported with reason `remote-node`.
 
+### Discovery
+
+The daemon publishes `agent-comms/pi-daemon.json` under the services
+root (`$PI_SERVICES_DIR`, else the user runtime directory), naming the
+comms endpoint file and `pi-rc daemon-start` as its activation, so a
+missing entry is a service to start rather than a failure to report. The
+listener is bound and answering before the entry is published, so an
+entry never names a port that does not greet, and the entry is removed
+only while both its `instance` and its `pid` still match this process: a
+successor that has already published its own entry keeps it when the
+first daemon stops.
+
+Activation exists but is not taken by the CLI: `pi-comms` reports the
+missing service and exits 4 rather than starting a daemon behind the
+user's back, and binding is explicit. `session-host` keeps its own
+`pi-pty-host/1` entry beside it.
+
+`pi/lib/pi_rpc_client.py` is the socket-profile library: it discovers,
+dials, greets, frames and reports failures as data. `pi/bin/pi-comms` is
+its first consumer - `node`, `peer list`, `send`, `broadcast`, `wait`,
+`replay`, `ack`, `receipt` and `spawn` - with JSON by default and
+`--format text` for people. Its exit codes are the failure vocabulary of
+the profile: 1 usage, 2 declined, 3 empty wait, 4 no service, 5 remote
+method, 6 authorization, 7 no answer after a request was written.
+
 ## Peers
 
 A peer is a direction this node reaches out over: an SSH destination,
@@ -516,5 +541,6 @@ the two implementations never share a runtime directory.
   the `agent-comms` listener, so only the `peer-control` frame that
   carries a launch across the link remains.
 * Extension and `pi-rc` rewiring; installer and migration tooling.
-* Discovery: `ServiceDirectory`, activation, binding and self
-  provisioning, which the descriptor work above prepares for.
+* Discovery activation: the descriptor publishes `pi-rc daemon-start`
+  and the client reports a missing service, but nothing yet starts one;
+  the CLI's binding is explicit, so a second entry is never dialed.

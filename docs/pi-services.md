@@ -66,6 +66,19 @@ with `pi-pty-host/1`.
 The descriptor holds non-secret coordinates only. A token belongs in the
 endpoint file it points at, mode 0600.
 
+A provider that can tell its own entry from a successor's adds an
+`instance` beside `pid` and removes the entry only while both still
+match; a client ignores the field. The unified service publishes both
+entries it serves, each naming its own endpoint file:
+
+```json
+{"service": "agent-comms", "version": 1,
+ "protocol": "pi-rpc/1", "provider": "pi-daemon", "pid": 3721013,
+ "instance": "0b1f...",
+ "endpoint_file": "/run/user/1000/pi-daemon/comms.json",
+ "activation": {"kind": "exec", "argv": ["pi-rc", "daemon-start"]}}
+```
+
 ## 3 Socket profile
 
 The provider listens on `127.0.0.1` and publishes host, port, and token
@@ -214,6 +227,10 @@ present, and makes them itself otherwise.
 - **Adopted:** `session-host` discovery (`pi_services.py`, pi-teams
   `service_registry.py`) publishes and reads the descriptor above, with
   its control protocol kept at `pi-pty-host/1`.
+- **Adopted:** `agent-comms`, socket profile. The unified service
+  publishes `agent-comms/pi-daemon.json` over its comms endpoint file and
+  ships `pi_rpc_client.py` (the socket-profile library) with `pi-comms`,
+  the operator CLI for mail, waits, acknowledgement, launches and peers.
 - **Adopted:** `tool-completion`, in-process only, published by
   pi-daemon's `bash` backend (which attaches `details.toolCompletion` to
   every result) and consumed by pi-consult before it answers a bridged
@@ -237,5 +254,5 @@ present, and makes them itself otherwise.
 - **Pending:** pi-cache and pi-checklist take the in-process profile when
   one becomes a provider or consumer.
 
-A socket-profile library is written when the first cross-session
-`pi-rpc/1` service exists; until then the profile is a contract only.
+A socket-profile library is `pi/lib/pi_rpc_client.py`; `agent-comms` is
+its first cross-session consumer.

@@ -14,6 +14,9 @@ class EndpointFile:
     def publish(self, coordinates):
         self._file.write_dict(coordinates)
 
+    def path(self):
+        return self._file.path()
+
     def read(self):
         try:
             return self._file.read_dict()

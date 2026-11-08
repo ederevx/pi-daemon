@@ -36,6 +36,10 @@ def main():
                    [sys.executable, "tests/comms_test.py"])
     all_ok &= step("comms socket tests",
                    [sys.executable, "tests/comms_rpc_test.py"])
+    all_ok &= step("service discovery tests",
+                   [sys.executable, "tests/comms_discovery_test.py"])
+    all_ok &= step("pi-comms CLI tests",
+                   [sys.executable, "tests/pi_comms_test.py"])
     all_ok &= step("extension tests (TS)",
                    ["node", "--experimental-strip-types",
                     "--experimental-transform-types", "tests/ts/run.ts"])

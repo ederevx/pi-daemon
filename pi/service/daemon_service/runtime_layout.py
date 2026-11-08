@@ -73,3 +73,8 @@ class RuntimeLayout:
     def endpoint_path(self):
         os.makedirs(self._runtime_root, exist_ok=True)
         return os.path.join(self._runtime_root, "control.json")
+
+    def comms_endpoint_path(self):
+        """The comms listener's coordinates, beside the control endpoint."""
+        os.makedirs(self._runtime_root, exist_ok=True)
+        return os.path.join(self._runtime_root, "comms.json")

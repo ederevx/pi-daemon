@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+# pi-comms — the operator CLI for the agent-comms service.
+#
+# Agent comms is mail plus launches over `pi-rpc/1` on the daemon's own
+# loopback listener (docs/rebuild.md, "Agent comms"). This client finds
+# the listener through the service directory, binds one identity at
+# `rpc.hello`, and prints the service's answer unchanged:
+#
+#   pi-comms [--agent ID] [--endpoint FILE] [--timeout SEC]
+#            [--format json|text] <command> [args]
+#
+#   node                                  the greeting: node, agent,
+#                                         methods, head sequence
+#   send TO [PAYLOAD|-] [--text STR]      one direct message
+#   broadcast [PAYLOAD|-] [--text STR]    one message to every local
+#                                         mailbox
+#   receipt REQUEST_ID                    what became of one send
+#   replay [--after SEQ] [--limit N] [--all]
+#                                         read the mailbox from a cursor
+#   wait [--after SEQ] [--limit N] [--timeout-ms MS]
+#                                         hold until mail arrives
+#   ack MESSAGE_ID...                     acknowledge delivered mail
+#   spawn [--agent-id ID] [--name NAME] [--env K=V]... DIR -- ARGV...
+#                                         launch another agent; every
+#                                         option comes before DIR, and
+#                                         the command follows --
+#   peer add NODE_ID --ssh TARGET --remote-port N
+#            [--local-port N] --credential FILE --verifier SHA256
+#   peer list
+#   peer remove NODE_ID
+#
+# The identity comes from --agent, else PI_COMMS_AGENT_ID (which the
+# spawn ledger sets for a launched agent). There is no default: binding
+# an identity creates its mailbox, so a guessed one would be a mailbox
+# every later broadcast reaches.
+#
+# Exit codes: 0 ok, 1 usage, 2 declined by the service, 3 the wait timed
+# out, 4 no service (nothing was sent), 5 a JSON-RPC error, 6 the token
+# was refused, 7 the request may have been acted on (retry with the same
+# --request-id, or ask the service before acting again).
+
+import argparse
+import json
+import os
+import sys
+import uuid
+
+
+def _seam_path():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (here, os.path.join(here, os.pardir, "lib")):
+        candidate = os.path.abspath(candidate)
+        if os.path.isfile(os.path.join(candidate, "pi_services.py")):
+            return candidate
+    return here
+
+
+sys.path.insert(0, _seam_path())
+import pi_rpc_client
+import pi_services
+
+SERVICE = "agent-comms"
+PROTOCOL = "pi-rpc/1"
+
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_DECLINED = 2
+EXIT_TIMED_OUT = 3
+EXIT_NO_SERVICE = 4
+EXIT_ERROR = 5
+EXIT_UNAUTHORIZED = 6
+EXIT_AMBIGUOUS = 7
+
+UNAUTHORIZED = -32001
+UNAVAILABLE = -32003
+TIMEOUT = -32004
+
+SUCCESS = ("accepted", "queued", "spawned", "ok")
+DECLINED = ("undeliverable", "cursor-expired", "failed", "request-conflict",
+            "unknown")
+
+USAGE = """usage: pi-comms [global options] <command> [args]
+
+  node | send | broadcast | receipt | replay | wait | ack | spawn | peer
+
+run 'pi-comms help' for the full list"""
+
+
+class Declined(Exception):
+    """A local problem the caller must fix before anything is sent."""
+
+
+def _identity(options):
+    agent = options.agent or os.environ.get("PI_COMMS_AGENT_ID")
+    if not agent:
+        raise Declined("an agent id is required: --agent or PI_COMMS_AGENT_ID")
+    return agent
+
+
+def _endpoint(options):
+    """An explicit endpoint is used as given; otherwise the descriptor."""
+    explicit = options.endpoint or os.environ.get("PI_COMMS_ENDPOINT")
+    if explicit:
+        return explicit
+    found = pi_services.ServiceDirectory().find(SERVICE, (PROTOCOL,))
+    if not found:
+        raise pi_rpc_client.Unreachable(
+            "no live agent-comms entry in the service directory")
+    return found[0]["endpoint_file"]
+
+
+class Command:
+    """One request: build its params, run it, and judge its answer."""
+
+    def __init__(self, options):
+        self.options = options
+        self.agent = _identity(options)
+        self.client = None
+        self.greeting = None
+
+    def connect(self):
+        endpoint = _endpoint(self.options)
+        self.client = pi_rpc_client.RpcClient(endpoint, self.options.timeout)
+        try:
+            self.client.connect()
+            self.greeting = self.client.hello(self.agent)
+        finally:
+            if self.greeting is None:
+                self.client.close()
+        return self
+
+    def call(self, method, params, mutating=False):
+        """A wait's socket deadline outlives the hold the service allows."""
+        deadline = self.options.timeout
+        if method == "comms.wait":
+            held = params.get("timeoutMs")
+            if not isinstance(held, (int, float)) or isinstance(held, bool):
+                held = 60_000
+            deadline += float(held) / 1000.0
+        return self.client.call(method, params, deadline=deadline,
+                                mutating=mutating)
+
+    def cursor(self, after):
+        return {"agent": {"nodeId": self.greeting["agent"]["nodeId"],
+                          "agentId": self.greeting["agent"]["agentId"]},
+                "sequence": after}
+
+    def close(self):
+        if self.client is not None:
+            self.client.close()
+
+
+def _code_for(result, mutating):
+    if not isinstance(result, dict):
+        return EXIT_OK
+    status = result.get("status")
+    if status in SUCCESS:
+        return EXIT_OK
+    if status == "timed-out":
+        return EXIT_TIMED_OUT
+    if status == "launching":
+        return EXIT_AMBIGUOUS
+    if status in DECLINED or result.get("reason"):
+        return EXIT_DECLINED
+    return EXIT_OK
+
+
+def _message_line(message):
+    sender = message.get("from") or {}
+    payload = json.dumps(message.get("payload"), separators=(",", ":"))
+    return "#%s %s@%s %s %s: %s" % (
+        message.get("sequence"), sender.get("agentId"), sender.get("nodeId"),
+        message.get("kind"), message.get("messageId"), payload)
+
+
+def _render_text(result):
+    lines = []
+    if isinstance(result, dict) and isinstance(result.get("messages"), list):
+        lines.extend(_message_line(message)
+                     for message in result["messages"])
+        cursor = result.get("cursor") or {}
+        lines.append("cursor %s%s" % (
+            cursor.get("sequence"),
+            " more" if result.get("more") else ""))
+        return lines
+    if isinstance(result, dict):
+        for key in sorted(result):
+            value = result[key]
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, separators=(",", ":"))
+            lines.append("%s: %s" % (key, value))
+        return lines
+    lines.append(json.dumps(result, separators=(",", ":")))
+    return lines
+
+
+def _print_result(result, options):
+    if options.format == "text":
+        for line in _render_text(result):
+            print(line)
+    else:
+        print(json.dumps(result, separators=(",", ":")))
+        sys.stdout.flush()
+
+
+def _payload(options):
+    """Exactly one payload source: an argument, stdin, or --text.
+    An argument is JSON when it parses, else the literal text."""
+    if options.text is not None:
+        return options.text
+    if options.payload is None:
+        raise Declined("a payload is required: PAYLOAD, '-' or --text")
+    text = sys.stdin.read() if options.payload == "-" else options.payload
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def _params_from(options, target=None):
+    params = {"requestId": options.request_id or uuid.uuid4().hex,
+              "kind": options.kind,
+              "payload": _payload(options)}
+    if target is not None:
+        reference = {"agentId": target}
+        if options.node:
+            reference["nodeId"] = options.node
+        params["to"] = reference
+    if options.ttl is not None:
+        params["ttlSeconds"] = options.ttl
+    return params
+
+
+def _run_send(command, options):
+    params = _params_from(options, options.to)
+    return command.call("comms.send", params, mutating=True)
+
+
+def _run_broadcast(command, options):
+    params = _params_from(options)
+    params["scope"] = "local"
+    return command.call("comms.broadcast", params, mutating=True)
+
+
+def _run_receipt(command, options):
+    return command.call("comms.receipt", {"requestId": options.request_id})
+
+
+def _run_replay(command, options, method="comms.replay"):
+    params = {}
+    if options.after is not None:
+        params["cursor"] = command.cursor(options.after)
+    if options.limit is not None:
+        params["limit"] = options.limit
+    return command.call(method, params)
+
+
+def _run_replay_all(command, options):
+    """Every page, in order, following the cursor the service hands back."""
+    after = options.after
+    pages = []
+    while True:
+        params = {"limit": options.limit} if options.limit is not None else {}
+        if after is not None:
+            params["cursor"] = command.cursor(after)
+        result = command.call("comms.replay", params)
+        pages.append(result)
+        if not isinstance(result, dict) or \
+                result.get("status") != "ok" or not result.get("more"):
+            break
+        cursor = result.get("cursor") or {}
+        after = cursor.get("sequence")
+        if after is None:
+            break
+    return pages
+
+
+def _run_wait(command, options):
+    params = {}
+    if options.after is not None:
+        params["cursor"] = command.cursor(options.after)
+    if options.limit is not None:
+        params["limit"] = options.limit
+    if options.timeout_ms is not None:
+        params["timeoutMs"] = options.timeout_ms
+    return command.call("comms.wait", params)
+
+
+def _run_ack(command, options):
+    return command.call("comms.ack", {"messageIds": options.ids},
+                        mutating=True)
+
+
+def _run_spawn(command, options):
+    argv = list(options.argv or [])
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        raise Declined("spawn needs the command: spawn [opts] DIR -- ARGV...")
+    environment = None
+    for entry in options.env or []:
+        name, _, value = entry.partition("=")
+        if not name or "=" not in entry:
+            raise Declined("--env takes NAME=VALUE")
+        environment = dict(environment or {}, **{name: value})
+    params = {"requestId": options.request_id or uuid.uuid4().hex,
+              "dir": options.dir, "argv": argv}
+    for name in ("agent_id", "name", "cols", "rows"):
+        value = getattr(options, name)
+        if value is not None:
+            key = "agentId" if name == "agent_id" else name
+            params[key] = value
+    if environment:
+        params["env"] = environment
+    return command.call("comms.spawn", params, mutating=True)
+
+
+def _run_peer(command, options):
+    if options.peer_command == "list":
+        return command.call("comms.peer.list", {})
+    if options.peer_command == "remove":
+        return command.call("comms.peer.remove",
+                            {"nodeId": options.node_id}, mutating=True)
+    params = {"nodeId": options.node_id, "sshTarget": options.ssh,
+              "remotePort": options.remote_port,
+              "outboundCredentialFile": options.credential,
+              "inboundCredentialSha256": options.verifier}
+    if options.local_port is not None:
+        params["localPort"] = options.local_port
+    return command.call("comms.peer.add", params, mutating=True)
+
+
+def _dispatch(command, options):
+    handlers = {
+        "node": lambda: command.greeting,
+        "send": lambda: _run_send(command, options),
+        "broadcast": lambda: _run_broadcast(command, options),
+        "receipt": lambda: _run_receipt(command, options),
+        "replay": lambda: (_run_replay_all(command, options)
+                           if options.all else _run_replay(command, options)),
+        "wait": lambda: _run_wait(command, options),
+        "ack": lambda: _run_ack(command, options),
+        "spawn": lambda: _run_spawn(command, options),
+        "peer": lambda: _run_peer(command, options),
+    }
+    return handlers[options.command]()
+
+
+def _execute(options):
+    command = Command(options).connect()
+    try:
+        result = _dispatch(command, options)
+        mutating = options.command in ("send", "broadcast", "ack", "spawn")
+        if options.command == "peer":
+            mutating = options.peer_command != "list"
+        if isinstance(result, list):
+            for page in result:
+                _print_result(page, options)
+            status = _code_for(result[-1] if result else {}, mutating)
+        else:
+            _print_result(result, options)
+            status = _code_for(result, mutating)
+        if status == EXIT_DECLINED and isinstance(result, dict):
+            _explain_decline(result)
+        return status
+    finally:
+        command.close()
+
+
+def _explain_decline(result):
+    reason = result.get("reason")
+    if reason:
+        print("pi-comms: declined: %s" % reason, file=sys.stderr)
+    oldest = result.get("oldestAvailableSequence")
+    if oldest is not None:
+        print("pi-comms: cursor expired; oldest available is %s" % oldest,
+              file=sys.stderr)
+
+
+def _parser():
+    parser = argparse.ArgumentParser(prog="pi-comms", usage=USAGE)
+    parser.add_argument("--agent", metavar="ID",
+                        help="the identity to bind (default PI_COMMS_AGENT_ID)")
+    parser.add_argument("--endpoint", metavar="FILE",
+                        help="the comms endpoint file (default: the "
+                             "agent-comms descriptor)")
+    parser.add_argument("--timeout", type=float, default=5.0,
+                        metavar="SEC", help="the socket bound per request")
+    parser.add_argument("--format", choices=("json", "text"), default="json")
+    commands = parser.add_subparsers(dest="command", metavar="<command>")
+    commands.add_parser("node", help="print the greeting")
+
+    def messaging(name, help_text, with_target):
+        sub = commands.add_parser(name, help=help_text)
+        if with_target:
+            sub.add_argument("to", metavar="TO", help="the recipient agent id")
+        sub.add_argument("payload", nargs="?", metavar="PAYLOAD",
+                         help="JSON payload text, or - for stdin")
+        sub.add_argument("--text", help="a plain string payload")
+        sub.add_argument("--node", metavar="NODE_ID",
+                         help="the recipient's node (default: this node)")
+        sub.add_argument("--kind", default="message", metavar="KIND")
+        sub.add_argument("--ttl", type=float, metavar="SEC")
+        sub.add_argument("--request-id", metavar="ID",
+                         help="reuse this id to retry one send safely")
+        return sub
+
+    messaging("send", "send one direct message", True)
+    messaging("broadcast", "send one message to every local mailbox", False)
+
+    receipt = commands.add_parser("receipt", help="what became of one send")
+    receipt.add_argument("request_id", metavar="REQUEST_ID")
+
+    replay = commands.add_parser("replay", help="read the mailbox")
+    replay.add_argument("--after", type=int, metavar="SEQ")
+    replay.add_argument("--limit", type=int, metavar="N")
+    replay.add_argument("--all", action="store_true",
+                        help="follow every page")
+
+    wait = commands.add_parser("wait", help="hold until mail arrives")
+    wait.add_argument("--after", type=int, metavar="SEQ")
+    wait.add_argument("--limit", type=int, metavar="N")
+    wait.add_argument("--timeout-ms", type=int, default=None,
+                      metavar="MS")
+
+    ack = commands.add_parser("ack", help="acknowledge delivered mail")
+    ack.add_argument("ids", nargs="+", metavar="MESSAGE_ID")
+
+    spawn = commands.add_parser(
+        "spawn", help="launch another agent: spawn [opts] DIR -- ARGV...")
+    spawn.add_argument("dir", metavar="DIR")
+    spawn.add_argument("--agent-id", metavar="ID")
+    spawn.add_argument("--name", metavar="NAME")
+    spawn.add_argument("--cols", type=int, metavar="N")
+    spawn.add_argument("--rows", type=int, metavar="N")
+    spawn.add_argument("--env", action="append", metavar="NAME=VALUE")
+    spawn.add_argument("--request-id", metavar="ID")
+    spawn.add_argument("argv", nargs=argparse.REMAINDER, metavar="ARGV")
+
+    peer = commands.add_parser("peer", help="peer administration")
+    peers = peer.add_subparsers(dest="peer_command", metavar="<action>")
+    peers.add_parser("list", help="list the configured peers")
+    remove = peers.add_parser("remove", help="remove one peer")
+    remove.add_argument("node_id", metavar="NODE_ID")
+    add = peers.add_parser("add", help="configure one peer")
+    add.add_argument("node_id", metavar="NODE_ID")
+    add.add_argument("--ssh", required=True, metavar="TARGET")
+    add.add_argument("--remote-port", required=True, type=int, metavar="N")
+    add.add_argument("--local-port", type=int, metavar="N")
+    add.add_argument("--credential", required=True, metavar="FILE")
+    add.add_argument("--verifier", required=True, metavar="SHA256")
+    return parser
+
+
+def main(argv):
+    if len(argv) >= 1 and argv[0] in ("help", "--help", "-h") and \
+            len(argv) == 1:
+        print(USAGE)
+        return EXIT_OK
+    options = _parser().parse_args(argv)
+    if options.command is None:
+        print(USAGE, file=sys.stderr)
+        return EXIT_USAGE
+    if options.command == "peer" and not options.peer_command:
+        print(USAGE, file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        if options.command == "peer" and options.peer_command == "add":
+            options.credential = os.path.abspath(options.credential)
+        return _execute(options)
+    except Declined as exc:
+        print("pi-comms: %s" % exc, file=sys.stderr)
+        return EXIT_USAGE
+    except pi_rpc_client.Unreachable as exc:
+        print("pi-comms: no service: %s" % exc, file=sys.stderr)
+        return EXIT_NO_SERVICE
+    except pi_rpc_client.Ambiguous as exc:
+        print("pi-comms: ambiguous: %s" % exc, file=sys.stderr)
+        print("pi-comms: retry with --request-id %s" %
+              (getattr(options, "request_id", None) or "<the id you used>"),
+              file=sys.stderr)
+        return EXIT_AMBIGUOUS
+    except pi_rpc_client.RpcFailure as exc:
+        print("pi-comms: %s [code %s]" % (exc.message, exc.code),
+              file=sys.stderr)
+        if exc.code == UNAUTHORIZED:
+            return EXIT_UNAUTHORIZED
+        if exc.code == UNAVAILABLE and getattr(options, "command", None) in (
+                "send", "broadcast", "ack", "spawn"):
+            print("pi-comms: the request may have been acted on",
+                  file=sys.stderr)
+            return EXIT_AMBIGUOUS
+        if exc.code == TIMEOUT:
+            return EXIT_TIMED_OUT
+        return EXIT_ERROR
+    except (OSError, ValueError) as exc:
+        print("pi-comms: %s" % exc, file=sys.stderr)
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -37,6 +37,9 @@ class ControlEndpoint:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((self._host, 0))
         listener.listen(self._config.backlog)
+        # A bounded accept poll, so a stop never waits out its grace on a
+        # thread blocked in accept().
+        listener.settimeout(max(0.01, self._config.accept_poll))
         self._socket = listener
         host, port = listener.getsockname()
         self._file.publish({
@@ -56,6 +59,8 @@ class ControlEndpoint:
         while not self._stopping.is_set():
             try:
                 connection, _ = self._socket.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 break
             except AttributeError:
