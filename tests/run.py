@@ -28,6 +28,8 @@ def main():
     all_ok = True
     all_ok &= step("OOP + removal lint",
                    [sys.executable, "tests/oop_lint.py"])
+    all_ok &= step("unified service tests",
+                   [sys.executable, "tests/service_test.py"])
     all_ok &= step("extension tests (TS)",
                    ["node", "--experimental-strip-types",
                     "--experimental-transform-types", "tests/ts/run.ts"])
