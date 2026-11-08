@@ -770,3 +770,8 @@ share a runtime directory.
 * Discovery activation: the descriptor publishes `pi-rc daemon-start`
   and the client reports a missing service, but nothing yet starts one;
   the CLI's binding is explicit, so a second entry is never dialed.
+* The install lock is broken after ten minutes, so a slow run can lose it
+  to a second one; both would then build under the same release name, and
+  the loser's staging directory can land inside the winner's generation
+  until the next install rebuilds it. Hold the lock for the life of the
+  process that took it, or check the owner before breaking it.
