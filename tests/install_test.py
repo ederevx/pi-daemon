@@ -182,15 +182,16 @@ class InstallScriptTests(unittest.TestCase):
 
     def test_a_release_is_immutable(self):
         # A published generation is the install for a running daemon: no
-        # bytecode may appear beside its modules, even after one of its
-        # commands has run from the public launcher.
+        # bytecode may appear beside its modules after one of its own commands
+        # has run, which the launcher alone cannot prevent.
         self.assertEqual(self.scratch.package().returncode, 0)
-        ran = subprocess.run(
-            ["python3", str(self.scratch.path(".local/bin/pi-comms")),
-             "help"],
-            env=self.scratch.env(), stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True)
-        self.assertEqual(ran.returncode, 0, ran.stderr)
+        for name in ("pi-comms", "pi-rc", "pi-daemon-migrate"):
+            ran = subprocess.run(
+                ["python3", str(self.scratch.release(f"bin/{name}")),
+                 "--help"],
+                env=self.scratch.env(), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True)
+            self.assertLess(ran.returncode, 3, ran.stderr)
         stray = [p for p in self.scratch.releases()[0].rglob("__pycache__")]
         self.assertEqual(stray, [], "the release was written after publishing")
         for rel in self.scratch.manifest()["sources"]:
@@ -422,14 +423,33 @@ class InstallScriptTests(unittest.TestCase):
 
     def test_install_ignores_a_unit_from_another_home(self):
         # Another home's unit is not this install's daemon: its daemon keeps
-        # running and this install proceeds.
-        self.scratch.env_extra = {
-            "FAKE_SYSTEMCTL_FRAGMENT": self.scratch.path(
-                "other-home/.config/systemd/user/pi-daemon.service"),
-            "FAKE_SYSTEMCTL_ACTIVE": "0",
-        }
+        # running and this install proceeds. This home's unit exists, so the
+        # comparison of the loaded unit with it is what decides.
+        own = self.scratch.path(".config/systemd/user/pi-daemon.service")
+        own.parent.mkdir(parents=True)
+        own.write_text(
+            "[Service]\n"
+            "Environment=\"PI_DAEMON_STATE_DIR="
+            f"{self.scratch.path('daemon-state')}\"\n"
+            "Environment=\"PI_DAEMON_RUNTIME_DIR="
+            f"{self.scratch.path('daemon-runtime')}\"\n"
+            "ExecStart=%h/.local/bin/pi-daemon\n")
+        other = self.scratch.path("other-home/pi-daemon.service")
+        other.parent.mkdir(parents=True)
+        other.write_text("[Service]\nExecStart=%h/.local/bin/pi-daemon\n")
+        self.scratch.env_extra = {"FAKE_SYSTEMCTL_FRAGMENT": other,
+                                  "FAKE_SYSTEMCTL_ACTIVE": "0"}
         result = self.scratch.package()
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            other.read_text(),
+            "[Service]\nExecStart=%h/.local/bin/pi-daemon\n",
+            "another home's unit is left alone")
+        rendered = own.read_text()
+        self.assertIn(
+            f"Environment=\"PI_DAEMON_STATE_DIR="
+            f"{self.scratch.path('daemon-state')}\"", rendered,
+            "this home's unit was rendered by this install")
 
     def test_a_v2_install_retires_its_flat_seam_module(self):
         # A manifest-only (v2) install owned the seams beside the binaries;
@@ -466,6 +486,36 @@ class InstallScriptTests(unittest.TestCase):
         self.assertEqual((active / "lib" / "pi_services.py").read_text(),
                          pristine, "the mutated tree is rebuilt")
 
+    def test_a_mutated_retained_generation_is_rebuilt_in_its_own_name(self):
+        # A retained generation can be the one a revert selects again. It is
+        # replaced by a rename, never deleted in place: a daemon may be
+        # importing from it, and nothing may be lost if the run is interrupted.
+        clone = self.scratch.clone()
+        source = clone / "pi" / "lib" / "pi_services.py"
+        original = source.read_bytes()
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        first = pathlib.Path(self.scratch.manifest()["active_root"])
+        with open(source, "a", encoding="utf-8") as handle:
+            handle.write("\n# a new build\n")
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        second = pathlib.Path(self.scratch.manifest()["active_root"])
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.scratch.manifest()["retained"], [str(first)])
+        with open(first / "lib" / "pi_services.py", "a",
+                  encoding="utf-8") as handle:
+            handle.write("\n# not ours\n")
+        source.write_bytes(original)
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        self.assertEqual(self.scratch.manifest()["active_root"], str(first),
+                         "a revert selects the retained content again")
+        self.assertTrue(second.is_dir(), "the newer generation is kept")
+        self.assertEqual((first / "lib" / "pi_services.py").read_bytes(),
+                         original, "the mutated tree holds its content again")
+        self.assertEqual(
+            [p.name for p in self.scratch.releases()
+             if p.name.startswith(".stale.")],
+            [], "the moved-aside tree does not outlive the run")
+
     def test_recovery_keeps_a_generation_it_did_not_create(self):
         # A publish that reuses an existing release created nothing, so an
         # interrupted run has nothing of its own to drop.
@@ -499,6 +549,46 @@ class InstallScriptTests(unittest.TestCase):
         self.assertEqual(self.scratch.package().returncode, 0)
         self.assertFalse(orphan.exists(), "an unreferenced generation is dropped")
         self.assertTrue(active.is_dir())
+
+    def test_a_sweep_keeps_the_active_and_the_newest_retained(self):
+        # No daemon serves, so an install drops every generation but the
+        # active one and the newest retained one: the directory stays bounded.
+        self.assertEqual(self.scratch.package().returncode, 0)
+        releases = self.scratch.path(".local/lib/pi-daemon/releases")
+        active = self.scratch.manifest()["active_root"]
+        older, newest = releases / "older", releases / "newest"
+        for tree in (older, newest):
+            (tree / "daemon").mkdir(parents=True)
+        manifest = self.scratch.manifest()
+        manifest["retained"] = [msysform(newest), msysform(older)]
+        (self.scratch.path(".pi/agent/.pi-daemon/manifest.json")
+         .write_text(json.dumps(manifest)))
+        self.assertEqual(self.scratch.package().returncode, 0)
+        self.assertFalse(older.exists(), "an older retained generation goes")
+        self.assertTrue(newest.is_dir(), "the newest retained one stays")
+        self.assertTrue(pathlib.Path(active).is_dir())
+
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "no unix sockets here")
+    def test_a_sweep_keeps_every_generation_while_a_daemon_serves(self):
+        # A serving daemon may be running any retained generation, so none is
+        # removed while one answers.
+        self.assertEqual(self.scratch.package().returncode, 0)
+        releases = self.scratch.path(".local/lib/pi-daemon/releases")
+        older, newest = releases / "older", releases / "newest"
+        for tree in (older, newest):
+            (tree / "daemon").mkdir(parents=True)
+        manifest = self.scratch.manifest()
+        manifest["retained"] = [msysform(newest), msysform(older)]
+        (self.scratch.path(".pi/agent/.pi-daemon/manifest.json")
+         .write_text(json.dumps(manifest)))
+        endpoint = self.scratch.runtime_dir / "pi-pty-host.sock"
+        listening = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listening.bind(str(endpoint))
+        listening.listen(1)
+        self.addCleanup(listening.close)
+        self.assertEqual(self.scratch.package().returncode, 0)
+        self.assertTrue(older.is_dir(), "a serving daemon keeps every one")
+        self.assertTrue(newest.is_dir())
 
     def test_an_unreferenced_generation_is_swept(self):
         # A crash between publishing a generation and writing its journal, or

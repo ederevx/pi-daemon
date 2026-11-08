@@ -652,8 +652,11 @@ Order matters, and each step is reversible on its own:
    runs from the candidate generation before any public file changes and
    refuses (76) while a daemon serves the old state or endpoint, and a
    held install lock exits 75. A generation no manifest names is swept
-   under the lock, and a retained one is dropped once no daemon serves it,
-   so a crash leaves no orphan release and the directory stays bounded.
+   under the lock; a retained one is dropped once no daemon serves, and
+   only the newest retained one survives then. While a daemon serves, no
+   retained generation is removed, because any of them may be the one it
+   runs, so the directory is bounded across an install with the unit
+   stopped and a crash leaves no orphan release.
 
 ## Cutover
 
@@ -718,12 +721,13 @@ written:
 1. `systemctl --user stop pi-daemon.service`.
 2. `pi install git:github.com/ederevx/pi-daemon@<the previous tag>`: its
    postinstall restores the previous `pi-daemon` launcher and unit.
-4. `rm -f ~/.local/bin/pi-comms ~/.local/bin/pi-daemon-migrate
+3. `rm -f ~/.local/bin/pi-comms ~/.local/bin/pi-daemon-migrate
    ~/.local/bin/pi-daemon-migrate.cmd ~/.local/bin/pi_rpc_client.py`: the
    previous release's manifest does not own them, so its `uninstall.sh`
-   would leave them behind, and the previous install kept no generation
-   under `~/.local/lib/pi-daemon/`, which that install also stops
-   maintaining.
+   would leave them behind.
+4. `rm -rf ~/.local/lib/pi-daemon/`: the previous install kept no
+   generation there and stops maintaining the directory, so the rollback
+   removes what this install published.
 5. `systemctl --user start pi-daemon.service`, unless step 2 already did:
    the postinstall runs `enable --now`, so this step only matters where
    systemd is absent and that call did nothing.

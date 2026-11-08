@@ -174,7 +174,9 @@ PY
 # killed run leaves its staging directory. A retained generation is kept
 # while a daemon may still be running it; with none serving, the newest one
 # still covers a command that read the manifest a moment ago, and the rest go
-# so the release directory stays bounded.
+# so the release directory stays bounded. A staging or moved-aside tree whose
+# pid still runs belongs to a live install, which a broken stale lock may have
+# let a second one start beside: that tree is left alone.
 sweep_releases() {
   local serving=0
   if serving_reason >/dev/null 2>&1; then serving=1; fi
@@ -195,9 +197,27 @@ retained = [path for path in document.get("retained") or []]
 keep = {document.get("active_root") or ""}
 keep.update(retained if serving == "1" else retained[:1])
 keep.discard("")
+
+
+def in_flight(name):
+    """A staging or moved-aside tree whose install is still running."""
+    for prefix in (".staging.", ".stale."):
+        if not name.startswith(prefix):
+            continue
+        pid = name[len(prefix):]
+        if not pid.isdigit():
+            return False
+        try:
+            os.kill(int(pid), 0)
+        except OSError:
+            return False
+        return True
+    return False
+
+
 for name in sorted(os.listdir(releases)):
     path = os.path.join(releases, name)
-    if not os.path.isdir(path) or path in keep:
+    if not os.path.isdir(path) or path in keep or in_flight(name):
         continue
     shutil.rmtree(path, ignore_errors=True)
 PY
@@ -473,13 +493,19 @@ if [[ -d "$candidate" \
       && "$(content_id "$candidate")" == "$(basename "$candidate")" ]]; then
   rm -rf "$stage"
 else
-  # Same filesystem, so the rename publishes a complete generation or
-  # nothing: no launcher can see a half-copied release. A directory whose
+  # Same filesystem, so each rename publishes a complete generation or
+  # nothing: no launcher sees a half-copied release. A directory whose
   # content is not the content its name digests was changed after it was
-  # published, so it is not reused.
-  rm -rf "$candidate"
+  # published, so it is not reused; it is renamed aside, never deleted in
+  # place, because a daemon may be importing from it this moment. A crash
+  # between the two renames leaves `.stale.<pid>`, which the next run sweeps.
+  if [[ -d "$candidate" ]]; then
+    mv "$candidate" "$releases/.stale.$$"
+  else
+    created=1
+  fi
   mv "$stage" "$candidate"
-  created=1
+  rm -rf "$releases/.stale.$$"
 fi
 
 # The migration runs from the candidate generation, with the exact roots the
