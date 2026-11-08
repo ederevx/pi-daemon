@@ -176,6 +176,7 @@ class Harness:
         self.service = CommsService(self.store, self.config, TOKEN, NODE,
                                     ledger, launcher)
         self.peer_store = None
+        self.credentials = layout.comms_peer_credentials_path()
         if peers is not None:
             self.peer_store = PeerConfigStore(layout.comms_peers_path(),
                                              self.config)
@@ -184,7 +185,7 @@ class Harness:
                 PeerAuthenticator(self.config, self.peer_store,
                                   reader=lambda _path: peers),
                 self.service.deliver_peer, NODE,
-                tunnel_factory=FakeTunnel))
+                tunnel_factory=FakeTunnel), credentials=self.credentials)
         self.service.start()
         self.listener = RpcListener(self.config, RpcCodec(), self.service)
         self.listener.start()
@@ -863,7 +864,8 @@ class PeerWireTests(SocketCase):
     def spec(self, **overrides):
         value = {"nodeId": self.NODE_B, "sshTarget": "peer.example",
                  "remotePort": 5000, "localPort": 0,
-                 "outboundCredentialFile": "/run/cred",
+                 "outboundCredentialFile": os.path.join(
+                     self.harness.credentials, "cred"),
                  "inboundCredentialSha256": hashlib.sha256(
                      self.CREDENTIAL.encode("utf-8")).hexdigest()}
         value.update(overrides)
@@ -872,6 +874,9 @@ class PeerWireTests(SocketCase):
     def configure(self, **overrides):
         return self.harness.client("op").result("comms.peer.add",
                                                 self.spec(**overrides))
+
+    def remote(self, agent_id="b"):
+        return {"nodeId": self.NODE_B, "agentId": agent_id}
 
     def peer_client(self, node_id=None, credential=CREDENTIAL, **options):
         client = Client(self.harness.address(),
@@ -1014,10 +1019,47 @@ class PeerWireTests(SocketCase):
         for field, value in (("nodeId", "not-a-node"),
                              ("sshTarget", "-oProxyCommand=evil"),
                              ("sshTarget", "two words"),
+                             ("sshTarget", "t" * 256),
                              ("remotePort", 0),
+                             ("remotePort", 65536),
+                             ("localPort", -1),
+                             ("localPort", 65536),
                              ("outboundCredentialFile", "relative"),
+                             ("outboundCredentialFile", "/" + "c" * 5000),
+                             ("outboundCredentialFile", "/run/cred"),
                              ("inboundCredentialSha256", "short")):
             answer = operator.call("comms.peer.add", self.spec(**{field: value}))
             self.assertEqual(answer["error"]["code"], INVALID_PARAMS, field)
         answer = operator.call("comms.peer.add", self.spec(nodeId=NODE))
         self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+
+    def test_a_remote_send_is_queued_for_its_peer(self):
+        self.configure()
+        answer = self.harness.client("a").result(
+            "comms.send", {"requestId": "r1", "to": self.remote(),
+                           "kind": "text", "payload": {"n": 1}})
+        self.assertEqual(answer["status"], "queued")
+        self.assertTrue(answer["deliveryId"])
+        listed = self.harness.client("op").result("comms.peer.list", {})
+        self.assertEqual(listed["peers"][0]["queued"], 1)
+
+    def test_a_send_to_a_removed_peer_is_undeliverable(self):
+        self.configure()
+        self.harness.client("op").result("comms.peer.remove",
+                                         {"nodeId": self.NODE_B})
+        answer = self.harness.client("a").result(
+            "comms.send", {"requestId": "r1", "to": self.remote(),
+                           "kind": "text", "payload": {"n": 1}})
+        self.assertEqual(answer, {"status": "undeliverable",
+                                  "reason": "no-such-peer"})
+
+    def test_a_connection_whose_generation_is_gone_must_greet_again(self):
+        self.configure()
+        peer = self.peer_client()
+        self.assertEqual(peer.result("comms.peer.ping", {})["nodeId"], NODE)
+        self.harness.client("op").result("comms.peer.remove",
+                                         {"nodeId": self.NODE_B})
+        self.configure()
+        answer = peer.call("comms.peer.ping", {})
+        self.assertEqual(answer["error"]["code"], UNAUTHORIZED)
+        self.assertIn("peer-stale", answer["error"]["message"])

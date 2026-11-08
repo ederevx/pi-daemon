@@ -58,11 +58,11 @@ class CommsService:
             self._peers.start()
         return self
 
-    def use_peers(self, manager, operations=None):
+    def use_peers(self, manager, operations=None, credentials=None):
         """Attach the peer manager and the wire it serves, before start()."""
         self._peers = manager
         self._peer_operations = operations or PeerOperations(
-            manager, self._config, self._node_id)
+            manager, self._config, self._node_id, directory=credentials)
         return self
 
     def peer_handlers(self):
@@ -161,13 +161,9 @@ class CommsService:
     def send(self, sender, request_id, target, kind, payload,
              ttl_seconds=None):
         with self._send_lock:
-            peer = None
-            if isinstance(target, dict):
-                node = target.get("nodeId")
-                if node and node != self._node_id and self._peers is not None:
-                    peer = self._peers.route(node)
+            route = self._peers.route if self._peers is not None else None
             result = self._store.accept(sender, request_id, target, kind,
-                                        payload, ttl_seconds, peer=peer)
+                                        payload, ttl_seconds, route=route)
             envelopes = result.get("envelopes") or []
             self._relay.publish(envelopes)
             if result.get("status") == QUEUED:

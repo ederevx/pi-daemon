@@ -37,7 +37,8 @@ from daemon_service.comms.wait_registry import WaitRegistry
 from daemon_service.config import ServiceConfig
 from daemon_service.runtime_layout import RuntimeLayout
 from daemon_service.transport.json_line_stream import JsonLineStream
-from daemon_service.transport.rpc_codec import RpcCodec
+from daemon_service.transport.rpc_codec import (INVALID_PARAMS,
+                                                 UNAUTHORIZED, RpcCodec)
 from daemon_service.transport.rpc_error import RpcError
 
 
@@ -1255,6 +1256,9 @@ class FakeLink:
     def alive(self):
         return self._alive
 
+    def interrupt(self):
+        self.interrupted = getattr(self, "interrupted", 0) + 1
+
     def close(self):
         self._alive = False
         self.closed += 1
@@ -1485,6 +1489,156 @@ class PeerStoreTests(PeerCase):
             store.accept(self._agent("a"), "r2", self.remote(), "text",
                          {"text": "hi"}, None, peer=self.route())
         self.assertEqual(caught.exception.code, "busy")
+
+
+class PeerBoundTests(PeerCase):
+    """The bounds and the ordering the store owes a peer it cannot reach."""
+
+    def test_the_route_is_resolved_under_the_store_lock(self):
+        done = threading.Event()
+
+        def cancel():
+            self.store.cancel_peer(NODE_B, "g1", "peer-removed")
+            done.set()
+
+        def route(node_id):
+            thread = threading.Thread(target=cancel)
+            thread.start()
+            # A removal cannot commit between the routing and the delivery.
+            self.assertFalse(done.wait(0.2))
+            return {"nodeId": node_id, "generation": "g1"}
+
+        result = self.store.accept(self._agent("a"), "r1", self.remote(),
+                                   "text", {"text": "hi"}, None, route=route)
+        self.assertEqual(result["status"], "queued")
+        self.assertTrue(done.wait(1.0))
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["reason"], "peer-removed")
+
+    def test_the_outbox_cap_counts_only_mail_still_queued(self):
+        store = self._peer_store(comms_peer_outbox_records=1)
+        store.reserve("a")
+        first = store.accept(self._agent("a"), "r1", self.remote(), "text",
+                             {"text": "hi"}, None, peer=self.route())
+        store.settle_peer(first["deliveryId"], "g1",
+                          {"status": "accepted",
+                           "deliveryId": first["deliveryId"],
+                           "messageId": "m", "sequence": 1})
+        again = store.accept(self._agent("a"), "r2", self.remote(), "text",
+                             {"text": "hi"}, None, peer=self.route())
+        self.assertEqual(again["status"], "queued")
+        with self.assertRaises(CommsError) as caught:
+            store.accept(self._agent("a"), "r3", self.remote(), "text",
+                         {"text": "hi"}, None, peer=self.route())
+        self.assertEqual(caught.exception.code, "busy")
+
+    def test_removal_reports_attempted_mail_as_unknown_and_late_settles_do_nothing(self):
+        first = self.send()
+        self.store.mark_attempt(first["deliveryId"], "g1", self.now)
+        counts = self.store.cancel_peer(NODE_B, "g1", "peer-removed")
+        self.assertEqual(counts, {"settled": 1, "undeliverable": 0,
+                                  "unknown": 1})
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["status"], "unknown")
+        self.assertTrue(self.store.settle_peer(
+            first["deliveryId"], "g1",
+            {"status": "accepted", "deliveryId": first["deliveryId"],
+             "messageId": "m", "sequence": 1}))
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["status"], "unknown")
+
+    def test_an_orphaned_generation_is_settled_rather_than_retained(self):
+        self.send()
+        counts = self.store.cancel_orphans({(NODE_B, "g2")}, "peer-removed")
+        self.assertEqual(counts["undeliverable"], 1)
+        self.assertEqual(self.store.queued(NODE_B), 0)
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["status"], "undeliverable")
+
+    def test_an_inbound_delivery_cannot_outlive_our_own_ttl(self):
+        delivery = self.delivery(expires=self.now + 10 * self.config.comms_max_ttl)
+        accepted = self.store.accept_peer(NODE_B, delivery)
+        self.assertEqual(accepted["outcome"]["status"], "accepted")
+        self.assertEqual(accepted["envelope"]["expiresAt"],
+                         self.now + self.config.comms_max_ttl)
+
+    def test_inbound_deliveries_are_bounded_in_count(self):
+        store = self._peer_store(comms_peer_inbound_records=1)
+        store.reserve("b")
+        store.accept_peer(NODE_B, self.delivery("d1", text="one"))
+        with self.assertRaises(CommsError) as caught:
+            store.accept_peer(NODE_B, self.delivery("d2", text="two"))
+        self.assertEqual(caught.exception.code, "busy")
+        # The replay of the accepted one is still answered, not refused.
+        self.assertEqual(store.accept_peer(NODE_B, self.delivery("d1", text="one"))
+                         ["outcome"]["status"], "accepted")
+
+    def test_an_inbound_delivery_is_bounded_by_our_own_limits(self):
+        self.store.reserve("b")
+        long_kind = self.delivery("d1")
+        long_kind["kind"] = "k" * (self.config.comms_kind_limit + 1)
+        with self.assertRaises(CommsError) as caught:
+            self.store.accept_peer(NODE_B, long_kind)
+        self.assertEqual(caught.exception.code, "bad-request")
+        long_agent = self.delivery("d2")
+        long_agent["from"]["agentId"] = "a" * (
+            self.config.comms_agent_id_limit + 1)
+        with self.assertRaises(CommsError) as caught:
+            self.store.accept_peer(NODE_B, long_agent)
+        self.assertEqual(caught.exception.code, "bad-request")
+
+
+class PeerCredentialTests(PeerCase):
+    """The credential file a peer link reads is ours, and only ours."""
+
+    def peers(self):
+        return PeerConfigStore(self.layout.comms_peers_path(), self.config)
+
+    def write(self, name, text="shared\n", mode=0o600):
+        directory = os.path.join(self.base, "credentials")
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(path, mode)
+        return directory, path
+
+    def test_a_credential_is_read_from_the_credentials_directory(self):
+        directory, path = self.write("cred")
+        auth = PeerAuthenticator(self.config, self.peers(),
+                                 directory=directory)
+        self.assertEqual(auth.outbound_credential(
+            {"outboundCredentialFile": path}), "shared")
+
+    def test_a_credential_outside_the_directory_is_refused(self):
+        directory, _ = self.write("cred")
+        elsewhere = os.path.join(self.base, "elsewhere")
+        os.makedirs(elsewhere, exist_ok=True)
+        path = os.path.join(elsewhere, "cred")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("shared")
+        os.chmod(path, 0o600)
+        auth = PeerAuthenticator(self.config, self.peers(),
+                                 directory=directory)
+        with self.assertRaises(ValueError) as caught:
+            auth.outbound_credential({"outboundCredentialFile": path})
+        self.assertEqual(str(caught.exception), "credential-unreadable")
+
+    def test_a_symlinked_credential_is_refused(self):
+        directory, path = self.write("cred")
+        link = os.path.join(directory, "link")
+        os.symlink(path, link)
+        auth = PeerAuthenticator(self.config, self.peers(),
+                                 directory=directory)
+        with self.assertRaises(ValueError):
+            auth.outbound_credential({"outboundCredentialFile": link})
+
+    def test_a_credential_readable_by_others_is_refused(self):
+        directory, path = self.write("cred", mode=0o644)
+        auth = PeerAuthenticator(self.config, self.peers(),
+                                 directory=directory)
+        with self.assertRaises(ValueError):
+            auth.outbound_credential({"outboundCredentialFile": path})
 
 
 class PeerConfigStoreTests(PeerCase):
@@ -1734,9 +1888,49 @@ class PeerWorkerTests(PeerCase):
         worker.start()
         self.assertTrue(_await(lambda: link.opened > 0))
         worker.stop()
+        self.assertGreaterEqual(link.interrupted, 1)
         self.assertGreaterEqual(link.closed, 1)
         self.assertGreaterEqual(tunnel.closed, 1)
-        self.assertFalse(worker._thread.is_alive())
+        self.assertEqual(worker.snapshot()["state"], "down")
+        # A stopped worker never reconnects: no further open is recorded.
+        opened = link.opened
+        self.assertFalse(_await(lambda: link.opened > opened, timeout=0.3))
+
+
+    def test_a_stale_generation_sends_the_worker_back_to_its_hello(self):
+        self.send()
+        link = FakeLink(failure=RpcError(UNAUTHORIZED, "peer-stale"))
+        worker = self.worker(link)
+        worker.start()
+        self.assertTrue(_await(lambda: link.opened >= 2))
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["status"], "queued")
+
+    def test_an_oversized_delivery_is_settled_rather_than_retried(self):
+        self.send()
+        link = FakeLink(failure=PeerLinkError("frame-too-large"))
+        self.worker(link).start()
+        self.assertTrue(_await(lambda: self.store.receipt(
+            self._agent("a"), "r1")["status"] == "undeliverable"))
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["reason"], "payload-too-large")
+
+    def test_a_remote_payload_refusal_settles_the_delivery(self):
+        self.send()
+        link = FakeLink(failure=RpcError(INVALID_PARAMS, "payload-too-large"))
+        self.worker(link).start()
+        self.assertTrue(_await(lambda: self.store.receipt(
+            self._agent("a"), "r1")["status"] == "undeliverable"))
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["reason"], "payload-too-large")
+
+    def test_a_failed_link_reports_a_bounded_reason(self):
+        self.send()
+        link = FakeLink(failure=PeerLinkError("x" * 10000))
+        worker = self.worker(link)
+        worker.start()
+        self.assertTrue(_await(lambda: worker.snapshot()["lastError"]))
+        self.assertLessEqual(len(worker.snapshot()["lastError"]), 256)
 
 
 class PeerOperationsTests(PeerCase):
@@ -1856,3 +2050,133 @@ class PeerOperationsTests(PeerCase):
         self.addCleanup(manager.stop)
         manager.start()
         self.assertIsNone(self.peers.get(NODE_B))
+
+    def test_removal_stops_the_worker_even_when_settling_fails(self):
+        tunnels = []
+
+        def factory():
+            tunnels.append(FakeTunnel())
+            return tunnels[-1]
+
+        peers = PeerConfigStore(os.path.join(self.base, "failing-peers.json"),
+                                self.config)
+        manager = PeerManager(self.config, self.store, peers,
+                              PeerAuthenticator(self.config, peers,
+                                                reader=lambda _path: "shared"),
+                              self._accept, NODE_A, clock=lambda: self.now,
+                              tunnel_factory=factory,
+                              link_factory=lambda: FakeLink())
+        self.addCleanup(manager.stop)
+        manager.start()
+        operations = PeerOperations(manager, self.config, NODE_A,
+                                    clock=lambda: self.now)
+        operations.add(None, self.spec())
+        original = self.store.cancel_peer
+
+        def failing(*_args, **_kwargs):
+            raise CommsError("store-failed")
+
+        self.store.cancel_peer = failing
+        self.addCleanup(setattr, self.store, "cancel_peer", original)
+        with self.assertRaises(RpcError) as caught:
+            operations.remove(None, {"nodeId": NODE_B})
+        self.assertEqual(str(caught.exception), "store-failed")
+        self.assertGreaterEqual(tunnels[0].closed, 1)
+        # Nothing was settled, so the removal stays visible as removing.
+        self.assertEqual(operations.list(None, {})["peers"][0]["state"],
+                         "removing")
+
+    def test_a_credential_outside_the_directory_is_refused_at_the_wire(self):
+        directory = os.path.join(self.base, "credentials")
+        operations = PeerOperations(self.manager, self.config, NODE_A,
+                                    clock=lambda: self.now,
+                                    directory=directory)
+        with self.assertRaises(RpcError) as caught:
+            operations.add(None, self.spec(outboundCredentialFile="/run/cred"))
+        self.assertEqual(caught.exception.code, -32602)
+        accepted = operations.add(None, self.spec(
+            outboundCredentialFile=os.path.join(directory, "cred")))
+        self.assertTrue(accepted["created"])
+
+    def test_ping_tells_a_stale_generation_to_greet_again(self):
+        self.operations.add(None, self.spec())
+        first = self.manager.generation(NODE_B)
+        self.assertEqual(self.operations.ping(
+            {"nodeId": NODE_B, "generation": first}, {}), {
+                "nodeId": NODE_A, "serverTime": self.now})
+        self.operations.remove(None, {"nodeId": NODE_B})
+        self.operations.add(None, self.spec())
+        self.assertNotEqual(self.manager.generation(NODE_B), first)
+        with self.assertRaises(RpcError) as caught:
+            self.operations.ping({"nodeId": NODE_B, "generation": first}, {})
+        self.assertEqual(caught.exception.code, -32001)
+
+
+class TunnelArgvTests(PeerCase):
+
+    def capture(self, marker=True, returncode=None):
+        calls = []
+
+        def spawn(argv, **options):
+            calls.append((argv, options))
+            out = b""
+            if marker:
+                for item in argv:
+                    if item.startswith("LocalCommand=echo "):
+                        out = item.split("echo ", 1)[1].encode() + b"\n"
+            return TunnelTests.ScriptedProcess(out, b"", returncode)
+
+        return calls, spawn
+
+    def peer(self, local_port=0):
+        return {"nodeId": NODE_B, "sshTarget": "peer.example",
+                "remotePort": 5000, "localPort": local_port}
+
+    def test_the_forward_runs_in_the_foreground_and_never_forks(self):
+        calls, spawn = self.capture()
+        tunnel = PeerTunnel(self.config, spawn=spawn)
+        self.addCleanup(tunnel.close)
+        tunnel.start(self.peer(local_port=6000))
+        argv, options = calls[0]
+        self.assertNotIn("-f", argv)
+        self.assertFalse(any("ForkAfterAuthentication" in item for item in argv))
+        self.assertEqual(options.get("shell"), False)
+        self.assertIn("BatchMode=yes", argv)
+        self.assertIn("ExitOnForwardFailure=yes", argv)
+        self.assertIn("StrictHostKeyChecking=yes", argv)
+        self.assertIn("ForwardAgent=no", argv)
+        self.assertIn("127.0.0.1:6000:127.0.0.1:5000", argv)
+        self.assertTrue(any(item.startswith("LocalCommand=echo pi-peer-ready-")
+                            for item in argv))
+        self.assertEqual(argv[-1], "peer.example")
+
+    def test_a_child_that_dies_before_its_marker_ends_the_wait(self):
+        _calls, spawn = self.capture(marker=False, returncode=255)
+        tunnel = PeerTunnel(self.config, spawn=spawn)
+        with self.assertRaises(TunnelError) as caught:
+            tunnel.start(self.peer())
+        self.assertTrue(caught.exception.reason.startswith("tunnel-exited"))
+
+    def test_close_ends_a_start_that_is_still_waiting(self):
+        self._peer_store(comms_peer_ready_timeout=2.0)
+        _calls, spawn = self.capture(marker=False, returncode=None)
+        tunnel = PeerTunnel(self.config, spawn=spawn)
+        caught = []
+
+        def run():
+            try:
+                tunnel.start(self.peer())
+            except TunnelError as failure:
+                caught.append(failure)
+
+        thread = threading.Thread(target=run)
+        started = time.time()
+        thread.start()
+        self.assertTrue(_await(lambda: tunnel.address() != ("127.0.0.1", 0),
+                              timeout=0.5))
+        tunnel.close()
+        thread.join(2.0)
+        self.assertFalse(thread.is_alive())
+        self.assertLess(time.time() - started, 1.5)
+        self.assertEqual(len(caught), 1)
+        self.assertTrue(caught[0].reason.startswith("tunnel-stopped"))

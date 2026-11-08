@@ -1,6 +1,8 @@
 """One ssh child per configured peer, and the marker that proves it bound.
 
-The child runs in its own process group with a foreground forward. Readiness
+The child runs in its own process group, in the foreground, so the process
+this module started is the forward itself and closing it closes the forward.
+Readiness
 is the marker its local `PermitLocalCommand` echoes only after every local
 forward is bound, so a stolen port is never adopted; the authenticated hello
 over the resulting socket is what makes the link up, not the tunnel.
@@ -12,6 +14,7 @@ import signal
 import socket
 import subprocess
 import threading
+import time
 
 from .peer_tunnel_error import TunnelError
 
@@ -31,12 +34,14 @@ class PeerTunnel:
         self._stderr = bytearray()
         self._readers = []
         self._local_port = 0
+        self._stopping = threading.Event()
 
     def start(self, peer):
         """Launch the forward and wait for its readiness marker."""
         with self._lock:
             if self._process is not None:
                 raise TunnelError("already-started")
+            self._stopping.clear()
             port = int(peer.get("localPort") or 0) or self._free_port()
             nonce = secrets.token_hex(8)
             argv = self._argv(peer, port, nonce)
@@ -53,26 +58,45 @@ class PeerTunnel:
             self._stderr = bytearray()
             self._start_reader(process.stdout, self._scan_stdout, nonce)
             self._start_reader(process.stderr, self._scan_stderr, None)
-            if not self._ready.wait(self._config.comms_peer_ready_timeout):
+            self._await_ready(process)
+            if not self._ready.is_set():
                 detail = self.stderr_text()
                 self._shutdown()
-                reason = "local-port-in-use" if "address already in use" \
-                    in detail.lower() else "tunnel-timeout"
+                if self._stopping.is_set():
+                    reason = "tunnel-stopped"
+                elif "address already in use" in detail.lower():
+                    reason = "local-port-in-use"
+                elif process.poll() is not None:
+                    reason = "tunnel-exited"
+                else:
+                    reason = "tunnel-timeout"
                 raise TunnelError(f"{reason}: {detail}".strip())
             return ("127.0.0.1", port)
 
+    def _await_ready(self, process):
+        """Wait for the marker in slices: a dead child or a stop ends it."""
+        deadline = time.monotonic() + self._config.comms_peer_ready_timeout
+        while not self._ready.is_set():
+            if self._stopping.is_set() or process.poll() is not None:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self._ready.wait(min(0.05, remaining))
+
     def address(self):
         return ("127.0.0.1", self._local_port)
-
-    def alive(self):
-        process = self._process
-        return process is not None and process.poll() is None
 
     def stderr_text(self):
         return bytes(self._stderr).decode("utf-8", "replace").strip()
 
     def close(self):
-        """Terminate the whole process group and reap it; report survival."""
+        """Terminate the whole process group and reap it; report survival.
+
+        It signals before it takes the lock, so a start still waiting for its
+        marker gives up instead of holding the caller for a whole timeout.
+        """
+        self._stopping.set()
         with self._lock:
             return self._shutdown()
 
@@ -84,12 +108,11 @@ class PeerTunnel:
         """
         process, self._process = self._process, None
         self._ready.set()
-        for reader in self._readers:
-            reader.join(self._config.stop_grace)
-        self._readers = []
         if process is None:
+            self._join_readers()
             return True
         clean = self._terminate(process)
+        self._join_readers()
         for stream in (process.stdout, process.stderr):
             try:
                 if stream is not None:
@@ -97,6 +120,12 @@ class PeerTunnel:
             except OSError:
                 pass
         return clean
+
+    def _join_readers(self):
+        """The child is gone, so its pipes end and its readers finish."""
+        for reader in self._readers:
+            reader.join(self._config.stop_grace)
+        self._readers = []
 
     def _terminate(self, process):
         if process.poll() is None:
@@ -141,7 +170,6 @@ class PeerTunnel:
             "-o", "ControlMaster=no",
             "-o", "ControlPath=none",
             "-o", "ControlPersist=no",
-            "-o", "ForkAfterAuthentication=yes",
             "-o", "StrictHostKeyChecking=yes",
             "-o", "ForwardAgent=no",
             "-o", "ForwardX11=no",

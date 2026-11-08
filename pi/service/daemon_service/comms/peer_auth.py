@@ -16,9 +16,10 @@ CREDENTIAL_BYTES = 4096
 class PeerAuthenticator:
     """It compares verifiers; it does not decide which methods exist."""
 
-    def __init__(self, config, peers, reader=None):
+    def __init__(self, config, peers, reader=None, directory=None):
         self._max_bytes = min(CREDENTIAL_BYTES, config.frame_bytes)
         self._peers = peers
+        self._directory = directory
         self._reader = reader or self._read
 
     def verify(self, node_id, credential):
@@ -45,12 +46,29 @@ class PeerAuthenticator:
     def _read(self, path):
         if not isinstance(path, str) or not os.path.isabs(path):
             raise ValueError("an absolute credential path is required")
-        info = os.stat(path)
-        if not stat.S_ISREG(info.st_mode):
-            raise ValueError("a regular credential file is required")
-        if info.st_size <= 0 or info.st_size > self._max_bytes:
-            raise ValueError("the credential file is out of bounds")
-        if info.st_mode & 0o077:
-            raise ValueError("the credential file is readable by others")
-        with open(path, "r", encoding="utf-8") as handle:
-            return handle.read().strip()
+        if self._directory is not None and \
+                os.path.dirname(path) != self._directory:
+            # Only the daemon's own credentials directory: a path an agent
+            # could point anywhere would make the token or a key sendable.
+            raise ValueError("the credential is not in its directory")
+        try:
+            descriptor = os.open(path,
+                                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as failure:
+            raise ValueError(f"the credential is unreadable: {failure}") \
+                from None
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or \
+                    info.st_uid != os.geteuid():
+                raise ValueError("a regular file of my own is required")
+            if info.st_size <= 0 or info.st_size > self._max_bytes:
+                raise ValueError("the credential file is out of bounds")
+            if info.st_mode & 0o077:
+                raise ValueError("the credential file is readable by others")
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                descriptor = None
+                return handle.read().strip()
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)

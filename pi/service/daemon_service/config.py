@@ -38,6 +38,7 @@ RANGES = {
     "comms_peer_clock_skew": 0.0,
     "comms_peer_cap": 0,
     "comms_peer_outbox_records": 0,
+    "comms_peer_inbound_records": 0,
     "comms_peer_stderr_bytes": 0,
 }
 
@@ -104,6 +105,7 @@ class ServiceConfig:
     comms_peer_clock_skew: float = 5.0
     comms_peer_cap: int = 32
     comms_peer_outbox_records: int = 1024
+    comms_peer_inbound_records: int = 1024
     comms_peer_stderr_bytes: int = 8192
     revision: int = 0
 

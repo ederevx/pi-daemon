@@ -6,14 +6,17 @@ daemon gave, and keeps the delivery queued whenever the answer is missing.
 
 import threading
 
+from ..transport.rpc_codec import UNAUTHORIZED
 from ..transport.rpc_error import RpcError
 from .error import CommsError
-from .mailbox_store import ACCEPTED, BAD_REQUEST, QUEUED, UNDELIVERABLE
+from .mailbox_store import (ACCEPTED, BAD_REQUEST, PAYLOAD_TOO_LARGE,
+                            QUEUED, UNDELIVERABLE)
 from .peer_link_error import PeerLinkError
 
 DELIVER = "comms.peer.deliver"
 PING = "comms.peer.ping"
 BATCH = 8
+REASON_LIMIT = 256
 UP = "up"
 DOWN = "down"
 
@@ -53,17 +56,20 @@ class PeerDelivery:
         with self._lock:
             return {"state": self._state, "lastError": self._last_error}
 
-    def stop(self):
-        """Stop the link, unblock the worker, then reap tunnel and thread."""
+    def signal(self):
+        """Unblock the worker and its links; it never waits for a lock."""
         self._stop.set()
         self._wake.set()
-        self._link.close()
+        self._link.interrupt()
         self._tunnel.close()
+
+    def stop(self):
+        """Signal, then reap the link, the worker and its tunnel."""
+        self.signal()
+        self._link.close()
         if self._thread is not None:
             self._thread.join(self._config.stop_grace)
-
-    def generation(self):
-        return self._generation
+        self._mark(DOWN, "stopped")
 
     # -- the worker --------------------------------------------------------
 
@@ -72,7 +78,10 @@ class PeerDelivery:
             if not self._connect():
                 self._pause()
                 continue
-            self._serve()
+            try:
+                self._serve()
+            except Exception as failure:                 # noqa: BLE001
+                self._mark(DOWN, str(failure) or "worker-failed")
             self._teardown()
             if not self._stop.is_set():
                 self._mark(DOWN, "link-closed")
@@ -84,10 +93,6 @@ class PeerDelivery:
             credential = self._credentials.outbound_credential(self._peer)
             self._link.open(address, self._peer, credential,
                             self._config.comms_peer_request_timeout)
-        except (OSError, ValueError, PeerLinkError) as failure:
-            self._teardown()
-            self._mark(DOWN, str(failure) or "link-down")
-            return False
         except Exception as failure:                     # noqa: BLE001
             self._teardown()
             self._mark(DOWN, str(failure) or "link-down")
@@ -133,10 +138,20 @@ class PeerDelivery:
                     DELIVER, {"delivery": delivery},
                     self._config.comms_peer_request_timeout)
             except RpcError as failure:
+                if failure.code == UNAUTHORIZED:
+                    # The remote dropped this generation: reconnect and hello.
+                    self._mark(DOWN, "peer-stale")
+                    return False
+                settled = self._too_large(delivery_id, failure)
+                if settled:
+                    continue
                 # The hop itself was refused: the record stays queued.
                 self._mark(UP, f"refused: {failure.code}")
                 return True
             except PeerLinkError as failure:
+                if failure.reason == "frame-too-large":
+                    self._too_large(delivery_id, failure)
+                    continue
                 self._mark(DOWN, failure.reason)
                 return False
             outcome = self._outcome(delivery_id, answer)
@@ -150,6 +165,20 @@ class PeerDelivery:
                 self._mark(UP, f"settle-failed: {failure.code}")
                 return True
         return True
+
+    def _too_large(self, delivery_id, failure):
+        """A refusal the remote will repeat: settle it instead of retrying."""
+        if str(getattr(failure, "reason", "")) == "frame-too-large" or \
+                str(getattr(failure, "message", "")) == PAYLOAD_TOO_LARGE:
+            try:
+                self._store.settle_peer(delivery_id, self._generation,
+                                        {"status": UNDELIVERABLE,
+                                         "deliveryId": delivery_id,
+                                         "reason": PAYLOAD_TOO_LARGE})
+            except CommsError as failure:
+                self._mark(UP, f"settle-failed: {failure.code}")
+            return True
+        return False
 
     def _probe(self):
         try:
@@ -177,7 +206,8 @@ class PeerDelivery:
     def _mark(self, state, reason):
         with self._lock:
             self._state = state
-            self._last_error = reason
+            self._last_error = None if reason is None \
+                else str(reason)[:REASON_LIMIT]
 
     @staticmethod
     def _outcome(delivery_id, answer):
@@ -187,12 +217,21 @@ class PeerDelivery:
             return None
         status = answer.get("status")
         if status == ACCEPTED:
+            message_id = answer.get("messageId")
+            sequence = answer.get("sequence")
+            if not isinstance(message_id, str) or not message_id:
+                return None
+            if isinstance(sequence, bool) or not isinstance(sequence, int) \
+                    or sequence < 1:
+                return None
             return {"status": ACCEPTED, "deliveryId": delivery_id,
-                    "messageId": answer.get("messageId"),
-                    "sequence": answer.get("sequence")}
+                    "messageId": message_id, "sequence": sequence}
         if status == UNDELIVERABLE:
+            reason = answer.get("reason")
+            if not isinstance(reason, str) or not reason:
+                reason = BAD_REQUEST
             return {"status": UNDELIVERABLE, "deliveryId": delivery_id,
-                    "reason": answer.get("reason") or BAD_REQUEST}
+                    "reason": reason}
         if status == QUEUED:
             return None
         if status == "expired":

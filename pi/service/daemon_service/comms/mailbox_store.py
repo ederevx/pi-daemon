@@ -60,6 +60,9 @@ class MailboxStore:
         self._reply_bytes = config.frame_bytes - config.comms_frame_margin
         self._peer_retention = config.comms_peer_retention
         self._outbox_records = config.comms_peer_outbox_records
+        self._inbound_records = config.comms_peer_inbound_records
+        self._agent_limit = config.comms_agent_id_limit
+        self._kind_limit = config.comms_kind_limit
         self._node_id = node_id
         self._clock = clock or time.time
         self._lock = threading.RLock()
@@ -346,13 +349,15 @@ class MailboxStore:
     # -- acceptance --------------------------------------------------------
 
     def accept(self, sender, request_id, target, kind, payload,
-               ttl_seconds=None, peer=None):
+               ttl_seconds=None, peer=None, route=None):
         """One durable commit: selection, sequences, envelopes and receipt.
 
         `target` is one address or ALL_TARGET for every existing mailbox.
         The fingerprint describes the request; the receipt records what it
         resolved to, so a retry replays the first expansion. A foreign
-        address is queued for its peer in the same commit.
+        address is queued for its peer in the same commit, and the peer is
+        resolved under the same lock, so a removal cannot slip between the
+        routing decision and the commit.
         """
         sender_address = self._address(sender)
         encoded = self._payload_text(payload)
@@ -371,9 +376,12 @@ class MailboxStore:
             if descriptor["kind"] == "direct" and \
                     descriptor["to"]["nodeId"] and \
                     descriptor["to"]["nodeId"] != self._node_id:
+                chosen = peer
+                if chosen is None and route is not None:
+                    chosen = route(descriptor["to"]["nodeId"])
                 return self._peer_accept_locked(
                     key, digest, sender_address, descriptor["to"], kind,
-                    encoded, wanted_ttl, str(request_id), now, peer)
+                    encoded, wanted_ttl, str(request_id), now, chosen)
             addresses = self._resolve_locked(descriptor, sender_address)
             candidate = {agent_id: self._copy_state(state)
                          for agent_id, state in self._recipients.items()}
@@ -473,7 +481,9 @@ class MailboxStore:
             return {"status": UNDELIVERABLE,
                     "receipt": self._detach(receipt),
                     "undeliverable": self._detach(receipt["undeliverable"])}
-        if len(self._outbox) >= self._outbox_records:
+        if sum(1 for record in self._outbox.values()
+               if record["state"] == QUEUED) >= self._outbox_records:
+            # Settled records are only dedupe markers; they hold no room.
             raise CommsError(BUSY)
         delivery_id = uuid.uuid4().hex
         expires_at = now + min(ttl, self._peer_retention)
@@ -519,6 +529,10 @@ class MailboxStore:
             self._finite(delivery.get("createdAt"))
         except CommsError:
             raise CommsError(BAD_REQUEST) from None
+        if len(kind) > self._kind_limit or \
+                len(source["agentId"]) > self._agent_limit or \
+                len(to["agentId"]) > self._agent_limit:
+            raise CommsError(BAD_REQUEST)
         if source["nodeId"] != peer_node_id or to["nodeId"] != self._node_id:
             raise CommsError(BAD_REQUEST)
         encoded = self._payload_text(delivery.get("payload"))
@@ -529,12 +543,16 @@ class MailboxStore:
         with self._lock:
             self._expire_if_due_locked()
             now = self._clock()
+            # The remote chose this expiry: never let it outlive our own.
+            expires_at = min(expires_at, now + self._max_ttl)
             stored = self._peer_deliveries.get(key)
             if stored is not None:
                 if stored["digest"] != digest:
                     raise CommsError(REQUEST_CONFLICT)
                 return {"outcome": self._detach(stored["outcome"]),
                         "envelope": None}
+            if len(self._peer_deliveries) >= self._inbound_records:
+                raise CommsError(BUSY)
             if now >= expires_at:
                 return {"outcome": {"status": EXPIRED,
                                     "deliveryId": delivery_id},
@@ -673,17 +691,32 @@ class MailboxStore:
 
     def cancel_peer(self, peer_node_id, generation, reason):
         """Settle what one peer can no longer carry, truthfully."""
+
+        def selected(record):
+            return record["peerNodeId"] == peer_node_id and (
+                generation is None or
+                record["peerGeneration"] == generation)
+
+        return self._cancel_locked(selected, reason)
+
+    def cancel_orphans(self, active, reason):
+        """Settle queued mail no configured peer generation can carry."""
+
+        def selected(record):
+            return (record["peerNodeId"], record["peerGeneration"]) \
+                not in active
+
+        return self._cancel_locked(selected, reason)
+
+    def _cancel_locked(self, selected, reason):
+        """Unattempted mail is undeliverable; attempted mail is unknown."""
         with self._lock:
             now = self._clock()
             outbox = dict(self._outbox)
             receipts = dict(self._receipts)
             undeliverable = unknown = 0
             for delivery_id, record in self._outbox.items():
-                if record["state"] != QUEUED or \
-                        record["peerNodeId"] != peer_node_id:
-                    continue
-                if generation is not None and \
-                        record["peerGeneration"] != generation:
+                if record["state"] != QUEUED or not selected(record):
                     continue
                 status = UNDELIVERABLE if record["attempts"] == 0 \
                     else UNKNOWN

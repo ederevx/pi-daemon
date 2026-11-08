@@ -31,7 +31,7 @@ class PeerLink:
         self._socket = None
         self._stream = None
         self._request_id = 0
-        self._greeting = None
+        self._frame_limit = None
 
     def open(self, address, peer, credential, timeout=None):
         """Connect, authenticate as this node, and require the peer's node."""
@@ -64,7 +64,7 @@ class PeerLink:
                 stream.close()
                 raise
             self._socket, self._stream = connection, stream
-            self._greeting = greeting
+            self._frame_limit = greeting["maxFrameBytes"]
             return greeting
 
     def request(self, method, params, timeout=None):
@@ -77,7 +77,9 @@ class PeerLink:
             request_id = f"p{self._request_id}"
             frame = self._codec.encode({"jsonrpc": "2.0", "id": request_id,
                                         "method": method, "params": params})
-            if len(frame) > self._config.frame_bytes:
+            if len(frame) > (self._frame_limit or self._config.frame_bytes):
+                # The greeting said how much the remote reads; a frame past
+                # it would cost the link, so this record can never be sent.
                 raise PeerLinkError("frame-too-large")
             try:
                 if timeout is not None:
@@ -90,14 +92,32 @@ class PeerLink:
             except (OSError, ValueError) as failure:
                 self._close_locked()
                 raise PeerLinkError(f"link-broken: {failure}") from None
-            if message.get("id") != request_id:
+            if not isinstance(message, dict) or \
+                    message.get("id") != request_id:
                 self._close_locked()
                 raise PeerLinkError("mismatched-reply")
             error = message.get("error")
             if isinstance(error, dict):
-                raise RpcError(int(error.get("code") or 0),
-                               str(error.get("message") or "refused"))
+                try:
+                    code = int(error.get("code") or 0)
+                except (TypeError, ValueError):
+                    self._close_locked()
+                    raise PeerLinkError("bad-error-code") from None
+                raise RpcError(code, str(error.get("message") or "refused"))
             return message.get("result")
+
+    def frame_limit(self):
+        """The frame the remote daemon accepts, learned from its greeting."""
+        return self._frame_limit
+
+    def interrupt(self):
+        """Break a request that is waiting, without taking the lock."""
+        connection = self._socket
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def alive(self):
         return self._stream is not None
@@ -116,10 +136,9 @@ class PeerLink:
                 connection.close()
             except OSError:
                 pass
-        self._greeting = None
 
     def _result(self, message, request_id):
-        if message.get("id") != request_id:
+        if not isinstance(message, dict) or message.get("id") != request_id:
             raise PeerLinkError("mismatched-greeting")
         error = message.get("error")
         if isinstance(error, dict):

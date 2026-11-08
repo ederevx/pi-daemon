@@ -1,9 +1,11 @@
 """The peer wire: administration for the local operator, delivery for peers.
 
-Validation lives here so neither the manager nor the store parses params.
-`comms.peer.deliver` is never offered to an agent's connection.
+Params are validated here, so neither the manager nor the config store parses
+them; the store still validates the delivery body it is handed, because that
+body is the remote's. `comms.peer.deliver` is never offered to an agent.
 """
 
+import os
 import re
 import time
 
@@ -30,18 +32,18 @@ CODES = {
     CLOSING: UNAVAILABLE,
     STALE_PEER: INVALID_PARAMS,
     CONFIG_CONFLICT: INVALID_PARAMS,
-    UNAUTHORIZED: UNAUTHORIZED,
 }
 
 
 class PeerOperations:
     """It validates the peer wire and projects the manager; it owns no state."""
 
-    def __init__(self, manager, config, node_id, clock=None):
+    def __init__(self, manager, config, node_id, clock=None, directory=None):
         self._manager = manager
         self._config = config
         self._node_id = node_id
         self._clock = clock or time.time
+        self._directory = directory
 
     def handlers(self):
         return {"comms.peer.add": self.add,
@@ -69,7 +71,10 @@ class PeerOperations:
         return self._call(self._manager.deliver, peer["nodeId"],
                           peer["generation"], params["delivery"])
 
-    def ping(self, _peer, _params):
+    def ping(self, peer, _params):
+        """A connection whose generation is gone is told to greet again."""
+        if self._manager.generation(peer["nodeId"]) != peer["generation"]:
+            raise RpcError(UNAUTHORIZED, STALE_PEER)
         return {"nodeId": self._node_id,
                 "serverTime": self.server_time()}
 
@@ -101,6 +106,11 @@ class PeerOperations:
                 not credential.startswith("/") or len(credential) > 4096:
             raise RpcError(INVALID_PARAMS,
                            "outboundCredentialFile must be an absolute path")
+        if self._directory is not None and \
+                os.path.dirname(credential) != self._directory:
+            raise RpcError(INVALID_PARAMS,
+                           "outboundCredentialFile must be in the "
+                           "credentials directory")
         verifier = params.get("inboundCredentialSha256")
         if not isinstance(verifier, str) or \
                 not VERIFIER.fullmatch(verifier):

@@ -138,10 +138,12 @@ class DaemonApplication:
                                spawns, launcher)
         peers = PeerConfigStore(self._layout.comms_peers_path(), self._config)
         self._comms_peers = peers
-        manager = PeerManager(self._config, store, peers,
-                              PeerAuthenticator(self._config, peers),
-                              service.deliver_peer, identity.id())
-        service.use_peers(manager)
+        credentials = self._layout.comms_peer_credentials_path()
+        manager = PeerManager(
+            self._config, store, peers,
+            PeerAuthenticator(self._config, peers, directory=credentials),
+            service.deliver_peer, identity.id())
+        service.use_peers(manager, credentials=credentials)
         self._comms = service
         service.start()
         listener = RpcListener(self._config, RpcCodec(), service,

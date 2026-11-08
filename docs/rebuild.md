@@ -318,6 +318,15 @@ Each configured peer runs one outbound worker that opens its tunnel and
 retries with a bounded backoff, and every state change commits before
 a link or worker exists.
 
+The tunnel is one ssh child in its own process group, in the
+foreground, so the process the daemon started is the forward it can
+stop; it is given the destination and both ports, never a shell. The
+credential it reads lives in the comms domain's peer-credentials
+directory, must be a regular file of the daemon's own user with no
+group or other permission bits, and is opened without following a
+symlink, so a path an agent names can never reach the token file or a
+key outside that directory.
+
 A peer connection presents `{version, peer: {nodeId, credential}}` at
 `rpc.hello`, never the daemon token and never an agent identity: the
 verifier configured for that node decides admission, and the greeting
@@ -334,11 +343,28 @@ body is a `request-conflict`. A peer whose node has no configured
 verifier, or whose credential does not match it, is refused at
 `rpc.hello` and no mailbox is created.
 
+The remote proposes, this node disposes: an inbound expiry is clamped
+to our own maximum TTL, agent ids and kinds are held to our limits, and
+the dedupe markers are bounded in count, so one peer cannot make mail
+or markers outlive our policy or fill the store. An answer that does
+not carry the delivery it names, with a message id and a sequence this
+node can use, is not recorded as an outcome.
+
+A foreign address is routed under the store's own lock, so a removal
+cannot slip between the routing decision and the commit, and mail left
+queued for a generation that no longer exists is settled when the
+manager starts rather than waiting for an expiry.
+
 Removal first marks the peer's generation removing, so no import or
-delivery is accepted under it, then settles the mail still queued for
-it as `undeliverable` with reason `peer-removed` and answers how much it
-settled. Adding the peer again mints a new generation, so mail queued
-for the removed one can never be delivered as mail for the new one.
+delivery is accepted under it, stops that peer's worker, then settles
+the mail still queued for it: mail never attempted is `undeliverable`
+with reason `peer-removed`, and mail already attempted is `unknown`,
+because this node cannot promise the remote mailbox did not take it.
+The answer reports both counts, and adding the peer again mints a new
+generation, so mail queued for the removed one can never be delivered
+as mail for the new one. A connection still bound to the removed
+generation is refused at `comms.peer.ping` with `peer-stale`, which
+sends its worker back to a fresh `rpc.hello` instead of wedging it.
 
 The message envelope is bounded by the frame, not only by the payload
 limit, so a notification always fits the connection that carries it. A

@@ -47,15 +47,23 @@ class PeerManager:
             self._store.cancel_peer(record["nodeId"], record["generation"],
                                     PEER_REMOVED)
             self._peers.finish_remove(record["nodeId"])
+        active = {(record["nodeId"], record["generation"])
+                  for record in self._peers.list() if record["state"] == ACTIVE}
+        # Mail a previous process queued for a generation this one no longer
+        # reaches is settled now, or no worker would ever look at it.
+        self._store.cancel_orphans(active, PEER_REMOVED)
         for record in self._peers.list():
             if record["state"] == ACTIVE:
                 self._spawn(record)
         return self
 
     def begin_shutdown(self):
+        """Every worker is signalled first; none waits on another's socket."""
         with self._lock:
             self._closing = True
             workers = list(self._workers.values())
+        for worker in workers:
+            worker.signal()
         for worker in workers:
             worker.stop()
         with self._lock:
@@ -122,11 +130,18 @@ class PeerManager:
                 return {"status": "not-found", "nodeId": node_id}
             removing = self._peers.begin_remove(node_id)
             worker = self._workers.pop(node_id, None)
-        counts = self._store.cancel_peer(node_id, removing["generation"],
-                                         PEER_REMOVED)
-        self._peers.finish_remove(node_id)
-        if worker is not None:
-            worker.stop()
+        try:
+            # The generation is already removing, so no import is admitted;
+            # stopping the worker first means no attempt starts behind us.
+            if worker is not None:
+                worker.stop()
+            counts = self._store.cancel_peer(node_id,
+                                             removing["generation"],
+                                             PEER_REMOVED)
+            self._peers.finish_remove(node_id)
+        finally:
+            if worker is not None:
+                worker.stop()
         return {"status": "removed", "nodeId": node_id,
                 "undeliverableCount": counts["undeliverable"],
                 "unknownCount": counts["unknown"]}
@@ -134,27 +149,16 @@ class PeerManager:
     def list(self):
         return {"peers": [self._view(record) for record in self._peers.list()]}
 
-    def snapshot(self):
-        return self.list()
-
     # -- internals ---------------------------------------------------------
 
     def _spawn(self, record):
         worker = PeerDelivery(
-            self._config, self._store, self._peers_entry(record),
+            self._config, self._store, dict(record),
             self._link_factory(), self._tunnel_factory(), self._auth,
             clock=self._clock)
         self._workers[record["nodeId"]] = worker
         worker.start()
         return worker
-
-    def _peers_entry(self, record):
-        """The record a worker reads; removal never mutates it in place."""
-        generation = self._peers.active_generation(record["nodeId"])
-        entry = dict(record)
-        if generation is not None:
-            entry["generation"] = generation
-        return entry
 
     def _view(self, record):
         with self._lock:

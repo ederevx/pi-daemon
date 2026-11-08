@@ -59,6 +59,10 @@ class RuntimeLayout:
     def comms_peers_path(self):
         return os.path.join(self.domain_root("comms"), "peers.json")
 
+    def comms_peer_credentials_path(self):
+        """The one directory a peer's outbound credential may live in."""
+        return os.path.join(self.domain_root("comms"), "peer-credentials")
+
     def settings_path(self):
         return os.path.join(self._state_root, "settings.json")
 
