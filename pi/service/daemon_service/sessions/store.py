@@ -152,6 +152,29 @@ class SessionStore:
             self._write_document()
             return record, True
 
+    def replace_all(self, records, run_states):
+        """Replace every name and run record.
+
+        A translated store is not a merge: runs no record names are
+        removed, run files land before the registry that names them, and
+        the transcript-file index and handoffs start empty.
+        """
+        with self._lock:
+            self._run_states = {key: dict(state)
+                                for key, state in run_states.items()}
+            os.makedirs(self._run_dir, exist_ok=True)
+            for entry in os.listdir(self._run_dir):
+                key = entry[:-len(".json")]
+                if entry.endswith(".json") and key not in self._run_states:
+                    self._remove_run_state(key)
+            for key, state in self._run_states.items():
+                self._write_run_state(key, state)
+            self._sessions = {record.name: record for record in records}
+            self._run_keys = {record.name: record.id for record in records}
+            self._files = {}
+            self._handoffs = {}
+            self._write_document()
+
     def mark_started(self, key, pid, identity, now=None):
         now = time.time() if now is None else now
         with self._lock:

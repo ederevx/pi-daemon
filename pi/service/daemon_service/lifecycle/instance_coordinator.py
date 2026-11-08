@@ -33,6 +33,47 @@ class InstanceCoordinator:
         self._instance = instance
         return instance
 
+    def held(self):
+        """A probe: whether another process owns the lock right now.
+
+        It creates nothing and keeps nothing: a missing file is an
+        unowned root, and a free lock is released before returning.
+        """
+        try:
+            handle = open(self._path, "rb")
+        except FileNotFoundError:
+            return False
+        try:
+            if os.name == "nt":
+                if os.fstat(handle.fileno()).st_size == 0:
+                    return False
+                return not self._probe_windows(handle)
+            return not self._probe_posix(handle)
+        finally:
+            handle.close()
+
+    @staticmethod
+    def _probe_posix(handle):
+        import fcntl
+
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return True
+
+    @staticmethod
+    def _probe_windows(handle):
+        import msvcrt
+
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return True
+
     def _lock(self, handle):
         if os.name == "nt":
             import msvcrt

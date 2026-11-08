@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(REPO, "pi", "service"))
 from daemon_service.config import ServiceConfig
 from daemon_service.sessions.error import SessionError
 from daemon_service.sessions.identity import ProcessIdentity
+from daemon_service.sessions.model import SessionRecord
 from daemon_service.sessions.operations import SessionOperations
 from daemon_service.sessions.pty_backend import PosixPtyBackend, service_root
 from daemon_service.sessions.relay import SessionRelay
@@ -163,6 +164,24 @@ class StoreTests(unittest.TestCase):
         record, _ = reserve(self.store)
         self.store.finish(record.id, "stop", 0)
         self.assertFalse(self.store.publish("pi-a", "busy"))
+
+    def test_replace_all_removes_unnamed_runs_and_answers_run_state(self):
+        record, _ = reserve(self.store, "pi-a")
+        self.store.finish(record.id, "stop", 0)
+        reserve(self.store, "pi-b")
+        kept = SessionRecord(id="key-c", generation="g", name="pi-c",
+                             desired="running", phase="exited",
+                             child={"state": "idle"}, created=1.0)
+        state = {"v": 1, "state": "busy", "seq": 7, "announced": True,
+                 "open": True, "ended": None, "history": []}
+        self.store.replace_all([kept], {"key-c": state})
+        reloaded, _ = store_for(self.base)
+        self.assertIsNone(reloaded.get("pi-a"))
+        self.assertIsNone(reloaded.run_state("pi-b"))
+        self.assertEqual(reloaded.run_state("pi-c")["seq"], 7)
+        self.assertEqual(reloaded.run_state("pi-c")["name"], "pi-c")
+        self.assertFalse(os.path.exists(
+            os.path.join(self.base[0], "runs", record.id + ".json")))
 
     def test_an_older_sequence_is_ignored(self):
         reserve(self.store)

@@ -22,6 +22,7 @@ from daemon_service.config import ServiceConfig
 from daemon_service.lifecycle.instance_coordinator import InstanceCoordinator
 from daemon_service.runtime_layout import RuntimeLayout
 from daemon_service.tasks.error import TaskError
+from daemon_service.tasks.model import DONE, Ticket
 from daemon_service.tasks.runner import TicketRunner
 from daemon_service.tasks.service import TaskService
 from daemon_service.tasks.store import TicketStore
@@ -132,6 +133,13 @@ class LayoutTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 layout.domain_root(name)
 
+    def test_the_lock_path_creates_nothing(self):
+        base = tempfile.mkdtemp(dir=SCRATCH)
+        runtime = os.path.join(base, "run")
+        layout = RuntimeLayout(os.path.join(base, "state"), runtime)
+        self.assertTrue(layout.instance_lock_path().startswith(runtime))
+        self.assertFalse(os.path.exists(runtime))
+
 
 class AtomicFileTests(unittest.TestCase):
     def test_write_read_and_mode_at_creation(self):
@@ -162,6 +170,20 @@ class InstanceTests(unittest.TestCase):
         first.release()
         second.acquire()
         second.release()
+
+    def test_the_probe_never_creates_or_keeps_the_lock(self):
+        path = os.path.join(tempfile.mkdtemp(dir=SCRATCH), "instance.lock")
+        probe = InstanceCoordinator(path)
+        self.assertFalse(probe.held())
+        self.assertFalse(os.path.exists(path))
+        holder = InstanceCoordinator(path)
+        holder.acquire()
+        self.assertTrue(probe.held())
+        holder.release()
+        self.assertFalse(probe.held())
+        self.assertFalse(probe.instance())
+        holder.acquire()
+        holder.release()
 
 
 class WireTests(unittest.TestCase):
@@ -336,6 +358,18 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(record["status"], "failed")
         self.assertIn("interrupted", record["error"])
         service.cancel(ticket["id"])
+
+    def test_replace_all_drops_logs_and_keeps_counter_ahead(self):
+        service, store, _ = tasks_service()
+        old, _ = service.submit("pi-1", SCRATCH, "printf 'a'")
+        service.wait(old["id"], 5)
+        ticket = Ticket(ticket_id="t-9a-41", session="pi-1", cwd=SCRATCH,
+                        command="true", status=DONE, created=1.0)
+        store.replace_all([ticket], 42)
+        self.assertIsNone(store.snapshot_one(old["id"]))
+        self.assertFalse(os.path.exists(store.log_path(old["id"])))
+        fresh = store.reserve("pi-1", SCRATCH, "true", 0, 32)[0]
+        self.assertEqual(fresh["id"], f"t-{os.getpid()}-43")
 
     def test_finished_records_are_capped_with_their_logs(self):
         service, store, _ = tasks_service(record_cap=2)

@@ -66,8 +66,11 @@ class RuntimeLayout:
     def settings_path(self):
         return os.path.join(self._state_root, "settings.json")
 
+    def migration_path(self):
+        """The record of a completed translation; absent until one runs."""
+        return os.path.join(self._state_root, "migration.json")
+
     def instance_lock_path(self):
-        os.makedirs(self._runtime_root, exist_ok=True)
         return os.path.join(self._runtime_root, "instance.lock")
 
     def endpoint_path(self):

@@ -59,6 +59,21 @@ class TicketStore:
                         if tid in self._records],
         })
 
+    def replace_all(self, tickets, next_id):
+        """Replace every record and drop every log: a translated store is
+        not a merge. Output is appended afterwards through append_output.
+        """
+        with self._lock:
+            entries = os.listdir(self._logs) if os.path.isdir(self._logs) \
+                else []
+            for entry in entries:
+                if entry.endswith(".log"):
+                    self._discard_log(entry[:-len(".log")])
+            self._records = {ticket.ticket_id: ticket for ticket in tickets}
+            self._order = [ticket.ticket_id for ticket in tickets]
+            self._next = int(next_id)
+            self._save_locked()
+
     def reserve(self, session, cwd, command, timeout, capacity):
         """One atomic operation: replay a running match or create a ticket.
 
