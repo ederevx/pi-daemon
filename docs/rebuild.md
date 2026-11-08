@@ -180,7 +180,9 @@ name: `id`, `generation`, `dir`, `argv`, `resume_argv`, `env`, `file`,
 `started`, plus the conversation bindings and handoffs. `<state>/sessions/runs/<id>.json`
 holds one run's `state`, `run`, `seq`, `seen`, `changed`, `opened`,
 `open`, `ended` and `history`; the two writes are separate, so a torn
-registry can never invent a verdict.
+registry can never invent a verdict. A registry that cannot be read
+refuses startup rather than starting empty, because an empty registry
+would let a new instance mint names that are still someone's.
 
 A verdict is decided in one place, `RunOutcome.seal`, and the order is
 the contract: daemon stop, then explicit stop, then reload death, then
