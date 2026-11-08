@@ -8,6 +8,13 @@ import threading
 from .config import ServiceConfig
 from .lifecycle.instance_coordinator import InstanceCoordinator
 from .runtime_layout import RuntimeLayout
+from .sessions.identity import ProcessIdentity
+from .sessions.operations import SessionOperations
+from .sessions.pty_backend import PosixPtyBackend, service_root
+from .sessions.relay import SessionRelay
+from .sessions.runner import SessionRunner
+from .sessions.service import SessionService
+from .sessions.store import SessionStore
 from .tasks.operations import TaskOperations
 from .tasks.runner import TicketRunner
 from .tasks.service import TaskService
@@ -30,6 +37,10 @@ class DaemonApplication:
         self._store = None
         self._runner = None
         self._tasks = None
+        self._sessions = None
+        self._session_store = None
+        self._session_runner = None
+        self._relay = None
         self._endpoint = None
 
     @classmethod
@@ -56,7 +67,10 @@ class DaemonApplication:
             store.load()
             runner = TicketRunner(store, self._config)
             tasks = TaskService(store, runner)
+            sessions = self._compose_sessions()
             handlers = TaskOperations(tasks).handlers()
+            handlers.update(SessionOperations(
+                sessions, self.request_stop, self._config).handlers())
             token = secrets.token_hex(16)
             codec = WireCodec()
             endpoint = ControlEndpoint(
@@ -70,6 +84,21 @@ class DaemonApplication:
         self._store, self._runner = store, runner
         self._tasks, self._endpoint = tasks, endpoint
         return self
+
+    def _compose_sessions(self):
+        store = SessionStore(self._layout.sessions_path(),
+                             self._layout.run_state_dir(), self._config)
+        store.load()
+        backend = PosixPtyBackend(self._config, service_root())
+        relay = SessionRelay(self._config, backend)
+        relay.start()
+        self._session_store, self._relay = store, relay
+        owner = ProcessIdentity.current(os.getpid()).to_dict()
+        owner["instance"] = self._instance
+        runner = SessionRunner(store, relay, self._config, backend, owner)
+        runner.recover()
+        self._session_runner = runner
+        return SessionService(store, runner, relay, self._config)
 
     def run(self):
         self.start()
@@ -85,17 +114,29 @@ class DaemonApplication:
     def stop(self):
         if self._tasks is not None:
             self._tasks.begin_shutdown()
+        if self._sessions is not None:
+            self._sessions.begin_shutdown("shutdown")
         if self._endpoint is not None:
             self._endpoint.stop()
+        if self._sessions is not None:
+            self._sessions.stop_all()
         if self._tasks is not None:
             self._tasks.stop()
+        if self._relay is not None:
+            self._relay.stop()
         if self._store is not None:
             self._store.save()
+        if self._session_store is not None:
+            self._session_store.save()
         self._coordinator.release()
         self._endpoint = None
         self._tasks = None
         self._runner = None
         self._store = None
+        self._sessions = None
+        self._session_store = None
+        self._session_runner = None
+        self._relay = None
 
     def _unwind(self):
         try:

@@ -4,6 +4,7 @@ import socket
 import threading
 
 from ..wire import BAD_HANDSHAKE, BAD_REQUEST, error_reply
+from .control_action import ControlAction
 from .endpoint_file import EndpointFile
 from .json_line_stream import JsonLineStream
 
@@ -69,6 +70,7 @@ class ControlEndpoint:
     def _serve(self, connection):
         stream = JsonLineStream(connection, self._config.frame_bytes,
                                 self._config.read_chunk_bytes)
+        transferred = False
         try:
             try:
                 hello = self._codec.decode(stream.read())
@@ -77,8 +79,14 @@ class ControlEndpoint:
             greeting = self._handshake.authorize(hello)
             stream.write(self._codec.encode(greeting))
             while not self._stopping.is_set():
-                response = self._answer(self._codec.decode(stream.read()))
-                stream.write(self._codec.encode(response))
+                action = self._answer(self._codec.decode(stream.read()),
+                                      connection)
+                if isinstance(action, ControlAction):
+                    transferred = self._apply(stream, action)
+                    if transferred:
+                        return
+                    continue
+                stream.write(self._codec.encode(action))
         except PermissionError as exc:
             self._try_write(stream, self._codec.encode(
                 error_reply(str(exc))))
@@ -89,11 +97,37 @@ class ControlEndpoint:
             with self._lock:
                 self._connections.discard(connection)
 
-    def _answer(self, request):
+    def _apply(self, stream, action):
+        """Write the reply, then hand the socket over or keep serving."""
+        if action.reply is not None:
+            stream.write(self._codec.encode(action.reply))
+        transferred = action.upgrade is not None
+        if transferred:
+            socket_, initial = stream.release()
+            with self._lock:
+                self._connections.discard(socket_)
+            try:
+                action.upgrade(socket_, initial)
+            except (OSError, ValueError):
+                if action.abort is not None:
+                    action.abort()
+                self._close(socket_)
+        if action.after_send is not None:
+            action.after_send()
+        return transferred
+
+    def _answer(self, request, connection=None):
         try:
-            return self._router.dispatch(request)
+            return self._router.dispatch(request, connection)
         except (LookupError, ValueError, KeyError):
             return error_reply(BAD_REQUEST)
+
+    @staticmethod
+    def _close(socket_):
+        try:
+            socket_.close()
+        except OSError:
+            pass
 
     def _try_write(self, stream, message):
         try:
