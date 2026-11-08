@@ -96,6 +96,8 @@ class ControlEndpoint:
             stream.close()
             with self._lock:
                 self._connections.discard(connection)
+                self._workers = [worker for worker in self._workers
+                                 if worker is not threading.current_thread()]
 
     def _apply(self, stream, action):
         """Write the reply, then hand the socket over or keep serving."""
@@ -108,10 +110,11 @@ class ControlEndpoint:
                 self._connections.discard(socket_)
             try:
                 action.upgrade(socket_, initial)
-            except (OSError, ValueError):
+            except BaseException:
                 if action.abort is not None:
                     action.abort()
                 self._close(socket_)
+                raise
         if action.after_send is not None:
             action.after_send()
         return transferred

@@ -6,6 +6,8 @@ import select
 import signal
 import time
 
+from .identity import ProcessIdentity
+
 
 class PtyChild:
     """The runner owns process lifetime here; nothing else signals a child."""
@@ -17,6 +19,7 @@ class PtyChild:
         self._error = error
         self._config = config
         self._released = False
+        self.identity = None
 
     @property
     def pid(self):
@@ -81,6 +84,12 @@ class PtyChild:
         self._signal(signal.SIGKILL)
 
     def _signal(self, number):
+        """A group is signalled only while it is still this child's."""
+        if self.process.returncode is not None:
+            return
+        if self.identity is not None and ProcessIdentity.current(self.pid) \
+                .classify(self.identity) != ProcessIdentity.SAME:
+            return
         try:
             if os.name == "nt":
                 if number == signal.SIGKILL:
@@ -88,12 +97,22 @@ class PtyChild:
                 else:
                     self.process.terminate()
                 return
-            os.killpg(os.getpgid(self.process.pid), number)
+            group = os.getpgid(self.process.pid)
+            if group == os.getpgrp():
+                # The helper before its gate opens still shares our group.
+                self.process.send_signal(number)
+            else:
+                os.killpg(group, number)
         except (OSError, ValueError):
             try:
                 self.process.send_signal(number)
             except (OSError, ValueError):
                 pass
+
+    def disown_master(self):
+        """Hand the PTY to the relay; this child never closes it again."""
+        master, self.master = self.master, -1
+        return master
 
     def close(self):
         self._close(self.master)

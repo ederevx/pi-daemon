@@ -28,7 +28,13 @@ class SessionService:
         return {"name": view["name"], "created": created, "session": view}
 
     def sessions(self):
-        return self._store.snapshot()
+        views = self._store.snapshot()
+        for view in views:
+            clients = self._relay.viewer_count(view["name"] and
+                                               self._key(view["name"]))
+            view["clients"] = clients
+            view["attached"] = bool(clients)
+        return views
 
     def which(self, file):
         holders = self._store.holders(file)
@@ -135,8 +141,8 @@ class SessionService:
         if not takeover or not others:
             return self._announced(record.name, None, [], others)
         primary, primary_state = others[0]
-        mine = int(record.child.get("clients") or 0)
-        theirs = self._clients(primary)
+        mine = self._relay.viewer_count(record.id)
+        theirs = self._relay.viewer_count(self._key(primary))
         if mine > theirs:
             self._store.set_handoff(primary, record.name)
             self._relay.drop_viewers(self._key(primary))
@@ -191,7 +197,7 @@ class SessionService:
         for record in self._store.live():
             if record.state() != "idle":
                 continue
-            if int(record.child.get("clients") or 0) > 0:
+            if self._relay.viewer_count(record.id) > 0:
                 continue
             self._runner.stop(record.name)
             purged.append(record.name)
@@ -219,10 +225,6 @@ class SessionService:
     def _key(self, name):
         record = self._store.get(name)
         return record.id if record is not None else None
-
-    def _clients(self, name):
-        record = self._store.get(name)
-        return int(record.child.get("clients") or 0) if record else 0
 
     def _announced(self, name, handoff, taken, remaining):
         return {

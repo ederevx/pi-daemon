@@ -61,14 +61,12 @@ class SessionRelay:
 
     def finish(self, key, reason="exit"):
         """Drain what the child wrote, then release its viewers."""
-        self._call(lambda: self._begin_finish(key, reason))
-        session = self._session(key)
+        session = self._call(lambda: self._begin_finish(key, reason))
         if session is not None:
             session.done.wait(timeout=self._config.settle_grace + 2.0)
 
     def viewer_count(self, key):
-        session = self._session(key)
-        return session.viewer_count() if session is not None else 0
+        return int(self._call(lambda: self._count(key)) or 0)
 
     def close(self, key):
         self._call(lambda: self._complete(key))
@@ -95,14 +93,6 @@ class SessionRelay:
         if failure is not None:
             raise failure
         return result
-
-    def _answer(self, ticket):
-        try:
-            ticket[0] = ticket[1]()
-        except Exception as failure:  # reported to the waiting caller
-            ticket[1] = failure
-            ticket[0] = None
-        ticket[2].set()
 
     def _wake(self):
         if self._wake_write < 0:
@@ -162,10 +152,14 @@ class SessionRelay:
     def _begin_finish(self, key, reason):
         session = self._sessions.get(key)
         if session is None:
-            return False
+            return None
         session.closing = True
         session.deadline = time.monotonic() + self._config.settle_grace
-        return True
+        return session
+
+    def _count(self, key):
+        session = self._sessions.get(key)
+        return session.viewer_count() if session is not None else 0
 
     def _drop_viewers(self, key):
         session = self._sessions.get(key)
@@ -184,6 +178,10 @@ class SessionRelay:
         for viewer_id in list(source.viewers):
             connection = source.viewers.pop(viewer_id)
             pending = source.pending.pop(viewer_id)
+            if not target.viewers:
+                # The target's own backlog belongs in front of what moves.
+                pending = target.backlog + pending
+                target.backlog.clear()
             target.viewers[viewer_id] = connection
             target.pending[viewer_id] = pending
             moved += 1
@@ -213,7 +211,8 @@ class SessionRelay:
         writable = []
         watched = list(self._sessions.values())
         for session in watched:
-            readable.append(session.master)
+            if not session.eof:
+                readable.append(session.master)
             if session.inbox:
                 writable.append(session.master)
             for viewer_id, connection in session.viewers.items():
@@ -224,6 +223,8 @@ class SessionRelay:
             ready_read, ready_write, _ = select.select(readable, writable, [],
                                                        self._config.relay_tick)
         except (OSError, ValueError):
+            # One closed descriptor must not stall every conversation.
+            self._prune()
             time.sleep(self._config.relay_tick)
             return
         for source in ready_read:
@@ -231,8 +232,10 @@ class SessionRelay:
         for source in ready_write:
             self._writable(source)
         for session in watched:
-            if session.closing and (session.eof
-                                    or time.monotonic() > session.deadline):
+            if not session.closing:
+                continue
+            drained = session.eof and not any(session.pending.values())
+            if drained or time.monotonic() > session.deadline:
                 self._complete(session.key)
 
     def _readable(self, source):
@@ -259,8 +262,11 @@ class SessionRelay:
         if not data:
             session.eof = True
             if not session.closing:
+                # The child stopped writing: drain what it wrote, then let
+                # the viewers go.
                 session.closing = True
-                session.deadline = time.monotonic()
+                session.deadline = time.monotonic() + \
+                    self._config.settle_grace
             return
         session.broadcast(data)
         for viewer_id in list(session.viewers):
@@ -315,8 +321,15 @@ class SessionRelay:
 
     # -- helpers -----------------------------------------------------------
 
-    def _session(self, key):
-        return self._sessions.get(key)
+    def _prune(self):
+        """Drop the conversations and viewers whose descriptor is gone."""
+        for session in list(self._sessions.values()):
+            if not _open_fd(session.master):
+                self._complete(session.key)
+                continue
+            for viewer_id, connection in list(session.viewers.items()):
+                if connection.fileno() < 0:
+                    session.drop_viewer(viewer_id)
 
     def _close_wake(self):
         for descriptor in (self._wake_read, self._wake_write):
@@ -333,6 +346,16 @@ def _close(connection):
         connection.close()
     except OSError:
         pass
+
+
+def _open_fd(descriptor):
+    if descriptor is None or descriptor < 0:
+        return False
+    try:
+        os.fstat(descriptor)
+    except OSError:
+        return False
+    return True
 
 
 def _close_master(master):

@@ -175,6 +175,24 @@ class StoreTests(unittest.TestCase):
         self.assertFalse(self.store.publish("pi-a", "busy", pid=os.getpid() + 1))
         self.assertTrue(self.store.publish("pi-a", "busy", pid=os.getpid()))
 
+    def test_a_second_finish_keeps_the_first_seal(self):
+        record, _ = reserve(self.store)
+        first = self.store.finish(record.id, "stop", 0)
+        second = self.store.finish(record.id, "exit", 1)
+        self.assertEqual(second, first)
+        state = self.store.run_state("pi-a")
+        self.assertEqual(state["ended"], first)
+        self.assertEqual(state["history"], [])
+
+    def test_recovery_leaves_an_unknown_identity_open(self):
+        record, _ = reserve(self.store)
+        other = SessionStore(os.path.join(self.base[0], "sessions.json"),
+                             os.path.join(self.base[0], "runs"), self.config)
+        other.load()
+        self.assertEqual(other.recover("i-2", skip=[record.id]), 1)
+        self.assertFalse(other.get("pi-a").live())
+        self.assertIsNone(other.run_state("pi-a")["ended"])
+
     def test_a_busy_transition_counts_a_run_once(self):
         reserve(self.store)
         self.store.publish("pi-a", "busy")
@@ -256,8 +274,10 @@ class OperationsTests(unittest.TestCase):
     def operations(self, service=None):
         self.service = service or StubService()
         self.stopped = []
-        return SessionOperations(self.service, lambda: self.stopped.append(1),
-                                 ServiceConfig())
+        return SessionOperations(
+            self.service,
+            lambda *mode: self.stopped.append(mode),
+            ServiceConfig())
 
     def test_a_start_needs_an_existing_directory(self):
         reply = self.operations().start(
@@ -303,7 +323,7 @@ class OperationsTests(unittest.TestCase):
         action = self.operations().shutdown({"cmd": "shutdown"})
         self.assertFalse(self.stopped)
         action.after_send()
-        self.assertEqual(self.stopped, [1])
+        self.assertEqual(self.stopped, [("shutdown",)])
 
     def test_input_is_projected_with_its_byte_count(self):
         service = StubService()
@@ -333,7 +353,7 @@ class RelayTests(unittest.TestCase):
         self.child.release()
         self.relay = SessionRelay(self.config, self.backend)
         self.relay.start()
-        self.relay.register("k", "g", self.child.master)
+        self.relay.register("k", "g", self.child.disown_master())
 
     def attach(self):
         viewer, peer = socket.socketpair()
@@ -372,6 +392,27 @@ class RelayTests(unittest.TestCase):
         viewer.settimeout(5)
         self.assertEqual(viewer.recv(65536), b"")
 
+    def test_final_output_reaches_a_viewer_before_release(self):
+        self.spawn("read line; printf 'LAST\\n'; exit 3")
+        viewer = self.attach()
+        self.relay.input("k", b"go\n")
+        self.child.wait(5)
+        self.relay.finish("k")
+        self.assertIn(b"LAST", self.read_until(viewer, b"LAST"))
+        viewer.settimeout(5)
+        self.assertEqual(viewer.recv(65536), b"")
+        viewer.close()
+
+    def test_a_moved_viewer_receives_the_target_backlog(self):
+        self.spawn("printf 'X\\n'; sleep 5")
+        other = self.spawn_second("printf 'T\\n'; sleep 5")
+        time.sleep(0.3)
+        viewer = self.attach()
+        self.assertIn(b"X", self.read_until(viewer, b"X"))
+        self.assertEqual(self.relay.move_viewers("k", other), 1)
+        self.assertIn(b"T", self.read_until(viewer, b"T"))
+        viewer.close()
+
     def test_a_second_viewer_shares_the_stream(self):
         self.spawn("read line; printf 'SHARED\\n'")
         first, second = self.attach(), self.attach()
@@ -390,12 +431,12 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(self.relay.viewer_count("k"), 0)
         viewer.close()
 
-    def spawn_second(self):
-        second = self.backend.spawn(["sh", "-c", "sleep 5"], REPO,
+    def spawn_second(self, script="sleep 5"):
+        second = self.backend.spawn(["sh", "-c", script], REPO,
                                     dict(os.environ), 80, 24)
         second.release()
         self.addCleanup(lambda: (second.terminate(grace=0.2), second.close()))
-        self.relay.register("k2", "g2", second.master)
+        self.relay.register("k2", "g2", second.disown_master())
         return "k2"
 
 
@@ -515,7 +556,7 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(self.control({"cmd": "which", "file": "/conv/a.jsonl"}),
                          {"ok": True, "name": "pi-live"})
         self.assertEqual(self.control({"cmd": "whichall",
-                                       "file": "/conv/a.jsonl"})["sessions"],
+                                       "file": "/conv/a.jsonl"})["names"],
                          [{"name": "pi-live", "state": "idle"}])
         self.assertEqual(self.control({"cmd": "state", "name": "pi-live",
                                        "state": "busy"})["accepted"], True)
@@ -533,6 +574,25 @@ class DaemonTests(unittest.TestCase):
         state = self.control({"cmd": "run-state", "name": "pi-live"})
         self.assertEqual(state["record"]["ended"]["verdict"], "exited-mid-run")
         session.close()
+
+    def test_a_shutdown_seals_the_runs_it_ends(self):
+        self.control({"cmd": "start", "name": "pi-live", "dir": REPO,
+                      "argv": ["sh", "-c", "sleep 30"]})
+        self.control({"cmd": "announce", "name": "pi-live",
+                      "file": "/conv/a.jsonl"})
+        self.control({"cmd": "state", "name": "pi-live", "state": "busy"})
+        self.control({"cmd": "shutdown"})
+        self.process.wait(20)
+        runs = os.path.join(self.state, "sessions", "runs")
+        sealed = []
+        for name in os.listdir(runs):
+            if not name.endswith(".json"):
+                continue
+            with open(os.path.join(runs, name), encoding="utf-8") as handle:
+                sealed.append(json.load(handle))
+        self.assertEqual(len(sealed), 1, sealed)
+        self.assertEqual(sealed[0]["ended"]["verdict"], "daemon-stopped")
+        self.assertFalse(sealed[0]["open"])
 
     def test_an_attach_failure_names_the_recorded_conversation(self):
         self.control({"cmd": "start", "name": "pi-gone", "dir": REPO,

@@ -1,6 +1,7 @@
 """Spawn, supervise and reap hosted sessions; the only owner of a child."""
 
 import os
+import signal
 import threading
 import time
 
@@ -39,21 +40,32 @@ class SessionRunner:
         except (OSError, ValueError) as exc:
             self._store.discard(record.id)
             raise SessionError(SPAWN_FAILED) from exc
+        with self._lock:
+            self._children[record.id] = child
         try:
-            self._store.mark_started(record.id, child.pid,
-                                     ProcessIdentity.current(child.pid))
-            self._relay.register(record.id, record.generation, child.master)
+            identity = ProcessIdentity.current(child.pid)
+            child.identity = identity
+            self._store.mark_started(record.id, child.pid, identity)
+            master = child.disown_master()
+            try:
+                self._relay.register(record.id, record.generation, master)
+            except BaseException:
+                _close(master)
+                raise
             child.release()
-        except (OSError, LookupError) as exc:
+        except (OSError, LookupError, TimeoutError) as exc:
             self._abandon(record.id, child)
             raise SessionError(SPAWN_FAILED) from exc
         watcher = threading.Thread(target=self._watch,
                                    args=(record.id, record.name, child),
                                    name="session-watch", daemon=True)
         with self._lock:
-            self._children[record.id] = child
             self._threads[record.id] = watcher
+            stopping = self._closed
         watcher.start()
+        if stopping:
+            # Shutdown started while this child was being recorded.
+            child.terminate()
         started = self._store.get(record.name)
         return started.view(), True
 
@@ -65,9 +77,17 @@ class SessionRunner:
         with self._lock:
             child = self._children.get(record.id)
         if child is None:
-            if record.live():
+            if not record.live():
+                return {"queued": False, "alive": False,
+                        "state": record.state()}
+            if record.phase != "spawning":
                 self._store.finish(record.id, reason, None)
-            return {"queued": False, "alive": False, "state": record.state()}
+                return {"queued": False, "alive": False,
+                        "state": record.state()}
+            # The reservation exists, the process does not yet: the start
+            # that owns it terminates what it spawned and is recorded.
+            self._store.request_stop(record.id, reason)
+            return {"queued": True, "alive": True, "state": "spawning"}
         self._store.request_stop(record.id, reason)
         child.terminate()
         return {"queued": True, "alive": True, "state": "stopping"}
@@ -95,6 +115,7 @@ class SessionRunner:
         """Stop or preserve children; the mode names the run's ending."""
         reason = "restart" if mode == "reboot" else "shutdown"
         with self._lock:
+            self._closed = True
             children = dict(self._children)
             records = {record.id: record for record in self._store.live()}
         for key, child in children.items():
@@ -114,29 +135,48 @@ class SessionRunner:
         for watcher in watchers:
             remaining = max(0.0, deadline - time.monotonic())
             watcher.join(remaining)
-        with self._lock:
-            self._closed = True
 
     def recover(self):
-        """A fresh instance owns no child; seal every open run as lost."""
-        return self._store.recover(self._owner.get("instance"))
+        """Seal what the last instance left, but only what is really gone."""
+        instance = self._owner.get("instance")
+        skip, reclaim = [], []
+        for record in self._store.live():
+            if record.owner.get("instance") == instance:
+                continue
+            identity = ProcessIdentity.from_dict(record.child.get("identity"))
+            pid = record.pid()
+            if pid <= 0:
+                continue
+            verdict = ProcessIdentity.current(pid).classify(identity)
+            if verdict == ProcessIdentity.SAME:
+                reclaim.append(pid)
+            elif verdict == ProcessIdentity.UNKNOWN:
+                # The PID cannot be proven gone: leave the run open rather
+                # than invent a death the evidence does not support.
+                skip.append(record.id)
+        for pid in reclaim:
+            _end_group(pid, self._config.cancel_grace)
+        return self._store.recover(instance, skip=skip)
 
     # -- internals ---------------------------------------------------------
 
     def _watch(self, key, name, child):
         try:
-            returncode = child.wait()
-        except Exception:
-            returncode = None
-        try:
-            self._relay.finish(key)
-        except Exception:
-            pass
-        self._store.finish(key, self._reason(key), returncode)
-        child.close()
-        with self._lock:
-            self._children.pop(key, None)
-            self._threads.pop(key, None)
+            try:
+                returncode = child.wait()
+            except Exception:
+                returncode = None
+            try:
+                self._relay.finish(key)
+            except Exception:
+                pass
+            self._store.finish(key, self._reason(key), returncode)
+        finally:
+            self._relay.close(key)
+            child.close()
+            with self._lock:
+                self._children.pop(key, None)
+                self._threads.pop(key, None)
 
     def _reason(self, key):
         recorded = self._store.stop_reason(key)
@@ -148,12 +188,15 @@ class SessionRunner:
         return "exit"
 
     def _abandon(self, key, child):
+        with self._lock:
+            self._children.pop(key, None)
+            self._threads.pop(key, None)
         try:
             child.terminate(grace=0.2)
         except Exception:
             pass
-        child.close()
         self._relay.close(key)
+        child.close()
         self._store.discard(key)
 
     def _environment(self, name, record, env_once):
@@ -163,3 +206,32 @@ class SessionRunner:
         if env_once:
             environment.update(env_once)
         return environment
+
+
+def _close(descriptor):
+    if descriptor is None or descriptor < 0:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _end_group(pid, grace):
+    """End a group this instance did not father, only while it is identical."""
+    identity = ProcessIdentity.current(pid)
+    for number in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            group = os.getpgid(pid)
+            if group == os.getpgrp():
+                os.kill(pid, number)
+            else:
+                os.killpg(group, number)
+        except OSError:
+            return
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if ProcessIdentity.current(pid).classify(identity) != \
+                    ProcessIdentity.SAME:
+                return
+            time.sleep(0.02)
