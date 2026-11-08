@@ -51,8 +51,16 @@ class TicketRunner:
         try:
             self._store.mark_running(ticket_id, child.pid, time.time())
         except LookupError:
+            # The reservation was reset away before the run was recorded, so
+            # the run never happened and the child goes with it.
+            self._terminate(child)
+            try:
+                child.stdout.close()
+            except OSError:
+                pass
+            self._store.discard(ticket_id)
             self._release(ticket_id)
-            return self._store.snapshot_one(ticket_id), False
+            raise TaskError(SPAWN_FAILED) from None
         drain = threading.Thread(target=self._drain, name="ticket-output",
                                  args=(ticket_id, child.stdout), daemon=True)
         with self._lock:
