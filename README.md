@@ -20,6 +20,9 @@ reattachment, background command tickets, and transcript retrieval.
   `daemon_tasks` for result, watch, status, cancel, and remove.
 - **Transcript retrieval** - `transcript_read` serves indexed
   conversation reads without parsing the whole file.
+- **Agent comms** - `pi-comms` and the `comms_*` tools mail another
+  agent identity on this node or over a peer link, wait for mail, and
+  launch another agent as a hosted session.
 - **Extension service contract** - `docs/pi-services.md` defines
   `pi-rpc/1`, the shared contract for one extension to call another or
   subscribe to its signals.
@@ -27,6 +30,9 @@ reattachment, background command tickets, and transcript retrieval.
 ## Install
 
 ### As a pi package
+
+The package is the only install: it loads the extensions from its own
+clone, and a bare `bash scripts/install.sh` writes nothing.
 
 ```bash
 pi install git:github.com/ederevx/pi-daemon@v2.9.59
@@ -36,21 +42,51 @@ pi install git:github.com/ederevx/pi-daemon@v2.9.59
 package's `provision` extension reconciles on every session start: when
 the clone's sources differ from what the install manifest recorded, it
 re-runs `scripts/install.sh --package` in the background. Together they
-provision the systemd user unit, the `pi-rc` client, the `pi` wrapper, the
-daemon, and the seam modules to the same manual paths, while the
-extensions load from the package clone. pi skips `npm install` when an
-updated pin resolves to the commit already checked out, so the
-session-start reconciliation is what applies such an update. Provisioning
-removes extension copies a prior manual install owned so only one loader
-source remains; if a leftover copy aborts sessions with tool-conflict
-errors before that can happen, run `bash scripts/install.sh --package`.
-Adopt a new daemon binary with `/daemon-reload`.
+provision the systemd user unit, the `pi-rc` and `pi-comms` clients, the
+`pi` wrapper, the daemon, and the seam modules to the same manual paths.
+pi skips `npm install` when an updated pin resolves to the commit already
+checked out, so the session-start reconciliation is what applies such an
+update. Provisioning removes extension copies a prior manual install owned
+so only one loader source remains; if a leftover copy aborts sessions with
+tool-conflict errors before that can happen, run
+`bash scripts/install.sh --package`. Adopt a new daemon binary with
+`/daemon-reload`.
+
+## Agent comms
+
+```bash
+pi-comms node                       # this node's identity and endpoints
+pi-comms send --to reviewer --text "the rebuild branch is green"
+pi-comms wait --timeout-ms 600000   # the next mail for my identity
+```
+
+The identity is `--agent` or `PI_COMMS_AGENT_ID`; there is no default,
+because binding an identity creates its mailbox. Exit codes: 0 ok, 1
+usage, 2 the service declined, 3 the wait timed out, 4 no service
+(nothing was sent), 5 a JSON-RPC error, 6 the token was refused, 7 the
+request may have been acted on (retry with the same `--request-id`). The
+extension exposes the same surface as
+`comms_send`, `comms_wait`, `comms_replay`, `comms_ack`, `comms_spawn`
+and `peers`, behind the `pre_daemon` gate, and shells out to
+`pi-comms --format json` (`PI_COMMS_BIN` overrides the binary).
+
+The client finds the service by capability, not by path: it reads the
+`agent-comms` descriptor from the services root (`PI_SERVICES_DIR`,
+otherwise the user runtime directory, otherwise the temp directory), and
+reports "no service" when nothing published one. The installed daemon is
+still the previous implementation, so until the service entry point
+switches, `pi-comms` and the comms tools answer `no service` unless a
+staging service runs with explicit roots.
 
 ## Uninstall
 
 ```bash
+pi remove github.com/ederevx/pi-daemon
 bash scripts/uninstall.sh
 ```
+
+Remove the pin first: with the manifest gone and the package still
+pinned, the next session start sees a stale clone and provisions again.
 
 ## Layout
 

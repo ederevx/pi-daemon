@@ -27,6 +27,10 @@ import { homedir } from "node:os";
  *  matches it; the installer owns the source-to-destination map, so only
  *  the recorded sources and their hashes are interpreted here. */
 export class ProvisionStamp {
+	/** install.sh's manifest format; an older record predates sources it
+	 *  did not record, so it is stale and provisions once. */
+	static MANIFEST_VERSION = 2;
+
 	/** @param repoRoot this package's clone
 	 *  @param manifestPath the installer's manifest (default: the agent
 	 *  home's) */
@@ -53,7 +57,9 @@ export class ProvisionStamp {
 			return false;
 		}
 		const sources = manifest.sources;
-		if (manifest.mode !== "package" || !sources || typeof sources !== "object") {
+		if (manifest.version !== ProvisionStamp.MANIFEST_VERSION
+				|| manifest.mode !== "package"
+				|| !sources || typeof sources !== "object") {
 			return false;
 		}
 		return Object.entries(sources).every(([rel, sha]) => {
@@ -106,7 +112,7 @@ export class PackageProvisioner {
 				: `install.sh exited ${result.status}`;
 			process.stderr.write(
 				`pi-daemon: package provisioning skipped (${reason}); ` +
-				`run "bash scripts/install.sh" manually.\n`,
+				`run "bash scripts/install.sh --package" manually.\n`,
 			);
 		}
 		return 0;

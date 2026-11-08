@@ -520,8 +520,11 @@ Order matters, and each step is reversible on its own:
 4. Ship the new client beside the old one and rewire `pi-rc` and the
    extensions to it, keeping it compatible with both servers, then
    remove the legacy aliases from the migration translator.
-5. Translate state once: read the old ticket and session files, write
-   the new layout, and leave the old files untouched for one release.
+5. Translate state once, after step 4 and before step 6: the `migrate`
+   subcommand of the new entry reads the legacy root and writes the new
+   layout, leaving the legacy files untouched for one release. Its
+   contract is below; no code can use it before the entry switch, so it
+   lands with step 6.
 6. Switch the entry point only after the clients and the installer
    land: `pi/daemon/pi-daemon` becomes the thin bootstrap, the
    implementation moves to `pi/lib/pi_daemon/`, and the old monolith
@@ -529,16 +532,62 @@ Order matters, and each step is reversible on its own:
    adapter is written between old and new code, so the switch is the
    last commit that can be rolled back without a client change.
 7. Update the installer for the private tree (`lib/`, `bin/`,
-   `daemon/`, `extensions/`), the unit files and the docs.
+   `daemon/`, `extensions/`), the unit files and the docs. Done: the
+   installer provisions `pi-comms` and `pi_rpc_client.py` beside `pi-rc`,
+   records manifest format 2 (with `scripts/install.sh` among its sources,
+   so an installer-only advance re-provisions), and manual mode is gone -
+   the package is the only install and a bare run writes nothing. The
+   private tree and the unit's environment land with step 6.
+
+## Cutover
+
+Two roots, never shared, so the two implementations can never see each
+other's lock, registry or descriptor:
+
+| | legacy | new |
+|---|---|---|
+| state | `$XDG_STATE_HOME/pi-pty-host/` | `PI_DAEMON_STATE_DIR` |
+| | `tickets.json`, `tickets/` | `tasks/tickets.json`, `tasks/logs/` |
+| | `sessions.json`, `session-files.json` | `sessions/sessions.json` |
+| | `run-state/<name>.json` | `sessions/runs/<key>.json` |
+| | `piDaemon` keys in `settings.json` | `PI_DAEMON_*` (`settings.json`) |
+| runtime | `$XDG_RUNTIME_DIR/pi-pty-host.sock` | `PI_DAEMON_RUNTIME_DIR` |
+
+`migrate` is the new entry's own subcommand, never `pi-rc` (a client that
+must speak to both servers and must never write server state) and never a
+one-shot script (which would duplicate the stores' layout). It reads the
+legacy root read-only and writes the new one:
+
+    pi-daemon migrate --dry-run        # print the plan as JSON, write nothing
+    pi-daemon migrate                  # translate, then record a marker
+
+`migration.json` in the new state root holds the sha256 of every legacy
+file it read. A rerun whose hashes still match does nothing; a rerun whose
+hashes moved refuses unless `--force` is given, because a translated store
+is not a merge; a run while the new instance lock is held refuses
+outright. The legacy root is never written, which is what makes rollback
+independent of the new code.
+
+The order is: stop the unit, `migrate --dry-run`, `migrate`, swap the
+entry point, start the unit. The installer runs the translation, not
+`ExecStartPre`: with `Restart=on-failure` and `StartLimitIntervalSec=0` a
+failing pre-start command would restart every two seconds forever.
 
 ## Rollback
 
-Rollback never depends on the new code. Every step keeps the previous
-release installed and its state files in place, so rollback is: stop
-the new service, restore the previous entry point and launchers, start
-the old service, and leave the new state directory in place as
-evidence. The instance lock and the runtime descriptor are per-root, so
-the two implementations never share a runtime directory.
+Rollback never depends on the new code, because the legacy root was never
+written:
+
+1. `systemctl --user stop pi-daemon.service`.
+2. `pi install git:github.com/ederevx/pi-daemon@<the previous tag>`: its
+   postinstall restores the previous `pi-daemon` launcher and unit.
+3. `systemctl --user start pi-daemon.service`.
+
+The new state root stays in place as evidence, and `migration.json` is
+what says it was already translated, so a later attempt re-adopts it
+instead of translating twice. The instance lock and the runtime
+descriptor are per-root, so the two implementations never share a runtime
+directory.
 
 ## Open work
 
@@ -560,7 +609,8 @@ the two implementations never share a runtime directory.
   schedule are in place on top of the mailbox, relay, waits, spawn and
   the `agent-comms` listener, so only the `peer-control` frame that
   carries a launch across the link remains.
-* Extension and `pi-rc` rewiring; installer and migration tooling.
+* Step 6: the entry switch, the private tree in the installer, the unit's
+  two roots, and `migrate` itself.
 * Discovery activation: the descriptor publishes `pi-rc daemon-start`
   and the client reports a missing service, but nothing yet starts one;
   the CLI's binding is explicit, so a second entry is never dialed.

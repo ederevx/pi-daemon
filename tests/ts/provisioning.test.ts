@@ -146,6 +146,18 @@ test("stamp: a manifest without package-mode sources is stale", () => {
   assert(!scratch.stamp().isCurrent(), "an older manifest is stale");
 });
 
+test("stamp: a version-1 package manifest is stale", () => {
+  const scratch = new ScratchPackage("older-version");
+  scratch.install();
+  const manifest = JSON.parse(readFileSync(scratch.manifest, "utf8"));
+  manifest.version = 1;
+  writeFileSync(scratch.manifest, JSON.stringify(manifest));
+  assert(
+    !scratch.stamp().isCurrent(),
+    "a record that did not list every installed source re-provisions once",
+  );
+});
+
 test("guard: a current clone provisions nothing", () => {
   const scratch = new ScratchPackage("noop");
   scratch.install();

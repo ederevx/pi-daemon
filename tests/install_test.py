@@ -17,6 +17,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 INSTALL = ROOT / "scripts" / "install.sh"
+UNINSTALL = ROOT / "scripts" / "uninstall.sh"
 BASH = shutil.which("bash")
 SCRATCH = os.path.expanduser("~/tmp")
 
@@ -78,28 +79,13 @@ class InstallScriptTests(unittest.TestCase):
         self.scratch = ScratchHome()
         self.addCleanup(self.scratch.cleanup)
 
-    def renamed_checkout(self):
-        """A differently named path that resolves to this checkout, so the
-        guard must match it by realpath, not by the final component."""
-        alias = self.scratch.root / "renamed-checkout"
-        try:
-            os.symlink(str(ROOT), str(alias), target_is_directory=True)
-            return str(alias)
-        except (OSError, NotImplementedError):
-            # No symlink privilege: the installer runs from the checkout,
-            # so a relative entry still resolves to it without the name
-            # "pi-daemon".
-            return "."
-
-    def test_manual_install_writes_extensions(self):
+    def test_bare_install_points_to_package_install(self):
         result = self.scratch.run()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(
-            self.scratch.path(".pi/agent/extensions/daemon.ts").is_file())
-        self.assertTrue(
-            self.scratch.path(".pi/agent/extensions/offload.ts").is_file())
-        owned = self.scratch.manifest()["owned"]
-        self.assertIn(winform(self.scratch.path(".pi/agent/extensions/daemon.ts")), [winform(o) for o in owned])
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("pi install", result.stderr)
+        self.assertFalse(
+            self.scratch.path(".pi/agent/.pi-daemon/manifest.json").exists())
+        self.assertFalse(self.scratch.path(".local/bin/pi-daemon").exists())
 
     def test_package_install_skips_extensions_and_writes_service_files(self):
         result = self.scratch.run("--package")
@@ -111,21 +97,57 @@ class InstallScriptTests(unittest.TestCase):
         for rel in (".local/bin/pi-daemon", ".local/bin/pi-rc", ".local/bin/pi",
                     ".local/bin/pi_platform.py", ".local/bin/pi_conpty.py",
                     ".local/bin/pi_settings.py", ".local/bin/pi_transcript.py",
-                    ".local/bin/pi_services.py",
+                    ".local/bin/pi_services.py", ".local/bin/pi_rpc_client.py",
+                    ".local/bin/pi-comms",
                     ".config/systemd/user/pi-daemon.service"):
             self.assertTrue(self.scratch.path(rel).is_file(), rel)
         owned = self.scratch.manifest()["owned"]
         self.assertNotIn(winform(self.scratch.path(".pi/agent/extensions/daemon.ts")), [winform(o) for o in owned])
 
-    def test_package_install_removes_prior_manual_extensions(self):
-        self.assertEqual(self.scratch.run().returncode, 0)
-        self.assertTrue(
-            self.scratch.path(".pi/agent/extensions/daemon.ts").exists())
+    def test_package_install_writes_comms_client(self):
+        result = self.scratch.run("--package")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        comms = self.scratch.path(".local/bin/pi-comms")
+        self.assertTrue(comms.is_file())
+        if os.name != "nt":
+            self.assertTrue(os.access(comms, os.X_OK))
+        owned = [winform(o) for o in self.scratch.manifest()["owned"]]
+        for rel in (".local/bin/pi-comms", ".local/bin/pi_rpc_client.py"):
+            self.assertIn(winform(self.scratch.path(rel)), owned, rel)
+
+    def test_installed_comms_client_imports_from_local_bin(self):
+        # The installed copy resolves its modules beside itself, so a
+        # missing pi_rpc_client.py fails here and nowhere else.
         self.assertEqual(self.scratch.run("--package").returncode, 0)
-        self.assertFalse(
-            self.scratch.path(".pi/agent/extensions/daemon.ts").exists())
-        self.assertFalse(
-            self.scratch.path(".pi/agent/extensions/offload.ts").exists())
+        result = subprocess.run(
+            ["python3", str(self.scratch.path(".local/bin/pi-comms")), "help"],
+            env=self.scratch.env(), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage: pi-comms", result.stdout)
+
+    def test_package_install_removes_manifest_owned_extension_copies(self):
+        # An install that predates the package-only rule recorded these as
+        # its own, and the current clone's content never matches them once
+        # either side is edited, so ownership is what decides.
+        ext_dir = self.scratch.path(".pi/agent/extensions")
+        ext_dir.mkdir(parents=True)
+        for name in ("daemon.ts", "offload.ts"):
+            dst = ext_dir / name
+            shutil.copyfile(ROOT / "pi" / "extensions" / name, dst)
+            dst.write_text("// an older install's copy\n")
+        state = self.scratch.path(".pi/agent/.pi-daemon")
+        state.mkdir(parents=True)
+        (state / "manifest.json").write_text(json.dumps({
+            "version": 1,
+            "mode": "manual",
+            "owned": [str(ext_dir / name) for name in ("daemon.ts", "offload.ts")],
+            "hashes": {},
+            "sources": {},
+        }))
+        self.assertEqual(self.scratch.run("--package").returncode, 0)
+        self.assertFalse((ext_dir / "daemon.ts").exists())
+        self.assertFalse((ext_dir / "offload.ts").exists())
 
     def test_package_install_removes_unrecorded_identical_copy(self):
         ext_dir = self.scratch.path(".pi/agent/extensions")
@@ -152,77 +174,32 @@ class InstallScriptTests(unittest.TestCase):
         self.assertEqual(self.scratch.run("--bogus").returncode, 2)
         self.assertIn("unexpected argument", self.scratch.run("--bogus").stderr)
 
-    def test_manual_install_refuses_when_pinned(self):
-        settings = self.scratch.path(".pi/agent/settings.json")
-        settings.write_text(json.dumps({"packages": [
-            "git:github.com/ederevx/pi-daemon@v2.9.24"]}))
-        result = self.scratch.run()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("installed as a pi package", result.stderr)
-        self.assertFalse(
-            self.scratch.path(".pi/agent/extensions/daemon.ts").exists())
-        self.assertFalse(
-            self.scratch.path(".pi/agent/.pi-daemon/manifest.json").exists())
-
-    def test_manual_install_refuses_local_path_entry(self):
-        settings = self.scratch.path(".pi/agent/settings.json")
-        settings.write_text(json.dumps({"packages": [
-            str(ROOT)]}))
-        result = self.scratch.run()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("installed as a pi package", result.stderr)
-        self.assertFalse(
-            self.scratch.path(".pi/agent/extensions/daemon.ts").exists())
-
-    def test_manual_install_refuses_differently_named_checkout(self):
-        # A worktree or renamed clone is not literally "pi-daemon": the
-        # guard must still catch a local entry pointing at this checkout.
-        settings = self.scratch.path(".pi/agent/settings.json")
-        settings.write_text(json.dumps({"packages": [
-            self.renamed_checkout()]}))
-        result = self.scratch.run()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("installed as a pi package", result.stderr)
-        self.assertFalse(
-            self.scratch.path(".pi/agent/extensions/daemon.ts").exists())
-
-    def test_manual_install_allows_unrelated_local_path(self):
-        other = self.scratch.root / "unrelated-package"
-        other.mkdir()
-        settings = self.scratch.path(".pi/agent/settings.json")
-        settings.write_text(json.dumps({"packages": [str(other)]}))
-        result = self.scratch.run()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(
-            self.scratch.path(".pi/agent/extensions/daemon.ts").is_file())
-
-    def test_manual_install_allowed_without_pin(self):
-        settings = self.scratch.path(".pi/agent/settings.json")
-        settings.write_text(json.dumps({"packages": [
-            "git:github.com/ederevx/pi-teams@v0.4.18"]}))
-        result = self.scratch.run()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(
-            self.scratch.path(".pi/agent/extensions/daemon.ts").is_file())
-
     def test_package_install_records_sources(self):
         result = self.scratch.run("--package")
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = self.scratch.manifest()
         self.assertEqual(manifest["mode"], "package")
+        self.assertEqual(manifest["version"], 2)
         sources = manifest["sources"]
-        for rendered in ("pi/systemd/pi-daemon.service", "pi/bin/pi-wrapper"):
+        for rendered in ("pi/systemd/pi-daemon.service", "pi/bin/pi-wrapper",
+                         "scripts/install.sh"):
             self.assertIn(rendered, sources)
         for rel, digest in sources.items():
             expected = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
             self.assertEqual(digest, expected, rel)
 
-    def test_manual_install_records_manual_mode(self):
-        result = self.scratch.run()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        manifest = self.scratch.manifest()
-        self.assertEqual(manifest["mode"], "manual")
-        self.assertIn("pi/extensions/daemon.ts", manifest["sources"])
+    def test_uninstall_removes_comms_client(self):
+        self.assertEqual(self.scratch.run("--package").returncode, 0)
+        foreign = self.scratch.path(".local/bin/other-tool")
+        foreign.write_text("#!/bin/sh\nexit 0\n")
+        result = subprocess.run(
+            [BASH, str(UNINSTALL)], cwd=str(ROOT), env=self.scratch.env(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.scratch.path(".local/bin/pi-comms").exists())
+        self.assertFalse(
+            self.scratch.path(".local/bin/pi_rpc_client.py").exists())
+        self.assertTrue(foreign.is_file())
 
     def test_install_refuses_while_locked(self):
         lock = self.scratch.path(".pi/agent/.pi-daemon/install.lock")

@@ -28,6 +28,7 @@
     "pi/daemon/",
     "pi/bin/",
     "pi/lib/",
+    "pi/systemd/",
     "scripts/",
     "README.md",
     "LICENSE"

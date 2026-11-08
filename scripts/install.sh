@@ -1,25 +1,24 @@
 #!/usr/bin/env bash
-# Install the Pi background service from this repo into the Pi agent home.
+# Provision the daemon, the clients, the seam modules and the systemd user
+# unit from this repo into the Pi agent home, recording every owned file in
+# a manifest so uninstall removes exactly what this repo installed.
 #
-# Copies the daemon and offload extensions, the pi-rc client, the
-# pi-daemon PTY host daemon, and the systemd user unit, recording every
-# owned file in a manifest so uninstall removes exactly what this repo
-# installed.
-# Idempotent: re-running refreshes owned copies in place. Existing
-# unrelated files are never touched.
+# pi-daemon installs as a pi package: the package loads pi/extensions from
+# its own clone, and scripts/postinstall.mjs plus the session-start
+# reconciliation in pi/extensions/provision.ts call this script with
+# --package to place everything outside the clone. A bare run writes
+# nothing. Idempotent: re-running refreshes owned copies in place, and
+# existing unrelated files are never touched.
 set -euo pipefail
 
-# A pi package install runs this script through scripts/postinstall.mjs
-# with --package: the package already loads pi/extensions from its own
-# clone, so package mode installs only the daemon, client, wrapper, unit,
-# and seam modules to the manual paths, and drops any extension copies a
-# prior manual install left in the agent home so the package stays the
-# one loader source. The bare manual invocation is unchanged.
-package_mode=0
-if [[ "${1:-}" == "--package" ]]; then
-  package_mode=1
-  shift
+if [[ "${1:-}" != "--package" ]]; then
+  [[ $# -eq 0 ]] || { echo "install: unexpected argument: $1" >&2; exit 2; }
+  echo "install: pi-daemon installs as a pi package:" >&2
+  echo "  pi install git:github.com/ederevx/pi-daemon@<tag>" >&2
+  echo "  bash scripts/install.sh --package refreshes the helpers and the unit." >&2
+  exit 2
 fi
+shift
 [[ $# -eq 0 ]] || { echo "install: unexpected argument: $1" >&2; exit 2; }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -41,21 +40,21 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,8) else 1)' || {
   exit 1
 }
 
-dest_extension="$pi_home/extensions/daemon.ts"
-dest_offload="$pi_home/extensions/offload.ts"
 dest_helper="$local_bin/pi-rc"
 dest_helper_cmd="$local_bin/pi-rc.cmd"
+dest_comms="$local_bin/pi-comms"
 dest_daemon="$local_bin/pi-daemon"
 dest_platform="$local_bin/pi_platform.py"
 dest_conpty="$local_bin/pi_conpty.py"
 dest_settings="$local_bin/pi_settings.py"
 dest_transcript="$local_bin/pi_transcript.py"
 dest_services="$local_bin/pi_services.py"
+dest_rpc_client="$local_bin/pi_rpc_client.py"
 dest_unit="$systemd_dir/pi-daemon.service"
 dest_wrapper="$local_bin/pi"
 dest_wrapper_cmd="$local_bin/pi.cmd"
 
-mkdir -p "$pi_home/extensions" "$local_bin" "$systemd_dir" "$state_dir"
+mkdir -p "$local_bin" "$systemd_dir" "$state_dir"
 
 # One installer at a time: every session start reconciles provisioning, and
 # hosted sessions respawn together after a reload, so concurrent runs must
@@ -69,51 +68,6 @@ mkdir "$lock" 2>/dev/null || {
 }
 trap 'rmdir "$lock" 2>/dev/null' EXIT
 
-# The one-loader guard: a pinned pi package already loads this repo's
-# extensions from its own clone, and a manual extension copy beside it
-# aborts every new pi session with tool-conflict errors ("Tool "bash"
-# conflicts ... offload.ts"). The bare manual invocation therefore
-# refuses outright whenever a packages entry installs pi-daemon — a git
-# pin, a local path whose final component is this package, or a local
-# path that resolves to this very checkout (a worktree or renamed clone
-# is not literally named pi-daemon). --package mode is exempt: it is the
-# package's own postinstall and exists to remove such copies. Uninstall
-# the manual copy or drop the pin first; nothing on disk has been touched
-# by the refusal.
-if [[ $package_mode -eq 0 ]]; then
-  pinned="$(python3 - "$pi_home/settings.json" "$repo_root" <<'PYGUARD'
-import json, os, sys
-try:
-    packages = json.load(open(sys.argv[1], encoding="utf-8")).get("packages", [])
-except Exception:
-    packages = []
-checkout = os.path.realpath(sys.argv[2])
-for entry in packages:
-    if not isinstance(entry, str):
-        continue
-    normalized = entry.replace("\\", "/").rstrip("/")
-    if normalized.startswith("git:") and "pi-daemon" in normalized:
-        print(entry)
-        break
-    if not normalized:
-        continue
-    if normalized.rsplit("/", 1)[-1] == "pi-daemon" \
-            or os.path.realpath(normalized) == checkout:
-        print(entry)
-        break
-PYGUARD
-)"
-  if [[ -n "$pinned" ]]; then
-    echo "install: pi-daemon is installed as a pi package ($pinned)." >&2
-    echo "  A manual install would load its extensions twice and abort every" >&2
-    echo "  new session with tool-conflict errors. Update the package instead" >&2
-    echo "  (pi update git:github.com/ederevx/pi-daemon), drop the pin before" >&2
-    echo "  a manual install, or use scripts/install.sh --package to refresh" >&2
-    echo "  only the bin helpers and unit." >&2
-    exit 1
-  fi
-fi
-
 sources=()
 install_to() {
 	# Atomic replacement, per shared convention: never truncate a file
@@ -125,28 +79,21 @@ install_to() {
 	sources+=("$src")
 }
 
-# In package mode the extensions are the package's, not this install's:
-# remove the copies a prior manual install left so a session never loads
-# both. A path goes when the previous manifest owned it, or when it is
-# byte-identical to this clone's extension (a manual copy whose manifest
-# is gone). Unrelated files are never touched.
-if [[ $package_mode -eq 1 ]]; then
-  for ext in daemon offload; do
-    src="$repo_root/pi/extensions/$ext.ts"
-    dst="$pi_home/extensions/$ext.ts"
-    [[ -f "$dst" ]] || continue
-    if { [[ -f "$manifest" ]] && grep -qF "\"$dst\"" "$manifest"; } \
-        || [[ "$(sha256sum "$dst" | cut -d' ' -f1)" == \
-              "$(sha256sum "$src" | cut -d' ' -f1)" ]]; then
-      rm -f "$dst"
-    fi
-  done
-fi
-
-if [[ $package_mode -eq 0 ]]; then
-  install_to 644 "$repo_root/pi/extensions/daemon.ts" "$dest_extension"
-  install_to 644 "$repo_root/pi/extensions/offload.ts" "$dest_offload"
-fi
+# Older installs could place extension copies in the agent home, where a
+# session would load them beside the package's own and abort on tool
+# conflicts. A copy goes when a previous manifest owned it, or when it is
+# byte-identical to this clone's extension (a copy whose manifest is gone).
+# Unrelated files are never touched.
+for ext in daemon offload; do
+  src="$repo_root/pi/extensions/$ext.ts"
+  dst="$pi_home/extensions/$ext.ts"
+  [[ -f "$dst" ]] || continue
+  if { [[ -f "$manifest" ]] && grep -qF "\"$dst\"" "$manifest"; } \
+      || [[ "$(sha256sum "$dst" | cut -d' ' -f1)" == \
+            "$(sha256sum "$src" | cut -d' ' -f1)" ]]; then
+    rm -f "$dst"
+  fi
+done
 
 install_to 755 "$repo_root/pi/bin/pi-rc" "$dest_helper"
 # PowerShell/cmd cannot execute shebang scripts, so a bare `pi-rc` would
@@ -154,6 +101,7 @@ install_to 755 "$repo_root/pi/bin/pi-rc" "$dest_helper"
 # solves the same problem for the wrapper. The shim delegates to the
 # extensionless client above, so one implementation serves both platforms.
 install_to 755 "$repo_root/pi/bin/pi-rc.cmd" "$dest_helper_cmd"
+install_to 755 "$repo_root/pi/bin/pi-comms" "$dest_comms"
 install_to 755 "$repo_root/pi/daemon/pi-daemon" "$dest_daemon"
 # The OS-agnostic seam module and its lazy Windows ConPTY backend ship
 # next to the scripts so both find pi_platform.py on sys.path.
@@ -162,6 +110,7 @@ install_to 644 "$repo_root/pi/lib/pi_conpty.py" "$dest_conpty"
 install_to 644 "$repo_root/pi/lib/pi_settings.py" "$dest_settings"
 install_to 644 "$repo_root/pi/lib/pi_transcript.py" "$dest_transcript"
 install_to 644 "$repo_root/pi/lib/pi_services.py" "$dest_services"
+install_to 644 "$repo_root/pi/lib/pi_rpc_client.py" "$dest_rpc_client"
 
 # The real pi binary must be resolved by PATH while skipping the
 # wrapper's own directory and the daemon's hosted-session shim. An install
@@ -196,16 +145,16 @@ install_to 755 "$repo_root/pi/bin/pi-wrapper.cmd" "$dest_wrapper_cmd"
 # The unit and the wrapper are rendered from templates, so the manifest
 # records those templates as the sources their destinations came from.
 sources+=("$repo_root/pi/systemd/pi-daemon.service" "$repo_root/pi/bin/pi-wrapper")
+# An installer-only advance must re-provision too, so the script records
+# itself: it is the map every destination below came from.
+sources+=("$repo_root/scripts/install.sh")
 
-owned=("$dest_daemon" "$dest_helper" "$dest_helper_cmd" "$dest_wrapper" "$dest_wrapper_cmd" "$dest_unit" "$dest_platform" "$dest_conpty" "$dest_settings" "$dest_transcript" "$dest_services")
-if [[ $package_mode -eq 0 ]]; then
-  owned=("$dest_daemon" "$dest_helper" "$dest_helper_cmd" "$dest_wrapper" "$dest_wrapper_cmd" "$dest_extension" "$dest_offload" "$dest_unit" "$dest_platform" "$dest_conpty" "$dest_settings" "$dest_transcript" "$dest_services")
-fi
+owned=("$dest_daemon" "$dest_helper" "$dest_helper_cmd" "$dest_comms" "$dest_wrapper" "$dest_wrapper_cmd" "$dest_unit" "$dest_platform" "$dest_conpty" "$dest_settings" "$dest_transcript" "$dest_services" "$dest_rpc_client")
 {
   printf '{\n'
-  printf '  "version": 1,\n'
+  printf '  "version": 2,\n'
   printf '  "repo": "%s",\n' "$repo_root"
-  printf '  "mode": "%s",\n' "$([[ $package_mode -eq 1 ]] && echo package || echo manual)"
+  printf '  "mode": "package",\n'
   printf '  "owned": [\n'
   for i in "${!owned[@]}"; do
     printf '    "%s"%s\n' "${owned[$i]}" "$([[ $i -lt $((${#owned[@]} - 1)) ]] && printf ,)"
@@ -245,12 +194,9 @@ echo "  daemon:    $dest_daemon"
 echo "  platform:  $dest_platform"
 echo "  conpty:    $dest_conpty"
 echo "  launcher:  $dest_helper"
+echo "  comms:     $dest_comms"
 echo "  pi wrap:   $dest_wrapper"
 echo "  pi cmd:    $dest_wrapper_cmd"
-if [[ $package_mode -eq 0 ]]; then
-  echo "  extension: $dest_extension"
-  echo "  offload:   $dest_offload"
-fi
 echo "  unit:      $dest_unit"
 echo "  manifest:  $manifest"
 echo
