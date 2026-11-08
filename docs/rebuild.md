@@ -261,6 +261,41 @@ Cross-domain access is through public methods that return detached
 snapshots. The store is the sole owner of ticket records: the runner
 receives IDs and keeps process bookkeeping only.
 
+## Agent comms
+
+Comms is a message channel between agent identities plus a way for an
+agent to spawn another one. There is no roster: no `register`,
+`unregister` or `list`, no membership snapshots, no live directory and
+no grant model. An identity exists because a mailbox exists, and the
+mailbox store is the only record of it.
+
+Every client shares the daemon's token, so the token is the trust
+boundary: a presented agent ID selects a mailbox, it does not prove
+ownership of it. A connection presents its own saved ID at `rpc.hello`
+and is bound to that identity for its life; a second connection with
+the same ID shares the same mailbox and acknowledgement state, and
+disconnecting one revokes nothing of the other.
+
+Mail is durable before anyone is told about it. Acceptance commits the
+envelopes and a send receipt in one write, so a retried `requestId`
+replays its first outcome instead of delivering twice, and an agent that
+is offline still finds its mail. Sequences belong to one mailbox;
+replay pages from a cursor, and a cursor older than the retained
+history reports where that history begins.
+
+`broadcast` means every mailbox that exists when the broadcast is
+accepted, minus the sender. The receipt freezes that audience, so a
+later mailbox receives no earlier broadcast and a retry expands no
+further.
+
+`spawn` delegates the process to the sessions domain; comms owns the
+spawn record with the child's identity, its parent provenance and the
+launch correlation ID. The parent reference is informational: a child's
+mail, own spawns, tools and memory writes never consult the parent's
+liveness, subscription or connection, no termination cascades, and
+ending either session leaves both mailboxes intact. Peers carry mail and
+delivery receipts only - never membership, spawn or session control.
+
 ## The migration
 
 Order matters, and each step is reversible on its own:
@@ -271,7 +306,7 @@ Order matters, and each step is reversible on its own:
    control contract, tickets, restart recovery and clean shutdown.
 3. Add the remaining domains against the same composition: sessions
    (session hosting, run state, revive, transcripts), then comms
-   (registry, relay, mailbox, waits, peers) as the `agent-comms`
+   (mailbox, relay, waits, spawn, peers) as the `agent-comms`
    capability over `pi-rpc/1` on its own listener. Hosting, run state,
    attach/detach, announce/handoff and recovery are in place; revive
    by name is the client's own `start`, and transcripts plus the
@@ -311,7 +346,7 @@ the two implementations never share a runtime directory.
 * A name whose last run was left unsealed (`unknown` identity) is
   reachable by `run-state` only until the name is reserved again; a
   record's run files should be found by id, not by the name's key.
-* Native comms: registry, relay, mailbox, waits, peers, and the
+* Native comms: mailbox, relay, waits, spawn, peers, and the
   `agent-comms` RPC listener.
 * Extension and `pi-rc` rewiring; installer and migration tooling.
 * Discovery: `ServiceDirectory`, activation, binding and self

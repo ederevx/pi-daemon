@@ -38,6 +38,15 @@ class ServiceConfig:
     relay_tick: float = 0.05
     settle_grace: float = 1.0
     history_limit: int = 4
+    comms_message_ttl: float = 120.0
+    comms_result_ttl: float = 3600.0
+    comms_max_ttl: float = 86400.0
+    comms_dedupe_ttl: float = 86400.0
+    comms_payload_bytes: int = 32768
+    comms_store_bytes: int = 16777216
+    comms_recipient_cap: int = 256
+    comms_messages_per_recipient: int = 256
+    comms_page_messages: int = 64
     revision: int = 0
 
     @classmethod

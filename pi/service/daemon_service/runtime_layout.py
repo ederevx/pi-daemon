@@ -47,6 +47,9 @@ class RuntimeLayout:
     def session_state_path(self, key):
         return os.path.join(self.run_state_dir(), f"{key}.json")
 
+    def comms_mailbox_path(self):
+        return os.path.join(self.domain_root("comms"), "mailbox.json")
+
     def settings_path(self):
         return os.path.join(self._state_root, "settings.json")
 
