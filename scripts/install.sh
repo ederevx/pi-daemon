@@ -76,11 +76,16 @@ fi
 seam_modules=(pi_platform.py pi_conpty.py pi_settings.py pi_transcript.py
               pi_services.py pi_rpc_client.py)
 
-extension_sources() {
+# A tree this repo installs whole: the files it tracks, so a scratch file is
+# never published or digested, and every file of the tree when it was handed
+# over without git. Both installed trees are listed the same way, so an
+# untracked module cannot reach one of them.
+owned_tree() {
+  local tree="$1"
   if git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git -C "$repo_root" ls-files -z -- pi/extensions | tr '\0' '\n'
+    git -C "$repo_root" ls-files -z -- "$tree" | tr '\0' '\n'
   else
-    ( cd "$repo_root" && find pi/extensions -type f \
+    ( cd "$repo_root" && find "$tree" -type f \
         ! -name '*.pyc' ! -path '*__pycache__*' )
   fi
 }
@@ -89,9 +94,8 @@ tree_sources() {
   printf '%s\n' pi/daemon/pi-daemon pi/bin/pi-rc pi/bin/pi-comms \
     pi/bin/pi-daemon-migrate
   printf 'pi/lib/%s\n' "${seam_modules[@]}"
-  ( cd "$repo_root" && find pi/lib/pi_daemon -type f -name '*.py' \
-      ! -path '*__pycache__*' )
-  extension_sources
+  owned_tree pi/lib/pi_daemon
+  owned_tree pi/extensions
 }
 
 template_sources() {
@@ -154,11 +158,49 @@ try:
         active = json.load(handle).get("active_root")
 except (OSError, ValueError):
     active = None
-if root and root != active and os.path.dirname(root) == releases:
+# Only a generation this run created is unreferenced: a candidate whose
+# content already existed is a release another manifest may still name, and
+# a process may be executing it.
+if document.get("created") and root and root != active \
+        and os.path.dirname(root) == releases:
     shutil.rmtree(root, ignore_errors=True)
 PY
   rm -f "$transaction"
   echo "install: restored the previous installation after an interrupted run" >&2
+}
+
+# Every generation the manifest does not name is unreferenced: a crash
+# between publishing one and writing its journal leaves exactly that, and a
+# killed run leaves its staging directory. A retained generation is kept
+# while a daemon may still be running it; with none serving, the newest one
+# still covers a command that read the manifest a moment ago, and the rest go
+# so the release directory stays bounded.
+sweep_releases() {
+  local serving=0
+  if serving_reason >/dev/null 2>&1; then serving=1; fi
+  mkdir -p "$releases"
+  python3 - "$releases" "$manifest" "$serving" <<'PY'
+import json
+import os
+import shutil
+import sys
+
+releases, manifest, serving = sys.argv[1:4]
+try:
+    with open(manifest, encoding="utf-8") as handle:
+        document = json.load(handle)
+except (OSError, ValueError):
+    document = {}
+retained = [path for path in document.get("retained") or []]
+keep = {document.get("active_root") or ""}
+keep.update(retained if serving == "1" else retained[:1])
+keep.discard("")
+for name in sorted(os.listdir(releases)):
+    path = os.path.join(releases, name)
+    if not os.path.isdir(path) or path in keep:
+        continue
+    shutil.rmtree(path, ignore_errors=True)
+PY
 }
 
 # -- refusals before anything public changes ----------------------------
@@ -328,14 +370,15 @@ render_launcher() {
 write_manifest() {
   local out="$1" retained="$2" sources_file="$3"
   shift 3
-  python3 - "$out" "$repo_root" "$active_root" "$retained" "$sources_file" "$@" <<'PY'
+  python3 - "$out" "$repo_root" "$active_root" "$retained" "$sources_file" \
+    "$manifest" "$@" <<'PY'
 import hashlib
 import json
 import os
 import sys
 
-out, repo, active, retained, sources_file = sys.argv[1:6]
-owned = sys.argv[6:]
+out, repo, active, retained, sources_file, previous = sys.argv[1:7]
+owned = sys.argv[7:]
 
 
 def digest(path):
@@ -350,6 +393,17 @@ for base, directories, files in os.walk(active):
         path = os.path.join(base, name)
         relative = os.path.relpath(path, active).replace(os.sep, "/")
         tree[relative] = digest(path)
+# A retained generation is not walked again: its files are the ones the
+# manifest that published it recorded, and uninstall removes exactly those.
+trees = {active: tree}
+try:
+    with open(previous, encoding="utf-8") as handle:
+        known = json.load(handle).get("trees") or {}
+except (OSError, ValueError):
+    known = {}
+for root in json.loads(retained):
+    if root in known:
+        trees[root] = known[root]
 sources = {}
 with open(sources_file, encoding="utf-8") as handle:
     for line in handle:
@@ -364,7 +418,7 @@ document = {
     "owned": owned,
     "hashes": {path: digest(path) for path in owned
                if os.path.isfile(path)},
-    "trees": {active: tree},
+    "trees": trees,
     "retained": json.loads(retained),
     "sources": sources,
 }
@@ -391,6 +445,7 @@ mkdir "$lock" 2>/dev/null || {
 trap 'rmdir "$lock" 2>/dev/null' EXIT
 
 recover_transaction
+sweep_releases
 
 # Older installs could place extension copies in the agent home, where a
 # session would load them beside the package's own and abort on tool
@@ -413,12 +468,14 @@ rm -rf "$stage"
 mkdir -p "$stage"
 build_tree "$stage"
 candidate="$releases/$(content_id "$stage")"
+created=0
 if [[ -d "$candidate" ]]; then
   rm -rf "$stage"
 else
   # Same filesystem, so the rename publishes a complete generation or
   # nothing: no launcher can see a half-copied release.
   mv "$stage" "$candidate"
+  created=1
 fi
 
 # The migration runs from the candidate generation, with the exact roots the
@@ -513,15 +570,17 @@ mkdir -p "$backups"
   done
   printf '\n]\n'
 } > "$state_dir/transaction-backups.$$"
-python3 - "$transaction" "$candidate" "$state_dir/transaction-backups.$$" <<'PY'
+python3 - "$transaction" "$candidate" "$created" \
+  "$state_dir/transaction-backups.$$" <<'PY'
 import json
 import sys
 
-out, active, backups = sys.argv[1:4]
+out, active, created, backups = sys.argv[1:5]
 with open(backups, encoding="utf-8") as handle:
     entries = json.load(handle)
 with open(out, "w", encoding="utf-8") as handle:
-    json.dump({"version": 1, "active_root": active, "backups": entries},
+    json.dump({"version": 1, "active_root": active,
+               "created": created == "1", "backups": entries},
               handle, indent=2, sort_keys=True)
     handle.write("\n")
 PY
@@ -602,14 +661,13 @@ retained+="]"
 retire="$state_dir/retire.$$"
 : > "$retire"
 if [[ -f "$manifest" ]]; then
-  python3 - "$manifest" "$retire" <<'PY'
+  python3 - "$manifest" "$retire" "${seam_modules[@]}" <<'PY'
 import json
 import os
 import sys
 
 manifest, out = sys.argv[1:3]
-flat = {"pi_platform.py", "pi_conpty.py", "pi_settings.py",
-        "pi_transcript.py", "pi_services.py", "pi_rpc_client.py"}
+flat = {os.path.basename(name) for name in sys.argv[3:]}
 try:
     with open(manifest, encoding="utf-8") as handle:
         document = json.load(handle)

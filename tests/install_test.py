@@ -308,8 +308,31 @@ class InstallScriptTests(unittest.TestCase):
                     ".config/systemd/user/pi-daemon.service"):
             self.assertFalse(self.scratch.path(rel).exists(), rel)
         self.assertFalse(
-            self.scratch.path(".local/lib/pi-daemon/releases").exists())
+            self.scratch.path(".local/lib/pi-daemon").exists(),
+            "the private tree above the releases is dropped")
         self.assertTrue(foreign.is_file())
+
+    def test_uninstall_removes_a_retained_generation(self):
+        # A retained release is described by the manifest that published it,
+        # so its recorded files go and anything else stays.
+        clone = self.scratch.clone()
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        first = pathlib.Path(self.scratch.manifest()["active_root"])
+        with open(clone / "pi" / "lib" / "pi_services.py", "a",
+                  encoding="utf-8") as handle:
+            handle.write("\n# a new build\n")
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        self.assertEqual(self.scratch.manifest()["retained"], [str(first)])
+        foreign = first / "notes.txt"
+        foreign.write_text("not ours\n")
+        result = subprocess.run(
+            [BASH, str(UNINSTALL)], cwd=str(ROOT), env=self.scratch.env(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((first / "lib" / "pi_services.py").exists(),
+                         "the retained generation's recorded files go")
+        self.assertTrue(foreign.is_file(),
+                        "a file the manifest never recorded stays")
 
     def test_install_refuses_while_locked(self):
         lock = self.scratch.path(".pi/agent/.pi-daemon/install.lock")
@@ -403,6 +426,67 @@ class InstallScriptTests(unittest.TestCase):
         result = self.scratch.package()
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_a_v2_install_retires_its_flat_seam_module(self):
+        # A manifest-only (v2) install owned the seams beside the binaries;
+        # the generation owns them now, so those copies go.
+        seams = self.scratch.path(".local/bin")
+        seams.mkdir(parents=True)
+        (seams / "pi_platform.py").write_text("# a flat seam module\n")
+        state = self.scratch.path(".pi/agent/.pi-daemon")
+        state.mkdir(parents=True)
+        (state / "manifest.json").write_text(json.dumps({
+            "version": 1, "mode": "manual",
+            "owned": [msysform(seams / "pi_platform.py")],
+            "hashes": {}, "sources": {},
+        }))
+        self.assertEqual(self.scratch.package().returncode, 0)
+        self.assertFalse((seams / "pi_platform.py").exists())
+        self.assertEqual(self.scratch.manifest()["version"], 3)
+
+    def test_recovery_keeps_a_generation_it_did_not_create(self):
+        # A publish that reuses an existing release created nothing, so an
+        # interrupted run has nothing of its own to drop.
+        clone = self.scratch.clone()
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        first = self.scratch.manifest()["active_root"]
+        with open(clone / "pi" / "lib" / "pi_services.py", "a",
+                  encoding="utf-8") as handle:
+            handle.write("\n# a new build\n")
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        second = self.scratch.manifest()["active_root"]
+        self.assertEqual(self.scratch.manifest()["retained"], [first])
+        (self.scratch.path(".pi/agent/.pi-daemon/install-transaction.json")
+         .write_text(json.dumps({"version": 1,
+                                 "active_root": msysform(first),
+                                 "created": False, "backups": []})))
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        self.assertTrue(pathlib.Path(first).is_dir(),
+                        "a retained release survives recovery")
+        self.assertTrue(pathlib.Path(second).is_dir())
+
+    def test_recovery_drops_the_generation_an_interrupted_run_created(self):
+        self.assertEqual(self.scratch.package().returncode, 0)
+        active = pathlib.Path(self.scratch.manifest()["active_root"])
+        orphan = self.scratch.path(".local/lib/pi-daemon/releases/orphan")
+        (orphan / "daemon").mkdir(parents=True)
+        (self.scratch.path(".pi/agent/.pi-daemon/install-transaction.json")
+         .write_text(json.dumps({"version": 1,
+                                 "active_root": msysform(orphan),
+                                 "created": True, "backups": []})))
+        self.assertEqual(self.scratch.package().returncode, 0)
+        self.assertFalse(orphan.exists(), "an unreferenced generation is dropped")
+        self.assertTrue(active.is_dir())
+
+    def test_an_unreferenced_generation_is_swept(self):
+        # A crash between publishing a generation and writing its journal, or
+        # a killed staging directory, leaves nothing the manifest names.
+        self.assertEqual(self.scratch.package().returncode, 0)
+        releases = self.scratch.path(".local/lib/pi-daemon/releases")
+        (releases / "leftover").mkdir()
+        (releases / ".staging.999").mkdir()
+        self.assertEqual(self.scratch.package().returncode, 0)
+        self.assertFalse((releases / "leftover").exists())
+        self.assertFalse((releases / ".staging.999").exists())
 
 
 if __name__ == "__main__":

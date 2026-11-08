@@ -23,24 +23,24 @@ systemctl --user daemon-reload 2>/dev/null || true
 
 mapfile -t recorded < <(python3 - "$manifest" <<'EOF'
 import json
-import os
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     document = json.load(handle)
-seen = []
-for path in document.get("owned") or []:
-    seen.append(path)
-for tree, files in sorted((document.get("trees") or {}).items()):
+seen = list(document.get("owned") or [])
+# Every generation the manifest publishes or retains is described file by
+# file in `trees`, so nothing is listed from disk: a directory holding a file
+# this repo did not install survives, in a retained generation as much as in
+# the active one.
+trees = document.get("trees") or {}
+for tree, files in sorted(trees.items()):
     for relative in sorted(files or {}):
         seen.append(tree.rstrip("/") + "/" + relative)
-for tree in document.get("retained") or []:
-    # An earlier generation is fully described by the manifest that
-    # published it; this record only knows the tree root, so its files are
-    # listed from disk and removed one by one.
-    for base, _directories, files in os.walk(tree):
-        for name in sorted(files):
-            seen.append(os.path.join(base, name))
+# The tree roots go in too: they are directories, so the removal loop passes
+# over them, and their two parents - the release directory and the private
+# tree above it - join the rmdir pass.
+for tree in sorted(trees):
+    seen.append(tree.rstrip("/"))
 for path in seen:
     print(path)
 EOF
