@@ -17,6 +17,7 @@ from .error import CommsError
 BUSY = "busy"
 REQUEST_CONFLICT = "request-conflict"
 STORE_CORRUPT = "store-corrupt"
+STORE_FAILED = "store-failed"
 BAD_REQUEST = "bad-request"
 PAYLOAD_TOO_LARGE = "payload-too-large"
 UNKNOWN_RECIPIENT = "unknown-recipient"
@@ -113,7 +114,8 @@ class MailboxStore:
             raise CommsError(STORE_CORRUPT)
         return {"next_sequence": next_sequence,
                 "messages": messages,
-                "acknowledged": acknowledged}
+                "acknowledged": acknowledged,
+                "provisional": self._owner(state.get("provisional"))}
 
     def _restore_envelope(self, item):
         accepted_at = self._finite(item["acceptedAt"])
@@ -167,6 +169,7 @@ class MailboxStore:
                     "messages": [self._detach(message)
                                  for message in state["messages"]],
                     "acknowledged": list(state["acknowledged"]),
+                    "provisional": state.get("provisional") or False,
                 }
                 for agent_id, state in self._recipients.items()
             },
@@ -176,8 +179,13 @@ class MailboxStore:
 
     # -- mailboxes ---------------------------------------------------------
 
-    def reserve(self, agent_id):
-        """A mailbox exists as soon as its identity is presented."""
+    def reserve(self, agent_id, provisional=False):
+        """A mailbox exists as soon as its identity is presented.
+
+        A provisional mailbox belongs to one launch, named by the value:
+        only that launch may release it, and the first presentation of the
+        identity, or the first message addressed to it, adopts it.
+        """
         with self._lock:
             self._expire_if_due_locked()
             state = self._recipients.get(agent_id)
@@ -185,11 +193,38 @@ class MailboxStore:
                 if len(self._recipients) >= self._recipient_cap:
                     raise CommsError(BUSY)
                 state = {"next_sequence": 0, "messages": [],
-                         "acknowledged": []}
+                         "acknowledged": [], "provisional": provisional}
                 candidate = dict(self._recipients)
                 candidate[agent_id] = state
                 self._commit_locked(candidate, self._receipts)
+            elif state.get("provisional") and not provisional:
+                adopted = self._copy_state(state)
+                adopted["provisional"] = False
+                candidate = dict(self._recipients)
+                candidate[agent_id] = adopted
+                self._commit_locked(candidate, self._receipts)
+                state = adopted
             return self._mailbox_snapshot(agent_id, state)
+
+    def release(self, agent_id, owner=None):
+        """Drop the provisional mailbox one launch reserved.
+
+        A mailbox that was adopted, holds mail or was reserved by another
+        launch is never removed: a failed launch cannot delete a working
+        agent's mailbox.
+        """
+        with self._lock:
+            state = self._recipients.get(agent_id)
+            if state is None or not state.get("provisional"):
+                return False
+            if state["messages"]:
+                return False
+            if owner is not None and state["provisional"] != owner:
+                return False
+            candidate = {name: value for name, value in
+                         self._recipients.items() if name != agent_id}
+            self._commit_locked(candidate, self._receipts)
+            return True
 
     def exists(self, agent_id):
         with self._lock:
@@ -199,6 +234,14 @@ class MailboxStore:
         with self._lock:
             state = self._recipients.get(agent_id) or {}
             return int(state.get("next_sequence") or 0)
+
+    def _owner(self, value):
+        """A provisional mailbox carries its owner, not a bare flag."""
+        if value in (None, False):
+            return False
+        if value is True:
+            return True
+        return self._text(value)
 
     def _mailbox_snapshot(self, agent_id, state):
         return {"agentId": agent_id,
@@ -286,6 +329,8 @@ class MailboxStore:
         if len(self._encode(envelope)) > self._reply_bytes:
             raise CommsError(PAYLOAD_TOO_LARGE)
         state["messages"].append(envelope)
+        # Mail makes the identity real: a failed launch never deletes it.
+        state["provisional"] = False
         return {"reason": None, "envelope": self._detach(envelope)}
 
     def _duplicate_result(self, stored):
@@ -432,7 +477,8 @@ class MailboxStore:
         return {"next_sequence": int(state["next_sequence"]),
                 "messages": [self._detach(message)
                              for message in state["messages"]],
-                "acknowledged": list(state["acknowledged"])}
+                "acknowledged": list(state["acknowledged"]),
+                "provisional": self._owner(state.get("provisional"))}
 
     def _ttl(self, kind, ttl_seconds):
         base = self._result_ttl if kind == RESULT_KIND else self._message_ttl

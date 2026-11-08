@@ -23,6 +23,10 @@ RANGES = {
     "comms_kind_limit": 0,
     "comms_agent_id_limit": 0,
     "comms_frame_margin": 255,
+    "comms_wait_max": 0.0,
+    "comms_wait_cap": 0,
+    "comms_waits_per_connection": 0,
+    "comms_spawn_records": 0,
 }
 
 
@@ -71,6 +75,10 @@ class ServiceConfig:
     comms_kind_limit: int = 64
     comms_agent_id_limit: int = 128
     comms_frame_margin: int = 1024
+    comms_wait_max: float = 60.0
+    comms_wait_cap: int = 256
+    comms_waits_per_connection: int = 1
+    comms_spawn_records: int = 1024
     revision: int = 0
 
     @classmethod
@@ -158,6 +166,10 @@ def _relationships(config):
         raise ValueError("comms_payload_bytes: leaves no frame for the reply")
     if config.comms_frame_margin < config.comms_agent_id_limit + 256:
         raise ValueError("comms_frame_margin: leaves no room for a reply")
+    if config.comms_waits_per_connection > config.comms_wait_cap:
+        raise ValueError("comms_waits_per_connection: exceeds the cap")
+    if config.comms_waits_per_connection >= config.comms_outbound_queue:
+        raise ValueError("comms_waits_per_connection: fills the outbound queue")
 
 
 def _finite(value, name):

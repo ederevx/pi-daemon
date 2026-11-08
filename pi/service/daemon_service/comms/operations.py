@@ -4,7 +4,10 @@ from ..transport.rpc_codec import (CAPACITY, INVALID_PARAMS, UNAVAILABLE)
 from ..transport.rpc_error import RpcError
 from .error import CommsError
 from .mailbox_store import (ALL_TARGET, BAD_REQUEST, BUSY, PAYLOAD_TOO_LARGE,
-                            REQUEST_CONFLICT, STORE_CORRUPT, UNKNOWN_RECIPIENT)
+                            REQUEST_CONFLICT, STORE_CORRUPT, STORE_FAILED,
+                            UNKNOWN_RECIPIENT)
+from .spawn_ledger import ENV_PREFIX, SPAWNED
+from .wait_registry import CLOSING, WAIT_PENDING
 
 LOCAL_SCOPE = "local"
 NO_LOCAL_RECIPIENT = "no-local-recipient"
@@ -15,7 +18,16 @@ CODES = {
     PAYLOAD_TOO_LARGE: INVALID_PARAMS,
     UNKNOWN_RECIPIENT: INVALID_PARAMS,
     STORE_CORRUPT: UNAVAILABLE,
+    STORE_FAILED: UNAVAILABLE,
+    CLOSING: UNAVAILABLE,
+    WAIT_PENDING: INVALID_PARAMS,
+    # Session launch verdicts, carried as data by the sessions domain.
+    "invalid-session": INVALID_PARAMS,
+    "no-dir": INVALID_PARAMS,
+    "name-taken": INVALID_PARAMS,
+    "spawn-failed": UNAVAILABLE,
 }
+SPAWN_FAILED = "spawn-failed"
 
 
 class CommsOperations:
@@ -26,12 +38,15 @@ class CommsOperations:
         self._config = config
 
     def handlers(self):
-        return {
+        handlers = {
             "comms.send": self.send,
             "comms.broadcast": self.broadcast,
             "comms.replay": self.replay,
             "comms.ack": self.ack,
         }
+        if self._service.spawns_enabled():
+            handlers["comms.spawn"] = self.spawn
+        return handlers
 
     def send(self, sender, params):
         request_id = self._identifier(params, "requestId")
@@ -80,6 +95,18 @@ class CommsOperations:
                 "cursor": self._position(agent, result["cursor"]),
                 "more": result["more"]}
 
+    def spawn(self, sender, params):
+        request_id = self._identifier(params, "requestId")
+        spec = self._spawn_spec(sender, params)
+        result = self._project(self._service.spawn, sender, request_id, spec)
+        answer = {"status": result["status"], "spawnId": result["spawnId"],
+                  "requestId": result["requestId"],
+                  "agent": result["agent"], "parent": result["parent"],
+                  "session": result["session"], "created": result["created"]}
+        if result["status"] != SPAWNED and result.get("reason"):
+            answer["reason"] = result["reason"]
+        return answer
+
     def ack(self, agent, params):
         message_ids = params.get("messageIds")
         if not isinstance(message_ids, list) or not all(
@@ -87,6 +114,34 @@ class CommsOperations:
             raise RpcError(INVALID_PARAMS, "messageIds must be strings")
         return self._project(self._service.acknowledge, agent["agentId"],
                              message_ids)
+
+    def wait_request(self, agent, params):
+        """What the registry needs to answer a wait, already validated."""
+        cursor = self._cursor(params, agent)
+        limit = self._limit(params)
+        value = params.get("timeoutMs")
+        if value is None:
+            timeout = self._config.comms_wait_max
+        elif isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or value < 0:
+            raise RpcError(INVALID_PARAMS, "timeoutMs must be a number")
+        else:
+            timeout = min(float(value) / 1000.0,
+                          self._config.comms_wait_max)
+        return {"cursor": cursor, "limit": limit, "timeout": timeout}
+
+    def wait_result(self, agent, result):
+        """A completed wait, in the same shape `comms.replay` returns."""
+        if result["status"] == "cursor-expired":
+            return {"status": result["status"],
+                    "oldestAvailableSequence":
+                        result["oldestAvailableSequence"]}
+        cursor = result["cursor"]
+        return {"status": result["status"],
+                "messages": result["messages"],
+                "cursor": self._position(
+                    agent, 0 if cursor is None else cursor),
+                "more": bool(result.get("more"))}
 
     # -- validation --------------------------------------------------------
 
@@ -141,6 +196,55 @@ class CommsOperations:
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise RpcError(INVALID_PARAMS, "limit must be a positive integer")
         return value
+
+    def _spawn_spec(self, sender, params):
+        spec = {"agentId": params.get("agentId"),
+                "name": params.get("name"),
+                "dir": params.get("dir"),
+                "argv": params.get("argv"),
+                "cols": params.get("cols"),
+                "rows": params.get("rows"),
+                "env": self._spawn_env(params.get("env"), "env"),
+                "envOnce": self._spawn_env(params.get("envOnce"), "envOnce")}
+        agent_id = spec["agentId"]
+        if agent_id is not None:
+            if not isinstance(agent_id, str) or not agent_id or \
+                    len(agent_id) > self._config.comms_agent_id_limit:
+                raise RpcError(INVALID_PARAMS, "agentId must be a short name")
+            if agent_id == sender["agentId"]:
+                raise RpcError(INVALID_PARAMS, "an agent cannot spawn itself")
+        if spec["name"] is not None and (not isinstance(spec["name"], str) or
+                                         not spec["name"]):
+            raise RpcError(INVALID_PARAMS, "name must be a string")
+        if not isinstance(spec["dir"], str) or not spec["dir"]:
+            raise RpcError(INVALID_PARAMS, "dir is required")
+        argv = spec["argv"]
+        if not isinstance(argv, list) or not argv or not all(
+                isinstance(item, str) and item for item in argv):
+            raise RpcError(INVALID_PARAMS, "argv must be command words")
+        for key in ("cols", "rows"):
+            value = spec[key]
+            if value is not None and (isinstance(value, bool) or
+                                      not isinstance(value, int)):
+                raise RpcError(INVALID_PARAMS, f"{key} must be a number")
+        return spec
+
+    def _spawn_env(self, value, name):
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise RpcError(INVALID_PARAMS, f"{name} must be an object")
+        environment = {}
+        for variable, entry in value.items():
+            if not isinstance(variable, str) or not variable or \
+                    not isinstance(entry, str):
+                raise RpcError(INVALID_PARAMS,
+                               f"{name} must map names to strings")
+            if variable.startswith(ENV_PREFIX):
+                raise RpcError(INVALID_PARAMS,
+                               f"{name} may not set {variable}")
+            environment[variable] = entry
+        return environment
 
     def _payload(self, params):
         if "payload" not in params:

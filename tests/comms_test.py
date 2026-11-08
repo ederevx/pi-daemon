@@ -7,14 +7,21 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "service"))
 
 from daemon_service.comms.error import CommsError
+from daemon_service.atomic_state_file import AtomicStateFile
 from daemon_service.comms.mailbox_store import ALL_TARGET, MailboxStore
+from daemon_service.comms.service import CommsService
 from daemon_service.comms.node_identity import NodeIdentity
+from daemon_service.comms.spawn_ledger import SpawnLedger
+from daemon_service.comms.wait_registry import WaitRegistry
 from daemon_service.config import ServiceConfig
 from daemon_service.runtime_layout import RuntimeLayout
 
@@ -52,6 +59,82 @@ class MailboxTests(StoreCase):
         first = self.store.reserve("a")
         second = self.store.reserve("a")
         self.assertEqual(first, second)
+
+    def test_a_provisional_mailbox_is_released(self):
+        self.store.reserve("a", provisional=True)
+        self.assertTrue(self.store.release("a"))
+        self.assertFalse(self.store.exists("a"))
+        self.assertFalse(self._store().exists("a"))
+        self.assertFalse(self.store.release("a"))
+
+    def test_a_provisional_mailbox_belongs_to_one_launch(self):
+        self.store.reserve("a", provisional="s1")
+        self.assertFalse(self.store.release("a", "s2"))
+        self.assertTrue(self.store.exists("a"))
+        self.assertTrue(self.store.release("a", "s1"))
+        self.assertFalse(self._store().exists("a"))
+
+    def test_a_launch_never_adopts_another_launch_mailbox(self):
+        self.store.reserve("a", provisional="s1")
+        self.store.reserve("a", provisional="s2")
+        self.assertFalse(self.store.release("a", "s2"))
+        self.assertTrue(self.store.exists("a"))
+
+    def test_a_reservation_survives_a_restart(self):
+        self.store.reserve("a", provisional="s1")
+        restarted = self._store()
+        self.assertFalse(restarted.release("a", "s2"))
+        self.assertTrue(restarted.exists("a"))
+        self.assertTrue(restarted.release("a", "s1"))
+        self.assertFalse(self._store().exists("a"))
+
+    def test_mail_for_another_mailbox_keeps_the_reservation(self):
+        self.store.reserve("a", provisional="s1")
+        self.store.reserve("b")
+        self.store.accept(self._agent("b"), "r1", self._agent("b"), "chat",
+                          {"text": "hi"}, ttl_seconds=1)
+        self.now += 10.0
+        self.assertEqual(self.store.expire(), 1)
+        self.assertTrue(self._store().release("a", "s1"))
+        self.assertFalse(self._store().exists("a"))
+
+    def test_expiry_keeps_the_reservation(self):
+        self.store.reserve("a", provisional="s1")
+        self.store.reserve("b")
+        self.store.accept(self._agent("a"), "r1", self._agent("b"), "chat",
+                          {"text": "hi"}, ttl_seconds=1)
+        self.now += 10.0
+        self.assertEqual(self.store.expire(), 1)
+        self.assertTrue(self._store().release("a", "s1"))
+        self.assertFalse(self._store().exists("a"))
+
+    def test_a_release_that_cannot_be_written_keeps_the_mailbox(self):
+        self.store.reserve("a", provisional="s1")
+        with failing_mailbox_writes(after=0):
+            with self.assertRaises(OSError):
+                self.store.release("a", "s1")
+        self.assertTrue(self._store().exists("a"))
+        self.assertTrue(self._store().release("a", "s1"))
+
+    def test_a_presented_mailbox_is_never_released(self):
+        self.store.reserve("a")
+        self.assertFalse(self.store.release("a"))
+        self.assertTrue(self.store.exists("a"))
+
+    def test_a_provisional_mailbox_is_adopted_when_presented(self):
+        self.store.reserve("a", provisional=True)
+        self.store.reserve("a")
+        self.assertFalse(self.store.release("a"))
+        self.assertTrue(self._store().exists("a"))
+
+    def test_a_provisional_mailbox_that_received_mail_stays(self):
+        self.store.reserve("a")
+        self.store.reserve("b", provisional=True)
+        self.store.accept(self._agent("a"), "r1", self._agent("b"), "chat",
+                          {"text": "hi"})
+        self.assertFalse(self.store.release("b"))
+        self.assertTrue(self.store.exists("b"))
+        self.assertTrue(self._store().exists("b"))
 
     def test_the_mailbox_cap_refuses_rather_than_evicts(self):
         self.store = self._store(comms_recipient_cap=2)
@@ -498,6 +581,585 @@ class NodeIdentityTests(unittest.TestCase):
 
     def test_a_missing_file_is_a_fresh_node(self):
         self.assertTrue(self._identity().id())
+
+class GatedStore:
+    """A mailbox store whose replay the test can hold, break or answer."""
+
+    def __init__(self):
+        self.gate = threading.Event()
+        self.gate.set()
+        self.calls = []
+        self.by_agent = {}
+        self.fail = False
+        self.explode = False
+        self.answer = {"status": "ok", "messages": [], "cursor": 0,
+                       "more": False}
+
+    def replay(self, agent_id, cursor=None, limit=None):
+        self.calls.append((agent_id, cursor, limit))
+        if self.fail:
+            raise OSError("disk")
+        if self.explode:
+            raise RuntimeError("a store bug")
+        self.gate.wait(5.0)
+        answer = self.by_agent.get(agent_id, self.answer)
+        return {"status": answer["status"],
+                "messages": [dict(message)
+                             for message in answer.get("messages", [])],
+                "cursor": answer.get("cursor"),
+                "more": bool(answer.get("more")),
+                "oldestAvailableSequence":
+                    answer.get("oldestAvailableSequence")}
+
+
+def failing_writes(after=0):
+    """The production failure: the disk refuses writes past the first ones."""
+    real = AtomicStateFile.write_dict
+    state = {"calls": 0}
+
+    def write(store, data):
+        state["calls"] += 1
+        if state["calls"] > after:
+            raise OSError("disk")
+        return real(store, data)
+
+    return mock.patch("daemon_service.atomic_state_file.AtomicStateFile"
+                      ".write_dict", write)
+
+
+def failing_mailbox_writes(after=0):
+    """Mailboxes persist through the text path, not `write_dict`."""
+    real = AtomicStateFile.write
+    state = {"calls": 0}
+
+    def write(store, text):
+        state["calls"] += 1
+        if state["calls"] > after:
+            raise OSError("disk")
+        return real(store, text)
+
+    return mock.patch("daemon_service.atomic_state_file.AtomicStateFile"
+                      ".write", write)
+
+
+class StubStore:
+    """Mailbox ownership, small enough to break on purpose."""
+
+    def __init__(self):
+        self.mailboxes = {}
+        self.provisional = set()
+        self.owners = {}
+        self.fail_reserve = False
+        self.fail_release = False
+        self.released = []
+
+    def exists(self, agent_id):
+        return agent_id in self.mailboxes
+
+    def reserve(self, agent_id, provisional=False):
+        if self.fail_reserve:
+            raise OSError("disk")
+        if agent_id not in self.mailboxes:
+            self.mailboxes[agent_id] = 0
+            if provisional:
+                self.provisional.add(agent_id)
+                self.owners[agent_id] = provisional
+        elif not provisional:
+            self.provisional.discard(agent_id)
+            self.owners.pop(agent_id, None)
+        return {"agentId": agent_id, "nodeId": "local", "headSequence": 0,
+                "pending": 0}
+
+    def release(self, agent_id, owner=None):
+        if self.fail_release:
+            raise OSError("disk")
+        if agent_id not in self.provisional:
+            return False
+        if owner is not None and self.owners.get(agent_id) != owner:
+            return False
+        self.provisional.discard(agent_id)
+        self.owners.pop(agent_id, None)
+        self.mailboxes.pop(agent_id, None)
+        self.released.append(agent_id)
+        return True
+
+
+class StubLauncher:
+    """A launcher that records the spec and answers on demand."""
+
+    def __init__(self):
+        self.launched = []
+        self.reason = None
+
+    def check(self, spec):
+        """The launcher contract: a normalised launch spec, or a refusal."""
+        name = (spec.get("name") or spec.get("agentId")).strip()
+        return {"ok": True, "spec": {
+            "name": name, "dir": spec.get("dir"),
+            "argv": list(spec.get("argv") or []),
+            "cols": spec.get("cols"), "rows": spec.get("rows"),
+            "env": dict(spec.get("env") or {}),
+            "env_once": dict(spec.get("envOnce") or {})}}
+
+    def launch(self, spec):
+        self.launched.append(dict(spec))
+        if self.reason is not None:
+            return {"ok": False, "reason": self.reason}
+        return {"ok": True, "name": spec["name"], "pid": 4242}
+
+
+class SpawnLedgerTests(StoreCase):
+    """A launch record exists before the launch, and a retry finds it."""
+
+    def setUp(self):
+        super().setUp()
+        self.ledger = self._ledger()
+
+    def _ledger(self, **overrides):
+        self.config = ServiceConfig.load(overrides=overrides)
+        ledger = SpawnLedger(self.layout.comms_spawns_path(), self.config,
+                             "local", clock=lambda: self.now)
+        ledger.load()
+        return ledger
+
+    def _parent(self, agent_id="a"):
+        return {"nodeId": "local", "agentId": agent_id}
+
+    def _agent(self, agent_id):
+        return {"nodeId": "local", "agentId": agent_id}
+
+    def test_an_open_record_is_found_by_its_request(self):
+        opened = self.ledger.open(self._parent(), "r1", "d1",
+                                  self._agent("kid"), "kid")
+        found = self.ledger.find(self._parent(), "r1", "d1")
+        self.assertEqual(found["spawnId"], opened["spawnId"])
+        self.assertEqual(found["status"], "launching")
+        self.assertEqual(found["agent"], self._agent("kid"))
+        self.assertEqual(found["session"], {"name": "kid"})
+
+    def test_a_new_request_has_no_record(self):
+        self.assertIsNone(self.ledger.find(self._parent(), "r1", "d1"))
+
+    def test_one_request_id_with_another_body_conflicts(self):
+        self.ledger.open(self._parent(), "r1", "d1", self._agent("kid"),
+                         "kid")
+        with self.assertRaises(CommsError) as caught:
+            self.ledger.find(self._parent(), "r1", "d2")
+        self.assertEqual(caught.exception.code, "request-conflict")
+
+    def test_the_ledger_cap_refuses_rather_than_evicts(self):
+        self.ledger = self._ledger(comms_spawn_records=1)
+        self.ledger.open(self._parent(), "r1", "d1", self._agent("kid"), "kid")
+        with self.assertRaises(CommsError) as caught:
+            self.ledger.open(self._parent(), "r2", "d2", self._agent("kid2"),
+                             "kid2")
+        self.assertEqual(caught.exception.code, "busy")
+        self.assertIsNone(self.ledger.find(self._parent(), "r2", "d2"))
+
+    def test_a_launching_record_never_expires(self):
+        self.ledger.open(self._parent(), "r1", "d1", self._agent("kid"), "kid")
+        self.now += 10 * self.config.comms_dedupe_ttl
+        self.assertIsNotNone(self._ledger().find(self._parent(), "r1", "d1"))
+
+    def test_a_settled_record_expires_after_the_ttl(self):
+        self.ledger.open(self._parent(), "r1", "d1", self._agent("kid"), "kid")
+        self.ledger.settle(self._parent(), "r1", "spawned")
+        self.assertIsNotNone(self.ledger.find(self._parent(), "r1", "d1"))
+        self.now += 2 * self.config.comms_dedupe_ttl
+        self.assertIsNone(self.ledger.find(self._parent(), "r1", "d1"))
+
+    def test_a_settled_record_survives_a_restart(self):
+        self.ledger.open(self._parent(), "r1", "d1", self._agent("kid"), "kid")
+        self.ledger.settle(self._parent(), "r1", "spawned")
+        found = self._ledger().find(self._parent(), "r1", "d1")
+        self.assertEqual(found["status"], "spawned")
+        self.assertIsNotNone(found["settled"])
+
+    def test_a_restart_settles_an_interrupted_launch(self):
+        self.ledger.open(self._parent(), "r1", "d1", self._agent("kid"), "kid")
+        self.now += 5.0
+        found = self._ledger().find(self._parent(), "r1", "d1")
+        self.assertEqual(found["status"], "failed")
+        self.assertEqual(found["reason"], "interrupted")
+        self.assertEqual(found["settled"], 1005.0)
+
+    def test_a_recovery_that_cannot_be_written_keeps_the_record(self):
+        self.ledger.open(self._parent(), "r1", "d1", self._agent("kid"), "kid")
+        with failing_writes(after=0):
+            with self.assertRaises(CommsError) as caught:
+                self._ledger()
+        self.assertEqual(caught.exception.code, "store-failed")
+        with open(self.layout.comms_spawns_path(), encoding="utf-8") as handle:
+            records = json.load(handle)["spawns"]
+        self.assertEqual([r["status"] for r in records.values()],
+                         ["launching"])
+        self.assertEqual(self._ledger().find(self._parent(), "r1", "d1")
+                         ["status"], "failed")
+
+    def test_a_discarded_record_is_gone(self):
+        self.ledger.open(self._parent(), "r1", "d1", self._agent("kid"), "kid")
+        self.ledger.discard(self._parent(), "r1")
+        self.assertIsNone(self.ledger.find(self._parent(), "r1", "d1"))
+        self.assertIsNone(self._ledger().find(self._parent(), "r1", "d1"))
+
+    def test_the_record_file_is_private(self):
+        self.ledger.open(self._parent(), "r1", "d1", self._agent("kid"), "kid")
+        mode = os.stat(self.layout.comms_spawns_path()).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_a_settle_that_cannot_be_written_keeps_the_launch_certainty(self):
+        ledger = SpawnLedger(self.layout.comms_spawns_path(), self.config,
+                             "local", clock=lambda: self.now)
+        ledger.load()
+        ledger.open(self._parent(), "r1", "d1", self._agent("kid"), "kid")
+        with failing_writes():
+            with self.assertRaises(CommsError) as caught:
+                ledger.settle(self._parent(), "r1", "spawned")
+        self.assertEqual(caught.exception.code, "store-failed")
+        self.assertEqual(ledger.find(self._parent(), "r1", "d1")["status"],
+                         "launching")
+        self.assertEqual(self._ledger().find(self._parent(), "r1", "d1")
+                         ["status"], "failed")
+
+    def test_a_broken_ledger_refuses_to_load(self):
+        with open(self.layout.comms_spawns_path(), "w",
+                  encoding="utf-8") as handle:
+            handle.write('{"version": 99, "spawns": {}}')
+        with self.assertRaises(CommsError) as caught:
+            self._ledger()
+        self.assertEqual(caught.exception.code, "store-corrupt")
+
+
+class RecordingSession:
+    """A connection stand-in that records how its wait ended."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.completed = []
+        self.refused = []
+
+    def complete(self, request_id, result):
+        with self._lock:
+            self.completed.append((request_id, result))
+
+    def refuse(self, request_id, code, message):
+        with self._lock:
+            self.refused.append((request_id, code, message))
+
+
+class WaitRegistryTests(StoreCase):
+
+    def setUp(self):
+        super().setUp()
+        self.store.reserve("a")
+        self.store.reserve("b")
+        self.session = RecordingSession()
+
+    def _registry(self, store=None, **overrides):
+        config = ServiceConfig.load(overrides=overrides)
+        registry = WaitRegistry(store or self.store, config)
+        registry.start()
+        self.addCleanup(registry.stop)
+        return registry
+
+    def _until(self, predicate, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.005)
+        return predicate()
+
+    def _send(self, request_id="s1", agent_id="b"):
+        return self.store.accept(self._agent("a"), request_id,
+                                 self._agent(agent_id), "chat", {"text": "hi"})
+
+    def test_mail_already_in_the_mailbox_answers_at_once(self):
+        self._send()
+        registry = self._registry()
+        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        self.assertTrue(self._until(lambda: self.session.completed))
+        request_id, result = self.session.completed[0]
+        self.assertEqual(request_id, "w1")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(result["messages"]), 1)
+
+    def test_a_signal_answers_a_pending_wait(self):
+        registry = self._registry()
+        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        self.assertEqual(registry.pending(), 1)
+        self._send()
+        registry.signal({"b"})
+        self.assertTrue(self._until(lambda: self.session.completed))
+        self.assertEqual(self.session.completed[0][1]["status"], "ok")
+
+    def test_a_wait_times_out_and_names_its_position(self):
+        registry = self._registry()
+        registry.begin(self.session, "w1", "b", 3, None, 0.05)
+        self.assertTrue(self._until(lambda: self.session.completed))
+        result = self.session.completed[0][1]
+        self.assertEqual(result["status"], "timed-out")
+        self.assertEqual(result["messages"], [])
+        self.assertEqual(result["cursor"], 3)
+
+    def test_a_cancelled_wait_is_answered_cancelled(self):
+        registry = self._registry()
+        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        self.assertTrue(registry.cancel(self.session, "w1"))
+        self.assertFalse(registry.cancel(self.session, "w1"))
+        self.assertEqual(self.session.refused, [("w1", -32800, "cancelled")])
+        self.assertEqual(self.session.completed, [])
+        self.assertEqual(registry.pending(), 0)
+
+    def test_one_wait_at_a_time_per_connection(self):
+        registry = self._registry(comms_waits_per_connection=1)
+        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        with self.assertRaises(CommsError) as caught:
+            registry.begin(self.session, "w2", "b", None, None, 5.0)
+        self.assertEqual(caught.exception.code, "busy")
+
+    def test_the_registry_cap_refuses_a_second_connection(self):
+        registry = self._registry(comms_wait_cap=1,
+                                  comms_waits_per_connection=1)
+        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        with self.assertRaises(CommsError) as caught:
+            registry.begin(RecordingSession(), "w2", "b", None, None, 5.0)
+        self.assertEqual(caught.exception.code, "busy")
+
+    def test_a_dropped_connection_leaves_no_pending_wait(self):
+        registry = self._registry()
+        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry.drop(self.session)
+        self.assertEqual(registry.pending(), 0)
+        self._send()
+        registry.signal({"b"})
+        time.sleep(0.05)
+        self.assertEqual(self.session.completed, [])
+
+    def test_a_pending_wait_is_refused_at_shutdown(self):
+        registry = self._registry(comms_wait_max=5.0)
+        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry.stop()
+        self.assertEqual(self.session.refused, [("w1", -32003, "closing")])
+        self.assertEqual(registry.pending(), 0)
+
+    def test_a_store_failure_refuses_one_wait_and_keeps_answering(self):
+        store = GatedStore()
+        store.fail = True
+        registry = self._registry(store=store)
+        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        self.assertTrue(self._until(lambda: self.session.refused))
+        self.assertEqual(self.session.refused,
+                         [("w1", -32003, "unavailable")])
+        store.fail = False
+        store.answer = {"status": "ok", "messages": [{"sequence": 1}],
+                        "cursor": 1, "more": False}
+        registry.begin(self.session, "w2", "b", None, None, 5.0)
+        self.assertTrue(self._until(lambda: self.session.completed))
+        self.assertEqual(self.session.completed[0][1]["messages"],
+                         [{"sequence": 1}])
+
+    def test_a_reused_request_id_never_steals_the_replacement(self):
+        store = GatedStore()
+        store.gate.clear()
+        store.answer = {"status": "ok", "messages": [{"sequence": 1}],
+                        "cursor": 1, "more": False}
+        registry = self._registry(store=store)
+        store.by_agent["c"] = {"status": "ok", "messages": [{"sequence": 9}],
+                               "cursor": 9, "more": False}
+        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        self.assertTrue(self._until(lambda: store.calls))
+        self.assertTrue(registry.cancel(self.session, "w1"))
+        registry.begin(self.session, "w1", "c", None, None, 5.0)
+        store.gate.set()
+        # The old evaluator finished replay and found a replacement: only the
+        # replacement itself may answer, so the thread loops for its own look.
+        self.assertTrue(self._until(lambda: len(store.calls) == 2))
+        self.assertTrue(self._until(lambda: self.session.completed))
+        # The replacement answered with its own mailbox, not the one the
+        # cancelled wait was still holding in replay.
+        self.assertEqual(self.session.completed,
+                         [("w1", {"status": "ok",
+                                  "messages": [{"sequence": 9}],
+                                  "cursor": 9, "more": False,
+                                  "oldestAvailableSequence": None})])
+        self.assertEqual(registry.pending(), 0)
+        self.assertEqual([refused[1] for refused in self.session.refused],
+                         [-32800])
+
+    def test_shutdown_refuses_a_wait_the_thread_is_still_answering(self):
+        store = GatedStore()
+        store.gate.clear()
+        store.answer = {"status": "ok", "messages": [{"sequence": 1}],
+                        "cursor": 1, "more": False}
+        registry = self._registry(store=store, stop_grace=0.05)
+        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        self.assertTrue(self._until(lambda: store.calls))
+        registry.stop()
+        # The replay is still held, and shutdown has already answered.
+        self.assertEqual(self.session.refused,
+                         [("w1", -32003, "closing")])
+        self.assertEqual(registry.pending(), 0)
+        self.assertFalse(registry.cancel(self.session, "w1"))
+        store.gate.set()
+        registry.stop()
+        self.assertEqual(self.session.completed, [])
+        self.assertEqual(len(self.session.refused), 1)
+
+    def test_an_unexpected_store_bug_refuses_only_its_wait(self):
+        store = GatedStore()
+        store.explode = True
+        registry = self._registry(store=store)
+        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        self.assertTrue(self._until(lambda: self.session.refused))
+        self.assertEqual(self.session.refused,
+                         [("w1", -32003, "unavailable")])
+        store.explode = False
+        store.answer = {"status": "ok", "messages": [{"sequence": 7}],
+                        "cursor": 7, "more": False}
+        registry.begin(self.session, "w2", "b", None, None, 5.0)
+        self.assertTrue(self._until(lambda: self.session.completed))
+        self.assertEqual(self.session.completed[0][1]["messages"],
+                         [{"sequence": 7}])
+
+    def test_a_reused_pending_request_id_is_refused(self):
+        registry = self._registry(comms_waits_per_connection=2)
+        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        with self.assertRaises(CommsError) as caught:
+            registry.begin(self.session, "w1", "b", None, None, 5.0)
+        self.assertEqual(caught.exception.code, "wait-pending")
+
+    def test_a_cursor_behind_the_retained_history_is_reported(self):
+        store = GatedStore()
+        store.answer = {"status": "cursor-expired",
+                        "oldestAvailableSequence": 4, "cursor": 0}
+        registry = self._registry(store=store)
+        registry.begin(self.session, "w1", "b", 0, None, 5.0)
+        self.assertTrue(self._until(lambda: self.session.completed))
+        result = self.session.completed[0][1]
+        self.assertEqual(result["status"], "cursor-expired")
+        self.assertEqual(result["oldestAvailableSequence"], 4)
+
+    def test_a_wait_after_shutdown_is_refused(self):
+        registry = self._registry()
+        registry.stop()
+        with self.assertRaises(CommsError) as caught:
+            registry.begin(self.session, "w1", "b", None, None, 5.0)
+        self.assertEqual(caught.exception.code, "closing")
+
+
+class SpawnServiceTests(unittest.TestCase):
+    """The spawn path over stub collaborators, so failures are reachable."""
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="pi-comms-spawn-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.config = ServiceConfig.load()
+        self.store = StubStore()
+        self.launcher = StubLauncher()
+        self.ledger = SpawnLedger(os.path.join(self.base, "spawns.json"),
+                                  self.config, "local")
+        self.ledger.load()
+        self.service = CommsService(self.store, self.config, "token", "local",
+                                    self.ledger, self.launcher)
+        self.service.serve_at("127.0.0.1", 1234)
+        self.sender = {"nodeId": "local", "agentId": "parent"}
+        self.spec = {"agentId": "kid", "name": None, "dir": self.base,
+                     "argv": ["/bin/true"], "cols": None, "rows": None,
+                     "env": None, "envOnce": None}
+
+    def _spawn(self, **changes):
+        spec = dict(self.spec, **changes)
+        return self.service.spawn(self.sender, "r1", spec)
+
+    def test_a_ledger_that_cannot_open_answers_a_store_failure(self):
+        with failing_writes():
+            with self.assertRaises(CommsError) as caught:
+                self._spawn()
+        self.assertEqual(caught.exception.code, "store-failed")
+        self.assertEqual(self.launcher.launched, [])
+        self.assertIsNone(self.ledger.find(self.sender, "r1", "digest"))
+
+    def test_a_failed_reservation_leaves_no_record_or_mailbox(self):
+        self.store.fail_reserve = True
+        with self.assertRaises(CommsError) as caught:
+            self._spawn()
+        self.assertEqual(caught.exception.code, "store-failed")
+        self.assertIsNone(self.ledger.find(self.sender, "r1", "digest"))
+        self.assertEqual(self.launcher.launched, [])
+
+    def test_an_uncertain_settlement_is_replayed_not_relaunched(self):
+        with failing_writes(after=1):
+            with self.assertRaises(CommsError) as caught:
+                self._spawn()
+        self.assertEqual(caught.exception.code, "store-failed")
+        self.assertEqual(len(self.launcher.launched), 1)
+        retried = self._spawn()
+        self.assertEqual(retried["status"], "launching")
+        self.assertFalse(retried["created"])
+        self.assertEqual(len(self.launcher.launched), 1)
+
+    def test_a_refused_launch_never_releases_an_earlier_launch_mailbox(self):
+        self.assertEqual(self._spawn()["status"], "spawned")
+        self.launcher.reason = "name-taken"
+        with self.assertRaises(CommsError) as caught:
+            self.service.spawn(self.sender, "r2", dict(self.spec))
+        self.assertEqual(caught.exception.code, "name-taken")
+        self.assertEqual(list(self.store.mailboxes), ["kid"])
+        self.assertEqual(self.store.released, [])
+        self.launcher.reason = None
+        self.assertEqual(self.service.spawn(self.sender, "r3",
+                                            dict(self.spec))["status"],
+                         "spawned")
+
+    def test_a_rollback_that_cannot_be_written_is_a_store_failure(self):
+        self.launcher.reason = "name-taken"
+        with failing_writes(after=1):
+            with self.assertRaises(CommsError) as caught:
+                self._spawn()
+        self.assertEqual(caught.exception.code, "store-failed")
+        self.assertEqual(self.store.released, ["kid"])
+        self.launcher.reason = None
+        self.assertEqual(self._spawn()["status"], "launching")
+        self.assertFalse(self._spawn()["created"])
+
+    def test_a_release_that_cannot_be_written_keeps_the_retry_record(self):
+        self.launcher.reason = "name-taken"
+        self.store.fail_release = True
+        with self.assertRaises(CommsError) as caught:
+            self._spawn()
+        self.assertEqual(caught.exception.code, "store-failed")
+        self.store.fail_release = False
+        self.launcher.reason = None
+        replayed = self._spawn()
+        self.assertEqual(replayed["status"], "launching")
+        self.assertFalse(replayed["created"])
+        self.assertEqual(len(self.launcher.launched), 1)
+
+    def test_a_refused_launch_releases_its_provisional_mailbox(self):
+        self.launcher.reason = "name-taken"
+        with self.assertRaises(CommsError) as caught:
+            self._spawn()
+        self.assertEqual(caught.exception.code, "name-taken")
+        self.assertEqual(self.store.mailboxes, {})
+        self.assertEqual(self.store.released, ["kid"])
+        self.launcher.reason = None
+        self.assertEqual(self._spawn()["status"], "spawned")
+        self.assertEqual(len(self.launcher.launched), 2)
+
+    def test_a_padded_session_name_is_recorded_trimmed(self):
+        verdict = self._spawn(agentId="kid2", name=" worker ")
+        self.assertEqual(verdict["session"], {"name": "worker"})
+        self.assertEqual(self.launcher.launched[0]["name"], "worker")
+        self.assertEqual(self._spawn(agentId="kid2", name=" worker ")
+                         ["session"], {"name": "worker"})
+
+    def test_a_caller_one_shot_environment_reaches_the_launch(self):
+        self._spawn(envOnce={"TERM": "xterm"})
+        launched = self.launcher.launched[0]
+        self.assertEqual(launched["env_once"]["TERM"], "xterm")
+        self.assertEqual(launched["env_once"]["PI_COMMS_PORT"], "1234")
+        self.assertEqual(launched["env"]["PI_COMMS_AGENT_ID"], "kid")
 
 
 if __name__ == "__main__":

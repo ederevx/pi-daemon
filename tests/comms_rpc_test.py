@@ -8,6 +8,8 @@ import shutil
 import socket
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 from collections import deque
@@ -17,14 +19,17 @@ sys.path.insert(0, os.path.join(REPO, "pi", "service"))
 
 from daemon_service.comms.mailbox_store import MailboxStore
 from daemon_service.comms.service import CommsService
+from daemon_service.comms.spawn_ledger import SpawnLedger
 from daemon_service.config import ServiceConfig
 from daemon_service.runtime_layout import RuntimeLayout
+from daemon_service.sessions.error import SessionError
+from daemon_service.sessions.launcher import SessionLauncher
 from daemon_service.transport.json_line_stream import JsonLineStream
 from daemon_service.transport.rpc_codec import (CAPACITY, INVALID_PARAMS,
                                                 INVALID_REQUEST,
                                                 METHOD_NOT_FOUND,
                                                 PARSE_ERROR, UNAUTHORIZED,
-                                                RpcCodec)
+                                                UNAVAILABLE, RpcCodec)
 from daemon_service.transport.rpc_listener import RpcListener
 
 TOKEN = "test-token"
@@ -54,6 +59,14 @@ class Client:
     def call(self, method, params=None):
         return self._exchange(method, params or {})
 
+    def send_request(self, method, params=None):
+        """Write one request and leave its reply to `receive`."""
+        self._next += 1
+        request_id = f"c{self._next}"
+        self._write({"jsonrpc": "2.0", "id": request_id, "method": method,
+                     "params": params or {}})
+        return request_id
+
     def notify(self, method, params=None):
         self._write({"jsonrpc": "2.0", "method": method, "params": params})
 
@@ -66,6 +79,9 @@ class Client:
     def notification(self):
         message = self._read()
         return message["method"], message["params"]
+
+    def receive(self):
+        return self._read()
 
     def frame(self, message):
         return self._codec.encode(message)
@@ -96,20 +112,48 @@ class Client:
         self._socket.sendall(self._codec.encode(message))
 
 
+class StubSessions:
+    """The sessions domain, reduced to what the launcher asks of it."""
+
+    def __init__(self):
+        self.starts = []
+        self.created = True
+        self.failure = None
+
+    def start(self, name, dir_, argv, cols, rows, env=None, env_once=None):
+        self.starts.append({"name": name, "dir": dir_, "argv": list(argv),
+                            "cols": cols, "rows": rows,
+                            "env": dict(env or {}),
+                            "env_once": dict(env_once or {})})
+        if self.failure is not None:
+            raise SessionError(self.failure)
+        return {"name": name, "created": self.created,
+                "session": {"name": name, "pid": 4242}}
+
+
 class Harness:
     """One daemon-side comms stack on a scratch root."""
 
-    def __init__(self, **overrides):
+    def __init__(self, spawns=False, **overrides):
         self.base = tempfile.mkdtemp(prefix="pi-comms-rpc-")
         layout = RuntimeLayout(os.path.join(self.base, "state"),
                               os.path.join(self.base, "run"))
         self.config = ServiceConfig.load(overrides=overrides)
         self.store = MailboxStore(layout.comms_mailbox_path(), self.config,
                                   NODE)
-        self.service = CommsService(self.store, self.config, TOKEN, NODE)
+        self.sessions = StubSessions() if spawns else None
+        ledger = None
+        launcher = None
+        if spawns:
+            ledger = SpawnLedger(layout.comms_spawns_path(), self.config, NODE)
+            launcher = SessionLauncher(self.sessions, self.config)
+        self.service = CommsService(self.store, self.config, TOKEN, NODE,
+                                    ledger, launcher)
         self.service.start()
         self.listener = RpcListener(self.config, RpcCodec(), self.service)
         self.listener.start()
+        host, port = self.listener.address()
+        self.service.serve_at(host, port)
         self.clients = []
 
     def address(self):
@@ -501,6 +545,267 @@ class SlowPeerTests(SocketCase):
         sender.result("comms.send", {"requestId": "f1", "to": self.agent("fast"),
                                      "kind": "text", "payload": {"n": 7}})
         self.assertEqual(fast.notification()[1]["payload"], {"n": 7})
+
+class WaitTests(SocketCase):
+
+    def test_wait_is_a_published_method(self):
+        client = self.harness.client("a")
+        self.assertIn("comms.wait", client.greeting["result"]["methods"])
+
+    def test_a_wait_returns_mail_the_mailbox_already_holds(self):
+        self.reserve("b")
+        sender = self.harness.client("a")
+        sender.result("comms.send", {"requestId": "r1",
+                                     "to": self.agent("b"), "kind": "chat",
+                                     "payload": {"text": "hi"}})
+        client = self.harness.client("b")
+        answer = client.result("comms.wait", {"timeoutMs": 1000})
+        self.assertEqual(answer["status"], "ok")
+        self.assertEqual(len(answer["messages"]), 1)
+        self.assertEqual(answer["messages"][0]["sequence"], 1)
+        self.assertEqual(answer["cursor"]["sequence"], 1)
+        self.assertEqual(answer["cursor"]["agent"]["agentId"], "b")
+        self.assertFalse(answer["more"])
+
+    def test_a_pending_wait_is_answered_by_arriving_mail(self):
+        receiver = self.harness.client("b")
+        sender = self.harness.client("a")
+        request_id = receiver.send_request("comms.wait", {"timeoutMs": 4000})
+        answers = []
+
+        def read():
+            answers.append(receiver.receive())
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        time.sleep(0.1)
+        sender.result("comms.send", {"requestId": "r1",
+                                     "to": self.agent("b"), "kind": "chat",
+                                     "payload": {"text": "hello"}})
+        reader.join(5.0)
+        self.assertEqual(len(answers), 1)
+        self.assertEqual(answers[0]["id"], request_id)
+        self.assertEqual(answers[0]["result"]["status"], "ok")
+        self.assertEqual(answers[0]["result"]["messages"][0]["sequence"], 1)
+
+    def test_a_wait_without_mail_times_out(self):
+        client = self.harness.client("b")
+        answer = client.result("comms.wait", {"timeoutMs": 50})
+        self.assertEqual(answer["status"], "timed-out")
+        self.assertEqual(answer["messages"], [])
+        self.assertEqual(answer["cursor"], {"agent": {"nodeId": NODE,
+                                                      "agentId": "b"},
+                                            "sequence": 0})
+
+    def test_cancel_answers_a_pending_wait(self):
+        client = self.harness.client("b")
+        request_id = client.send_request("comms.wait", {"timeoutMs": 4000})
+        client.notify("rpc.cancel", {"id": request_id})
+        answer = client.receive()
+        self.assertEqual(answer["id"], request_id)
+        self.assertEqual(answer["error"]["code"], -32800)
+
+    def test_a_malformed_cancel_keeps_the_connection(self):
+        client = self.harness.client("b")
+        for request_id in ([1], {"id": 1}, True, 1.5, None):
+            client.notify("rpc.cancel", {"id": request_id})
+        self.assertEqual(client.result("comms.wait", {"timeoutMs": 50})
+                         ["status"], "timed-out")
+
+    def test_cancel_as_a_request_is_not_in_the_profile(self):
+        client = self.harness.client("b")
+        answer = client.call("rpc.cancel", {"id": "c1"})
+        self.assertEqual(answer["error"]["code"], METHOD_NOT_FOUND)
+
+    def test_shutdown_answers_a_pending_wait(self):
+        client = self.harness.client("b")
+        request_id = client.send_request("comms.wait", {"timeoutMs": 4000})
+        self.harness.service.begin_shutdown()
+        self.harness.listener.stop()
+        answer = client.receive()
+        self.assertEqual(answer["id"], request_id)
+        self.assertEqual(answer["error"]["code"], UNAVAILABLE)
+
+    def test_a_wait_answers_a_cursor_the_mailbox_no_longer_holds(self):
+        self.reserve("b")
+        sender = self.harness.client("a")
+        sender.result("comms.send", {"requestId": "r1",
+                                     "to": self.agent("b"), "kind": "chat",
+                                     "payload": {"text": "hi"},
+                                     "ttlSeconds": 1})
+        self.harness.store.expire(now=time.time() + 5)
+        client = self.harness.client("b")
+        answer = client.result("comms.wait", {
+            "timeoutMs": 50,
+            "cursor": {"agent": self.agent("b"), "sequence": 0}})
+        self.assertIn(answer["status"], ("ok", "cursor-expired"))
+        if answer["status"] == "cursor-expired":
+            self.assertEqual(answer["oldestAvailableSequence"], 2)
+
+    def test_a_second_wait_on_one_connection_is_capacity(self):
+        client = self.harness.client("b")
+        client.send_request("comms.wait", {"timeoutMs": 4000})
+        second = client.send_request("comms.wait", {"timeoutMs": 4000})
+        answer = client.receive()
+        self.assertEqual(answer["id"], second)
+        self.assertEqual(answer["error"]["code"], CAPACITY)
+
+    def test_a_reused_pending_request_id_is_wait_pending(self):
+        client = self.harness.client("b")
+        for _ in range(2):
+            client._write({"jsonrpc": "2.0", "id": "dup",
+                           "method": "comms.wait",
+                           "params": {"timeoutMs": 4000}})
+        answer = client.receive()
+        self.assertEqual(answer["id"], "dup")
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+        self.assertEqual(answer["error"]["message"], "wait-pending")
+        # The first wait is untouched and still answers on its own.
+        client.notify("rpc.cancel", {"id": "dup"})
+        self.assertEqual(client.receive()["error"]["code"], -32800)
+
+    def test_a_wait_with_a_foreign_cursor_is_refused(self):
+        client = self.harness.client("b")
+        answer = client.call("comms.wait", {
+            "timeoutMs": 50,
+            "cursor": {"agent": self.agent("a"), "sequence": 0}})
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+
+    def test_a_wait_with_a_broken_timeout_is_refused(self):
+        client = self.harness.client("b")
+        for timeout in (-1, "soon", True, [1]):
+            answer = client.call("comms.wait", {"timeoutMs": timeout})
+            self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+
+    def test_a_wait_is_clamped_to_the_configured_maximum(self):
+        self.harness = self.make_harness(comms_wait_max=0.05)
+        self.addCleanup(self.harness.close)
+        client = self.harness.client("b")
+        started = time.monotonic()
+        answer = client.result("comms.wait", {"timeoutMs": 60000})
+        self.assertEqual(answer["status"], "timed-out")
+        self.assertLess(time.monotonic() - started, 2.0)
+
+
+class SpawnTests(SocketCase):
+
+    def make_harness(self, **overrides):
+        return Harness(spawns=True, **overrides)
+
+    def spawn(self, client, **params):
+        request = {"requestId": "r1", "dir": self.harness.base,
+                   "argv": ["/bin/true"], "agentId": "kid"}
+        request.update(params)
+        return client.call("comms.spawn", request)
+
+    def test_a_spawn_names_the_child_and_its_parent(self):
+        client = self.harness.client("a")
+        answer = self.spawn(client)
+        self.assertNotIn("error", answer)
+        result = answer["result"]
+        self.assertEqual(result["status"], "spawned")
+        self.assertTrue(result["created"])
+        self.assertEqual(result["agent"], {"nodeId": NODE, "agentId": "kid"})
+        self.assertEqual(result["parent"], {"nodeId": NODE, "agentId": "a"})
+        self.assertEqual(result["session"], {"name": "kid"})
+        self.assertEqual(len(result["spawnId"]), 32)
+        self.assertTrue(self.harness.store.exists("kid"))
+
+    def test_the_child_is_told_where_it_came_from(self):
+        client = self.harness.client("a")
+        result = self.spawn(client)["result"]
+        launched = self.harness.sessions.starts[0]
+        self.assertEqual(launched["name"], "kid")
+        self.assertEqual(launched["env"]["PI_COMMS_AGENT_ID"], "kid")
+        self.assertEqual(launched["env"]["PI_COMMS_NODE_ID"], NODE)
+        self.assertEqual(launched["env"]["PI_COMMS_PARENT_AGENT_ID"], "a")
+        self.assertEqual(launched["env"]["PI_COMMS_SPAWN_ID"],
+                         result["spawnId"])
+        host, port = self.harness.address()
+        self.assertEqual(launched["env_once"]["PI_COMMS_HOST"], host)
+        self.assertEqual(launched["env_once"]["PI_COMMS_PORT"], str(port))
+
+    def test_a_spawn_defaults_its_session_name_to_the_agent(self):
+        client = self.harness.client("a")
+        self.spawn(client, agentId=None, name="worker")
+        result = self.harness.sessions.starts[0]
+        self.assertEqual(result["name"], "worker")
+
+    def test_a_retried_spawn_replays_its_verdict(self):
+        client = self.harness.client("a")
+        first = self.spawn(client)["result"]
+        second = self.spawn(client)["result"]
+        self.assertEqual(second["spawnId"], first["spawnId"])
+        self.assertFalse(second["created"])
+        self.assertEqual(second["status"], "spawned")
+        self.assertEqual(len(self.harness.sessions.starts), 1)
+
+    def test_one_request_id_with_another_body_is_refused(self):
+        client = self.harness.client("a")
+        self.spawn(client)
+        answer = self.spawn(client, argv=["/bin/false"])
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+        self.assertEqual(len(self.harness.sessions.starts), 1)
+
+    def test_a_taken_session_name_leaves_no_mailbox(self):
+        self.harness.sessions.created = False
+        client = self.harness.client("a")
+        refused = self.spawn(client)
+        self.assertEqual(refused["error"]["code"], INVALID_PARAMS)
+        self.assertEqual(refused["error"]["message"], "name-taken")
+        self.assertFalse(self.harness.store.exists("kid"))
+        self.harness.sessions.created = True
+        retried = self.spawn(client)
+        self.assertEqual(retried["result"]["status"], "spawned")
+        self.assertEqual(len(self.harness.sessions.starts), 2)
+
+    def test_a_failed_launch_leaves_no_record_or_mailbox(self):
+        self.harness.sessions.failure = "spawn-failed"
+        client = self.harness.client("a")
+        answer = self.spawn(client)
+        self.assertEqual(answer["error"]["code"], UNAVAILABLE)
+        self.assertEqual(answer["error"]["message"], "spawn-failed")
+        self.assertFalse(self.harness.store.exists("kid"))
+        self.harness.sessions.failure = None
+        retried = self.spawn(client)["result"]
+        self.assertEqual(retried["status"], "spawned")
+        self.assertTrue(retried["created"])
+        self.assertTrue(self.harness.store.exists("kid"))
+        self.assertEqual(len(self.harness.sessions.starts), 2)
+
+    def test_a_client_may_not_set_identity_variables(self):
+        client = self.harness.client("a")
+        answer = self.spawn(client, env={"PI_COMMS_AGENT_ID": "x"})
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+        self.assertEqual(self.harness.sessions.starts, [])
+
+    def test_an_agent_cannot_spawn_itself(self):
+        client = self.harness.client("a")
+        answer = self.spawn(client, agentId="a")
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+
+    def test_a_missing_directory_is_refused(self):
+        client = self.harness.client("a")
+        answer = self.spawn(client, dir=os.path.join(self.harness.base,
+                                                     "missing"))
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+        self.assertEqual(answer["error"]["message"], "no-dir")
+
+    def test_a_broken_argv_is_refused(self):
+        client = self.harness.client("a")
+        for argv in ([], "true", [1], [""]):
+            answer = self.spawn(client, argv=argv)
+            self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+
+    def test_spawn_is_not_offered_without_a_launcher(self):
+        self.harness = Harness()
+        self.addCleanup(self.harness.close)
+        client = self.harness.client("a")
+        self.assertNotIn("comms.spawn", client.greeting["result"]["methods"])
+        answer = client.call("comms.spawn", {"requestId": "r1",
+                                             "dir": self.harness.base,
+                                             "argv": ["/bin/true"]})
+        self.assertEqual(answer["error"]["code"], METHOD_NOT_FOUND)
 
 
 if __name__ == "__main__":

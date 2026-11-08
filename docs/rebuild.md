@@ -287,7 +287,8 @@ presents `{token, version, agent}` at `rpc.hello` and is bound to that
 agent for its life; the greeting returns the methods, the subscribeable
 topics (`comms.message`), the bound agent, its mailbox cursor and the
 frame limit. The published methods are `comms.send`, `comms.broadcast`,
-`comms.replay` and `comms.ack`, over the profile's `rpc.subscribe`,
+`comms.replay`, `comms.ack` and `comms.wait`, plus `comms.spawn` when the
+daemon composes a launcher, over the profile's `rpc.subscribe`,
 `rpc.unsubscribe` and `rpc.cancel`; there is no `comms.list`,
 `comms.register` or `comms.unregister`.
 
@@ -336,9 +337,50 @@ accepted, minus the sender. The receipt freezes that audience, so a
 later mailbox receives no earlier broadcast and a retry expands no
 further.
 
+`comms.wait` long-polls the mailbox: `{cursor?, limit?, timeoutMs?}`
+answers in the shape of `comms.replay` with `status` `ok` or `timed-out`,
+where a timeout returns the unchanged cursor. The wait is clamped by
+`comms_wait_max`, never holds its connection (the socket keeps reading),
+is answered `-32800` by `rpc.cancel` and `-32003` by shutdown, and a
+second concurrent wait on one connection or a wait over
+`comms_wait_cap` (the global count) or the wait already outstanding on
+that connection answers `capacity`, with `comms_waits_per_connection`
+(default 1) waits allowed on one connection. The same request id reused
+while its wait is pending answers `-32602` (`wait-pending`), and
+shutdown answers every pending wait `-32003` before the listener closes
+its sockets. A cursor the mailbox no longer holds answers `cursor-expired`
+with `oldestAvailableSequence`, exactly as `comms.replay` reports it.
+Waits are answered from the mailbox, not from the live relay, so a wait
+never loses mail that a disconnected notification queue dropped.
+
 `spawn` delegates the process to the sessions domain; comms owns the
 spawn record with the child's identity, its parent provenance and the
-launch correlation ID. The parent reference is informational: a child's
+launch correlation ID. It takes `{requestId, agentId?, name?, dir, argv,
+cols?, rows?, env?, envOnce?}` and answers `{status, spawnId,
+requestId, agent, parent, session, created, reason?}`. The ledger record
+is written before the mailbox is reserved and the process started, so a
+retry with the same `requestId` and the same body replays the recorded
+verdict while a different body is `request-conflict`. The record never
+expires while it is `launching`, and a restart settles it `failed` with
+reason `interrupted` rather than launching twice. A launch that started
+nothing leaves neither record nor mailbox and answers its reason
+(`no-dir`, `name-taken`, `invalid-session`, `spawn-failed`), so a retry
+is free. The mailbox such a launch reserved is provisional and belongs
+to one launch, named by its `spawnId`. Presenting the identity or
+addressing mail to it adopts the mailbox, and only the launch that
+reserved an empty, unadopted mailbox can remove it. A ledger that cannot
+be written answers `store-failed` (`-32003`). A reservation that failed
+leaves no record, while a launch whose settlement failed stays
+`launching` and every retry replays that uncertainty instead of
+launching twice. A rollback that cannot be written also answers
+`store-failed`, so the retry replays that uncertainty rather than
+reporting a free failure. The child is told who launched it through
+`PI_COMMS_AGENT_ID`, `PI_COMMS_NODE_ID`, `PI_COMMS_PARENT_AGENT_ID` and
+`PI_COMMS_SPAWN_ID`, and once, in `envOnce`, where to connect back
+through `PI_COMMS_HOST` and `PI_COMMS_PORT`. A client may not set those
+variables.
+There is no other link: the parent is a provenance line in the child's
+environment, never a dependency. The parent reference is informational: a child's
 mail, own spawns, tools and memory writes never consult the parent's
 liveness, subscription or connection, no termination cascades, and
 ending either session leaves both mailboxes intact. Peers carry mail and
@@ -397,8 +439,9 @@ the two implementations never share a runtime directory.
 * The outbound queue bounds frames, not bytes: one connection can hold
   `comms_outbound_queue` frames of up to `frame_bytes`, and nothing caps
   the connection count. Give it a byte budget when fan-out grows.
-* Native comms: mailbox, relay, waits, spawn, peers, and the
-  `agent-comms` RPC listener.
+* Comms peers: cross-node mail, remote spawn and the peer link, on top
+  of the mailbox, relay, waits, spawn and the `agent-comms` listener
+  that are in place.
 * Extension and `pi-rc` rewiring; installer and migration tooling.
 * Discovery: `ServiceDirectory`, activation, binding and self
   provisioning, which the descriptor work above prepares for.

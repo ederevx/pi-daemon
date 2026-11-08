@@ -675,6 +675,71 @@ class EndpointTests(unittest.TestCase):
             other.start()
 
 
+class CommsSpawnTests(unittest.TestCase):
+    """The real composition: comms launching through the sessions domain."""
+
+    def setUp(self):
+        self.app = DaemonApplication.from_environment({
+            "PI_DAEMON_STATE_DIR": roots()[0],
+            "PI_DAEMON_RUNTIME_DIR": roots()[1],
+        }).start()
+        self.scratch = tempfile.mkdtemp(dir=SCRATCH)
+
+    def tearDown(self):
+        self.app.stop()
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def spawn(self, **changes):
+        service = self.app._comms
+        spec = {"agentId": "kid", "name": None, "dir": self.scratch,
+                "argv": [sys.executable, "-c", "pass"],
+                "cols": None, "rows": None, "env": None, "envOnce": None}
+        spec.update(changes)
+        return service.spawn({"nodeId": service.node_id(),
+                              "agentId": "parent"}, "r1", spec)
+
+    def test_comms_composes_a_launcher_over_the_sessions_service(self):
+        self.assertIsNotNone(self.app._sessions)
+        self.assertTrue(self.app._comms.spawns_enabled())
+
+    def test_a_spawn_launches_a_real_child_and_reserves_its_mailbox(self):
+        result = self.spawn()
+        self.assertEqual(result["status"], "spawned")
+        self.assertEqual(result["agent"], {"nodeId": self.app._comms.node_id(),
+                                           "agentId": "kid"})
+        self.assertEqual(result["session"], {"name": "kid"})
+        self.assertTrue(self.app._comms_store.exists("kid"))
+        names = [view["name"] for view in self.app._sessions.sessions()]
+        self.assertIn("kid", names)
+
+    def test_a_launch_reaches_the_real_sessions_domain_with_its_env(self):
+        report = os.path.join(self.scratch, "env.txt")
+        script = ("import os, json\n"
+                  "open(%r, 'w').write(json.dumps(dict(os.environ)))\n" % report)
+        result = self.spawn(argv=[sys.executable, "-c", script],
+                            envOnce={"PI_TEST_ONCE": "once"})
+        self.assertEqual(result["status"], "spawned")
+        child = self.app._sessions.sessions()
+        self.assertEqual([view["name"] for view in child], ["kid"])
+        deadline = time.monotonic() + 10.0
+        while not os.path.exists(report) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        with open(report, encoding="utf-8") as opened:
+            environment = json.load(opened)
+        self.assertEqual(environment.get("PI_TEST_ONCE"), "once")
+        self.assertEqual(environment.get("PI_COMMS_AGENT_ID"), "kid")
+        self.assertEqual(environment.get("PI_COMMS_PARENT_AGENT_ID"),
+                         "parent")
+        self.assertEqual(environment.get("PI_COMMS_PORT"),
+                         str(self.app._comms._endpoint["port"]))
+
+    def test_a_retry_replays_the_launch_it_already_made(self):
+        first = self.spawn()
+        second = self.spawn()
+        self.assertEqual(second["spawnId"], first["spawnId"])
+        self.assertFalse(second["created"])
+
+
 class StopTests(unittest.TestCase):
     def test_stop_removes_the_descriptor_and_releases_ownership(self):
         state, runtime = roots()

@@ -53,6 +53,9 @@ class RuntimeLayout:
     def comms_node_path(self):
         return os.path.join(self.domain_root("comms"), "node.json")
 
+    def comms_spawns_path(self):
+        return os.path.join(self.domain_root("comms"), "spawns.json")
+
     def settings_path(self):
         return os.path.join(self._state_root, "settings.json")
 

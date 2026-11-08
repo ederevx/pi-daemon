@@ -8,10 +8,12 @@ import threading
 from .comms.mailbox_store import MailboxStore
 from .comms.node_identity import NodeIdentity
 from .comms.service import CommsService
+from .comms.spawn_ledger import SpawnLedger
 from .config import ServiceConfig
 from .lifecycle.instance_coordinator import InstanceCoordinator
 from .runtime_layout import RuntimeLayout
 from .sessions.identity import ProcessIdentity
+from .sessions.launcher import SessionLauncher
 from .sessions.operations import SessionOperations
 from .sessions.pty_backend import PosixPtyBackend, service_root
 from .sessions.relay import SessionRelay
@@ -51,6 +53,7 @@ class DaemonApplication:
         self._comms = None
         self._comms_store = None
         self._comms_listener = None
+        self._comms_spawns = None
         self._node_identity = None
 
     @classmethod
@@ -80,6 +83,9 @@ class DaemonApplication:
             tasks = TaskService(store, runner)
             self._tasks = tasks
             sessions = self._compose_sessions()
+            # Comms composes its launcher over the sessions service, so the
+            # owner must be visible before comms is built.
+            self._sessions = sessions
             handlers = TaskOperations(tasks).handlers()
             handlers.update(SessionOperations(
                 sessions, self.request_stop, self._config).handlers())
@@ -95,7 +101,6 @@ class DaemonApplication:
         except BaseException:
             self._unwind()
             raise
-        self._sessions = sessions
         return self
 
     def _compose_sessions(self):
@@ -121,12 +126,19 @@ class DaemonApplication:
         store = MailboxStore(self._layout.comms_mailbox_path(), self._config,
                              identity.id())
         self._comms_store = store
-        service = CommsService(store, self._config, token, identity.id())
+        spawns = SpawnLedger(self._layout.comms_spawns_path(), self._config,
+                             identity.id())
+        self._comms_spawns = spawns
+        launcher = SessionLauncher(self._sessions, self._config)
+        service = CommsService(store, self._config, token, identity.id(),
+                               spawns, launcher)
         self._comms = service
         service.start()
         listener = RpcListener(self._config, RpcCodec(), service)
         self._comms_listener = listener
         listener.start()
+        host, port = listener.address()
+        service.serve_at(host, port)
         return service, listener
 
     def run(self):
@@ -147,6 +159,8 @@ class DaemonApplication:
             self._tasks.begin_shutdown()
         if self._sessions is not None:
             self._sessions.begin_shutdown(self._mode)
+        if self._comms is not None:
+            self._comms.begin_shutdown()
         if self._comms_listener is not None:
             self._comms_listener.stop()
         if self._endpoint is not None:

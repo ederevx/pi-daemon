@@ -76,12 +76,26 @@ class RpcListener:
             self._thread.join(self._config.stop_grace)
         with self._lock:
             connections = list(self._connections)
+        # Wake each reader, but keep the write half open: the worker drains
+        # its queued replies (a shutdown refusal, a last result) before its
+        # writer closes the socket.
         for connection in connections:
             try:
-                connection.shutdown(socket.SHUT_RDWR)
+                connection.shutdown(socket.SHUT_RD)
             except OSError:
                 pass
         with self._lock:
             workers = list(self._workers)
         for worker in workers:
             worker.join(self._config.stop_grace)
+        with self._lock:
+            remaining = list(self._connections)
+        for connection in remaining:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                connection.close()
+            except OSError:
+                pass
