@@ -31,6 +31,13 @@ class ServiceConfig:
     write_retries: int = 5
     write_retry_delay: float = 0.05
     shell: str = ""
+    default_cols: int = 120
+    default_rows: int = 40
+    master_chunk_bytes: int = 65536
+    relay_buffer_bytes: int = 262144
+    relay_tick: float = 0.05
+    settle_grace: float = 1.0
+    history_limit: int = 4
     revision: int = 0
 
     @classmethod

@@ -36,6 +36,17 @@ class RuntimeLayout:
         os.makedirs(path, exist_ok=True)
         return path
 
+    def sessions_path(self):
+        return os.path.join(self.domain_root("sessions"), "sessions.json")
+
+    def run_state_dir(self):
+        path = os.path.join(self.domain_root("sessions"), "runs")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def session_state_path(self, key):
+        return os.path.join(self.run_state_dir(), f"{key}.json")
+
     def settings_path(self):
         return os.path.join(self._state_root, "settings.json")
 
