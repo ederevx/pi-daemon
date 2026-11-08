@@ -263,6 +263,29 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "too-busy")
         service.cancel(first["id"])
 
+    def test_a_reset_race_ends_the_child_and_the_submission(self):
+        service, store, _ = tasks_service()
+        runner = service._runner
+        spawned = []
+        real_spawn = runner._spawn
+
+        def spawn(snapshot, env):
+            child = real_spawn(snapshot, env)
+            spawned.append(child)
+            return child
+
+        def gone(ticket_id, pid, started):
+            raise LookupError(ticket_id)
+
+        runner._spawn = spawn
+        store.mark_running = gone
+        with self.assertRaises(TaskError) as caught:
+            service.submit("pi-1", SCRATCH, "sleep 30")
+        self.assertEqual(caught.exception.code, "spawn-failed")
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].poll())
+        self.assertEqual(store.running_ids(), [])
+
     def test_a_paged_offset_past_the_end_is_clamped(self):
         service, _, _ = tasks_service()
         ticket, _ = service.submit("pi-1", SCRATCH, "printf 'abc'")
