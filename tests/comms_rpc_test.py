@@ -2,6 +2,7 @@
 """Identity-bound agent messaging over real sockets (pi-rpc/1).
 Zero dependencies (stdlib only)."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -18,6 +19,9 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "service"))
 
 from daemon_service.comms.mailbox_store import MailboxStore
+from daemon_service.comms.peer_auth import PeerAuthenticator
+from daemon_service.comms.peer_config_store import PeerConfigStore
+from daemon_service.comms.peer_manager import PeerManager
 from daemon_service.comms.service import CommsService
 from daemon_service.comms.spawn_ledger import SpawnLedger
 from daemon_service.config import ServiceConfig
@@ -40,7 +44,7 @@ class Client:
     """A test consumer: one socket, its ids and its notification queue."""
 
     def __init__(self, address, agent_id=None, token=TOKEN, version=1,
-                 node_id=None, greeting=True):
+                 node_id=None, greeting=True, peer=None):
         self._codec = RpcCodec()
         self._socket = socket.create_connection(address, timeout=5.0)
         self._socket.settimeout(5.0)
@@ -50,10 +54,12 @@ class Client:
         self.greeting = {}
         if greeting:
             params = {"token": token, "version": version}
-            if agent_id is not None:
+            if peer is not None:
+                params = {"version": version, "peer": peer}
+            elif agent_id is not None:
                 params["agent"] = {"agentId": agent_id}
-            if node_id is not None:
-                params["agent"]["nodeId"] = node_id
+                if node_id is not None:
+                    params["agent"]["nodeId"] = node_id
             self.greeting = self._exchange("rpc.hello", params)
 
     def call(self, method, params=None):
@@ -131,10 +137,30 @@ class StubSessions:
                 "session": {"name": name, "pid": 4242}}
 
 
+class FakeTunnel:
+    """A tunnel that is up at a port nothing listens on: no ssh in tests."""
+
+    def __init__(self):
+        self.started = 0
+        self.closed = 0
+        self._address = ("127.0.0.1", 1)
+
+    def start(self, _peer):
+        self.started += 1
+        return self._address
+
+    def address(self):
+        return self._address
+
+    def close(self):
+        self.closed += 1
+        return True
+
+
 class Harness:
     """One daemon-side comms stack on a scratch root."""
 
-    def __init__(self, spawns=False, **overrides):
+    def __init__(self, spawns=False, peers=None, **overrides):
         self.base = tempfile.mkdtemp(prefix="pi-comms-rpc-")
         layout = RuntimeLayout(os.path.join(self.base, "state"),
                               os.path.join(self.base, "run"))
@@ -149,6 +175,16 @@ class Harness:
             launcher = SessionLauncher(self.sessions, self.config)
         self.service = CommsService(self.store, self.config, TOKEN, NODE,
                                     ledger, launcher)
+        self.peer_store = None
+        if peers is not None:
+            self.peer_store = PeerConfigStore(layout.comms_peers_path(),
+                                             self.config)
+            self.service.use_peers(PeerManager(
+                self.config, self.store, self.peer_store,
+                PeerAuthenticator(self.config, self.peer_store,
+                                  reader=lambda _path: peers),
+                self.service.deliver_peer, NODE,
+                tunnel_factory=FakeTunnel))
         self.service.start()
         self.listener = RpcListener(self.config, RpcCodec(), self.service)
         self.listener.start()
@@ -381,14 +417,14 @@ class MessagingTests(SocketCase):
         self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
         self.assertEqual(sender.result("comms.replay", {})["status"], "ok")
 
-    def test_a_send_to_a_foreign_node_is_undeliverable(self):
+    def test_a_send_to_an_unconfigured_peer_is_undeliverable(self):
         sender = self.harness.client("a")
         self.reserve("b")
         answer = sender.result("comms.send", {
             "requestId": "r1", "to": {"nodeId": "peer", "agentId": "b"},
             "kind": "text", "payload": {"n": 1}})
         self.assertEqual(answer["status"], "undeliverable")
-        self.assertEqual(answer["reason"], "remote-node")
+        self.assertEqual(answer["reason"], "no-such-peer")
 
     def test_acknowledgement_is_shared_between_connections(self):
         sender = self.harness.client("a")
@@ -810,3 +846,178 @@ class SpawnTests(SocketCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class PeerWireTests(SocketCase):
+    """The peer wire: its own credential, its own methods, its own mail."""
+
+    NODE_B = "b" * 32
+    CREDENTIAL = "shared"
+
+    def make_harness(self, **overrides):
+        values = {"comms_peer_reconnect_initial": 3600.0,
+                  "comms_peer_reconnect_max": 3600.0}
+        values.update(overrides)
+        return Harness(peers=self.CREDENTIAL, **values)
+
+    def spec(self, **overrides):
+        value = {"nodeId": self.NODE_B, "sshTarget": "peer.example",
+                 "remotePort": 5000, "localPort": 0,
+                 "outboundCredentialFile": "/run/cred",
+                 "inboundCredentialSha256": hashlib.sha256(
+                     self.CREDENTIAL.encode("utf-8")).hexdigest()}
+        value.update(overrides)
+        return value
+
+    def configure(self, **overrides):
+        return self.harness.client("op").result("comms.peer.add",
+                                                self.spec(**overrides))
+
+    def peer_client(self, node_id=None, credential=CREDENTIAL, **options):
+        client = Client(self.harness.address(),
+                        peer={"nodeId": node_id or self.NODE_B,
+                              "credential": credential}, **options)
+        self.harness.clients.append(client)
+        return client
+
+    def delivery(self, delivery_id="d1", to="b"):
+        now = time.time()
+        return {"deliveryId": delivery_id,
+                "from": {"nodeId": self.NODE_B, "agentId": "a"},
+                "to": {"nodeId": NODE, "agentId": to},
+                "kind": "text",
+                "payload": {"text": "hi"},
+                "createdAt": now,
+                "expiresAt": now + 60}
+
+    def test_a_peer_gets_its_own_greeting_and_never_an_agent_session(self):
+        self.configure()
+        peer = self.peer_client()
+        self.assertNotIn("error", peer.greeting)
+        greeting = peer.greeting["result"]
+        self.assertEqual(greeting["nodeId"], NODE)
+        self.assertEqual(greeting["peer"], {"nodeId": self.NODE_B})
+        self.assertEqual(greeting["topics"], [])
+        self.assertIn("comms.peer.deliver", greeting["methods"])
+        self.assertIn("comms.peer.ping", greeting["methods"])
+        self.assertNotIn("comms.send", greeting["methods"])
+        self.assertNotIn("comms.peer.add", greeting["methods"])
+        self.assertNotIn("agent", greeting)
+
+    def test_an_agent_is_offered_the_peer_administration_not_the_peer_wire(self):
+        self.configure()
+        greeting = self.harness.client("op").greeting["result"]
+        self.assertIn("comms.peer.add", greeting["methods"])
+        self.assertIn("comms.peer.list", greeting["methods"])
+        self.assertNotIn("comms.peer.deliver", greeting["methods"])
+
+    def test_a_peer_without_a_configured_verifier_is_refused(self):
+        peer = self.peer_client()
+        self.assertEqual(peer.greeting["error"]["code"], UNAUTHORIZED)
+        self.assertIsNone(self.harness.peer_store.get(self.NODE_B))
+
+    def test_a_peer_with_the_wrong_credential_is_refused(self):
+        self.configure()
+        peer = self.peer_client(credential="other")
+        self.assertEqual(peer.greeting["error"]["code"], UNAUTHORIZED)
+
+    def test_a_peer_hello_cannot_carry_the_daemon_token(self):
+        self.configure()
+        client = Client(self.harness.address(), agent_id="a")
+        client.close()
+        answer = Client(self.harness.address(), greeting=False)
+        self.harness.clients.append(answer)
+        answer._write({"jsonrpc": "2.0", "id": "c1", "method": "rpc.hello",
+                       "params": {"version": 1, "token": TOKEN,
+                                  "peer": {"nodeId": self.NODE_B,
+                                           "credential": self.CREDENTIAL}}})
+        self.assertEqual(answer._read()["error"]["code"], INVALID_PARAMS)
+
+    def test_a_peer_hello_cannot_claim_an_agent_identity(self):
+        self.configure()
+        answer = Client(self.harness.address(), greeting=False)
+        self.harness.clients.append(answer)
+        answer._write({"jsonrpc": "2.0", "id": "c1", "method": "rpc.hello",
+                       "params": {"version": 1, "agent": {"agentId": "a"},
+                                  "peer": {"nodeId": self.NODE_B,
+                                           "credential": self.CREDENTIAL}}})
+        self.assertEqual(answer._read()["error"]["code"], INVALID_PARAMS)
+
+    def test_a_peer_delivers_mail_into_the_local_mailbox(self):
+        self.configure()
+        self.reserve("b")
+        peer = self.peer_client()
+        answer = peer.result("comms.peer.deliver",
+                             {"delivery": self.delivery()})
+        self.assertEqual(answer["status"], "accepted")
+        self.assertEqual(answer["sequence"], 1)
+        self.assertEqual(answer["deliveryId"], "d1")
+        replayed = self.harness.client("b").result("comms.replay", {})
+        self.assertEqual(len(replayed["messages"]), 1)
+        self.assertEqual(replayed["messages"][0]["from"],
+                         {"nodeId": self.NODE_B, "agentId": "a"})
+
+    def test_a_repeated_delivery_answers_the_same_outcome_once(self):
+        self.configure()
+        self.reserve("b")
+        peer = self.peer_client()
+        delivery = self.delivery()
+        first = peer.result("comms.peer.deliver", {"delivery": delivery})
+        again = peer.result("comms.peer.deliver", {"delivery": delivery})
+        self.assertEqual(again, first)
+        self.assertEqual(len(self.harness.client("b")
+                             .result("comms.replay", {})["messages"]), 1)
+
+    def test_a_peer_cannot_reach_an_agent_method(self):
+        self.configure()
+        peer = self.peer_client()
+        answer = peer.call("comms.send", {"requestId": "r1",
+                                          "to": self.agent("a"),
+                                          "kind": "text",
+                                          "payload": {"n": 1}})
+        self.assertEqual(answer["error"]["code"], METHOD_NOT_FOUND)
+
+    def test_an_agent_cannot_deliver_as_a_peer(self):
+        self.configure()
+        answer = self.harness.client("a").call(
+            "comms.peer.deliver", {"delivery": self.delivery()})
+        self.assertEqual(answer["error"]["code"], METHOD_NOT_FOUND)
+
+    def test_a_removed_peer_cannot_deliver_under_its_old_generation(self):
+        self.configure()
+        self.reserve("b")
+        peer = self.peer_client()
+        removed = self.harness.client("op").result("comms.peer.remove",
+                                                   {"nodeId": self.NODE_B})
+        self.assertEqual(removed["status"], "removed")
+        answer = peer.call("comms.peer.deliver", {"delivery": self.delivery()})
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+        self.assertEqual(self.harness.client("b").result(
+            "comms.replay", {})["messages"], [])
+
+    def test_the_operator_configures_lists_and_removes_a_peer(self):
+        operator = self.harness.client("op")
+        added = operator.result("comms.peer.add", self.spec())
+        self.assertEqual(added["status"], "configured")
+        self.assertTrue(added["created"])
+        self.assertNotIn("inboundCredentialSha256", added["peer"])
+        self.assertNotIn("outboundCredentialFile", added["peer"])
+        listed = operator.result("comms.peer.list", {})
+        self.assertEqual([peer["nodeId"] for peer in listed["peers"]],
+                         [self.NODE_B])
+        self.assertEqual(listed["peers"][0]["state"], "down")
+        operator.result("comms.peer.remove", {"nodeId": self.NODE_B})
+        self.assertEqual(operator.result("comms.peer.list", {})["peers"], [])
+
+    def test_a_peer_specification_is_validated_at_the_wire(self):
+        operator = self.harness.client("op")
+        for field, value in (("nodeId", "not-a-node"),
+                             ("sshTarget", "-oProxyCommand=evil"),
+                             ("sshTarget", "two words"),
+                             ("remotePort", 0),
+                             ("outboundCredentialFile", "relative"),
+                             ("inboundCredentialSha256", "short")):
+            answer = operator.call("comms.peer.add", self.spec(**{field: value}))
+            self.assertEqual(answer["error"]["code"], INVALID_PARAMS, field)
+        answer = operator.call("comms.peer.add", self.spec(nodeId=NODE))
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)

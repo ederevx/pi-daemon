@@ -24,7 +24,19 @@ UNKNOWN_RECIPIENT = "unknown-recipient"
 REMOTE_NODE = "remote-node"
 RESULT_KIND = "result"
 ALL_TARGET = "all"
-SCHEMA = 1
+QUEUED = "queued"
+ACCEPTED = "accepted"
+UNDELIVERABLE = "undeliverable"
+UNKNOWN = "unknown"
+NO_SUCH_PEER = "no-such-peer"
+PEER_REMOVED = "peer-removed"
+RETENTION_EXPIRED = "retention-expired"
+UNCONFIRMED = "delivery-unconfirmed"
+MAILBOX_FULL = "mailbox-full"
+EXPIRED = "expired"
+RECEIPT_NOT_FOUND = "receipt-not-found"
+SCHEMA = 2
+LEGACY_SCHEMA = 1
 # The room a reply wrapper, an id and the result keys need.
 OVERHEAD_BYTES = 1024
 
@@ -46,14 +58,29 @@ class MailboxStore:
         self._per_recipient = config.comms_messages_per_recipient
         self._page = config.comms_page_messages
         self._reply_bytes = config.frame_bytes - config.comms_frame_margin
+        self._peer_retention = config.comms_peer_retention
+        self._outbox_records = config.comms_peer_outbox_records
         self._node_id = node_id
         self._clock = clock or time.time
         self._lock = threading.RLock()
         self._recipients = {}
         self._receipts = {}
+        self._outbox = {}
+        self._peer_deliveries = {}
 
     def node_id(self):
         return self._node_id
+
+    def now(self):
+        return self._clock()
+
+    def queued(self, peer_node_id, generation=None):
+        with self._lock:
+            return sum(1 for record in self._outbox.values()
+                       if record["state"] == QUEUED and
+                       record["peerNodeId"] == peer_node_id and
+                       (generation is None or
+                        record["peerGeneration"] == generation))
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -64,13 +91,16 @@ class MailboxStore:
             if text is None:
                 self._recipients = {}
                 self._receipts = {}
+                self._outbox = {}
+                self._peer_deliveries = {}
                 return
             try:
                 data = json.loads(text)
             except ValueError:
                 raise CommsError(STORE_CORRUPT) from None
-            recipients, receipts = self._restore(data)
-            self._recipients, self._receipts = recipients, receipts
+            restored = self._restore(data)
+            (self._recipients, self._receipts, self._outbox,
+             self._peer_deliveries) = restored
             self._expire_locked(self._clock())
 
     def save(self):
@@ -78,17 +108,26 @@ class MailboxStore:
             self._file.write_dict(self._snapshot_locked())
 
     def _restore(self, data):
-        if not isinstance(data, dict) or data.get("version") != SCHEMA:
+        if not isinstance(data, dict) or \
+                data.get("version") not in (SCHEMA, LEGACY_SCHEMA):
             raise CommsError(STORE_CORRUPT)
         raw_recipients = data.get("recipients")
         raw_receipts = data.get("send_receipts")
+        raw_outbox = data.get("outbox") or {}
+        raw_inbound = data.get("peer_deliveries") or {}
         if not isinstance(raw_recipients, dict) or \
-                not isinstance(raw_receipts, dict):
+                not isinstance(raw_receipts, dict) or \
+                not isinstance(raw_outbox, dict) or \
+                not isinstance(raw_inbound, dict):
             raise CommsError(STORE_CORRUPT)
         return ({agent_id: self._restore_recipient(state)
                  for agent_id, state in raw_recipients.items()},
                 {key: self._restore_receipt(value)
-                 for key, value in raw_receipts.items()})
+                 for key, value in raw_receipts.items()},
+                {key: self._restore_outbox(value)
+                 for key, value in raw_outbox.items()},
+                {key: self._restore_inbound(value)
+                 for key, value in raw_inbound.items()})
 
     def _restore_recipient(self, state):
         try:
@@ -135,6 +174,7 @@ class MailboxStore:
         try:
             if not isinstance(value, dict):
                 raise CommsError(STORE_CORRUPT)
+            at = self._finite(value["at"])
             return {
                 "digest": self._text(value["digest"]),
                 "accepted": [self._restore_accepted(item)
@@ -142,8 +182,58 @@ class MailboxStore:
                 "undeliverable": [self._restore_undeliverable(item)
                                   for item in self._list(
                                       value["undeliverable"])],
-                "at": self._finite(value["at"]),
+                "at": at,
+                "retainUntil": self._finite(
+                    value.get("retainUntil", at + self._dedupe_ttl)),
+                "deliveryId": self._optional_text(value.get("deliveryId")),
+                "initial": self._optional_map(value.get("initial")),
+                "outcome": self._optional_map(value.get("outcome")),
             }
+        except (KeyError, TypeError, ValueError):
+            raise CommsError(STORE_CORRUPT) from None
+        except CommsError as exc:
+            if exc.code == STORE_CORRUPT:
+                raise
+            raise CommsError(STORE_CORRUPT) from None
+
+    def _restore_outbox(self, value):
+        try:
+            if not isinstance(value, dict):
+                raise CommsError(STORE_CORRUPT)
+            state = self._text(value["state"])
+            if state not in (QUEUED, ACCEPTED, UNDELIVERABLE, UNKNOWN):
+                raise CommsError(STORE_CORRUPT)
+            delivery = value.get("delivery")
+            settled = value.get("settledAt")
+            return {
+                "receiptKey": self._text(value["receiptKey"]),
+                "peerNodeId": self._text(value["peerNodeId"]),
+                "peerGeneration": self._text(value["peerGeneration"]),
+                "delivery": None if delivery is None
+                else self._detach(delivery),
+                "state": state,
+                "attempts": self._whole(value.get("attempts", 0)),
+                "nextAttemptAt": self._finite(value["nextAttemptAt"]),
+                "expiresAt": self._finite(value["expiresAt"]),
+                "outcome": self._optional_map(value.get("outcome")),
+                "settledAt": None if settled is None else self._finite(settled),
+                "retainUntil": self._finite(value["retainUntil"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            raise CommsError(STORE_CORRUPT) from None
+        except CommsError as exc:
+            if exc.code == STORE_CORRUPT:
+                raise
+            raise CommsError(STORE_CORRUPT) from None
+
+    def _restore_inbound(self, value):
+        try:
+            if not isinstance(value, dict):
+                raise CommsError(STORE_CORRUPT)
+            return {"digest": self._text(value["digest"]),
+                    "expiresAt": self._finite(value["expiresAt"]),
+                    "retainUntil": self._finite(value["retainUntil"]),
+                    "outcome": self._detach(value["outcome"])}
         except (KeyError, TypeError, ValueError):
             raise CommsError(STORE_CORRUPT) from None
         except CommsError as exc:
@@ -175,6 +265,10 @@ class MailboxStore:
             },
             "send_receipts": {key: self._detach(value)
                               for key, value in self._receipts.items()},
+            "outbox": {key: self._detach(value)
+                       for key, value in self._outbox.items()},
+            "peer_deliveries": {key: self._detach(value)
+                                for key, value in self._peer_deliveries.items()},
         }
 
     # -- mailboxes ---------------------------------------------------------
@@ -252,12 +346,13 @@ class MailboxStore:
     # -- acceptance --------------------------------------------------------
 
     def accept(self, sender, request_id, target, kind, payload,
-               ttl_seconds=None):
+               ttl_seconds=None, peer=None):
         """One durable commit: selection, sequences, envelopes and receipt.
 
         `target` is one address or ALL_TARGET for every existing mailbox.
         The fingerprint describes the request; the receipt records what it
-        resolved to, so a retry replays the first expansion.
+        resolved to, so a retry replays the first expansion. A foreign
+        address is queued for its peer in the same commit.
         """
         sender_address = self._address(sender)
         encoded = self._payload_text(payload)
@@ -273,6 +368,12 @@ class MailboxStore:
                 if stored["digest"] != digest:
                     raise CommsError(REQUEST_CONFLICT)
                 return self._duplicate_result(stored)
+            if descriptor["kind"] == "direct" and \
+                    descriptor["to"]["nodeId"] and \
+                    descriptor["to"]["nodeId"] != self._node_id:
+                return self._peer_accept_locked(
+                    key, digest, sender_address, descriptor["to"], kind,
+                    encoded, wanted_ttl, str(request_id), now, peer)
             addresses = self._resolve_locked(descriptor, sender_address)
             candidate = {agent_id: self._copy_state(state)
                          for agent_id, state in self._recipients.items()}
@@ -292,7 +393,11 @@ class MailboxStore:
             receipt = {"digest": digest,
                        "accepted": accepted,
                        "undeliverable": undeliverable,
-                       "at": now}
+                       "at": now,
+                       "retainUntil": now + self._dedupe_ttl,
+                       "deliveryId": None,
+                       "initial": None,
+                       "outcome": None}
             receipts = dict(self._receipts)
             receipts[key] = receipt
             self._commit_locked(candidate, receipts)
@@ -334,12 +439,275 @@ class MailboxStore:
         return {"reason": None, "envelope": self._detach(envelope)}
 
     def _duplicate_result(self, stored):
+        if stored.get("initial") is not None:
+            result = {"status": "duplicate",
+                      "receipt": self._detach(stored),
+                      "initial": self._detach(stored["initial"])}
+            if stored.get("outcome") is not None:
+                result["outcome"] = self._detach(stored["outcome"])
+            return result
         result = {"status": "duplicate", "receipt": self._detach(stored)}
         if stored["accepted"]:
             result["messages"] = self._detach(stored["accepted"])
         if stored["undeliverable"]:
             result["undeliverable"] = self._detach(stored["undeliverable"])
         return result
+
+    # -- peers -------------------------------------------------------------
+
+    def _peer_accept_locked(self, key, digest, sender_address, address, kind,
+                            encoded, ttl, request_id, now, peer):
+        """A foreign address: one receipt and one queued delivery, together."""
+        to = self._address(address)
+        receipt = {"digest": digest, "accepted": [], "undeliverable": [],
+                   "at": now, "retainUntil": now + self._dedupe_ttl,
+                   "deliveryId": None, "initial": None, "outcome": None}
+        if peer is None or not peer.get("generation"):
+            receipt["undeliverable"] = [{"to": to, "reason": NO_SUCH_PEER}]
+            receipt["initial"] = {"status": UNDELIVERABLE,
+                                  "requestId": request_id,
+                                  "reason": NO_SUCH_PEER}
+            receipts = dict(self._receipts)
+            receipts[key] = receipt
+            self._commit_locked(self._recipients, receipts)
+            return {"status": UNDELIVERABLE,
+                    "receipt": self._detach(receipt),
+                    "undeliverable": self._detach(receipt["undeliverable"])}
+        if len(self._outbox) >= self._outbox_records:
+            raise CommsError(BUSY)
+        delivery_id = uuid.uuid4().hex
+        expires_at = now + min(ttl, self._peer_retention)
+        retain_until = expires_at + self._dedupe_ttl
+        delivery = {"deliveryId": delivery_id, "from": sender_address,
+                    "to": to, "kind": kind,
+                    "payload": json.loads(encoded),
+                    "createdAt": now, "expiresAt": expires_at}
+        record = {"receiptKey": key, "peerNodeId": peer["nodeId"],
+                  "peerGeneration": peer["generation"],
+                  "delivery": delivery, "state": QUEUED, "attempts": 0,
+                  "nextAttemptAt": now, "expiresAt": expires_at,
+                  "outcome": None, "settledAt": None,
+                  "retainUntil": retain_until}
+        receipt["deliveryId"] = delivery_id
+        receipt["retainUntil"] = retain_until
+        receipt["initial"] = {"status": QUEUED, "requestId": request_id,
+                              "deliveryId": delivery_id,
+                              "expiresAt": expires_at}
+        receipts = dict(self._receipts)
+        receipts[key] = receipt
+        outbox = dict(self._outbox)
+        outbox[delivery_id] = record
+        self._commit_locked(self._recipients, receipts, outbox)
+        return {"status": QUEUED, "deliveryId": delivery_id,
+                "expiresAt": expires_at, "peerNodeId": peer["nodeId"],
+                "receipt": self._detach(receipt)}
+
+    def accept_peer(self, peer_node_id, delivery):
+        """The remote node's one envelope, or the refusal it must learn.
+
+        Deduplication comes first: a replay returns the recorded outcome and
+        publishes nothing, whatever the mailbox now holds.
+        """
+        if not isinstance(delivery, dict):
+            raise CommsError(BAD_REQUEST)
+        try:
+            delivery_id = self._text(delivery.get("deliveryId"))
+            source = self._address(delivery.get("from"))
+            to = self._address(delivery.get("to"))
+            kind = self._text(delivery.get("kind"))
+            expires_at = self._finite(delivery.get("expiresAt"))
+            self._finite(delivery.get("createdAt"))
+        except CommsError:
+            raise CommsError(BAD_REQUEST) from None
+        if source["nodeId"] != peer_node_id or to["nodeId"] != self._node_id:
+            raise CommsError(BAD_REQUEST)
+        encoded = self._payload_text(delivery.get("payload"))
+        digest = hashlib.sha256(json.dumps(
+            {"delivery": self._detach(delivery)},
+            sort_keys=True).encode("utf-8")).hexdigest()
+        key = json.dumps([peer_node_id, delivery_id], sort_keys=True)
+        with self._lock:
+            self._expire_if_due_locked()
+            now = self._clock()
+            stored = self._peer_deliveries.get(key)
+            if stored is not None:
+                if stored["digest"] != digest:
+                    raise CommsError(REQUEST_CONFLICT)
+                return {"outcome": self._detach(stored["outcome"]),
+                        "envelope": None}
+            if now >= expires_at:
+                return {"outcome": {"status": EXPIRED,
+                                    "deliveryId": delivery_id},
+                        "envelope": None}
+            candidate = {agent_id: self._copy_state(state)
+                         for agent_id, state in self._recipients.items()}
+            state = candidate.get(to["agentId"])
+            envelope = None
+            if state is None:
+                outcome = {"status": UNDELIVERABLE,
+                           "deliveryId": delivery_id,
+                           "reason": UNKNOWN_RECIPIENT}
+            elif len(state["messages"]) >= self._per_recipient:
+                outcome = {"status": UNDELIVERABLE,
+                           "deliveryId": delivery_id,
+                           "reason": MAILBOX_FULL}
+            else:
+                state["next_sequence"] += 1
+                envelope = {"messageId": uuid.uuid4().hex, "from": source,
+                            "to": to, "sequence": state["next_sequence"],
+                            "kind": kind,
+                            "payload": json.loads(encoded),
+                            "acceptedAt": now, "expiresAt": expires_at}
+                if len(self._encode(envelope)) > self._reply_bytes:
+                    state["next_sequence"] -= 1
+                    envelope = None
+                    outcome = {"status": UNDELIVERABLE,
+                               "deliveryId": delivery_id,
+                               "reason": PAYLOAD_TOO_LARGE}
+                else:
+                    state["messages"].append(envelope)
+                    state["provisional"] = False
+                    outcome = {"status": ACCEPTED,
+                               "deliveryId": delivery_id,
+                               "messageId": envelope["messageId"],
+                               "sequence": envelope["sequence"]}
+            inbound = dict(self._peer_deliveries)
+            inbound[key] = {"digest": digest, "expiresAt": expires_at,
+                            "retainUntil": expires_at + self._dedupe_ttl,
+                            "outcome": self._detach(outcome)}
+            self._commit_locked(candidate, self._receipts, self._outbox,
+                                inbound)
+            return {"outcome": self._detach(outcome),
+                    "envelope": None if envelope is None
+                    else self._detach(envelope)}
+
+    def receipt(self, sender, request_id):
+        """What happened to one send, in the terms the sender asked in."""
+        sender_address = self._address(sender)
+        key = json.dumps([sender_address, str(request_id)], sort_keys=True)
+        with self._lock:
+            self._expire_if_due_locked()
+            stored = self._receipts.get(key)
+            if stored is None:
+                return {"status": UNKNOWN, "reason": RECEIPT_NOT_FOUND}
+            current = stored.get("outcome") or stored.get("initial")
+            if current is not None:
+                answer = {"status": current["status"],
+                          "requestId": str(current.get("requestId") or
+                                           request_id),
+                          "deliveryId": current.get("deliveryId")}
+                for field in ("expiresAt", "messageId", "sequence",
+                              "reason"):
+                    if current.get(field) is not None:
+                        answer[field] = current[field]
+                return answer
+            if stored["accepted"]:
+                first = stored["accepted"][0]
+                return {"status": ACCEPTED, "requestId": str(request_id),
+                        "to": first["to"],
+                        "messageId": first["messageId"],
+                        "sequence": first["sequence"]}
+            if stored["undeliverable"]:
+                return {"status": UNDELIVERABLE,
+                        "requestId": str(request_id),
+                        "reason": stored["undeliverable"][0]["reason"]}
+            return {"status": UNKNOWN, "reason": RECEIPT_NOT_FOUND}
+
+    def due(self, peer_node_id, generation, limit):
+        """The queued deliveries one peer may attempt now, oldest first."""
+        with self._lock:
+            self._expire_if_due_locked()
+            now = self._clock()
+            ready = [record for record in self._outbox.values()
+                     if record["state"] == QUEUED and
+                     record["peerNodeId"] == peer_node_id and
+                     record["peerGeneration"] == generation and
+                     record["nextAttemptAt"] <= now and
+                     record["expiresAt"] > now]
+            ready.sort(key=lambda record: (record["nextAttemptAt"],
+                                           record["expiresAt"]))
+            return [self._detach(record) for record in ready[:int(limit)]]
+
+    def mark_attempt(self, delivery_id, generation, next_attempt_at):
+        """The attempt is durable before the link is allowed to see it."""
+        with self._lock:
+            record = self._outbox.get(delivery_id)
+            if record is None or record["state"] != QUEUED or \
+                    record["peerGeneration"] != generation:
+                return False
+            changed = self._detach(record)
+            changed["attempts"] += 1
+            changed["nextAttemptAt"] = float(next_attempt_at)
+            outbox = dict(self._outbox)
+            outbox[delivery_id] = changed
+            self._commit_locked(self._recipients, self._receipts, outbox)
+            return True
+
+    def settle_peer(self, delivery_id, generation, outcome):
+        """Record a terminal outcome; a repeated report changes nothing."""
+        with self._lock:
+            record = self._outbox.get(delivery_id)
+            if record is None or record["peerGeneration"] != generation:
+                return False
+            if record["state"] != QUEUED:
+                return True
+            status = outcome.get("status") if isinstance(outcome, dict) \
+                else None
+            if status not in (ACCEPTED, UNDELIVERABLE, UNKNOWN):
+                raise CommsError(BAD_REQUEST)
+            changed = self._detach(record)
+            changed["state"] = status
+            changed["outcome"] = self._detach(outcome)
+            changed["settledAt"] = self._clock()
+            changed["delivery"] = None
+            outbox = dict(self._outbox)
+            outbox[delivery_id] = changed
+            receipts = dict(self._receipts)
+            receipt = receipts.get(record["receiptKey"])
+            if receipt is not None:
+                updated = self._detach(receipt)
+                updated["outcome"] = self._detach(outcome)
+                receipts[record["receiptKey"]] = updated
+            self._commit_locked(self._recipients, receipts, outbox)
+            return True
+
+    def cancel_peer(self, peer_node_id, generation, reason):
+        """Settle what one peer can no longer carry, truthfully."""
+        with self._lock:
+            now = self._clock()
+            outbox = dict(self._outbox)
+            receipts = dict(self._receipts)
+            undeliverable = unknown = 0
+            for delivery_id, record in self._outbox.items():
+                if record["state"] != QUEUED or \
+                        record["peerNodeId"] != peer_node_id:
+                    continue
+                if generation is not None and \
+                        record["peerGeneration"] != generation:
+                    continue
+                status = UNDELIVERABLE if record["attempts"] == 0 \
+                    else UNKNOWN
+                changed = self._detach(record)
+                changed["state"] = status
+                changed["settledAt"] = now
+                changed["delivery"] = None
+                changed["outcome"] = {"status": status,
+                                      "deliveryId": delivery_id,
+                                      "reason": reason}
+                outbox[delivery_id] = changed
+                receipt = receipts.get(record["receiptKey"])
+                if receipt is not None:
+                    updated = self._detach(receipt)
+                    updated["outcome"] = self._detach(changed["outcome"])
+                    receipts[record["receiptKey"]] = updated
+                if status == UNDELIVERABLE:
+                    undeliverable += 1
+                else:
+                    unknown += 1
+            if undeliverable or unknown:
+                self._commit_locked(self._recipients, receipts, outbox)
+            return {"settled": undeliverable + unknown,
+                    "undeliverable": undeliverable, "unknown": unknown}
 
     def _resolve_locked(self, descriptor, sender_address):
         if descriptor["kind"] == "all":
@@ -426,18 +794,28 @@ class MailboxStore:
         stale_message = any(message["expiresAt"] <= now
                             for state in self._recipients.values()
                             for message in state["messages"])
-        stale_receipt = any(float(receipt.get("at") or 0) <=
-                            now - self._dedupe_ttl
-                            for receipt in self._receipts.values())
-        if stale_message or stale_receipt:
+        stale_receipt = any(self._retention(value) <= now
+                            for value in self._receipts.values())
+        stale_outbox = any(record["state"] == QUEUED and
+                           record["expiresAt"] <= now
+                           for record in self._outbox.values())
+        stale_inbound = any(value["retainUntil"] <= now
+                            for value in self._peer_deliveries.values())
+        if stale_message or stale_receipt or stale_outbox or stale_inbound:
             self._expire_locked(now)
 
+    def _retention(self, value):
+        """When a receipt's own metadata may be forgotten."""
+        keep = value.get("retainUntil")
+        if keep is None:
+            keep = float(value.get("at") or 0) + self._dedupe_ttl
+        return float(keep)
+
     def _expire_locked(self, now):
-        """Drop expired mail and the acknowledgement markers that named it."""
+        """Drop expired mail and markers; settle what can no longer be sent."""
         candidate = {}
         dropped = 0
         pruned = 0
-        horizon = now - self._dedupe_ttl
         for agent_id, state in self._recipients.items():
             copied = self._copy_state(state)
             fresh = [message for message in copied["messages"]
@@ -452,25 +830,67 @@ class MailboxStore:
             candidate[agent_id] = copied
         receipts = {key: self._detach(value)
                     for key, value in self._receipts.items()
-                    if float(value.get("at") or 0) > horizon}
+                    if self._retention(value) > now}
         receipts_dropped = len(self._receipts) - len(receipts)
-        if dropped or pruned or receipts_dropped:
-            self._commit_locked(candidate, receipts)
-        return dropped + pruned + receipts_dropped
+        outbox = {}
+        settled = 0
+        for delivery_id, record in self._outbox.items():
+            changed = self._detach(record)
+            if changed["state"] == QUEUED and changed["expiresAt"] <= now:
+                status = UNDELIVERABLE if changed["attempts"] == 0 \
+                    else UNKNOWN
+                changed["state"] = status
+                changed["settledAt"] = now
+                changed["delivery"] = None
+                changed["outcome"] = {
+                    "status": status, "deliveryId": delivery_id,
+                    "reason": RETENTION_EXPIRED if status == UNDELIVERABLE
+                    else UNCONFIRMED}
+                self._settle_receipt(receipts, record["receiptKey"],
+                                     changed["outcome"])
+                settled += 1
+            if changed["retainUntil"] > now:
+                outbox[delivery_id] = changed
+            else:
+                settled += 1
+        inbound = {key: self._detach(value)
+                   for key, value in self._peer_deliveries.items()
+                   if value["retainUntil"] > now}
+        inbound_dropped = len(self._peer_deliveries) - len(inbound)
+        if dropped or pruned or receipts_dropped or settled or inbound_dropped:
+            self._commit_locked(candidate, receipts, outbox, inbound)
+        return (dropped + pruned + receipts_dropped + settled + inbound_dropped)
+
+    @staticmethod
+    def _settle_receipt(receipts, key, outcome):
+        receipt = receipts.get(key)
+        if receipt is None:
+            return
+        updated = json.loads(json.dumps(receipt))
+        updated["outcome"] = json.loads(json.dumps(outcome))
+        receipts[key] = updated
 
     # -- internals ---------------------------------------------------------
 
-    def _commit_locked(self, recipients, receipts):
+    def _commit_locked(self, recipients, receipts, outbox=None,
+                       peer_deliveries=None):
         """Persist first, publish second: nobody sees unsaved mail."""
-        previous = (self._recipients, self._receipts)
-        self._recipients, self._receipts = recipients, receipts
+        previous = (self._recipients, self._receipts, self._outbox,
+                    self._peer_deliveries)
+        self._recipients = recipients
+        self._receipts = receipts
+        if outbox is not None:
+            self._outbox = outbox
+        if peer_deliveries is not None:
+            self._peer_deliveries = peer_deliveries
         try:
             encoded = self._encode(self._snapshot_locked())
             if len(encoded) > self._store_bytes:
                 raise CommsError(BUSY)
             self._file.write(encoded.decode("utf-8"))
         except BaseException:
-            self._recipients, self._receipts = previous
+            (self._recipients, self._receipts, self._outbox,
+             self._peer_deliveries) = previous
             raise
 
     def _copy_state(self, state):
@@ -534,6 +954,18 @@ class MailboxStore:
         if not isinstance(value, str) or not value:
             raise CommsError(STORE_CORRUPT)
         return value
+
+    def _optional_text(self, value):
+        if value is None:
+            return None
+        return self._text(value)
+
+    def _optional_map(self, value):
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise CommsError(STORE_CORRUPT)
+        return self._detach(value)
 
     def _whole(self, value):
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:

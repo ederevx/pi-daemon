@@ -7,6 +7,9 @@ import threading
 
 from .comms.mailbox_store import MailboxStore
 from .comms.node_identity import NodeIdentity
+from .comms.peer_auth import PeerAuthenticator
+from .comms.peer_config_store import PeerConfigStore
+from .comms.peer_manager import PeerManager
 from .comms.service import CommsService
 from .comms.spawn_ledger import SpawnLedger
 from .config import ServiceConfig
@@ -54,6 +57,7 @@ class DaemonApplication:
         self._comms_store = None
         self._comms_listener = None
         self._comms_spawns = None
+        self._comms_peers = None
         self._node_identity = None
 
     @classmethod
@@ -132,9 +136,16 @@ class DaemonApplication:
         launcher = SessionLauncher(self._sessions, self._config)
         service = CommsService(store, self._config, token, identity.id(),
                                spawns, launcher)
+        peers = PeerConfigStore(self._layout.comms_peers_path(), self._config)
+        self._comms_peers = peers
+        manager = PeerManager(self._config, store, peers,
+                              PeerAuthenticator(self._config, peers),
+                              service.deliver_peer, identity.id())
+        service.use_peers(manager)
         self._comms = service
         service.start()
-        listener = RpcListener(self._config, RpcCodec(), service)
+        listener = RpcListener(self._config, RpcCodec(), service,
+                               port=self._config.comms_port)
         self._comms_listener = listener
         listener.start()
         host, port = listener.address()
@@ -189,6 +200,7 @@ class DaemonApplication:
         self._comms = None
         self._comms_store = None
         self._comms_listener = None
+        self._comms_peers = None
         self._node_identity = None
 
     def _unwind(self):

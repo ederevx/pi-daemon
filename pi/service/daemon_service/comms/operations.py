@@ -4,8 +4,8 @@ from ..transport.rpc_codec import (CAPACITY, INVALID_PARAMS, UNAVAILABLE)
 from ..transport.rpc_error import RpcError
 from .error import CommsError
 from .mailbox_store import (ALL_TARGET, BAD_REQUEST, BUSY, PAYLOAD_TOO_LARGE,
-                            REQUEST_CONFLICT, STORE_CORRUPT, STORE_FAILED,
-                            UNKNOWN_RECIPIENT)
+                            QUEUED, REQUEST_CONFLICT, STORE_CORRUPT,
+                            STORE_FAILED, UNDELIVERABLE, UNKNOWN_RECIPIENT)
 from .spawn_ledger import ENV_PREFIX, SPAWNED
 from .wait_registry import CLOSING, WAIT_PENDING
 
@@ -43,9 +43,11 @@ class CommsOperations:
             "comms.broadcast": self.broadcast,
             "comms.replay": self.replay,
             "comms.ack": self.ack,
+            "comms.receipt": self.receipt,
         }
         if self._service.spawns_enabled():
             handlers["comms.spawn"] = self.spawn
+        handlers.update(self._service.peer_handlers())
         return handlers
 
     def send(self, sender, params):
@@ -56,12 +58,19 @@ class CommsOperations:
         ttl = self._ttl(params)
         result = self._project(self._service.send, sender, request_id, target,
                                kind, payload, ttl)
+        initial = self._initial(result)
+        if initial is not None:
+            return initial
         accepted = self._accepted(result)
         if accepted:
             return {"status": "accepted",
                     "messageId": accepted[0]["messageId"]}
         return {"status": "undeliverable",
                 "reason": self._undeliverable(result)[0]["reason"]}
+
+    def receipt(self, sender, params):
+        request_id = self._identifier(params, "requestId")
+        return self._project(self._service.receipt, sender, request_id)
 
     def broadcast(self, sender, params):
         request_id = self._identifier(params, "requestId")
@@ -274,6 +283,25 @@ class CommsOperations:
         return {"agent": {"nodeId": agent["nodeId"],
                           "agentId": agent["agentId"]},
                 "sequence": sequence}
+
+    @staticmethod
+    def _initial(result):
+        """A remote send's first answer, replayed as it was first given."""
+        initial = None
+        if result["status"] == QUEUED:
+            initial = result
+        elif result["status"] == "duplicate":
+            initial = result.get("initial")
+        if initial is None:
+            return None
+        if initial["status"] == QUEUED:
+            return {"status": QUEUED,
+                    "deliveryId": initial["deliveryId"],
+                    "expiresAt": initial["expiresAt"]}
+        if initial["status"] == UNDELIVERABLE:
+            return {"status": UNDELIVERABLE,
+                    "reason": initial.get("reason")}
+        return None
 
     @staticmethod
     def _accepted(result):

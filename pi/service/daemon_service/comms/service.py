@@ -10,9 +10,11 @@ from ..transport.rpc_codec import (CAPACITY, INVALID_PARAMS, UNAUTHORIZED,
                                    UNAVAILABLE)
 from ..transport.rpc_error import RpcError
 from .error import CommsError
-from .mailbox_store import BAD_REQUEST, STORE_FAILED
+from .mailbox_store import BAD_REQUEST, QUEUED, STORE_FAILED
 from .message_relay import MessageRelay
 from .operations import CommsOperations, SPAWN_FAILED
+from .peer_operations import PeerOperations
+from .peer_session import PeerSession
 from .session import CommsSession
 from .spawn_ledger import (ENV_AGENT_ID, ENV_HOST, ENV_NODE_ID,
                            ENV_PARENT_AGENT_ID, ENV_PORT, ENV_SPAWN_ID,
@@ -34,6 +36,8 @@ class CommsService:
         self._node_id = node_id
         self._spawns = spawns
         self._launcher = launcher
+        self._peers = None
+        self._peer_operations = None
         self._relay = MessageRelay()
         self._waits = WaitRegistry(store, config)
         self._operations = CommsOperations(self, config)
@@ -50,16 +54,34 @@ class CommsService:
         if self._spawns is not None:
             self._spawns.load()
         self._waits.start()
+        if self._peers is not None:
+            self._peers.start()
         return self
+
+    def use_peers(self, manager, operations=None):
+        """Attach the peer manager and the wire it serves, before start()."""
+        self._peers = manager
+        self._peer_operations = operations or PeerOperations(
+            manager, self._config, self._node_id)
+        return self
+
+    def peer_handlers(self):
+        if self._peer_operations is None:
+            return {}
+        return self._peer_operations.handlers()
 
     def begin_shutdown(self):
         """No new wait is registered while the pending ones are answered."""
         self._closing = True
+        if self._peers is not None:
+            self._peers.begin_shutdown()
         self._waits.stop()
 
     def stop(self):
         if not self._closing:
             self.begin_shutdown()
+        if self._peers is not None:
+            self._peers.stop()
         self._store.save()
         if self._spawns is not None:
             self._spawns.save()
@@ -77,6 +99,8 @@ class CommsService:
     def bind(self, params, writer):
         """Authenticate a hello, reserve its mailbox and bind the socket."""
         params = self._params(params)
+        if params.get("peer") is not None:
+            return self._bind_peer(params)
         supplied = str(params.get("token") or "")
         if not hmac.compare_digest(supplied, self._token):
             raise RpcError(UNAUTHORIZED, "bad token")
@@ -90,6 +114,28 @@ class CommsService:
                            str(exc.code)) from None
         return CommsSession(self._config, self._store, self._relay,
                             self._waits, writer, self._operations, agent)
+
+    def _bind_peer(self, params):
+        """A peer presents its own credential, never the daemon token."""
+        if self._peers is None or self._peer_operations is None:
+            raise RpcError(UNAUTHORIZED, "peers are not served here")
+        if params.get("agent") is not None or params.get("token") is not None:
+            raise RpcError(INVALID_PARAMS, "one identity per connection")
+        if params.get("version") != VERSION:
+            raise RpcError(INVALID_PARAMS, "unsupported version")
+        peer = params.get("peer")
+        if not isinstance(peer, dict):
+            raise RpcError(UNAUTHORIZED, "a peer identity is required")
+        node_id = peer.get("nodeId")
+        credential = peer.get("credential")
+        if not isinstance(node_id, str) or not isinstance(credential, str) \
+                or not self._peers.verify(node_id, credential):
+            raise RpcError(UNAUTHORIZED, "bad peer credential")
+        generation = self._peers.generation(node_id)
+        if generation is None:
+            raise RpcError(UNAUTHORIZED, "the peer is not configured")
+        return PeerSession(self._config, self._peer_operations,
+                           {"nodeId": node_id, "generation": generation})
 
     def _agent(self, value):
         if not isinstance(value, dict):
@@ -115,13 +161,34 @@ class CommsService:
     def send(self, sender, request_id, target, kind, payload,
              ttl_seconds=None):
         with self._send_lock:
+            peer = None
+            if isinstance(target, dict):
+                node = target.get("nodeId")
+                if node and node != self._node_id and self._peers is not None:
+                    peer = self._peers.route(node)
             result = self._store.accept(sender, request_id, target, kind,
-                                        payload, ttl_seconds)
+                                        payload, ttl_seconds, peer=peer)
             envelopes = result.get("envelopes") or []
             self._relay.publish(envelopes)
+            if result.get("status") == QUEUED:
+                self._peers.wake(result["peerNodeId"])
         self._waits.signal({envelope["to"]["agentId"] for envelope
                             in envelopes})
         return result
+
+    def receipt(self, sender, request_id):
+        return self._store.receipt(sender, request_id)
+
+    def deliver_peer(self, peer_node_id, generation, delivery):
+        """One authenticated peer's mail, committed before it is published."""
+        with self._send_lock:
+            result = self._store.accept_peer(peer_node_id, delivery)
+            envelope = result.get("envelope")
+            if envelope is not None:
+                self._relay.publish([envelope])
+        if envelope is not None:
+            self._waits.signal({envelope["to"]["agentId"]})
+        return result["outcome"]
 
     def replay(self, agent_id, cursor, limit):
         return self._store.replay(agent_id, cursor, limit)

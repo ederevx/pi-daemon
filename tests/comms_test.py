@@ -2,9 +2,12 @@
 """The agent comms domain: durable mailboxes, channels and receipts.
 Zero dependencies (stdlib only)."""
 
+import hashlib
+import io
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -16,6 +19,15 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "service"))
 
 from daemon_service.comms.error import CommsError
+from daemon_service.comms.peer_auth import PeerAuthenticator
+from daemon_service.comms.peer_config_store import PeerConfigStore
+from daemon_service.comms.peer_delivery import PeerDelivery
+from daemon_service.comms.peer_link import PeerLink
+from daemon_service.comms.peer_link_error import PeerLinkError
+from daemon_service.comms.peer_manager import PeerManager
+from daemon_service.comms.peer_operations import PeerOperations
+from daemon_service.comms.peer_tunnel import PeerTunnel
+from daemon_service.comms.peer_tunnel_error import TunnelError
 from daemon_service.atomic_state_file import AtomicStateFile
 from daemon_service.comms.mailbox_store import ALL_TARGET, MailboxStore
 from daemon_service.comms.service import CommsService
@@ -24,6 +36,9 @@ from daemon_service.comms.spawn_ledger import SpawnLedger
 from daemon_service.comms.wait_registry import WaitRegistry
 from daemon_service.config import ServiceConfig
 from daemon_service.runtime_layout import RuntimeLayout
+from daemon_service.transport.json_line_stream import JsonLineStream
+from daemon_service.transport.rpc_codec import RpcCodec
+from daemon_service.transport.rpc_error import RpcError
 
 
 class StoreCase(unittest.TestCase):
@@ -233,12 +248,13 @@ class DeliveryTests(StoreCase):
         self.assertEqual(caught.exception.code, "busy")
         self.assertEqual(len(self._store().replay("b")["messages"]), 1)
 
-    def test_a_foreign_node_is_undeliverable(self):
+    def test_a_foreign_node_has_no_route_without_a_peer(self):
+        self.store.reserve("b")
         result = self.store.accept(self._agent("a"), "r1",
                                    {"nodeId": "peer", "agentId": "b"},
                                    "text", {"body": "hi"})
         self.assertEqual(result["status"], "undeliverable")
-        self.assertEqual(result["undeliverable"][0]["reason"], "remote-node")
+        self.assertEqual(result["undeliverable"][0]["reason"], "no-such-peer")
         self.assertEqual(self.store.replay("b")["messages"], [])
 
     def test_an_oversized_payload_is_refused(self):
@@ -1164,3 +1180,679 @@ class SpawnServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# -- peers -----------------------------------------------------------------
+
+NODE_A = "a" * 32
+NODE_B = "b" * 32
+NODE_C = "c" * 32
+
+
+def _await(predicate, timeout=2.0):
+    """Poll a worker's effect; the worker owns its own thread."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
+class FakeTunnel:
+    """A tunnel that is already up; the test owns its address."""
+
+    def __init__(self, failure=None):
+        self._failure = failure
+        self.started = 0
+        self.closed = 0
+        self._address = ("127.0.0.1", 4242)
+
+    def start(self, peer):
+        self.started += 1
+        if self._failure is not None:
+            raise self._failure
+        return self._address
+
+    def address(self):
+        return self._address
+
+    def close(self):
+        self.closed += 1
+        return True
+
+
+class FakeLink:
+    """A link whose answers the test dictates, and whose requests it records."""
+
+    def __init__(self, answers=None, failure=None):
+        self.answers = list(answers or [])
+        self.failure = failure
+        self.requests = []
+        self.opened = 0
+        self.closed = 0
+        self.node_id = ""
+        self._alive = False
+
+    def open(self, address, peer, credential, timeout=None):
+        self.opened += 1
+        self.node_id = peer["nodeId"]
+        self._alive = True
+        return {"nodeId": self.node_id}
+
+    def request(self, method, params, timeout=None):
+        self.requests.append((method, params))
+        if method == "comms.peer.ping":
+            return {"nodeId": self.node_id, "serverTime": 0}
+        if self.failure is not None:
+            raise self.failure
+        if self.answers:
+            return self.answers.pop(0)
+        delivery_id = params.get("delivery", {}).get("deliveryId")
+        return {"status": "accepted", "deliveryId": delivery_id,
+                "messageId": "m", "sequence": 1}
+
+    def alive(self):
+        return self._alive
+
+    def close(self):
+        self._alive = False
+        self.closed += 1
+
+
+class StubCredentials:
+    def outbound_credential(self, peer):
+        return "shared"
+
+
+class PeerCase(unittest.TestCase):
+    """A peer-capable store with a movable clock and one configured peer."""
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="pi-comms-peer-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.layout = RuntimeLayout(os.path.join(self.base, "state"),
+                                    os.path.join(self.base, "run"))
+        self.now = 1000.0
+        self.store = self._peer_store()
+        self.store.reserve("a")
+        self.store.reserve("b")
+
+    def _peer_store(self, **overrides):
+        values = {"comms_peer_reconnect_initial": 0.01,
+                  "comms_peer_reconnect_max": 0.02,
+                  "comms_peer_probe_interval": 0.05,
+                  "comms_peer_request_timeout": 0.2,
+                  "comms_peer_ready_timeout": 0.2}
+        values.update(overrides)
+        self.config = ServiceConfig.load(overrides=values)
+        store = MailboxStore(self.layout.comms_mailbox_path(), self.config,
+                             NODE_A, clock=lambda: self.now)
+        store.load()
+        return store
+
+    def _agent(self, agent_id):
+        return {"nodeId": NODE_A, "agentId": agent_id}
+
+    def remote(self, agent_id="b"):
+        return {"nodeId": NODE_B, "agentId": agent_id}
+
+    def route(self, generation="g1"):
+        return {"nodeId": NODE_B, "generation": generation}
+
+    def send(self, request_id="r1", peer=None, ttl=None, text="hi"):
+        return self.store.accept(self._agent("a"), request_id,
+                                 self.remote(), "text", {"text": text},
+                                 ttl, peer=self.route() if peer is None
+                                 else peer)
+
+    def delivery(self, delivery_id="d1", to="b", expires=None, text="hi"):
+        return {"deliveryId": delivery_id,
+                "from": {"nodeId": NODE_B, "agentId": "a"},
+                "to": {"nodeId": NODE_A, "agentId": to},
+                "kind": "text",
+                "payload": {"text": text},
+                "createdAt": self.now,
+                "expiresAt": self.now + 60 if expires is None else expires}
+
+
+class PeerStoreTests(PeerCase):
+
+    def test_a_remote_send_commits_a_receipt_and_a_queued_delivery(self):
+        result = self.send()
+        self.assertEqual(result["status"], "queued")
+        receipt = self.store.receipt(self._agent("a"), "r1")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertEqual(receipt["deliveryId"], result["deliveryId"])
+        reloaded = self._peer_store()
+        due = reloaded.due(NODE_B, "g1", 10)
+        self.assertEqual([record["delivery"]["deliveryId"] for record in due],
+                         [result["deliveryId"]])
+        self.assertEqual(reloaded.queued(NODE_B), 1)
+
+    def test_a_remote_request_id_cannot_be_reused_for_a_local_send(self):
+        self.send()
+        with self.assertRaises(CommsError) as caught:
+            self.store.accept(self._agent("a"), "r1", self.remote(), "text",
+                              {"text": "other"})
+        self.assertEqual(caught.exception.code, "request-conflict")
+
+    def test_a_remote_send_replays_its_first_answer(self):
+        first = self.send()
+        self.store.settle_peer(first["deliveryId"], "g1",
+                               {"status": "accepted",
+                                "deliveryId": first["deliveryId"],
+                                "messageId": "m", "sequence": 3})
+        again = self.send()
+        self.assertEqual(again["status"], "duplicate")
+        self.assertEqual(again["initial"]["status"], "queued")
+        self.assertEqual(again["initial"]["deliveryId"],
+                         first["deliveryId"])
+
+    def test_an_attempt_is_recorded_before_the_link_sees_it(self):
+        first = self.send()
+        self.assertTrue(self.store.mark_attempt(first["deliveryId"], "g1",
+                                                self.now))
+        reloaded = self._peer_store()
+        due = reloaded.due(NODE_B, "g1", 5)
+        self.assertEqual(due[0]["attempts"], 1)
+        self.assertFalse(reloaded.mark_attempt("missing", "g1", self.now))
+
+    def test_a_settled_delivery_is_not_attempted_again(self):
+        first = self.send()
+        self.store.settle_peer(first["deliveryId"], "g1",
+                               {"status": "accepted",
+                                "deliveryId": first["deliveryId"],
+                                "messageId": "m", "sequence": 1})
+        self.assertEqual(self.store.due(NODE_B, "g1", 5), [])
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["status"], "accepted")
+
+    def test_an_unattempted_delivery_that_expires_is_undeliverable(self):
+        self.send(ttl=10)
+        self.now += 11
+        receipt = self.store.receipt(self._agent("a"), "r1")
+        self.assertEqual(receipt["status"], "undeliverable")
+        self.assertEqual(receipt["reason"], "retention-expired")
+        self.assertEqual(self.store.due(NODE_B, "g1", 5), [])
+
+    def test_an_attempted_delivery_that_expires_is_unknown(self):
+        first = self.send(ttl=10)
+        self.store.mark_attempt(first["deliveryId"], "g1", self.now)
+        self.now += 11
+        receipt = self.store.receipt(self._agent("a"), "r1")
+        self.assertEqual(receipt["status"], "unknown")
+        self.assertEqual(receipt["reason"], "delivery-unconfirmed")
+
+    def test_an_unconfigured_peer_is_recorded_truthfully(self):
+        result = self.store.accept(self._agent("a"), "r1", self.remote(),
+                                   "text", {"text": "hi"}, None, peer=None)
+        self.assertEqual(result["status"], "undeliverable")
+        self.assertEqual(result["undeliverable"][0]["reason"], "no-such-peer")
+        again = self.store.accept(self._agent("a"), "r1", self.remote(),
+                                  "text", {"text": "hi"}, None, peer=None)
+        self.assertEqual(again["status"], "duplicate")
+
+    def test_removal_settles_attempted_and_unattempted_mail_truthfully(self):
+        first = self.send("r1")
+        second = self.send("r2")
+        self.store.mark_attempt(second["deliveryId"], "g1", self.now)
+        counts = self.store.cancel_peer(NODE_B, "g1", "peer-removed")
+        self.assertEqual(counts, {"settled": 2, "undeliverable": 1,
+                                  "unknown": 1})
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["reason"], "peer-removed")
+        self.assertEqual(self.store.receipt(self._agent("a"), "r2")
+                         ["status"], "unknown")
+        self.assertEqual(self.store.due(NODE_B, "g1", 5), [])
+
+    def test_an_import_commits_one_envelope_and_one_outcome(self):
+        first = self.store.accept_peer(NODE_B, self.delivery())
+        self.assertEqual(first["outcome"]["status"], "accepted")
+        self.assertIsNotNone(first["envelope"])
+        again = self.store.accept_peer(NODE_B, self.delivery())
+        self.assertEqual(again["outcome"], first["outcome"])
+        self.assertIsNone(again["envelope"])
+        messages = self.store.replay("b")["messages"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["from"], {"nodeId": NODE_B,
+                                               "agentId": "a"})
+        self.assertEqual(messages[0]["sequence"], 1)
+
+    def test_an_import_conflict_is_refused(self):
+        self.store.accept_peer(NODE_B, self.delivery())
+        with self.assertRaises(CommsError) as caught:
+            self.store.accept_peer(NODE_B, self.delivery(text="different"))
+        self.assertEqual(caught.exception.code, "request-conflict")
+
+    def test_an_expired_import_cannot_reappear(self):
+        delivery = self.delivery(expires=self.now - 1)
+        result = self.store.accept_peer(NODE_B, delivery)
+        self.assertEqual(result["outcome"]["status"], "expired")
+        self.assertIsNone(result["envelope"])
+        self.assertEqual(self.store.replay("b")["messages"], [])
+
+    def test_an_unknown_recipient_refusal_is_durable(self):
+        first = self.store.accept_peer(NODE_B, self.delivery(to="nobody"))
+        self.assertEqual(first["outcome"]["reason"], "unknown-recipient")
+        again = self.store.accept_peer(NODE_B, self.delivery(to="nobody"))
+        self.assertEqual(again["outcome"], first["outcome"])
+
+    def test_an_import_for_a_third_node_is_refused(self):
+        delivery = self.delivery()
+        delivery["to"]["nodeId"] = NODE_C
+        with self.assertRaises(CommsError) as caught:
+            self.store.accept_peer(NODE_B, delivery)
+        self.assertEqual(caught.exception.code, "bad-request")
+
+    def test_a_forged_source_is_refused(self):
+        delivery = self.delivery()
+        delivery["from"]["nodeId"] = NODE_C
+        with self.assertRaises(CommsError) as caught:
+            self.store.accept_peer(NODE_B, delivery)
+        self.assertEqual(caught.exception.code, "bad-request")
+
+    def test_a_schema_one_snapshot_still_loads(self):
+        path = self.layout.comms_mailbox_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        AtomicStateFile(path, 0o600, 5, 0.01).write_dict({
+            "version": 1,
+            "recipients": {"b": {"next_sequence": 2, "messages": [],
+                                 "acknowledged": [], "provisional": False}},
+            "send_receipts": {}})
+        store = self._peer_store()
+        self.assertTrue(store.exists("b"))
+        self.assertEqual(store.head_sequence("b"), 2)
+        self.assertEqual(store.queued(NODE_B), 0)
+        self.assertEqual(store.accept_peer(NODE_B, self.delivery())
+                         ["outcome"]["sequence"], 3)
+
+    def test_a_corrupt_mailbox_snapshot_fails_closed(self):
+        path = self.layout.comms_mailbox_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("{")
+        with self.assertRaises(CommsError) as caught:
+            self._peer_store()
+        self.assertEqual(caught.exception.code, "store-corrupt")
+
+    def test_the_outbox_is_bounded(self):
+        store = self._peer_store(comms_peer_outbox_records=1)
+        store.reserve("a")
+        store.accept(self._agent("a"), "r1", self.remote(), "text",
+                     {"text": "hi"}, None, peer=self.route())
+        with self.assertRaises(CommsError) as caught:
+            store.accept(self._agent("a"), "r2", self.remote(), "text",
+                         {"text": "hi"}, None, peer=self.route())
+        self.assertEqual(caught.exception.code, "busy")
+
+
+class PeerConfigStoreTests(PeerCase):
+
+    def spec(self, **overrides):
+        value = {"nodeId": NODE_B, "sshTarget": "peer.example",
+                 "remotePort": 5000, "localPort": 0,
+                 "outboundCredentialFile": "/run/cred",
+                 "inboundCredentialSha256": "c" * 64}
+        value.update(overrides)
+        return value
+
+    def test_configuration_round_trips(self):
+        peers = PeerConfigStore(self.layout.comms_peers_path(), self.config)
+        added = peers.add(self.spec())
+        self.assertTrue(added["created"])
+        reloaded = PeerConfigStore(self.layout.comms_peers_path(),
+                                   self.config)
+        reloaded.load()
+        stored = reloaded.get(NODE_B)
+        self.assertEqual(stored["sshTarget"], "peer.example")
+        self.assertEqual(stored["state"], "active")
+        self.assertEqual(reloaded.active_generation(NODE_B),
+                         stored["generation"])
+
+    def test_a_corrupt_peer_file_fails_closed(self):
+        path = self.layout.comms_peers_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("{")
+        peers = PeerConfigStore(path, self.config)
+        with self.assertRaises(CommsError) as caught:
+            peers.load()
+        self.assertEqual(caught.exception.code, "store-corrupt")
+
+
+class TunnelTests(PeerCase):
+
+    class ScriptedProcess:
+        def __init__(self, out=b"", err=b"", returncode=None):
+            self.stdout = io.BytesIO(out)
+            self.stderr = io.BytesIO(err)
+            self.returncode = returncode
+            self.pid = 999999
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+    def spawner(self, marker=True, error=b"", returncode=None):
+        def spawn(argv, **_kwargs):
+            out = b""
+            for item in argv:
+                if item.startswith("LocalCommand=echo "):
+                    out = item.split("echo ", 1)[1].encode() + b"\n"
+            return self.ScriptedProcess(out if marker else b"", error,
+                                        returncode)
+        return spawn
+
+    def test_the_readiness_marker_opens_the_tunnel(self):
+        tunnel = PeerTunnel(self.config, spawn=self.spawner())
+        self.addCleanup(tunnel.close)
+        host, port = tunnel.start({"nodeId": NODE_B, "sshTarget": "t",
+                                   "remotePort": 5000, "localPort": 0})
+        self.assertEqual(host, "127.0.0.1")
+        self.assertTrue(port > 0)
+        self.assertEqual(tunnel.address(), (host, port))
+
+    def test_a_tunnel_without_its_marker_never_opens(self):
+        tunnel = PeerTunnel(self.config, spawn=self.spawner(marker=False,
+                                                            returncode=0))
+        with self.assertRaises(TunnelError):
+            tunnel.start({"nodeId": NODE_B, "sshTarget": "t",
+                          "remotePort": 5000, "localPort": 0})
+
+    def test_a_port_collision_reports_itself(self):
+        tunnel = PeerTunnel(self.config, spawn=self.spawner(
+            marker=False, error=b"bind: Address already in use\n",
+            returncode=255))
+        with self.assertRaises(TunnelError) as caught:
+            tunnel.start({"nodeId": NODE_B, "sshTarget": "t",
+                          "remotePort": 5000, "localPort": 6000})
+        self.assertTrue(caught.exception.reason.startswith(
+            "local-port-in-use"))
+
+
+class GreetingServer:
+    """One loopback peer that answers a hello with a chosen greeting."""
+
+    def __init__(self, greeting, answer=None):
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(4)
+        self._greeting = greeting
+        self._answer = answer
+        self._codec = RpcCodec()
+        self._stopping = False
+        self.address = self._listener.getsockname()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def close(self):
+        self._stopping = True
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+
+    def _serve(self):
+        while not self._stopping:
+            try:
+                connection, _ = self._listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._one, args=(connection,),
+                             daemon=True).start()
+
+    def _one(self, connection):
+        codec, stream = self._codec, JsonLineStream(connection, 65536, 8192)
+        try:
+            hello = codec.decode(stream.read())
+            stream.write(codec.encode(codec.result(hello["id"],
+                                                   self._greeting)))
+            if self._answer is not None:
+                request = codec.decode(stream.read())
+                stream.write(codec.encode(codec.result(request["id"],
+                                                       self._answer)))
+        except (OSError, ValueError):
+            pass
+        finally:
+            connection.close()
+
+
+class PeerLinkTests(PeerCase):
+
+    def greeting(self, **overrides):
+        value = {"service": "agent-comms", "version": 1,
+                 "protocol": "pi-rpc/1", "nodeId": NODE_B,
+                 "peer": {"nodeId": NODE_A},
+                 "methods": ["comms.peer.deliver", "comms.peer.ping"],
+                 "topics": [], "maxFrameBytes": 65536,
+                 "serverTime": self.now,
+                 "limits": {"maxTtlSeconds": 86400.0,
+                            "maxPayloadBytes": 32768}}
+        value.update(overrides)
+        return value
+
+    def link(self):
+        return PeerLink(self.config, NODE_A, clock=lambda: self.now)
+
+    def peer(self):
+        return {"nodeId": NODE_B}
+
+    def test_a_link_requires_the_expected_node(self):
+        server = GreetingServer(self.greeting(nodeId=NODE_C))
+        self.addCleanup(server.close)
+        with self.assertRaises(PeerLinkError) as caught:
+            self.link().open(server.address, self.peer(), "credential")
+        self.assertEqual(caught.exception.reason, "wrong-node")
+
+    def test_a_link_requires_the_expected_protocol(self):
+        server = GreetingServer(self.greeting(protocol="pi-rpc/2"))
+        self.addCleanup(server.close)
+        with self.assertRaises(PeerLinkError) as caught:
+            self.link().open(server.address, self.peer(), "credential")
+        self.assertEqual(caught.exception.reason, "wrong-protocol")
+
+    def test_a_link_speaks_one_request_at_a_time(self):
+        server = GreetingServer(self.greeting(),
+                                answer={"nodeId": NODE_B, "serverTime": 7.0})
+        self.addCleanup(server.close)
+        link = self.link()
+        self.addCleanup(link.close)
+        link.open(server.address, self.peer(), "credential")
+        self.assertTrue(link.alive())
+        self.assertEqual(link.request("comms.peer.ping", {}),
+                         {"nodeId": NODE_B, "serverTime": 7.0})
+        link.close()
+        self.assertFalse(link.alive())
+        with self.assertRaises(PeerLinkError):
+            link.request("comms.peer.ping", {})
+
+
+class PeerWorkerTests(PeerCase):
+
+    def worker(self, link, tunnel=None):
+        record = {"nodeId": NODE_B, "generation": "g1",
+                  "sshTarget": "peer.example", "remotePort": 5000,
+                  "localPort": 0}
+        worker = PeerDelivery(self.config, self.store, record, link,
+                              tunnel or FakeTunnel(),
+                              StubCredentials(), clock=lambda: self.now)
+        self.addCleanup(worker.stop)
+        return worker
+
+    def test_an_accepted_answer_settles_the_receipt(self):
+        first = self.send()
+        link = FakeLink(answers=[{"status": "accepted",
+                                  "deliveryId": first["deliveryId"],
+                                  "messageId": "m1", "sequence": 4}])
+        self.worker(link).start()
+        self.assertTrue(_await(lambda: self.store.receipt(
+            self._agent("a"), "r1")["status"] == "accepted"))
+        receipt = self.store.receipt(self._agent("a"), "r1")
+        self.assertEqual(receipt["messageId"], "m1")
+        self.assertEqual(receipt["sequence"], 4)
+        self.assertEqual(self.store.queued(NODE_B), 0)
+
+    def test_an_answer_for_another_delivery_is_not_accepted(self):
+        first = self.send()
+        link = FakeLink(answers=[{"status": "accepted",
+                                  "deliveryId": "someone-else",
+                                  "messageId": "m1", "sequence": 4}])
+        self.worker(link).start()
+        self.assertTrue(_await(lambda: link.requests))
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["status"], "queued")
+
+    def test_a_refusal_settles_with_the_remote_reason(self):
+        first = self.send()
+        link = FakeLink(answers=[{"status": "undeliverable",
+                                  "deliveryId": first["deliveryId"],
+                                  "reason": "mailbox-full"}])
+        self.worker(link).start()
+        self.assertTrue(_await(lambda: self.store.receipt(
+            self._agent("a"), "r1")["status"] == "undeliverable"))
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["reason"], "mailbox-full")
+
+    def test_a_broken_link_keeps_the_delivery_queued(self):
+        self.send()
+        link = FakeLink(failure=PeerLinkError("link-down"))
+        self.worker(link).start()
+        self.assertTrue(_await(lambda: any(method == "comms.peer.deliver"
+                                           for method, _ in link.requests)))
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["status"], "queued")
+
+    def test_stopping_closes_the_link_and_the_tunnel(self):
+        link, tunnel = FakeLink(), FakeTunnel()
+        worker = self.worker(link, tunnel)
+        worker.start()
+        self.assertTrue(_await(lambda: link.opened > 0))
+        worker.stop()
+        self.assertGreaterEqual(link.closed, 1)
+        self.assertGreaterEqual(tunnel.closed, 1)
+        self.assertFalse(worker._thread.is_alive())
+
+
+class PeerOperationsTests(PeerCase):
+
+    def setUp(self):
+        super().setUp()
+        self.peers = PeerConfigStore(self.layout.comms_peers_path(),
+                                     self.config)
+        self.auth = PeerAuthenticator(self.config, self.peers,
+                                      reader=lambda _path: "shared")
+        self.accepted = []
+        self.manager = PeerManager(self.config, self.store, self.peers,
+                                   self.auth, self._accept, NODE_A,
+                                   clock=lambda: self.now,
+                                   tunnel_factory=lambda: FakeTunnel(),
+                                   link_factory=lambda: FakeLink())
+        self.addCleanup(self.manager.stop)
+        self.manager.start()
+        self.operations = PeerOperations(self.manager, self.config, NODE_A,
+                                         clock=lambda: self.now)
+
+    def _accept(self, node_id, generation, delivery):
+        self.accepted.append((node_id, generation, delivery))
+        return {"status": "accepted", "deliveryId": delivery["deliveryId"],
+                "messageId": "m", "sequence": 1}
+
+    def spec(self, **overrides):
+        value = {"nodeId": NODE_B, "sshTarget": "peer.example",
+                 "remotePort": 5000, "localPort": 0,
+                 "outboundCredentialFile": "/run/cred",
+                 "inboundCredentialSha256": hashlib.sha256(
+                     b"shared").hexdigest()}
+        value.update(overrides)
+        return value
+
+    def test_a_peer_can_be_configured_while_it_is_down(self):
+        answer = self.operations.add(None, self.spec())
+        self.assertEqual(answer["status"], "configured")
+        self.assertTrue(answer["created"])
+        listed = self.operations.list(None, {})
+        self.assertEqual([peer["nodeId"] for peer in listed["peers"]],
+                         [NODE_B])
+        self.assertIn(listed["peers"][0]["state"], ("down", "up"))
+
+    def test_a_configuration_is_idempotent_and_a_change_conflicts(self):
+        self.operations.add(None, self.spec())
+        again = self.operations.add(None, self.spec())
+        self.assertFalse(again["created"])
+        with self.assertRaises(RpcError) as caught:
+            self.operations.add(None, self.spec(remotePort=5001))
+        self.assertEqual(caught.exception.code, -32602)
+
+    def test_a_peer_cannot_peer_with_itself(self):
+        with self.assertRaises(RpcError) as caught:
+            self.operations.add(None, self.spec(nodeId=NODE_A))
+        self.assertEqual(caught.exception.code, -32602)
+
+    def test_a_credential_is_verified_and_never_listed(self):
+        self.operations.add(None, self.spec())
+        self.assertTrue(self.manager.verify(NODE_B, "shared"))
+        self.assertFalse(self.manager.verify(NODE_B, "other"))
+        self.assertFalse(self.manager.verify(NODE_C, "shared"))
+        listed = self.operations.list(None, {})["peers"][0]
+        self.assertNotIn("inboundCredentialSha256", listed)
+        self.assertNotIn("outboundCredentialFile", listed)
+
+    def test_an_inbound_delivery_is_admitted_only_for_the_live_generation(self):
+        self.operations.add(None, self.spec())
+        generation = self.manager.generation(NODE_B)
+        delivery = self.delivery()
+        self.manager.deliver(NODE_B, generation, delivery)
+        self.assertEqual(self.accepted[0][0], NODE_B)
+        with self.assertRaises(CommsError) as caught:
+            self.manager.deliver(NODE_B, "stale", delivery)
+        self.assertEqual(caught.exception.code, "peer-stale")
+
+    def offline(self):
+        """A manager whose tunnel never comes up, so mail stays queued."""
+        peers = PeerConfigStore(os.path.join(self.base, "offline-peers.json"),
+                                self.config)
+        manager = PeerManager(self.config, self.store, peers,
+                              PeerAuthenticator(self.config, peers,
+                                                reader=lambda _path: "shared"),
+                              self._accept, NODE_A, clock=lambda: self.now,
+                              tunnel_factory=lambda: FakeTunnel(
+                                  failure=TunnelError("spawn-failed")),
+                              link_factory=lambda: FakeLink())
+        self.addCleanup(manager.stop)
+        manager.start()
+        return manager, PeerOperations(manager, self.config, NODE_A,
+                                       clock=lambda: self.now)
+
+    def test_removal_reports_what_it_settled_and_a_readd_is_a_new_generation(self):
+        manager, operations = self.offline()
+        operations.add(None, self.spec())
+        first = manager.generation(NODE_B)
+        self.store.accept(self._agent("a"), "r1", self.remote(), "text",
+                          {"text": "hi"}, None,
+                          peer={"nodeId": NODE_B, "generation": first})
+        removed = operations.remove(None, {"nodeId": NODE_B})
+        self.assertEqual(removed["status"], "removed")
+        self.assertEqual(removed["undeliverableCount"], 1)
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["reason"], "peer-removed")
+        operations.add(None, self.spec())
+        self.assertNotEqual(manager.generation(NODE_B), first)
+        self.assertEqual(operations.remove(None, {"nodeId": NODE_C}),
+                         {"status": "not-found", "nodeId": NODE_C})
+
+    def test_an_interrupted_removal_is_completed_on_start(self):
+        self.peers.add(self.spec())
+        self.peers.begin_remove(NODE_B)
+        manager = PeerManager(self.config, self.store, self.peers, self.auth,
+                              self._accept, NODE_A, clock=lambda: self.now,
+                              tunnel_factory=lambda: FakeTunnel(),
+                              link_factory=lambda: FakeLink())
+        self.addCleanup(manager.stop)
+        manager.start()
+        self.assertIsNone(self.peers.get(NODE_B))

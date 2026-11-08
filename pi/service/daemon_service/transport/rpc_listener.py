@@ -9,11 +9,12 @@ from .rpc_connection import RpcConnection
 class RpcListener:
     """It owns the listening socket and its workers, nothing else."""
 
-    def __init__(self, config, codec, access, host="127.0.0.1"):
+    def __init__(self, config, codec, access, host="127.0.0.1", port=0):
         self._config = config
         self._codec = codec
         self._access = access
         self._host = host
+        self._port = port
         self._socket = None
         self._thread = None
         self._connections = set()
@@ -29,7 +30,7 @@ class RpcListener:
     def start(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((self._host, 0))
+        listener.bind((self._host, self._port))
         listener.listen(self._config.backlog)
         # A blocking accept does not notice a close from another thread.
         listener.settimeout(self._config.accept_poll)

@@ -300,10 +300,45 @@ reconnects and replays from its own cursor.
 This node has one identity, `nodeId`, minted on first use and kept in
 the state root beside the mailbox store; it is what agents put in an
 address, and an unreadable or empty `node.json` refuses startup rather
-than minting a second name. An address that names another node is
-reported `undeliverable` with reason `remote-node`: peers are not part
-of this build yet, and a send never pretends a remote mailbox accepted
-mail.
+than minting a second name. A direct address that names another node is
+queued for the peer that reaches that node; when no configured peer
+reaches it the send answers `undeliverable` with reason `no-such-peer`,
+and a broadcast never leaves the node: an address it cannot reach is
+reported with reason `remote-node`.
+
+## Peers
+
+A peer is a direction this node reaches out over: an SSH destination,
+the port on both ends, and a reference to the credential file the
+outbound link reads. `comms.peer.add`, `comms.peer.list` and
+`comms.peer.remove` are the operator surface, and peer configuration
+holds endpoints and a SHA-256 verifier per source node, never a
+credential's contents; an answer carries no credential field at all.
+Each configured peer runs one outbound worker that opens its tunnel and
+retries with a bounded backoff, and every state change commits before
+a link or worker exists.
+
+A peer connection presents `{version, peer: {nodeId, credential}}` at
+`rpc.hello`, never the daemon token and never an agent identity: the
+verifier configured for that node decides admission, and the greeting
+binds the connection to the peer's own node with the peer methods
+(`comms.peer.deliver`, `comms.peer.ping`), no agent method and no
+topics. An agent connection is offered the peer administration and
+never the peer wire.
+
+Inbound delivery is one envelope, committed before it is published,
+and answers `accepted` with the mailbox sequence it took. A delivery ID
+is deduplicated per source node: a replay returns the outcome recorded
+the first time and stores nothing, and the same ID with a different
+body is a `request-conflict`. A peer whose node has no configured
+verifier, or whose credential does not match it, is refused at
+`rpc.hello` and no mailbox is created.
+
+Removal first marks the peer's generation removing, so no import or
+delivery is accepted under it, then settles the mail still queued for
+it as `undeliverable` with reason `peer-removed` and answers how much it
+settled. Adding the peer again mints a new generation, so mail queued
+for the removed one can never be delivered as mail for the new one.
 
 The message envelope is bounded by the frame, not only by the payload
 limit, so a notification always fits the connection that carries it. A
@@ -439,9 +474,11 @@ the two implementations never share a runtime directory.
 * The outbound queue bounds frames, not bytes: one connection can hold
   `comms_outbound_queue` frames of up to `frame_bytes`, and nothing caps
   the connection count. Give it a byte budget when fan-out grows.
-* Comms peers: cross-node mail, remote spawn and the peer link, on top
-  of the mailbox, relay, waits, spawn and the `agent-comms` listener
-  that are in place.
+* Remote spawn over a peer link: cross-node mail, admission, removal,
+  the operator surface for the peer's mailbox and the outbound retry
+  schedule are in place on top of the mailbox, relay, waits, spawn and
+  the `agent-comms` listener, so only the `peer-control` frame that
+  carries a launch across the link remains.
 * Extension and `pi-rc` rewiring; installer and migration tooling.
 * Discovery: `ServiceDirectory`, activation, binding and self
   provisioning, which the descriptor work above prepares for.

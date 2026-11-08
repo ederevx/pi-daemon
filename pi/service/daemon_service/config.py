@@ -27,6 +27,18 @@ RANGES = {
     "comms_wait_cap": 0,
     "comms_waits_per_connection": 0,
     "comms_spawn_records": 0,
+    "comms_peer_retention": 0.0,
+    "comms_peer_ready_timeout": 0.0,
+    "comms_peer_request_timeout": 0.0,
+    "comms_peer_probe_interval": 0.0,
+    "comms_peer_reconnect_initial": 0.0,
+    "comms_peer_reconnect_max": 0.0,
+    "comms_peer_keepalive_interval": 0,
+    "comms_peer_keepalive_failures": 0,
+    "comms_peer_clock_skew": 0.0,
+    "comms_peer_cap": 0,
+    "comms_peer_outbox_records": 0,
+    "comms_peer_stderr_bytes": 0,
 }
 
 
@@ -79,6 +91,20 @@ class ServiceConfig:
     comms_wait_cap: int = 256
     comms_waits_per_connection: int = 1
     comms_spawn_records: int = 1024
+    comms_port: int = 0
+    comms_peer_retention: float = 86400.0
+    comms_peer_ssh_command: str = "ssh"
+    comms_peer_ready_timeout: float = 5.0
+    comms_peer_request_timeout: float = 5.0
+    comms_peer_probe_interval: float = 15.0
+    comms_peer_reconnect_initial: float = 1.0
+    comms_peer_reconnect_max: float = 60.0
+    comms_peer_keepalive_interval: int = 5
+    comms_peer_keepalive_failures: int = 2
+    comms_peer_clock_skew: float = 5.0
+    comms_peer_cap: int = 32
+    comms_peer_outbox_records: int = 1024
+    comms_peer_stderr_bytes: int = 8192
     revision: int = 0
 
     @classmethod
@@ -170,6 +196,12 @@ def _relationships(config):
         raise ValueError("comms_waits_per_connection: exceeds the cap")
     if config.comms_waits_per_connection >= config.comms_outbound_queue:
         raise ValueError("comms_waits_per_connection: fills the outbound queue")
+    if config.comms_peer_reconnect_initial > config.comms_peer_reconnect_max:
+        raise ValueError("comms_peer_reconnect_initial: exceeds the maximum")
+    if config.comms_peer_retention > config.comms_max_ttl:
+        raise ValueError("comms_peer_retention: exceeds comms_max_ttl")
+    if not 0 <= config.comms_port <= 65535:
+        raise ValueError("comms_port: must be a tcp port")
 
 
 def _finite(value, name):
