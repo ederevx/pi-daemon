@@ -32,25 +32,27 @@ class TicketRunner:
         with self._lock:
             if self._closed:
                 raise TaskError(TOO_BUSY)
-            if self._store.running_count() >= self._config.max_running:
-                raise TaskError(TOO_BUSY)
-            snapshot, created = self._store.reserve(session, cwd, command,
-                                                    timeout)
+            snapshot, created = self._store.reserve(
+                session, cwd, command, timeout, self._config.max_running)
             ticket_id = snapshot["id"]
             if not created:
                 return snapshot, True
             event = threading.Event()
             self._events[ticket_id] = event
             self._timeouts[ticket_id] = snapshot["timeout"]
-        try:
-            child = self._spawn(snapshot, env)
-        except (OSError, ValueError):
-            self._store.discard(ticket_id)
-            self._release(ticket_id)
-            raise TaskError(SPAWN_FAILED) from None
-        with self._lock:
+            try:
+                child = self._spawn(snapshot, env)
+            except (OSError, ValueError):
+                self._store.discard(ticket_id)
+                self._events.pop(ticket_id, None)
+                self._timeouts.pop(ticket_id, None)
+                raise TaskError(SPAWN_FAILED) from None
             self._children[ticket_id] = child
-        self._store.mark_running(ticket_id, child.pid, time.time())
+        try:
+            self._store.mark_running(ticket_id, child.pid, time.time())
+        except LookupError:
+            self._release(ticket_id)
+            return self._store.snapshot_one(ticket_id), False
         drain = threading.Thread(target=self._drain, name="ticket-output",
                                  args=(ticket_id, child.stdout), daemon=True)
         with self._lock:
@@ -166,7 +168,7 @@ class TicketRunner:
             outcome, error = FAILED, f"exit code {child.returncode}"
         try:
             self._store.finish(ticket_id, outcome, child.returncode, error)
-        except OSError:
+        except (LookupError, OSError):
             pass
         finally:
             self._release(ticket_id)

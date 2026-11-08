@@ -1,8 +1,5 @@
 """The tasks domain's public surface: tickets, never internals."""
 
-from .store import TicketStore
-
-
 class TaskService:
     """Every task operation reaches the store and the runner through here."""
 
@@ -24,9 +21,10 @@ class TaskService:
         return self._store.snapshot(session)
 
     def output(self, ticket_id, offset=0):
-        data, next_offset, size = self._store.output(ticket_id, offset)
+        data, offset, next_offset, size = self._store.output(ticket_id,
+                                                             offset)
         return {"ticket": self._store.snapshot_one(ticket_id),
-                "data": data, "offset": int(offset or 0),
+                "data": data, "offset": offset,
                 "next": next_offset, "size": size}
 
     def text(self, ticket_id):
