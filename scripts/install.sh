@@ -712,8 +712,8 @@ fi
 
 active_root="$candidate"
 all_sources > "$state_dir/sources.$$"
-write_manifest "$manifest.tmp" "$retained" "$state_dir/sources.$$" "${public[@]}"
-mv "$manifest.tmp" "$manifest"
+write_manifest "$manifest.tmp.$$" "$retained" "$state_dir/sources.$$" "${public[@]}"
+mv "$manifest.tmp.$$" "$manifest"
 rm -f "$state_dir/sources.$$"
 while IFS= read -r retired; do
   [[ -n "$retired" ]] || continue
