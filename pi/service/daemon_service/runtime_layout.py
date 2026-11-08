@@ -50,6 +50,9 @@ class RuntimeLayout:
     def comms_mailbox_path(self):
         return os.path.join(self.domain_root("comms"), "mailbox.json")
 
+    def comms_node_path(self):
+        return os.path.join(self.domain_root("comms"), "node.json")
+
     def settings_path(self):
         return os.path.join(self._state_root, "settings.json")
 

@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(REPO, "pi", "service"))
 
 from daemon_service.comms.error import CommsError
 from daemon_service.comms.mailbox_store import ALL_TARGET, MailboxStore
+from daemon_service.comms.node_identity import NodeIdentity
 from daemon_service.config import ServiceConfig
 from daemon_service.runtime_layout import RuntimeLayout
 
@@ -32,7 +33,7 @@ class StoreCase(unittest.TestCase):
     def _store(self, **overrides):
         self.config = ServiceConfig.load(overrides=overrides)
         store = MailboxStore(self.layout.comms_mailbox_path(), self.config,
-                             node_id="local", clock=lambda: self.now)
+                             "local", clock=lambda: self.now)
         store.load()
         return store
 
@@ -44,8 +45,8 @@ class MailboxTests(StoreCase):
 
     def test_a_reserved_mailbox_is_durable(self):
         self.store.reserve("a")
-        self.assertEqual(self.store.identities(), ["a"])
-        self.assertEqual(self._store().identities(), ["a"])
+        self.assertTrue(self.store.exists("a"))
+        self.assertTrue(self._store().exists("a"))
 
     def test_reserving_twice_keeps_the_original_mailbox(self):
         first = self.store.reserve("a")
@@ -59,7 +60,7 @@ class MailboxTests(StoreCase):
         with self.assertRaises(CommsError) as caught:
             self.store.reserve("c")
         self.assertEqual(caught.exception.code, "busy")
-        self.assertEqual(self.store.identities(), ["a", "b"])
+        self.assertFalse(self.store.exists("c"))
 
 
 class DeliveryTests(StoreCase):
@@ -149,6 +150,14 @@ class DeliveryTests(StoreCase):
         self.assertEqual(caught.exception.code, "busy")
         self.assertEqual(len(self._store().replay("b")["messages"]), 1)
 
+    def test_a_foreign_node_is_undeliverable(self):
+        result = self.store.accept(self._agent("a"), "r1",
+                                   {"nodeId": "peer", "agentId": "b"},
+                                   "text", {"body": "hi"})
+        self.assertEqual(result["status"], "undeliverable")
+        self.assertEqual(result["undeliverable"][0]["reason"], "remote-node")
+        self.assertEqual(self.store.replay("b")["messages"], [])
+
     def test_an_oversized_payload_is_refused(self):
         self.store = self._store(comms_payload_bytes=16)
         self.store.reserve("a")
@@ -157,6 +166,49 @@ class DeliveryTests(StoreCase):
             self.store.accept(self._agent("a"), "r1", self._agent("b"),
                               "text", {"body": "x" * 64})
         self.assertEqual(caught.exception.code, "payload-too-large")
+
+
+class NodeTests(StoreCase):
+
+    def test_mail_addressed_to_this_node_is_local(self):
+        node = NodeIdentity(self.layout.comms_node_path(), self.config).load()
+        store = MailboxStore(self.layout.comms_mailbox_path(), self.config,
+                             node.id(), clock=lambda: self.now)
+        store.load()
+        store.reserve("a")
+        store.reserve("b")
+        address = {"nodeId": node.id(), "agentId": "b"}
+        result = store.accept({"nodeId": node.id(), "agentId": "a"}, "r1",
+                              address, "text", {"n": 1})
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(store.replay("b")["messages"][0]["to"], address)
+
+
+class EnvelopeBoundsTests(StoreCase):
+
+    def test_mail_that_cannot_fit_a_notification_is_refused(self):
+        self.store = self._store(frame_bytes=2048, comms_frame_margin=1024,
+                                 comms_payload_bytes=1024)
+        self.store.reserve("a")
+        self.store.reserve("b")
+        with self.assertRaises(CommsError) as caught:
+            self.store.accept(self._agent("a"), "r1", self._agent("b"),
+                              "text", {"body": "x" * 1200})
+        self.assertEqual(caught.exception.code, "payload-too-large")
+
+    def test_a_page_fits_the_frame_whatever_the_message_count(self):
+        self.store = self._store(frame_bytes=2048, comms_frame_margin=512,
+                                 comms_payload_bytes=1024,
+                                 comms_page_messages=64)
+        self.store.reserve("a")
+        self.store.reserve("b")
+        for index in range(10):
+            self.store.accept(self._agent("a"), f"r{index}",
+                              self._agent("b"), "text",
+                              {"body": "x" * 400})
+        page = self.store.replay("b")
+        self.assertLess(len(page["messages"]), 10)
+        self.assertTrue(page["more"])
 
 
 class BroadcastTests(StoreCase):
@@ -307,6 +359,34 @@ class ExpiryTests(StoreCase):
         self.now += 200.0
         self.assertEqual(len(self.store.replay("b")["messages"]), 1)
 
+    def test_expired_mail_frees_capacity_for_new_mail(self):
+        self.store = self._store(comms_messages_per_recipient=1,
+                                 comms_message_ttl=5.0)
+        self.store.reserve("a")
+        self.store.reserve("b")
+        self.store.accept(self._agent("a"), "r1", self._agent("b"),
+                          "text", {"n": 1})
+        self.now += 6.0
+        result = self.store.accept(self._agent("a"), "r2", self._agent("b"),
+                                   "text", {"n": 2})
+        self.assertEqual(result["status"], "accepted")
+
+    def test_an_acknowledgement_marker_ends_with_its_message(self):
+        self.store = self._store(comms_message_ttl=5.0)
+        self.store.reserve("a")
+        self.store.reserve("b")
+        self.store.accept(self._agent("a"), "r1", self._agent("b"),
+                          "text", {"n": 1})
+        message_id = self.store.replay("b")["messages"][0]["messageId"]
+        self.store.acknowledge("b", [message_id])
+        self.now += 6.0
+        self.assertEqual(self.store.acknowledge("b", [message_id])["unknown"],
+                         [message_id])
+        with open(self.layout.comms_mailbox_path(),
+                  encoding="utf-8") as handle:
+            stored = json.load(handle)
+        self.assertEqual(stored["recipients"]["b"]["acknowledged"], [])
+
     def test_an_expired_receipt_no_longer_deduplicates(self):
         self.store = self._store(comms_dedupe_ttl=30.0)
         self.store.reserve("a")
@@ -340,12 +420,84 @@ class RecoveryTests(StoreCase):
             self._store()
         self.assertEqual(caught.exception.code, "store-corrupt")
 
+    def test_a_broken_sequence_invariant_refuses_to_open(self):
+        self.store.reserve("b")
+        self.store.accept(self._agent("a"), "r1", self._agent("b"),
+                          "text", {"n": 1})
+        with open(self.layout.comms_mailbox_path(),
+                  encoding="utf-8") as handle:
+            document = json.load(handle)
+        document["recipients"]["b"]["next_sequence"] = 0
+        with open(self.layout.comms_mailbox_path(), "w",
+                  encoding="utf-8") as handle:
+            json.dump(document, handle)
+        with self.assertRaises(CommsError) as caught:
+            self._store()
+        self.assertEqual(caught.exception.code, "store-corrupt")
+
+    def test_a_broken_receipt_refuses_to_open(self):
+        self.store.reserve("a")
+        self.store.reserve("b")
+        self.store.accept(self._agent("a"), "r1", self._agent("b"),
+                          "text", {"n": 1})
+        with open(self.layout.comms_mailbox_path(),
+                  encoding="utf-8") as handle:
+            document = json.load(handle)
+        key = next(iter(document["send_receipts"]))
+        document["send_receipts"][key]["accepted"] = {"not": "a list"}
+        with open(self.layout.comms_mailbox_path(), "w",
+                  encoding="utf-8") as handle:
+            json.dump(document, handle)
+        with self.assertRaises(CommsError):
+            self._store()
+
+    def test_an_empty_store_file_is_corruption_not_a_fresh_start(self):
+        with open(self.layout.comms_mailbox_path(), "w",
+                  encoding="utf-8"):
+            pass
+        with self.assertRaises(CommsError) as caught:
+            self._store()
+        self.assertEqual(caught.exception.code, "store-corrupt")
+
     def test_an_unknown_schema_refuses_to_open(self):
         with open(self.layout.comms_mailbox_path(), "w",
                   encoding="utf-8") as handle:
             json.dump({"version": 99}, handle)
         with self.assertRaises(CommsError):
             self._store()
+
+
+class NodeIdentityTests(unittest.TestCase):
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="pi-node-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.config = ServiceConfig.load()
+        self.path = os.path.join(self.base, "comms", "node.json")
+
+    def _identity(self):
+        return NodeIdentity(self.path, self.config).load()
+
+    def test_an_identity_is_minted_once_and_reused(self):
+        first = self._identity().id()
+        self.assertRegex(first, r"^[0-9a-f]{32}$")
+        self.assertEqual(self._identity().id(), first)
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_a_broken_identity_refuses_to_load(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        for text in ("", "{", "{}", '{"version": 9, "nodeId": "%s"}'
+                     % ("a" * 32),
+                     '{"version": 1, "nodeId": "short"}',
+                     '{"version": 1, "nodeId": 7}'):
+            with open(self.path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            with self.assertRaises(CommsError) as caught:
+                self._identity()
+            self.assertEqual(caught.exception.code, "store-corrupt")
+
+    def test_a_missing_file_is_a_fresh_node(self):
+        self.assertTrue(self._identity().id())
 
 
 if __name__ == "__main__":

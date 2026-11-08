@@ -1,9 +1,10 @@
-"""One bound connection: its identity, its subscription, its requests."""
+"""One bound connection: its identity, its topics, its requests."""
+
+import threading
 
 from ..transport.rpc_codec import INVALID_PARAMS, RpcCodec
 from ..transport.rpc_error import RpcError
-
-TOPIC_MESSAGE = "comms.message"
+from .message_relay import MESSAGE_TOPIC as TOPIC_MESSAGE
 
 
 class CommsSession:
@@ -17,8 +18,12 @@ class CommsSession:
         self._handlers = dict(handlers)
         self._agent = agent
         self._codec = RpcCodec()
-        self._subscription = relay.attach(agent["agentId"], self._notify,
-                                          self._disconnect)
+        self._subscribed = set()
+        self._topics_lock = threading.Lock()
+        relay.attach(self)
+
+    def agent_id(self):
+        return self._agent["agentId"]
 
     def greeting(self):
         return {
@@ -29,7 +34,7 @@ class CommsSession:
             "topics": [TOPIC_MESSAGE],
             "maxFrameBytes": self._config.frame_bytes,
             "agent": dict(self._agent),
-            "cursor": self._store.head_sequence(self._agent["agentId"]),
+            "headSequence": self._store.head_sequence(self.agent_id()),
         }
 
     def methods(self):
@@ -39,22 +44,49 @@ class CommsSession:
     def handle(self, request):
         method = request.get("method")
         if method == "rpc.subscribe":
-            return {"topics": self._subscription.subscribe(
-                self._topics(request))}
+            return {"topics": self._change_topics(self._topics(request), True)}
         if method == "rpc.unsubscribe":
-            return {"topics": self._subscription.unsubscribe(
-                self._topics(request))}
+            return {"topics": self._change_topics(self._topics(request),
+                                                  False)}
         handler = self._handlers.get(method)
         if handler is None:
             raise LookupError(method)
         return handler(self._agent, self._params(request))
+
+    def deliver(self, envelope):
+        """Offer one envelope; unsent mail is replayed from the mailbox."""
+        if not self._wants():
+            return
+        try:
+            self._writer.send(self._codec.notification(TOPIC_MESSAGE, envelope))
+        except OSError:
+            self._end()
+        except RpcError:
+            # The envelope cannot fit a frame; the stored mail is replayed.
+            return
 
     def cancel(self, params):
         """No wait is pending in this build, so nothing is cancelled."""
         return None
 
     def close(self):
-        self._relay.detach(self._subscription)
+        self._relay.detach(self)
+
+    def _end(self):
+        self._relay.detach(self)
+        self._writer.close(wait=False)
+
+    def _wants(self):
+        with self._topics_lock:
+            return TOPIC_MESSAGE in self._subscribed
+
+    def _change_topics(self, topics, subscribed):
+        with self._topics_lock:
+            if subscribed:
+                self._subscribed.update(topics)
+            else:
+                self._subscribed.difference_update(topics)
+            return sorted(self._subscribed)
 
     def _topics(self, request):
         params = self._params(request)
@@ -72,9 +104,3 @@ class CommsSession:
         if not isinstance(params, dict):
             raise RpcError(INVALID_PARAMS, "params must be an object")
         return params
-
-    def _notify(self, topic, params):
-        self._writer.send(self._codec.notification(topic, params))
-
-    def _disconnect(self):
-        self._writer.close()

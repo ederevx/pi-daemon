@@ -1,1 +1,1 @@
-"""The agent comms domain: durable mailboxes, membership, waits, peers."""
+"""The agent comms domain: durable mailboxes and one channel for all."""

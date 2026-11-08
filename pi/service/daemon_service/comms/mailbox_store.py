@@ -6,6 +6,7 @@ the durable store is the only record that it exists.
 
 import hashlib
 import json
+import math
 import threading
 import time
 import uuid
@@ -16,15 +17,21 @@ from .error import CommsError
 BUSY = "busy"
 REQUEST_CONFLICT = "request-conflict"
 STORE_CORRUPT = "store-corrupt"
+BAD_REQUEST = "bad-request"
+PAYLOAD_TOO_LARGE = "payload-too-large"
+UNKNOWN_RECIPIENT = "unknown-recipient"
+REMOTE_NODE = "remote-node"
 RESULT_KIND = "result"
 ALL_TARGET = "all"
 SCHEMA = 1
+# The room a reply wrapper, an id and the result keys need.
+OVERHEAD_BYTES = 1024
 
 
 class MailboxStore:
     """Accepted mail is durable before anyone is told about it."""
 
-    def __init__(self, path, config, node_id="", clock=None):
+    def __init__(self, path, config, node_id, clock=None):
         self._file = AtomicStateFile(path, config.file_mode,
                                      config.write_retries,
                                      config.write_retry_delay)
@@ -37,68 +44,119 @@ class MailboxStore:
         self._recipient_cap = config.comms_recipient_cap
         self._per_recipient = config.comms_messages_per_recipient
         self._page = config.comms_page_messages
+        self._reply_bytes = config.frame_bytes - config.comms_frame_margin
         self._node_id = node_id
         self._clock = clock or time.time
         self._lock = threading.RLock()
         self._recipients = {}
         self._receipts = {}
 
+    def node_id(self):
+        return self._node_id
+
     # -- lifecycle ---------------------------------------------------------
 
     def load(self):
-        """Read one snapshot, expire what is stale and republish it."""
+        """Read one snapshot, refuse a broken one, expire what is stale."""
         with self._lock:
-            try:
-                data = self._file.read_dict()
-            except ValueError:
-                raise CommsError(STORE_CORRUPT) from None
-            if data is None:
+            text = self._file.read()
+            if text is None:
                 self._recipients = {}
                 self._receipts = {}
                 return
-            if not isinstance(data, dict) or data.get("version") != SCHEMA:
-                raise CommsError(STORE_CORRUPT)
-            self._recipients = {
-                agent_id: self._restore_recipient(state)
-                for agent_id, state in (data.get("recipients") or {}).items()
-            }
-            self._receipts = {
-                key: self._detach(receipt)
-                for key, receipt in (data.get("send_receipts") or {}).items()
-            }
+            try:
+                data = json.loads(text)
+            except ValueError:
+                raise CommsError(STORE_CORRUPT) from None
+            recipients, receipts = self._restore(data)
+            self._recipients, self._receipts = recipients, receipts
             self._expire_locked(self._clock())
 
     def save(self):
         with self._lock:
             self._file.write_dict(self._snapshot_locked())
 
-    def _restore_recipient(self, state):
-        if not isinstance(state, dict):
+    def _restore(self, data):
+        if not isinstance(data, dict) or data.get("version") != SCHEMA:
             raise CommsError(STORE_CORRUPT)
-        messages = []
-        for item in state.get("messages") or []:
-            try:
-                messages.append(self._restore_envelope(item))
-            except (KeyError, TypeError, ValueError):
-                raise CommsError(STORE_CORRUPT) from None
-        return {
-            "next_sequence": int(state.get("next_sequence") or 0),
-            "messages": messages,
-            "acknowledged": [str(item) for item in state.get("acknowledged")
-                             or []],
-        }
+        raw_recipients = data.get("recipients")
+        raw_receipts = data.get("send_receipts")
+        if not isinstance(raw_recipients, dict) or \
+                not isinstance(raw_receipts, dict):
+            raise CommsError(STORE_CORRUPT)
+        return ({agent_id: self._restore_recipient(state)
+                 for agent_id, state in raw_recipients.items()},
+                {key: self._restore_receipt(value)
+                 for key, value in raw_receipts.items()})
+
+    def _restore_recipient(self, state):
+        try:
+            if not isinstance(state, dict):
+                raise CommsError(STORE_CORRUPT)
+            messages = [self._restore_envelope(item)
+                        for item in self._list(state.get("messages"))]
+            next_sequence = self._whole(state.get("next_sequence"))
+            acknowledged = [self._text(item)
+                            for item in self._list(state.get("acknowledged"))]
+        except (KeyError, TypeError, ValueError):
+            raise CommsError(STORE_CORRUPT) from None
+        except CommsError as exc:
+            if exc.code == STORE_CORRUPT:
+                raise
+            raise CommsError(STORE_CORRUPT) from None
+        sequences = [message["sequence"] for message in messages]
+        identifiers = [message["messageId"] for message in messages]
+        if len(set(sequences)) != len(sequences) or \
+                len(set(identifiers)) != len(identifiers):
+            raise CommsError(STORE_CORRUPT)
+        if sequences and next_sequence < max(sequences):
+            raise CommsError(STORE_CORRUPT)
+        return {"next_sequence": next_sequence,
+                "messages": messages,
+                "acknowledged": acknowledged}
 
     def _restore_envelope(self, item):
+        accepted_at = self._finite(item["acceptedAt"])
+        expires_at = self._finite(item["expiresAt"])
         return {
-            "messageId": str(item["messageId"]),
+            "messageId": self._text(item["messageId"]),
             "from": self._address(item["from"]),
             "to": self._address(item["to"]),
-            "sequence": int(item["sequence"]),
-            "kind": str(item["kind"]),
+            "sequence": self._whole(item["sequence"]),
+            "kind": self._text(item["kind"]),
             "payload": self._detach(item["payload"]),
-            "acceptedAt": float(item["acceptedAt"]),
-            "expiresAt": float(item["expiresAt"]),
+            "acceptedAt": accepted_at,
+            "expiresAt": expires_at,
         }
+
+    def _restore_receipt(self, value):
+        try:
+            if not isinstance(value, dict):
+                raise CommsError(STORE_CORRUPT)
+            return {
+                "digest": self._text(value["digest"]),
+                "accepted": [self._restore_accepted(item)
+                             for item in self._list(value["accepted"])],
+                "undeliverable": [self._restore_undeliverable(item)
+                                  for item in self._list(
+                                      value["undeliverable"])],
+                "at": self._finite(value["at"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            raise CommsError(STORE_CORRUPT) from None
+        except CommsError as exc:
+            if exc.code == STORE_CORRUPT:
+                raise
+            raise CommsError(STORE_CORRUPT) from None
+
+    def _restore_accepted(self, item):
+        return {"to": self._address(item["to"]),
+                "messageId": self._text(item["messageId"]),
+                "sequence": self._whole(item["sequence"])}
+
+    def _restore_undeliverable(self, item):
+        return {"to": self._address(item["to"]),
+                "reason": self._text(item["reason"])}
 
     def _snapshot_locked(self):
         return {
@@ -121,6 +179,7 @@ class MailboxStore:
     def reserve(self, agent_id):
         """A mailbox exists as soon as its identity is presented."""
         with self._lock:
+            self._expire_if_due_locked()
             state = self._recipients.get(agent_id)
             if state is None:
                 if len(self._recipients) >= self._recipient_cap:
@@ -136,10 +195,6 @@ class MailboxStore:
         with self._lock:
             return agent_id in self._recipients
 
-    def identities(self):
-        with self._lock:
-            return sorted(self._recipients)
-
     def head_sequence(self, agent_id):
         with self._lock:
             state = self._recipients.get(agent_id) or {}
@@ -147,7 +202,8 @@ class MailboxStore:
 
     def _mailbox_snapshot(self, agent_id, state):
         return {"agentId": agent_id,
-                "nextSequence": state["next_sequence"],
+                "nodeId": self._node_id,
+                "headSequence": state["next_sequence"],
                 "pending": len(state["messages"])}
 
     # -- acceptance --------------------------------------------------------
@@ -167,48 +223,29 @@ class MailboxStore:
         digest = self._digest(kind, encoded, descriptor, wanted_ttl)
         key = json.dumps([sender_address, str(request_id)], sort_keys=True)
         with self._lock:
+            self._expire_if_due_locked()
             now = self._clock()
             stored = self._receipts.get(key)
-            if stored is not None and now - float(stored["at"]) > \
-                    self._dedupe_ttl:
-                stored = None
-                self._receipts = {existing: value
-                                  for existing, value in self._receipts.items()
-                                  if existing != key}
             if stored is not None:
                 if stored["digest"] != digest:
                     raise CommsError(REQUEST_CONFLICT)
                 return self._duplicate_result(stored)
-            ttl = self._ttl(kind, ttl_seconds)
             addresses = self._resolve_locked(descriptor, sender_address)
             candidate = {agent_id: self._copy_state(state)
                          for agent_id, state in self._recipients.items()}
             accepted, undeliverable, envelopes = [], [], []
             for address in addresses:
-                agent_id = address["agentId"]
-                state = candidate.get(agent_id)
-                if state is None:
+                outcome = self._deliver_locked(
+                    candidate, address, sender_address, kind, encoded,
+                    wanted_ttl, now)
+                if outcome["reason"] is not None:
                     undeliverable.append({"to": address,
-                                          "reason": "unknown-recipient"})
+                                          "reason": outcome["reason"]})
                     continue
-                if len(state["messages"]) >= self._per_recipient:
-                    raise CommsError(BUSY)
-                state["next_sequence"] += 1
-                envelope = {
-                    "messageId": uuid.uuid4().hex,
-                    "from": sender_address,
-                    "to": address,
-                    "sequence": state["next_sequence"],
-                    "kind": kind,
-                    "payload": self._detach(json.loads(encoded)),
-                    "acceptedAt": now,
-                    "expiresAt": now + ttl,
-                }
-                state["messages"].append(envelope)
-                envelopes.append(self._detach(envelope))
+                envelopes.append(outcome["envelope"])
                 accepted.append({"to": address,
-                                 "messageId": envelope["messageId"],
-                                 "sequence": envelope["sequence"]})
+                                 "messageId": outcome["envelope"]["messageId"],
+                                 "sequence": outcome["envelope"]["sequence"]})
             receipt = {"digest": digest,
                        "accepted": accepted,
                        "undeliverable": undeliverable,
@@ -224,6 +261,32 @@ class MailboxStore:
             if undeliverable:
                 result["undeliverable"] = self._detach(undeliverable)
             return result
+
+    def _deliver_locked(self, candidate, address, sender_address, kind,
+                        encoded, ttl, now):
+        """One recipient's envelope, or the reason it cannot exist."""
+        if address["nodeId"] and address["nodeId"] != self._node_id:
+            return {"reason": REMOTE_NODE, "envelope": None}
+        state = candidate.get(address["agentId"])
+        if state is None:
+            return {"reason": UNKNOWN_RECIPIENT, "envelope": None}
+        if len(state["messages"]) >= self._per_recipient:
+            raise CommsError(BUSY)
+        state["next_sequence"] += 1
+        envelope = {
+            "messageId": uuid.uuid4().hex,
+            "from": sender_address,
+            "to": address,
+            "sequence": state["next_sequence"],
+            "kind": kind,
+            "payload": self._detach(json.loads(encoded)),
+            "acceptedAt": now,
+            "expiresAt": now + ttl,
+        }
+        if len(self._encode(envelope)) > self._reply_bytes:
+            raise CommsError(PAYLOAD_TOO_LARGE)
+        state["messages"].append(envelope)
+        return {"reason": None, "envelope": self._detach(envelope)}
 
     def _duplicate_result(self, stored):
         result = {"status": "duplicate", "receipt": self._detach(stored)}
@@ -248,20 +311,28 @@ class MailboxStore:
     # -- reading -----------------------------------------------------------
 
     def replay(self, agent_id, cursor=None, limit=None):
+        """A page that fits one frame, oldest first, after `cursor`."""
         with self._lock:
             self._expire_if_due_locked()
             state = self._recipients.get(agent_id)
             if state is None:
-                raise CommsError("unknown-recipient")
+                raise CommsError(UNKNOWN_RECIPIENT)
             oldest = self._oldest_locked(state)
             if cursor is not None and int(cursor) + 1 < oldest:
                 return {"status": "cursor-expired",
-                        "oldestAvailableSequence": oldest}
+                        "oldestAvailableSequence": oldest,
+                        "cursor": int(cursor)}
             position = 0 if cursor is None else int(cursor)
             page = min(int(limit or self._page), self._page)
             waiting = [message for message in state["messages"]
                        if message["sequence"] > position]
-            window = waiting[:page]
+            window = []
+            for message in waiting[:page]:
+                if window and len(self._encode_response(window + [message],
+                                                        message["sequence"])) \
+                        > self._reply_bytes:
+                    break
+                window.append(message)
             following = window[-1]["sequence"] if window else position
             return {"status": "ok",
                     "messages": [self._detach(message) for message in window],
@@ -280,7 +351,7 @@ class MailboxStore:
             self._expire_if_due_locked()
             state = self._recipients.get(agent_id)
             if state is None:
-                raise CommsError("unknown-recipient")
+                raise CommsError(UNKNOWN_RECIPIENT)
             present = {message["messageId"] for message in state["messages"]}
             seen = set(state["acknowledged"])
             fresh, repeated, unknown = [], [], []
@@ -317,26 +388,30 @@ class MailboxStore:
             self._expire_locked(now)
 
     def _expire_locked(self, now):
+        """Drop expired mail and the acknowledgement markers that named it."""
         candidate = {}
         dropped = 0
+        pruned = 0
         horizon = now - self._dedupe_ttl
         for agent_id, state in self._recipients.items():
             copied = self._copy_state(state)
-            fresh = []
-            for message in copied["messages"]:
-                if message["expiresAt"] > now:
-                    fresh.append(message)
-                    continue
-                dropped += 1
+            fresh = [message for message in copied["messages"]
+                     if message["expiresAt"] > now]
+            dropped += len(copied["messages"]) - len(fresh)
             copied["messages"] = fresh
+            remaining = {message["messageId"] for message in fresh}
+            markers = [item for item in copied["acknowledged"]
+                       if item in remaining]
+            pruned += len(copied["acknowledged"]) - len(markers)
+            copied["acknowledged"] = markers
             candidate[agent_id] = copied
         receipts = {key: self._detach(value)
                     for key, value in self._receipts.items()
                     if float(value.get("at") or 0) > horizon}
         receipts_dropped = len(self._receipts) - len(receipts)
-        if dropped or receipts_dropped:
+        if dropped or pruned or receipts_dropped:
             self._commit_locked(candidate, receipts)
-        return dropped + receipts_dropped
+        return dropped + pruned + receipts_dropped
 
     # -- internals ---------------------------------------------------------
 
@@ -345,10 +420,10 @@ class MailboxStore:
         previous = (self._recipients, self._receipts)
         self._recipients, self._receipts = recipients, receipts
         try:
-            encoded = json.dumps(self._snapshot_locked(), sort_keys=True)
-            if len(encoded.encode("utf-8")) > self._store_bytes:
+            encoded = self._encode(self._snapshot_locked())
+            if len(encoded) > self._store_bytes:
                 raise CommsError(BUSY)
-            self._file.write(encoded)
+            self._file.write(encoded.decode("utf-8"))
         except BaseException:
             self._recipients, self._receipts = previous
             raise
@@ -363,26 +438,35 @@ class MailboxStore:
         base = self._result_ttl if kind == RESULT_KIND else self._message_ttl
         wanted = base if ttl_seconds is None else float(ttl_seconds)
         if wanted <= 0:
-            raise CommsError("bad-request")
+            raise CommsError(BAD_REQUEST)
         return min(wanted, self._max_ttl)
 
     def _payload_text(self, payload):
         try:
             encoded = json.dumps(payload, sort_keys=True)
         except (TypeError, ValueError):
-            raise CommsError("bad-request") from None
+            raise CommsError(BAD_REQUEST) from None
         if len(encoded.encode("utf-8")) > self._payload_bytes:
-            raise CommsError("payload-too-large")
+            raise CommsError(PAYLOAD_TOO_LARGE)
         return encoded
 
     def _address(self, value):
         if not isinstance(value, dict):
-            raise CommsError("bad-request")
+            raise CommsError(BAD_REQUEST)
         agent_id = str(value.get("agentId") or "")
         if not agent_id:
-            raise CommsError("bad-request")
+            raise CommsError(BAD_REQUEST)
         return {"nodeId": str(value.get("nodeId") or ""),
                 "agentId": agent_id}
+
+    def _encode(self, value):
+        return json.dumps(value, sort_keys=True).encode("utf-8")
+
+    def _encode_response(self, messages, cursor):
+        return self._encode({"status": "ok",
+                             "messages": messages,
+                             "cursor": cursor,
+                             "more": True})
 
     def _detach(self, value):
         """A copy that shares no container with store-owned state."""
@@ -394,3 +478,26 @@ class MailboxStore:
                                "target": descriptor,
                                "ttl": ttl}, sort_keys=True)
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _list(self, value):
+        if not isinstance(value, list):
+            raise CommsError(STORE_CORRUPT)
+        return value
+
+    def _text(self, value):
+        if not isinstance(value, str) or not value:
+            raise CommsError(STORE_CORRUPT)
+        return value
+
+    def _whole(self, value):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise CommsError(STORE_CORRUPT)
+        return value
+
+    def _finite(self, value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise CommsError(STORE_CORRUPT)
+        number = float(value)
+        if not math.isfinite(number):
+            raise CommsError(STORE_CORRUPT)
+        return number

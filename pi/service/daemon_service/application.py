@@ -6,6 +6,7 @@ import signal
 import threading
 
 from .comms.mailbox_store import MailboxStore
+from .comms.node_identity import NodeIdentity
 from .comms.service import CommsService
 from .config import ServiceConfig
 from .lifecycle.instance_coordinator import InstanceCoordinator
@@ -50,6 +51,7 @@ class DaemonApplication:
         self._comms = None
         self._comms_store = None
         self._comms_listener = None
+        self._node_identity = None
 
     @classmethod
     def from_environment(cls, environ=None):
@@ -74,26 +76,26 @@ class DaemonApplication:
                                 self._layout.logs_dir(), self._config)
             store.load()
             runner = TicketRunner(store, self._config)
+            self._store, self._runner = store, runner
             tasks = TaskService(store, runner)
+            self._tasks = tasks
             sessions = self._compose_sessions()
             handlers = TaskOperations(tasks).handlers()
             handlers.update(SessionOperations(
                 sessions, self.request_stop, self._config).handlers())
             token = secrets.token_hex(16)
-            comms, comms_listener = self._compose_comms(token)
+            self._compose_comms(token)
             codec = WireCodec()
             endpoint = ControlEndpoint(
                 self._layout, self._config, ControlHandshake(token),
                 ControlRouter(handlers), codec, self._instance, token,
             )
+            self._endpoint = endpoint
             endpoint.start()
         except BaseException:
             self._unwind()
             raise
-        self._store, self._runner = store, runner
-        self._tasks, self._endpoint = tasks, endpoint
         self._sessions = sessions
-        self._comms, self._comms_listener = comms, comms_listener
         return self
 
     def _compose_sessions(self):
@@ -112,12 +114,19 @@ class DaemonApplication:
         return SessionService(store, runner, relay, self._config)
 
     def _compose_comms(self, token):
-        store = MailboxStore(self._layout.comms_mailbox_path(), self._config)
-        service = CommsService(store, self._config, token)
+        """Every owner is held before it starts, so unwind can stop it."""
+        identity = NodeIdentity(self._layout.comms_node_path(),
+                                self._config).load()
+        self._node_identity = identity
+        store = MailboxStore(self._layout.comms_mailbox_path(), self._config,
+                             identity.id())
+        self._comms_store = store
+        service = CommsService(store, self._config, token, identity.id())
+        self._comms = service
         service.start()
         listener = RpcListener(self._config, RpcCodec(), service)
+        self._comms_listener = listener
         listener.start()
-        self._comms_store = store
         return service, listener
 
     def run(self):
@@ -166,6 +175,7 @@ class DaemonApplication:
         self._comms = None
         self._comms_store = None
         self._comms_listener = None
+        self._node_identity = None
 
     def _unwind(self):
         try:

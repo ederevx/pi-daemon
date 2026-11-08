@@ -8,6 +8,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -28,6 +29,9 @@ from daemon_service.transport.control_handshake import ControlHandshake
 from daemon_service.transport.endpoint_file import EndpointFile
 from daemon_service.transport.endpoint_probe import EndpointProbe
 from daemon_service.transport.json_line_stream import JsonLineStream
+from daemon_service.transport.rpc_codec import CAPACITY, RpcCodec
+from daemon_service.transport.rpc_error import RpcError
+from daemon_service.transport.rpc_writer import RpcWriter
 from daemon_service.wire import WireCodec
 
 SCRATCH = tempfile.mkdtemp(prefix="pi-service-")
@@ -82,6 +86,29 @@ class ConfigTests(unittest.TestCase):
             ServiceConfig.load(overrides={"record_cap": True})
         with self.assertRaises(ValueError):
             ServiceConfig.load(overrides={"record_cap": "2.5"})
+
+    def test_a_comms_setting_that_would_stop_mail_falls_through(self):
+        loaded = ServiceConfig.load(environ={
+            "PI_DAEMON_COMMS_PAGE_MESSAGES": "0",
+            "PI_DAEMON_COMMS_OUTBOUND_QUEUE": "0",
+        })
+        self.assertEqual(loaded.comms_page_messages,
+                         ServiceConfig().comms_page_messages)
+        self.assertEqual(loaded.comms_outbound_queue,
+                         ServiceConfig().comms_outbound_queue)
+
+    def test_comms_settings_that_disagree_are_refused(self):
+        for overrides in (
+                {"comms_message_ttl": 100.0, "comms_max_ttl": 10.0},
+                {"comms_result_ttl": 100.0, "comms_max_ttl": 10.0},
+                {"comms_payload_bytes": 4096, "frame_bytes": 4096},
+                {"comms_frame_margin": 4096, "frame_bytes": 4096},
+                {"comms_payload_bytes": 2000, "comms_frame_margin": 2100,
+                 "frame_bytes": 4096},
+                {"comms_frame_margin": 300, "comms_agent_id_limit": 128},
+        ):
+            with self.assertRaises(ValueError):
+                ServiceConfig.load(overrides=overrides)
 
     def test_no_legacy_team_or_ptyd_names_are_honored(self):
         loaded = ServiceConfig.load(environ={
@@ -182,6 +209,94 @@ class WireTests(unittest.TestCase):
         finally:
             stream.close()
             right.close()
+
+
+class BlockingConnection:
+    """A peer that takes nothing until the test lets it."""
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.entered = threading.Event()
+        self.sent = []
+        self.closed = False
+
+    def sendall(self, data):
+        self.entered.set()
+        self.release.wait(2.0)
+        if self.closed:
+            raise OSError("closed")
+        self.sent.append(data)
+
+    def shutdown(self, how):
+        self.closed = True
+        self.release.set()
+
+    def close(self):
+        self.closed = True
+        self.release.set()
+
+
+class WriterTests(unittest.TestCase):
+
+    def writer(self, connection, **overrides):
+        config = ServiceConfig.load(overrides=dict(
+            {"comms_outbound_queue": 2, "stop_grace": 0.2}, **overrides))
+        return RpcWriter(connection, config, RpcCodec())
+
+    def test_a_full_queue_ends_the_connection_instead_of_blocking(self):
+        connection = BlockingConnection()
+        writer = self.writer(connection)
+        writer.send({"jsonrpc": "2.0", "method": "a"})
+        self.assertTrue(connection.entered.wait(1.0))
+        writer.send({"jsonrpc": "2.0", "method": "b"})
+        writer.send({"jsonrpc": "2.0", "method": "c"})
+        with self.assertRaises(OSError):
+            writer.send({"jsonrpc": "2.0", "method": "d"})
+        self.assertTrue(connection.closed)
+        writer.close()
+
+    def test_close_waits_no_longer_than_the_grace(self):
+        connection = BlockingConnection()
+        writer = self.writer(connection)
+        writer.send({"jsonrpc": "2.0", "method": "a"})
+        started = time.monotonic()
+        writer.close()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(connection.closed)
+
+    def test_close_flushes_what_was_already_queued(self):
+        connection = BlockingConnection()
+        writer = self.writer(connection, stop_grace=2.0)
+        writer.send({"jsonrpc": "2.0", "method": "a"})
+        writer.send({"jsonrpc": "2.0", "method": "b"})
+        connection.release.set()
+        writer.close()
+        self.assertEqual([json.loads(frame)["method"]
+                          for frame in connection.sent], ["a", "b"])
+        self.assertTrue(connection.closed)
+
+    def test_a_reply_over_the_frame_limit_names_the_limit(self):
+        connection = BlockingConnection()
+        writer = self.writer(connection, frame_bytes=2048,
+                             comms_payload_bytes=256,
+                             comms_frame_margin=512)
+        with self.assertRaises(RpcError) as caught:
+            writer.send({"jsonrpc": "2.0", "result": "x" * 4096})
+        self.assertEqual(caught.exception.code, CAPACITY)
+        writer.close()
+
+    def test_nothing_is_sent_after_overflow(self):
+        connection = BlockingConnection()
+        writer = self.writer(connection)
+        writer.send({"jsonrpc": "2.0", "method": "a"})
+        self.assertTrue(connection.entered.wait(1.0))
+        writer.send({"jsonrpc": "2.0", "method": "b"})
+        writer.send({"jsonrpc": "2.0", "method": "c"})
+        with self.assertRaises(OSError):
+            writer.send({"jsonrpc": "2.0", "method": "d"})
+        connection.release.set()
+        writer.close()
+        self.assertEqual(connection.sent, [])
 
 
 class StoreTests(unittest.TestCase):

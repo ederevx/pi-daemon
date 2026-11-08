@@ -248,6 +248,12 @@ There are no legacy names, no `PI_PTYD_*` fallbacks and no pi-teams
 aliases: migration translates configuration once, in the migration
 step, and the new service only reads its own names.
 
+A comms setting whose zero would stop mail rather than disable a
+feature is refused, so it falls through to its next source. The comms
+sizes also have to agree with each other: a message TTL may not exceed
+the maximum TTL, a payload plus the reply margin must fit one frame, and
+the reply margin must be at least the agent-id limit plus 256 bytes.
+
 ## Domain boundaries
 
 | Domain | Owns | Never |
@@ -290,12 +296,40 @@ subscribed connection in sequence order, and a subscriber that falls
 behind its bounded queue is disconnected rather than served a gap, so it
 reconnects and replays from its own cursor.
 
+This node has one identity, `nodeId`, minted on first use and kept in
+the state root beside the mailbox store; it is what agents put in an
+address, and an unreadable or empty `node.json` refuses startup rather
+than minting a second name. An address that names another node is
+reported `undeliverable` with reason `remote-node`: peers are not part
+of this build yet, and a send never pretends a remote mailbox accepted
+mail.
+
+The message envelope is bounded by the frame, not only by the payload
+limit, so a notification always fits the connection that carries it. A
+payload that cannot fit answers `payload-too-large`; a replay page is
+shortened to the frame and reports `more` with a cursor.
+Agent ids, request ids and kinds have their own length limits, and the
+reply margin must leave room for the reply wrapper, a short request id
+and the cursor, so a message that was accepted can always be paged back.
+A JSON-RPC id has no length limit: a reply that does not fit is answered
+with `capacity` instead of being dropped.
+Acknowledgement markers expire with the messages they name.
+
 Mail is durable before anyone is told about it. Acceptance commits the
 envelopes and a send receipt in one write, so a retried `requestId`
 replays its first outcome instead of delivering twice, and an agent that
 is offline still finds its mail. Sequences belong to one mailbox;
 replay pages from a cursor, and a cursor older than the retained
 history reports where that history begins.
+
+Acknowledgement marks mail read; it does not free the capacity a
+mailbox holds, because acknowledged mail stays replayable until it
+expires, and capacity is about the mail the store keeps.
+
+A client subscribes, then replays from its cursor: mail accepted
+before the subscription arrives only through that replay, and mail
+accepted after it can arrive both live and in the replay, so a client
+deduplicates by sequence.
 
 `broadcast` means every mailbox that exists when the broadcast is
 accepted, minus the sender. The receipt freezes that audience, so a
@@ -360,6 +394,9 @@ the two implementations never share a runtime directory.
 * A name whose last run was left unsealed (`unknown` identity) is
   reachable by `run-state` only until the name is reserved again; a
   record's run files should be found by id, not by the name's key.
+* The outbound queue bounds frames, not bytes: one connection can hold
+  `comms_outbound_queue` frames of up to `frame_bytes`, and nothing caps
+  the connection count. Give it a byte budget when fan-out grows.
 * Native comms: mailbox, relay, waits, spawn, peers, and the
   `agent-comms` RPC listener.
 * Extension and `pi-rc` rewiring; installer and migration tooling.
