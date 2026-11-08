@@ -44,12 +44,19 @@ pi/service/daemon_service/sessions/pty_backend.py PosixPtyBackend
 pi/service/daemon_service/sessions/pty_child.py  PtyChild
 pi/service/daemon_service/sessions/pty_exec.py   PtyExec
 pi/service/daemon_service/transport/control_action.py ControlAction
+pi/service/daemon_service/migration/legacy_root.py LegacyRoot
+pi/service/daemon_service/migration/translator.py  LegacyTranslator
+pi/service/daemon_service/migration/plan.py        MigrationPlan
+pi/service/daemon_service/migration/marker.py      MigrationMarker
+pi/service/daemon_service/migration/migration.py   Migration
+pi/service/daemon_service/migration/command.py     MigrateCommand
 ```
 
 Each file owns one cohesive responsibility and one primary class. The
 entry point only bootstraps: it requires `PI_DAEMON_STATE_DIR` and
-`PI_DAEMON_RUNTIME_DIR`, composes `DaemonApplication`, and runs it. The
-staging entry never falls back to the live roots.
+`PI_DAEMON_RUNTIME_DIR`, dispatches its one verb (`migrate`) or composes
+`DaemonApplication`, and runs it. The staging entry never falls back to
+the live roots.
 
 `DaemonApplication` starts the instance lock, the tasks domain, the
 sessions domain and the control endpoint in that order, and stops them
@@ -245,8 +252,10 @@ default, and invalid values fall through to the next source. Booleans
 and non-finite numbers are refused, and zero is a value, not "unset".
 
 There are no legacy names, no `PI_PTYD_*` fallbacks and no pi-teams
-aliases: migration translates configuration once, in the migration
-step, and the new service only reads its own names.
+aliases: the new service only reads its own names. No legacy
+`piDaemon` key has a service field - a ticket TTL, an extension watch,
+an idle window or a transcript-index limit has no counterpart here -
+so `migrate` translates no configuration.
 
 A comms setting whose zero would stop mail rather than disable a
 feature is refused, so it falls through to its next source. The comms
@@ -523,8 +532,9 @@ Order matters, and each step is reversible on its own:
 5. Translate state once, after step 4 and before step 6: the `migrate`
    subcommand of the new entry reads the legacy root and writes the new
    layout, leaving the legacy files untouched for one release. Its
-   contract is below; no code can use it before the entry switch, so it
-   lands with step 6.
+   contract is below. The verb ships with the staging entry and is
+   tested there; only its call from the installer waits for step 6,
+   because until the swap the root it reads keeps changing.
 6. Switch the entry point only after the clients and the installer
    land: `pi/daemon/pi-daemon` becomes the thin bootstrap, the
    implementation moves to `pi/lib/pi_daemon/`, and the old monolith
@@ -551,7 +561,8 @@ other's lock, registry or descriptor:
 | | `sessions.json` | `sessions/sessions.json` |
 | | `session-files.json` (a transcript-file index) | none: dropped |
 | | `run-state/<name>.json` | `sessions/runs/<key>.json` |
-| | the `piDaemon` keys of the agent home's `settings.json` | |
+| | `gc-reap/<name>.json` (a reap request) | none: the new side asks nothing of a session |
+| | the `piDaemon` keys of the agent home's `settings.json` | none: no key has a service field |
 | | | `<state>/settings.json`, an optional `daemon` section |
 | | | `PI_DAEMON_<FIELD>`, which overrides a field |
 | runtime | `$XDG_RUNTIME_DIR/pi-pty-host.sock` | `PI_DAEMON_RUNTIME_DIR` |
@@ -571,8 +582,21 @@ is not a merge; a run while the new instance lock is held refuses
 outright. The legacy root is never written, which is what makes rollback
 independent of the new code.
 
+Every run prints the plan as JSON, and `--dry-run` differs only in that it
+writes nothing, so it fails exactly where the real run would. The exit
+status names the outcome: 0 for a translation or an already-current root,
+1 for an unreadable input, 3 for a held instance lock, 4 for sources that
+moved since the marker, and 5 for a state root that holds untranslated
+state. Nothing is written on any refusal. A translation writes the ticket
+and session stores through their owners and records the marker last, with
+the digests of the files it actually read; a file that moved in between
+leaves no marker, and the next run then refuses as untranslated state.
+
 The order follows from `migrate` belonging to the new entry, which only
-exists after the swap. Stop the unit, then install the new release with
+exists after the swap. `migrate` lives in the staging entry and is tested
+there; the installer's call to it lands with step 6, because a root the
+legacy daemon still serves keeps moving and every later install would
+refuse. Stop the unit, then install the new release with
 `PI_DAEMON_STATE_DIR` and `PI_DAEMON_RUNTIME_DIR` exported to the values
 the unit will use. That installer replaces the launcher and the unit, runs
 `migrate --dry-run` and then `migrate`, and only afterwards runs
@@ -601,8 +625,10 @@ written:
 The new state root stays in place as evidence. A rollback moves the
 legacy state again, because the legacy daemon keeps writing it, so the
 next `migrate` refuses on the changed hashes; `--force` is what
-retranslates it, and it replaces the new root rather than merging into it,
-which is why the marker never re-adopts a translated root silently. The
+retranslates it. A forced run replaces the ticket and session stores and
+leaves `comms/` (the node identity, the mailbox, the peers) and
+`settings.json` alone, which is why the marker never re-adopts a
+translated root silently. The
 instance lock and the runtime descriptor are per-root, so the two
 implementations never share a runtime directory.
 
@@ -627,7 +653,7 @@ implementations never share a runtime directory.
   the `agent-comms` listener, so only the `peer-control` frame that
   carries a launch across the link remains.
 * Step 6: the entry switch, the private tree in the installer, the unit's
-  two roots, and `migrate` itself.
+  two roots, and the installer's call to `migrate`.
 * Discovery activation: the descriptor publishes `pi-rc daemon-start`
   and the client reports a missing service, but nothing yet starts one;
   the CLI's binding is explicit, so a second entry is never dialed.

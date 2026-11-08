@@ -7,17 +7,21 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from daemon_service.application import DaemonApplication
+from daemon_service.migration.command import MigrateCommand
 from daemon_service.transport.service_descriptor import ServiceDescriptor
 
 REQUIRED = ("PI_DAEMON_STATE_DIR", "PI_DAEMON_RUNTIME_DIR")
 
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
     missing = [name for name in REQUIRED if not os.environ.get(name)]
     if missing:
         print("pi-daemon: explicit roots required: " + ", ".join(missing),
               file=sys.stderr)
         return 2
+    if argv[:1] == ["migrate"]:
+        return MigrateCommand.from_environment(os.environ).run(argv[1:])
     # The entry, not an embedder, publishes into the shared service
     # directory: clients find the control wire and agent comms there.
     application = DaemonApplication.from_environment(
