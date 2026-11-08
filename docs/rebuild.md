@@ -93,6 +93,11 @@ transient per submission and is never stored in a record.
 * A running ticket that matches a new submission is replayed, not
   started twice, and that replay is decided before the running cap, so
   a re-sent identical command never fails `too-busy`.
+* A submission that loses its record to a reset before the run is
+  recorded ends its child and is answered `spawn-failed`, so no run is
+  ever left untracked.
+* `timeout` and `offset` refuse booleans, `nan` and `inf`, which the
+  published server accepted by accident.
 * A paged read clamps an offset past the end and reports the clamped
   offset, so `offset`, `next` and `size` always agree.
 
