@@ -722,8 +722,9 @@ transient unit of its own, with the environment a ticket cannot supply:
 `PATH` must reach the real `pi` (`~/.pi/agent/bin/pi`, not the wrapper
 directory and not the shim), and `PI_CODING_AGENT_DIR`,
 `PI_DAEMON_STATE_DIR`, `PI_DAEMON_RUNTIME_DIR` and `TMPDIR` are named
-explicitly. The script logs outside the deployment clone, which the next
-`pi install` resets and cleans, and it decides on the installer's status:
+explicitly. An operator-written script for it logs outside the
+deployment clone, which the next `pi install` resets and cleans, and
+decides on the installer's status:
 75 is retried while a session's background provision holds the lock, 76
 means a daemon came back and the legacy unit is still in place to start,
 and a failed migration installs nothing.
@@ -737,10 +738,11 @@ written:
    cgroup when a hosted session is asking (see Cutover: `systemd-run`).
 2. `pi install git:github.com/ederevx/pi-daemon@<the tag the running
    install came from>`: its postinstall restores the previous
-   `pi-daemon` launcher and unit. The target is the tag pinned in
-   `~/.pi/agent/settings.json`, not the previous tag by number: a host
-   can run a tag the release list has moved past, and rolling back
-   below it would drop whatever that tag carried.
+   `pi-daemon` launcher and unit. The target is the tag `settings.json`
+   named before the cutover, not the previous tag by number: a host can
+   run a tag the release list has moved past, and rolling back below it
+   would drop whatever that tag carried. Record it before the cutover,
+   because the entry then names the new one.
 3. `rm -f ~/.local/bin/pi-comms ~/.local/bin/pi-daemon-migrate
    ~/.local/bin/pi-daemon-migrate.cmd ~/.local/bin/pi_rpc_client.py`: the
    previous release's manifest does not own them, so its `uninstall.sh`
