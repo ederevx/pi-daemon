@@ -8,10 +8,10 @@ STOPPED = "stopped"
 RELOAD_DEATH = "reload-death"
 DIED_MID_RUN = "died-mid-run"
 EXITED_MID_RUN = "exited-mid-run"
-UNKNOWN_RUN = "unknown"
 CRASHED_AT_PROMPT = "crashed-at-prompt"
 RUN_ABORTED = "run-aborted"
 SETTLED = "settled"
+UNKNOWN_RUN = "unknown"
 LOST_MID_RUN = "lost-mid-run"
 LOST_AT_PROMPT = "lost-at-prompt"
 
@@ -47,8 +47,6 @@ class RunOutcome:
         if reason == "lost":
             return (LOST_MID_RUN if state in ("busy", "waiting")
                     else LOST_AT_PROMPT), "lost"
-        if not published:
-            return UNKNOWN_RUN, "unknown"
         if state in ("busy", "waiting"):
             if abnormal:
                 return DIED_MID_RUN, "signal" if signal_name else "exit"
@@ -57,6 +55,8 @@ class RunOutcome:
             return CRASHED_AT_PROMPT, "signal" if signal_name else "exit"
         if record.get("aborted"):
             return RUN_ABORTED, "abort"
+        if not published:
+            return UNKNOWN_RUN, "unknown"
         return SETTLED, None
 
 

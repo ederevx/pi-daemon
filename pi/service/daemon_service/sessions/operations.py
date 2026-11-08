@@ -50,7 +50,7 @@ class SessionOperations:
         return {"ok": True, **self._service.which(_file(request))}
 
     def whichall(self, request):
-        return {"ok": True, "sessions": self._service.whichall(_file(request))}
+        return {"ok": True, "names": self._service.whichall(_file(request))}
 
     def run_state(self, request):
         return self._project(self._service.run_state, _name(request))
@@ -150,13 +150,14 @@ class SessionOperations:
         return {"ok": True, "purged": self._service.purge()}
 
     def daemon_restart(self, request):
-        return ControlAction(reply={"ok": True},
-                             after_send=self._request_stop)
+        # Deferred: a restart hands the endpoint to a successor; without
+        # one the reply must not promise a daemon that never comes back.
+        return error_reply("bad-request")
 
     def shutdown(self, request):
-        _mode(request)
+        mode = _mode(request)
         return ControlAction(reply={"ok": True},
-                             after_send=self._request_stop)
+                             after_send=lambda: self._request_stop(mode))
 
     # -- internals ---------------------------------------------------------
 

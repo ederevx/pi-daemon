@@ -32,6 +32,7 @@ class DaemonApplication:
         self._layout = layout
         self._config = config
         self._stopping = threading.Event()
+        self._mode = "shutdown"
         self._coordinator = InstanceCoordinator(layout.instance_lock_path())
         self._instance = None
         self._store = None
@@ -83,6 +84,7 @@ class DaemonApplication:
             raise
         self._store, self._runner = store, runner
         self._tasks, self._endpoint = tasks, endpoint
+        self._sessions = sessions
         return self
 
     def _compose_sessions(self):
@@ -108,14 +110,16 @@ class DaemonApplication:
             self.stop()
         return 0
 
-    def request_stop(self):
+    def request_stop(self, mode="shutdown"):
+        """Ask the run to end; the mode names what the sessions become."""
+        self._mode = mode
         self._stopping.set()
 
     def stop(self):
         if self._tasks is not None:
             self._tasks.begin_shutdown()
         if self._sessions is not None:
-            self._sessions.begin_shutdown("shutdown")
+            self._sessions.begin_shutdown(self._mode)
         if self._endpoint is not None:
             self._endpoint.stop()
         if self._sessions is not None:

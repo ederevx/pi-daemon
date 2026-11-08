@@ -27,6 +27,14 @@ class PtyExec:
         gate, error, cwd, argv = _arguments()
         if not _gate_open(gate):
             os._exit(1)
+        os.close(gate)
+        try:
+            # An inheritable pipe survives a successful exec, so the parent
+            # would wait for an EOF that never comes. Non-inheritable makes
+            # the successful exec itself close it.
+            os.set_inheritable(error, False)
+        except OSError:
+            pass
         try:
             _login_tty(0)
             os.chdir(cwd)

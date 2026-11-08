@@ -134,7 +134,11 @@ gc-reap-ack | daemon-purge | daemon-restart | shutdown
 ```
 
 * `list` answers the published session view: `name`, `dir`, `pid`,
-  `attached`, `clients`, `file`, `state`, `argv`.
+  `attached`, `clients`, `file`, `state`, `argv`; the client counts are
+  read from the relay, never from the stored copy, which can lag a
+  viewer that went away.
+* `which` names the session a conversation is hosted by; `whichall`
+  answers `names`, one `name`/`state` entry per live holder.
 * `start` answers `created` (a live name is replayed, never replaced);
   the child environment is `os.environ` plus the stored `env`, plus
   `PI_DAEMON_SESSION`, plus the transient `env_once` overlay.
@@ -158,13 +162,15 @@ gc-reap-ack | daemon-purge | daemon-restart | shutdown
   resume is the client's own `start`, which pi-rc already performs).
 * `detach` closes every viewer and leaves the child running; `stop`
   asks the child to end and answers `queued`, `alive`, `state`.
-* `daemon-purge` stops idle sessions with no viewer; `daemon-restart`
-  and `shutdown` answer before the application stops.
+* `daemon-purge` stops idle sessions with no viewer; `shutdown`
+  answers before the application stops and carries the same `mode` the
+  run ends with.
 
 Deferred to the next increment, and answered `bad-request` today:
-`carry`, `extensions-reload`, `handover`, the transcript commands and
-the comms capabilities. Each needs either the transcript index or the
-comms domain; none of them is faked.
+`carry`, `extensions-reload`, `handover`, `daemon-restart`, the
+transcript commands and the comms capabilities. A restart is a handover
+to a successor process, so promising it before a successor exists would
+leave pi-rc waiting for an endpoint that never comes.
 
 ### Durable records
 
@@ -180,21 +186,27 @@ A verdict is decided in one place, `RunOutcome.seal`, and the order is
 the contract: daemon stop, then explicit stop, then reload death, then
 lost ownership, then a death mid-run (a signal or a non-zero exit) or
 an exit mid-run, then a crash at the prompt, then an aborted run, then
-settled, and `unknown` when the run never announced itself. A reopen
-carries the earlier seals into `history`, so a death and a revive never
-erase the death.
+settled, and finally `unknown` for a run that never announced itself.
+`ended` is the current run's verdict and `history` holds only earlier
+runs: a reopen moves the previous `ended` into `history`, so a death
+and a revive never erase the death and never repeat it. A run is sealed
+once; a second finish answers the first verdict unchanged.
 
 ### Process identity
 
 A PID alone proves nothing. `ProcessIdentity` records the boot id and
 the `/proc` start tick, and `classify` answers `same`, `gone` or
 `unknown`; only `same` permits signalling, `gone` refuses it, and
-`unknown` blocks recovery rather than guessing. A child is recorded
-before it execs: the helper holds a gate until the parent has written
-the record and registered the PTY, then `execvpe`s in place, so the
-recorded PID is the conversation's PID. An exec failure travels back
-through the error pipe and the start is refused as `spawn-failed`
-with the child reaped.
+`unknown` blocks recovery rather than guessing: a record whose process
+cannot be proven gone is released but its run stays open, unsealed. A
+child is recorded before it execs: the helper holds a gate until the
+parent has written the record and registered the PTY, then `execvpe`s in
+place, so the recorded PID is the conversation's PID. The helper closes
+the gate and makes the error pipe non-inheritable, so a successful exec
+closes it and the parent sees EOF instead of waiting out a timeout. An
+exec failure travels back through that pipe and the start is refused as
+`spawn-failed` with the child reaped. The PTY is handed to the relay at
+registration and the child never closes it again.
 
 ### The relay
 
@@ -203,18 +215,25 @@ own bounded queue and is dropped, not blocked on, when it falls behind.
 Output produced while nobody watches is kept in one bounded backlog and
 handed to the next viewer as its first chunk, so an attach never opens
 on a half-drawn screen. Viewer input and resizes are queued commands, so
-the request threads never touch a descriptor. `finish` drains until EOF
-or a grace deadline, then closes the viewers; `move_viewers` transfers
-sockets and their queues between sessions without a byte loss.
+the request threads never touch a descriptor. On EOF the viewers keep
+receiving until their queues drain, and only then are they released, so
+a child's last line is never lost. `finish` waits for that drain or a
+grace deadline; `move_viewers` transfers sockets and their queues,
+prefixed with the target's backlog when it had no viewer, without a
+byte loss. A descriptor that went bad is pruned instead of stalling the
+select loop.
 
 ### Recovery and shutdown
 
 A new instance owns no child, so every record another instance left
 `running` is marked exited and its open run is sealed `lost-mid-run` or
 `lost-at-prompt`; names and conversations survive, the process does not.
+A record whose process is still provably the same is ended first, and
+one that cannot be classified is left open as unsealed evidence.
 Shutdown marks every record `stopped`, terminates each child, lets each
-watcher seal its run, drains the relay, then persists both stores. A
-`reboot` mode keeps `desired: running` for the next instance.
+watcher seal its run `daemon-stopped`, drains the relay, then persists
+both stores. A `reboot` mode keeps `desired: running` for the next
+instance.
 
 ## Configuration
 
