@@ -2213,6 +2213,31 @@ def test_terminal_contract():
                         "%s missing %s" % (type(mode).__name__, name))
 
 
+def test_child_contract():
+    # The host drives every child through the same methods, and the two
+    # backends share no base class: pi_conpty cannot import pi_platform.
+    # A missing exit_outcome made drop() raise after the session was
+    # removed and before its record was sealed, so a stopped session kept
+    # reading as unsealed. Duck-typing is the only guard across the
+    # boundary, so both classes answer for it here.
+    conpty = _conpty()
+    plat = daemon.pi_platform
+    required = ("exit_abnormal", "exit_outcome", "wait_nohang",
+                "kill_tree", "close", "read_output", "write_input",
+                "resize")
+    for child in (plat.PosixPtyChild(), conpty.WindowsPtyChild()):
+        for name in required:
+            assert_true(callable(getattr(child, name, None)),
+                        "%s missing %s" % (type(child).__name__, name))
+        # A clean quit and a death must stay distinguishable in the
+        # sealed record, whichever status encoding the child uses.
+        assert_eq(child.exit_outcome(0), (False, 0),
+                  "%s: a clean quit" % (type(child).__name__))
+        assert_eq(child.exit_outcome(3)[1:], (3,),
+                  "%s: a nonzero exit keeps its code"
+                  % (type(child).__name__))
+
+
 def test_utf8_chunker():
     # A multi-byte character split across relay chunks must be held back
     # rather than decoded twice by WriteFile on the UTF-8 console.

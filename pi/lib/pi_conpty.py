@@ -473,6 +473,13 @@ class WindowsPtyChild:
         # the child died abnormally (a clean quit is 0).
         return bool(status)
 
+    def exit_outcome(self, status):
+        # A raw Windows exit code carries no signal bit, so the signal
+        # half of the run-outcome record stays False and the code speaks
+        # for itself. Drop called this once already and found nothing: the
+        # record stayed unsealed while the session was already gone.
+        return (False, status)
+
     def wait_nohang(self):
         if self._reaped:
             return (True, self._exit_code)
