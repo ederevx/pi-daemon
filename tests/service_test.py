@@ -139,13 +139,14 @@ class InstanceTests(unittest.TestCase):
 
 class WireTests(unittest.TestCase):
     def test_hello_uses_the_published_contract(self):
-        handshake = ControlHandshake("secret", ["ticket-submit"])
+        handshake = ControlHandshake("secret")
         greeting = handshake.authorize({"cmd": "hello", "token": "secret"})
         self.assertEqual(greeting["srv"], "pi-daemon")
         self.assertEqual(greeting["proto"], 1)
         self.assertEqual(greeting["caps"], [])
         self.assertEqual(greeting["index"], 1)
-        self.assertEqual(greeting["commands"], ["ticket-submit"])
+        self.assertEqual(set(greeting),
+                         {"ok", "srv", "proto", "caps", "index"})
         with self.assertRaises(PermissionError):
             handshake.authorize({"cmd": "hello", "token": "wrong"})
         with self.assertRaises(PermissionError):
@@ -206,7 +207,7 @@ class StoreTests(unittest.TestCase):
             "logs" + os.sep + first["id"] + ".log", "tickets.json"),
             os.path.dirname(store.log_path(first["id"])), config)
         reloaded.load()
-        second = reloaded.reserve("pi-1", SCRATCH, "true", 0)[0]
+        second = reloaded.reserve("pi-1", SCRATCH, "true", 0, 32)[0]
         self.assertNotEqual(first["id"], second["id"])
 
     def test_running_records_become_interrupted_after_a_reload(self):
@@ -250,6 +251,27 @@ class RunnerTests(unittest.TestCase):
         result = service.output(ticket["id"])
         self.assertEqual(result["data"], b"hello")
         self.assertEqual(result["size"], 5)
+
+    def test_capacity_is_decided_after_the_replay_guard(self):
+        service, _, _ = tasks_service(max_running=1)
+        first, _ = service.submit("pi-1", SCRATCH, "sleep 30")
+        replay, reused = service.submit("pi-1", SCRATCH, "sleep 30")
+        self.assertTrue(reused)
+        self.assertEqual(replay["id"], first["id"])
+        with self.assertRaises(TaskError) as caught:
+            service.submit("pi-1", SCRATCH, "sleep 31")
+        self.assertEqual(caught.exception.code, "too-busy")
+        service.cancel(first["id"])
+
+    def test_a_paged_offset_past_the_end_is_clamped(self):
+        service, _, _ = tasks_service()
+        ticket, _ = service.submit("pi-1", SCRATCH, "printf 'abc'")
+        service.wait(ticket["id"], 10)
+        paged = service.output(ticket["id"], 100)
+        self.assertEqual(paged["offset"], 3)
+        self.assertEqual(paged["next"], 3)
+        self.assertEqual(paged["data"], b"")
+        self.assertEqual(paged["size"], 3)
 
     def test_a_failure_is_kept_not_lost(self):
         service, _, _ = tasks_service()
@@ -394,7 +416,19 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(self.greeting["srv"], "pi-daemon")
         self.assertEqual(self.greeting["proto"], 1)
         self.assertEqual(self.greeting["index"], 1)
-        self.assertIn("ticket-submit", self.greeting["commands"])
+        self.assertEqual(self.greeting["caps"], [])
+
+    def test_a_malformed_hello_is_bad_handshake(self):
+        connection = socket.create_connection(
+            (self.coordinates["host"], self.coordinates["port"]), 2)
+        stream = JsonLineStream(connection, 65536, 8192)
+        try:
+            stream.write(b"nope\n")
+            reply = json.loads(stream.read())
+            self.assertFalse(reply["ok"])
+            self.assertEqual(reply["error"], "bad-handshake")
+        finally:
+            stream.close()
 
     def test_a_malformed_request_is_bad_request(self):
         self.talk({"cmd": "ticket-list"})
@@ -421,6 +455,34 @@ class EndpointTests(unittest.TestCase):
                          ["error"], "no-ticket")
         self.assertEqual(self.talk({"cmd": "ticket-remove", "id": "t-nope"})
                          ["error"], "no-ticket")
+
+    def test_numeric_strings_are_accepted_like_the_published_server(self):
+        self.talk({"cmd": "ticket-list"})
+        submitted = self.talk({"cmd": "ticket-submit", "session": "pi-1",
+                               "cwd": SCRATCH, "command": "printf 'abc'",
+                               "timeout": "5"})
+        self.assertTrue(submitted["ok"])
+        self.talk({"cmd": "ticket-wait", "id": submitted["id"],
+                   "timeout": "10"})
+        paged = self.talk({"cmd": "ticket-output", "id": submitted["id"],
+                           "offset": "1"})
+        self.assertEqual(base64.b64decode(paged["data"]), b"bc")
+        self.assertEqual(paged["offset"], 1)
+
+    def test_an_empty_session_filter_is_listed_not_refused(self):
+        self.talk({"cmd": "ticket-list"})
+        self.talk({"cmd": "ticket-submit", "session": "pi-1",
+                   "cwd": SCRATCH, "command": "printf 'x'"})
+        self.assertTrue(self.talk({"cmd": "ticket-list", "session": ""})["ok"])
+
+    def test_a_null_wait_timeout_is_bad_request(self):
+        self.talk({"cmd": "ticket-list"})
+        submitted = self.talk({"cmd": "ticket-submit", "session": "pi-1",
+                               "cwd": SCRATCH, "command": "printf 'x'"})
+        self.assertEqual(self.talk({"cmd": "ticket-wait",
+                                    "id": submitted["id"],
+                                    "timeout": None})["error"],
+                         "bad-request")
 
     def test_removing_a_running_ticket_is_refused(self):
         self.talk({"cmd": "ticket-list"})

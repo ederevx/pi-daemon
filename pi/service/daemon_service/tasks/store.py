@@ -5,9 +5,9 @@ import threading
 import time
 
 from ..atomic_state_file import AtomicStateFile
-from ..wire import TICKET_RUNNING
+from ..wire import TICKET_RUNNING, TOO_BUSY
 from .error import TaskError
-from .model import CANCELLED, DONE, FAILED, RUNNING, Ticket
+from .model import FAILED, RUNNING, Ticket
 
 
 class TicketStore:
@@ -59,14 +59,20 @@ class TicketStore:
                         if tid in self._records],
         })
 
-    def reserve(self, session, cwd, command, timeout):
-        """One atomic operation: replay a running match or create a ticket."""
+    def reserve(self, session, cwd, command, timeout, capacity):
+        """One atomic operation: replay a running match or create a ticket.
+
+        The replay is decided before capacity, because a re-sent identical
+        command is a replay, never a new load.
+        """
         with self._lock:
             for ticket_id in self._order:
                 ticket = self._records[ticket_id]
                 if (ticket.status == RUNNING and ticket.session == session
                         and ticket.cwd == cwd and ticket.command == command):
                     return ticket.to_dict(), False
+            if self.running_count() >= capacity:
+                raise TaskError(TOO_BUSY)
             self._next += 1
             ticket = Ticket(
                 ticket_id=f"t-{os.getpid()}-{self._next}",
@@ -152,7 +158,7 @@ class TicketStore:
             return len(chunk)
 
     def output(self, ticket_id, offset=0):
-        """Raw bytes from one offset, with the next offset and the size."""
+        """Raw bytes from one offset, with the clamped offset and the size."""
         with self._lock:
             ticket = self._records.get(ticket_id)
             if ticket is None:
@@ -165,7 +171,7 @@ class TicketStore:
                 data = handle.read(size - offset)
         except FileNotFoundError:
             data = b""
-        return data, offset + len(data), size
+        return data, offset, offset + len(data), size
 
     def discard(self, ticket_id):
         """Drop a reservation that never became a run."""
@@ -192,17 +198,6 @@ class TicketStore:
             self._save_locked()
             self._discard_log(ticket_id)
             return True
-
-    def reset(self):
-        with self._lock:
-            removed = [tid for tid in self._order
-                       if self._records[tid].status != RUNNING]
-            for ticket_id in removed:
-                self._records.pop(ticket_id, None)
-                self._order.remove(ticket_id)
-                self._discard_log(ticket_id)
-            self._save_locked()
-            return len(removed)
 
     def reset_all(self):
         with self._lock:

@@ -3,7 +3,7 @@
 import socket
 import threading
 
-from ..wire import BAD_REQUEST
+from ..wire import BAD_HANDSHAKE, BAD_REQUEST, error_reply
 from .endpoint_file import EndpointFile
 from .json_line_stream import JsonLineStream
 
@@ -70,15 +70,18 @@ class ControlEndpoint:
         stream = JsonLineStream(connection, self._config.frame_bytes,
                                 self._config.read_chunk_bytes)
         try:
-            greeting = self._handshake.authorize(
-                self._codec.decode(stream.read()))
+            try:
+                hello = self._codec.decode(stream.read())
+            except ValueError:
+                raise PermissionError(BAD_HANDSHAKE) from None
+            greeting = self._handshake.authorize(hello)
             stream.write(self._codec.encode(greeting))
             while not self._stopping.is_set():
                 response = self._answer(self._codec.decode(stream.read()))
                 stream.write(self._codec.encode(response))
         except PermissionError as exc:
             self._try_write(stream, self._codec.encode(
-                self._codec.error(str(exc))))
+                error_reply(str(exc))))
         except (ValueError, ConnectionError, OSError):
             pass
         finally:
@@ -90,7 +93,7 @@ class ControlEndpoint:
         try:
             return self._router.dispatch(request)
         except (LookupError, ValueError, KeyError):
-            return self._codec.error(BAD_REQUEST)
+            return error_reply(BAD_REQUEST)
 
     def _try_write(self, stream, message):
         try:

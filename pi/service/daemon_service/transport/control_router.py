@@ -17,6 +17,4 @@ class ControlRouter:
         handler = self._handlers.get(operation)
         if handler is None:
             raise LookupError(f"unknown command: {operation}")
-        result = handler(request)
-        return result if isinstance(result, dict) else {"ok": True,
-                                                        "result": result}
+        return handler(request)

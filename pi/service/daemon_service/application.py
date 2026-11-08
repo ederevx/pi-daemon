@@ -60,7 +60,7 @@ class DaemonApplication:
             token = secrets.token_hex(16)
             codec = WireCodec()
             endpoint = ControlEndpoint(
-                self._layout, self._config, ControlHandshake(token, handlers),
+                self._layout, self._config, ControlHandshake(token),
                 ControlRouter(handlers), codec, self._instance, token,
             )
             endpoint.start()

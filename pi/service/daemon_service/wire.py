@@ -10,6 +10,11 @@ TOO_BUSY = "too-busy"
 SPAWN_FAILED = "spawn-failed"
 
 
+def error_reply(code):
+    """The one shape of every failure reply."""
+    return {"ok": False, "error": code}
+
+
 class WireCodec:
     """One owner of the published protocol and its error vocabulary."""
 
@@ -32,5 +37,4 @@ class WireCodec:
     def hello_request(self, token):
         return {"cmd": "hello", "token": token}
 
-    def error(self, code):
-        return {"ok": False, "error": code}
+
