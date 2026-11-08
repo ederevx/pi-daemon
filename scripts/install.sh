@@ -328,6 +328,20 @@ refuse_while_serving() {
   maintenance "$reason"
 }
 
+# One field of a migration plan, or nothing when the plan is unreadable.
+plan_field() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        print(json.load(handle).get(sys.argv[2]) or "")
+except Exception:
+    print("")
+PY
+}
+
 # -- one published generation -------------------------------------------
 
 build_tree() {
@@ -522,7 +536,13 @@ plan="$state_dir/migration-plan.$$"
 preview=0
 "${migrate_env[@]}" "$candidate/bin/pi-daemon-migrate" --dry-run \
   > "$plan" 2>"$plan.err" || preview=$?
-if [[ $preview -ne 0 ]]; then
+migrate=1
+if [[ $preview -eq 3 && "$(plan_field "$plan" intent)" == "current" ]]; then
+  # A daemon holds the lock over stores that are already translated: this
+  # install publishes a generation and writes no state, and the daemon keeps
+  # the release it started from.
+  migrate=0
+elif [[ $preview -ne 0 ]]; then
   cat "$plan.err" >&2 || true
   # A held instance lock (3) means a new daemon is running: that is the
   # maintenance case, not a broken translation.
@@ -534,17 +554,7 @@ if [[ $preview -ne 0 ]]; then
   die "migration preview failed; nothing was installed or started"
 fi
 rm -f "$plan.err"
-action="$(python3 - "$plan" <<'PY'
-import json
-import sys
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as handle:
-        print(json.load(handle).get("action") or "")
-except Exception:
-    print("")
-PY
-)"
+action="$(plan_field "$plan" action)"
 rm -f "$plan"
 if [[ "$action" == "translate" ]]; then
   # Only a translation needs the daemon stopped: it is the step that
@@ -552,7 +562,8 @@ if [[ "$action" == "translate" ]]; then
   refuse_while_serving
 fi
 mkdir -p "$new_state" "$new_runtime"
-if ! output="$("${migrate_env[@]}" "$candidate/bin/pi-daemon-migrate" 2>&1)"; then
+if [[ $migrate -eq 1 ]] \
+    && ! output="$("${migrate_env[@]}" "$candidate/bin/pi-daemon-migrate" 2>&1)"; then
   printf '%s\n' "$output" >&2
   die "migration failed; nothing was installed or started"
 fi

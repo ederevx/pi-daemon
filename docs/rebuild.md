@@ -688,7 +688,9 @@ legacy root read-only and writes the new one:
 file it read. A rerun whose hashes still match does nothing; a rerun whose
 hashes moved refuses unless `--force` is given, because a translated store
 is not a merge; a run while the new instance lock is held refuses
-outright. The legacy root is never written, which is what makes rollback
+outright, though the plan still reports the intent it refused for, so a
+caller can tell a translated store from one that needs a translation.
+The legacy root is never written, which is what makes rollback
 independent of the new code.
 
 A run that reaches a decision prints the plan as JSON, and `--dry-run`
@@ -706,7 +708,11 @@ The order follows from the generation being built before anything public
 changes: the installer builds the candidate release, runs
 `pi-daemon-migrate --dry-run` and then `pi-daemon-migrate` from inside it
 with the roots the unit will declare, and only afterwards replaces the
-launchers and the unit and runs `systemctl --user enable --now`. A failed
+launchers and the unit and runs `systemctl --user enable --now`. When the
+lock is held and the plan's intent is `current`, no store needs writing,
+so the installer publishes the generation and skips the translation
+altogether; a lock over an untranslated or moved legacy root still stops
+it. A failed
 translation starts nothing, because a started service would take the
 instance lock and the next translation would refuse on it. The installer
 runs the translation rather than `ExecStartPre`: with

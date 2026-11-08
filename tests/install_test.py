@@ -15,6 +15,7 @@ import pathlib
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -24,6 +25,10 @@ INSTALL = ROOT / "scripts" / "install.sh"
 UNINSTALL = ROOT / "scripts" / "uninstall.sh"
 BASH = shutil.which("bash")
 SCRATCH = os.path.expanduser("~/tmp")
+
+sys.path.insert(0, str(ROOT / "pi" / "lib"))
+
+from pi_daemon.lifecycle.instance_coordinator import InstanceCoordinator
 
 
 class ScratchHome:
@@ -104,6 +109,14 @@ class ScratchHome:
     def manifest(self):
         return json.loads(
             self.path(".pi/agent/.pi-daemon/manifest.json").read_text())
+
+    def hold_instance_lock(self):
+        """Takes the lock a serving daemon holds, so an install sees one."""
+        lock = self.root / "daemon-runtime" / "instance.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        holder = InstanceCoordinator(str(lock))
+        holder.acquire()
+        return holder
 
     def releases(self):
         return sorted((self.path(".local/lib/pi-daemon/releases")).iterdir())
@@ -410,6 +423,31 @@ class InstallScriptTests(unittest.TestCase):
         result = self.scratch.package()
         self.assertEqual(result.returncode, 76, result.stdout + result.stderr)
         self.assertFalse(self.scratch.path(".local/bin/pi-daemon").exists())
+
+    def test_a_current_install_publishes_beside_a_running_daemon(self):
+        clone = self.scratch.clone()
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        first = self.scratch.manifest()["active_root"]
+        marker = self.scratch.path("daemon-state/migration.json").read_bytes()
+        with open(clone / "pi" / "bin" / "pi-rc", "a", encoding="utf-8") as handle:
+            handle.write("\n# a new build\n")
+        holder = self.scratch.hold_instance_lock()
+        self.addCleanup(holder.release)
+        result = self.scratch.package(clone)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(self.scratch.manifest()["active_root"], first)
+        self.assertIn(first, self.scratch.manifest()["retained"])
+        self.assertEqual(
+            self.scratch.path("daemon-state/migration.json").read_bytes(), marker)
+
+    def test_an_untranslated_install_still_refuses_beside_a_running_daemon(self):
+        holder = self.scratch.hold_instance_lock()
+        self.addCleanup(holder.release)
+        result = self.scratch.package()
+        self.assertEqual(result.returncode, 76, result.stdout + result.stderr)
+        self.assertIn("nothing was changed", result.stderr)
+        self.assertFalse(
+            self.scratch.path(".pi/agent/.pi-daemon/manifest.json").exists())
 
     def test_install_refuses_beside_an_active_unit(self):
         # A legacy unit declares neither new root, so the question is which

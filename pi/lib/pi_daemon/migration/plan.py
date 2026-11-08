@@ -44,6 +44,7 @@ class MigrationPlan:
         self._locked = bool(locked)
         self._translator = LegacyTranslator(config, clock())
         self._action = TRANSLATE
+        self._intent = TRANSLATE
         self._refusal = None
         self._changed = []
         self._tickets = []
@@ -70,10 +71,15 @@ class MigrationPlan:
         self._marker = marker
 
     def _decide(self):
-        sources = self._sources
+        self._decide_unlocked()
+        # A held lock refuses the run, but the plan still says what the run
+        # would do: an install beside a daemon may publish when it is current.
+        self._intent = self._action
         if self._locked:
             self._action, self._refusal = REFUSE, INSTANCE_LOCKED
-            return
+
+    def _decide_unlocked(self):
+        sources = self._sources
         if self._marker is None:
             if self._state_present() and not self._force:
                 self._action, self._refusal = REFUSE, UNMARKED_STATE
@@ -180,6 +186,7 @@ class MigrationPlan:
         return {
             "dry_run": bool(dry_run),
             "action": self._action,
+            "intent": self._intent,
             "refusal": self._refusal,
             "force": self._force,
             "legacy_root": self._legacy.root(),

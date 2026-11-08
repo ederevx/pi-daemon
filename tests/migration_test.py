@@ -344,6 +344,25 @@ class RefusalTests(unittest.TestCase):
         finally:
             holder.release()
 
+    def test_a_held_lock_still_reports_what_the_run_would_do(self):
+        holder = InstanceCoordinator(self.fixture.layout().instance_lock_path())
+        holder.acquire()
+        try:
+            code, plan, _ = self.fixture.run("--dry-run")
+            self.assertEqual((code, plan["action"], plan["intent"]),
+                             (3, "refuse", "translate"))
+        finally:
+            holder.release()
+        self.assertEqual(self.fixture.run()[0], 0)
+        holder.acquire()
+        try:
+            code, plan, _ = self.fixture.run("--dry-run")
+            self.assertEqual((code, plan["refusal"], plan["intent"],
+                              plan["changed"]),
+                             (3, "instance-locked", "current", []))
+        finally:
+            holder.release()
+
     def test_untranslated_state_refuses_until_forced(self):
         os.makedirs(os.path.join(self.fixture.state, "tasks"))
         with open(os.path.join(self.fixture.state, "tasks", "tickets.json"),
