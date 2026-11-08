@@ -207,7 +207,7 @@ test("guard: a missing state directory is created for the log", async () => {
   const guard = new ProvisioningGuard(
     new ProvisionStamp(scratch.clone, join(scratch.root, "state", "manifest.json")),
     new PackageProvisioner(scratch.clone));
-  await withEnv({ HOME: scratch.home, PATH: scratch.path() }, async () => {
+  await withEnv(scratch.env(), async () => {
     const spawned = guard.run(() => undefined);
     assert(spawned, "a missing manifest provisions");
     await new Promise<void>((resolve) => spawned.on("exit", () => resolve()));
@@ -224,7 +224,7 @@ test("guard: a stale clone re-provisions the installed copies", async () => {
   const failures: Array<string | null | undefined> = [];
   const guard = scratch.guard();
   let spawned: ReturnType<ProvisioningGuard["run"]> = null;
-  await withEnv({ HOME: scratch.home, PATH: scratch.path() }, async () => {
+  await withEnv(scratch.env(), async () => {
     spawned = guard.run((failure) => failures.push(failure));
     assert(spawned, "a stale clone spawns provisioning");
     await new Promise<void>((resolve) => spawned!.on("exit", () => resolve()));
@@ -246,7 +246,7 @@ test("extension: a headless session start provisions without a UI", async () => 
   unlinkSync(scratch.manifest);
 
   const start = sessionStartHandler();
-  await withEnv({ HOME: scratch.home, PATH: scratch.path() }, async () => {
+  await withEnv(scratch.env(), async () => {
     await start({ ui: undefined });
     await waitFor(() => scratch.stamp().isCurrent(),
       "the session start provisions a stale clone");
@@ -261,7 +261,7 @@ test("extension: a failing notice never escapes the session start", async () => 
   unlinkSync(scratch.manifest);
 
   const start = sessionStartHandler();
-  await withEnv({ HOME: scratch.home, PATH: scratch.path() }, async () => {
+  await withEnv(scratch.env(), async () => {
     await start({
       ui: {
         notify: () => {

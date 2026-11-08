@@ -163,7 +163,16 @@ PY
 
 # -- refusals before anything public changes ----------------------------
 
+# `systemctl --user` answers for the whole user manager, not for the home this
+# install targets, so the question is narrowed first: is the unit this install
+# owns on disk, and does it declare the two roots this run resolves? A unit
+# rendered for other roots - another home, an isolated test tree - is not
+# serving this install, and its daemon must not stop an install here.
 service_active() {
+  local unit="$systemd_dir/pi-daemon.service"
+  [[ -f "$unit" ]] || return 1
+  grep -Fqx "Environment=\"PI_DAEMON_STATE_DIR=$new_state\"" "$unit" || return 1
+  grep -Fqx "Environment=\"PI_DAEMON_RUNTIME_DIR=$new_runtime\"" "$unit" || return 1
   command -v systemctl >/dev/null 2>&1 || return 1
   systemctl --user is-active --quiet pi-daemon.service >/dev/null 2>&1
 }
