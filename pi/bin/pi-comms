@@ -56,6 +56,8 @@ def _seam_path():
 
 
 sys.path.insert(0, _seam_path())
+# The seams live in a published release, which nothing may write to.
+sys.dont_write_bytecode = True
 import pi_rpc_client
 import pi_services
 

@@ -185,6 +185,8 @@ def _platform_path():
 
 
 sys.path.insert(0, _platform_path())
+# The seams live in a published release, which nothing may write to.
+sys.dont_write_bytecode = True
 import pi_platform
 import pi_services
 

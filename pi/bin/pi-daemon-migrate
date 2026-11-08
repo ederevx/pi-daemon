@@ -12,6 +12,8 @@ import sys
 LIB = os.path.abspath(os.path.join(
     os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 sys.path.insert(0, LIB)
+# The seams live in a published release, which nothing may write to.
+sys.dont_write_bytecode = True
 
 from pi_daemon.environment import EntryEnvironment
 from pi_daemon.migration.command import MigrateCommand

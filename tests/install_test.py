@@ -182,14 +182,19 @@ class InstallScriptTests(unittest.TestCase):
 
     def test_a_release_is_immutable(self):
         # A published generation is the install for a running daemon: no
-        # bytecode may appear beside its modules.
+        # bytecode may appear beside its modules, even after one of its
+        # commands has run from the public launcher.
         self.assertEqual(self.scratch.package().returncode, 0)
+        ran = subprocess.run(
+            ["python3", str(self.scratch.path(".local/bin/pi-comms")),
+             "help"],
+            env=self.scratch.env(), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
         stray = [p for p in self.scratch.releases()[0].rglob("__pycache__")]
         self.assertEqual(stray, [], "the release was written after publishing")
-        sources = self.scratch.manifest()["sources"]
-        for rel, digest in sources.items():
+        for rel in self.scratch.manifest()["sources"]:
             self.assertNotIn("__pycache__", rel)
-            self.assertNotIn(".pyc", digest and rel)
 
     def test_package_install_records_sources(self):
         clone = self.scratch.clone()
