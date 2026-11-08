@@ -209,22 +209,34 @@ the reload there; a busy session is skipped and nothing retries it, so
 the caller runs the command again. Nothing is started, respawned or
 revived, so a broken update cannot become a spawn storm.
 
-The request is a file under the state root,
-`<state root>/extensions-reload/<name>.json`, written whole under a
-name that carries the round token and carrying a fresh token per round.
-The hosted extension's watcher consumes it by deleting it and queues
-pi's own `/daemon-reload`; a session that has not acknowledged within
-the grace - an older extension without the watcher, a watcher event
-that never arrived, or a scheduler that never ran the queued command -
-gets `/reload` typed into its PTY instead. That fallback is guarded
-twice: the round takes the request back only if it still carries its own
-token (a request consumed at the deadline, or a later round's file, is
-never deleted), and it types only into the same live, idle run it
-selected. The typed bytes are queued for the PTY, not proven rendered,
-and the fallback assumes the TUI is at a prompt: idle is the service's
-only evidence, so a half-typed editor is the operator's risk. A token
-consumed in one round never fires in the next, and a startup purges
-whatever a previous run left behind, half-written temporaries included.
+The request is a round's own file under the state root,
+`<state root>/extensions-reload/<name>/<round>.json`, written whole
+under a round name nothing can reuse and carrying the run it is for (the
+run id and generation the daemon puts in the child's environment), so a
+successor that took the session name never answers its predecessor's
+request. The extension's watcher queues pi's own
+`/daemon-reload --signal <round>` without removing the file; that
+command's handler removes exactly the round's file and only then runs
+pi's own reload. The queued command is terminal either way, so a round
+the daemon already took back stays inert instead of falling through to
+the manual restart, and a removal that fails for any reason other than
+the file being gone is not an acknowledgement. A session that has not
+acknowledged within the grace - an older extension without the watcher,
+a watcher event that never arrived, or a scheduler that never ran the
+queued command - gets `/reload` typed into its PTY instead. That
+fallback is guarded twice: the round claims only its own file, so a
+request consumed at the deadline or a later round's request is never
+deleted, and it types by the run identity it selected (id and
+generation), never by name, so a successor that took the name never
+receives the earlier round's bytes. The typed bytes are queued for the
+PTY, not proven rendered, and the fallback assumes the TUI is at a
+prompt: idle is the service's only evidence, so a half-typed editor is
+the operator's risk. One round's file is unique to it, so no round can
+ever answer or delete another's request, and a startup purges the
+directory, half-written temporaries included. The claim protocol and
+that purge assume a state root is owned by one daemon (its instance lock
+lives in the runtime root): two daemons sharing one state root would
+race each other's claims and purge each other's requests.
 
 The reply carries `reloaded` (a session whose request was taken, or
 whose PTY accepted the typed command), `skipped` (`id` and `reason`:

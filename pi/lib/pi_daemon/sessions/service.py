@@ -288,22 +288,25 @@ class SessionService:
             for name in names:
                 if name not in live:
                     skipped.append({"id": name, "reason": "unknown"})
-        token = self._reload.token()
+        # One round name per session: a later round writes its own file,
+        # so nothing this round does can touch a request it did not write.
+        tokens = {name: self._reload.token()
+                  for _key, _generation, name in targets}
         pending = []
         for key, generation, name in targets:
-            if self._reload.signal(name, token):
+            if self._reload.signal(name, tokens[name], key, generation):
                 pending.append((key, generation, name))
             else:
                 skipped.append({"id": name, "reason": "write-failed"})
         consumed = set(self._reload.await_consumed(
-            [name for _key, _generation, name in pending]))
+            [name for _key, _generation, name in pending], tokens))
         reloaded = [name for _key, _generation, name in pending
                     if name in consumed]
         for key, generation, name in pending:
             if name in consumed:
                 continue
             try:
-                claimed = self._reload.claim(name, token)
+                claimed = self._reload.claim(name, tokens[name])
             except OSError:
                 skipped.append({"id": name, "reason": "write-failed"})
                 continue
@@ -320,7 +323,10 @@ class SessionService:
                 skipped.append({"id": name, "reason": "not-idle"})
                 continue
             try:
-                self._runner.send(name, FALLBACK.encode("utf-8"))
+                # The captured identity, never the name again: a successor
+                # that took the name must not receive this run's fallback.
+                self._runner.send_run(key, generation,
+                                      FALLBACK.encode("utf-8"))
             except (SessionError, OSError, TimeoutError):
                 skipped.append({"id": name, "reason": "write-failed"})
             else:

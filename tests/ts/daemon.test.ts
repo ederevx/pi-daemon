@@ -6,21 +6,49 @@
  * module-global state and no leaks across instances.
  */
 
-import { mkdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  writeFileSync,
+  existsSync,
+  rmSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { test, assert, assertEq, withEnv, withPlatform, waitFor, scratchDir } from "./harness.ts";
 import {
+  HostedReloadWatcher,
   RcBackground,
   ProcessRunner,
   DaemonSupervisor,
   endpointPath,
   stateHome,
-  reloadSignalPath,
+  reloadSignalDir,
   windowlessCandidates,
   settledAborted,
   default as factory,
 } from "../../pi/extensions/daemon.ts";
+
+/** The run identity the daemon gives every hosted child. */
+const RUN_ID = "run-1";
+const RUN_GENERATION = "gen-1";
+
+/** The environment a hosted session sees, with its run identity. */
+const HOSTED_ENV = {
+  PI_DAEMON_RUN_ID: RUN_ID,
+  PI_DAEMON_RUN_GENERATION: RUN_GENERATION,
+};
+
+/** Leave a reload request for this run, as the daemon writes it. */
+function writeReloadRequest(
+  path: string,
+  token: string,
+  run: string = RUN_ID,
+  generation: string = RUN_GENERATION,
+): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({ token, run, generation }));
+}
 
 interface ExeResult {
   code: number;
@@ -414,23 +442,24 @@ test("daemon: auto /reload is silent and never messages the agent", async () => 
 test("daemon: reload signal queues the command once and reloads", async () => {
   const state = join(scratchDir(), "signal-state");
   await hosted("pi-sigtest", async () => {
-    await withEnv({ XDG_STATE_HOME: state }, async () => {
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
       const pi = new MockPi();
       factory(pi as never);
       // session_start listeners: [watcher start, announce, silent reload]
       await pi.sessionStarters[0]({ reason: "startup" });
-      const sig = join(state, "pi-pty-host", "extensions-reload",
-        "pi-sigtest.json");
-      // the daemon wrote a fresh round token
-      writeFileSync(sig, JSON.stringify({ token: "round-1" }));
+      const dir = join(state, "pi-pty-host", "extensions-reload", "pi-sigtest");
+      const sig = join(dir, "round-1.json");
+      // the daemon wrote a fresh round, one file per round
+      writeReloadRequest(sig, "round-1");
       await waitFor(() => pi.messages.length === 1, "queued reload command");
-      assertEq(pi.messages[0], "/daemon-reload");
+      assertEq(pi.messages[0], "/daemon-reload --signal round-1",
+        "the queued command carries its round");
       // expandPromptTemplates is what dispatches the command: a bare
       // slash message would be submitted as a plain user prompt
       assertEq(pi.messageOptions[0].expandPromptTemplates, true);
       assertEq(pi.messageOptions[0].deliverAs, "followUp");
       assert(existsSync(sig), "file stays until the command consumes it");
-      // command handler consumes the pending token and reloads
+      // command handler consumes exactly that round and reloads
       let reloaded = 0;
       const c = ctx() as never as { reload: () => Promise<void> };
       c.reload = async () => {
@@ -439,41 +468,111 @@ test("daemon: reload signal queues the command once and reloads", async () => {
       const cmd = pi.commands.get("daemon-reload") as {
         handler: (args: unknown[], ctx: unknown) => Promise<void>;
       };
-      await cmd.handler([], c);
+      await cmd.handler(["--signal", "round-1"], c);
       assertEq(reloaded, 1, "ctx.reload ran");
-      assert(!existsSync(sig), "signal consumed (daemon's ack)");
-      // one-shot per round: a manual command run without a fresh
-      // signal is inert
-      await cmd.handler([], c);
-      assertEq(reloaded, 1, "no reload without a pending signal");
-      // a stale repeat of an already consumed token never fires again
-      writeFileSync(sig, JSON.stringify({ token: "round-1" }));
+      assert(!existsSync(sig), "request consumed (the daemon's ack)");
+      // one-shot per round: the same round never fires twice
+      await cmd.handler(["--signal", "round-1"], c);
+      assertEq(reloaded, 1, "a consumed round is inert");
+      // a stale repeat of an already consumed round is not even queued
+      writeReloadRequest(sig, "round-1");
       await new Promise((resolve) => setTimeout(resolve, 200));
-      assertEq(pi.messages.length, 1, "stale signal is not even queued");
-      // a genuinely fresh round token queues a new reload
-      writeFileSync(sig, JSON.stringify({ token: "round-2" }));
-      await waitFor(() => pi.messages.length === 2, "fresh token re-queued");
-      await cmd.handler([], c);
-      assertEq(reloaded, 2, "fresh signal fires once");
-      assert(!existsSync(sig), "second signal consumed");
+      assertEq(pi.messages.length, 1, "stale request is not even queued");
+      // a genuinely fresh round queues a command carrying it
+      writeReloadRequest(join(dir, "round-2.json"), "round-2");
+      await waitFor(() => pi.messages.length === 2, "fresh round re-queued");
+      assertEq(pi.messages[1], "/daemon-reload --signal round-2");
+      await cmd.handler(["--signal", "round-2"], c);
+      assertEq(reloaded, 2, "fresh round fires once");
+      assert(!existsSync(join(dir, "round-2.json")), "second round consumed");
       // release the watcher so the test run's event loop can exit
       await pi.shutdownHandlers[0]({ reason: "quit" });
     });
   });
 });
 
+test("daemon: a round left across a reload is picked up on re-arm", async () => {
+  const state = join(scratchDir(), "signal-rearm");
+  await hosted("pi-sigrearm", async () => {
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
+      const pi = new MockPi();
+      factory(pi as never);
+      await pi.sessionStarters[0]({ reason: "startup" });
+      const dir = join(state, "pi-pty-host", "extensions-reload",
+        "pi-sigrearm");
+      // the runtime is torn down before the queued command ran: the round
+      // stays on disk, so it must still be answered by the next runtime
+      await pi.shutdownHandlers[0]({ reason: "reload" });
+      writeReloadRequest(join(dir, "round-lost.json"), "round-lost");
+      await pi.sessionStarters[0]({ reason: "reload" });
+      await waitFor(() => pi.messages.length === 1, "lost round re-queued");
+      assertEq(pi.messages[0], "/daemon-reload --signal round-lost");
+      await pi.shutdownHandlers[0]({ reason: "quit" });
+    });
+  });
+});
+
+test("daemon: a request for another run is never answered", async () => {
+  const state = join(scratchDir(), "signal-successor");
+  await hosted("pi-sigsucc", async () => {
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
+      const pi = new MockPi();
+      factory(pi as never);
+      await pi.sessionStarters[0]({ reason: "startup" });
+      const dir = join(state, "pi-pty-host", "extensions-reload",
+        "pi-sigsucc");
+      // the predecessor's round is still on disk when this run starts
+      const foreign = join(dir, "round-prev.json");
+      writeReloadRequest(foreign, "round-prev", "run-0", "gen-0");
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assertEq(pi.messages.length, 0, "a predecessor's round is left alone");
+      assert(existsSync(foreign), "left for the daemon to claim");
+      // this run's own request is the one answered
+      writeReloadRequest(join(dir, "round-own.json"), "round-own");
+      await waitFor(() => pi.messages.length === 1, "own round queued");
+      assertEq(pi.messages[0], "/daemon-reload --signal round-own");
+      await pi.shutdownHandlers[0]({ reason: "quit" });
+    });
+  });
+});
+
+test("daemon: a removal that fails is not an acknowledgement", async () => {
+  if (process.platform === "win32" || process.getuid?.() === 0) return;
+  const dir = join(scratchDir(), "consume-retry");
+  const queued: string[] = [];
+  const watcher = new HostedReloadWatcher(dir, (token) => queued.push(token),
+    RUN_ID, RUN_GENERATION);
+  const request = join(dir, "round-1.json");
+  writeReloadRequest(request, "round-1");
+  watcher.start();
+  await waitFor(() => queued.length === 1, "queued once");
+  chmodSync(dir, 0o500);
+  try {
+    assertEq(watcher.consume("round-1"), false,
+      "a removal that failed is not an acknowledgement");
+    assert(existsSync(request), "the request stays for a later attempt");
+  } finally {
+    chmodSync(dir, 0o700);
+  }
+  // a later event retries it: the round was never marked consumed
+  await waitFor(
+    () => queued.filter((token) => token === "round-1").length >= 2,
+    "the failed round is answered on a later peek");
+  watcher.stop();
+});
+
 test("daemon: unconsumed token (daemon fallback) never double-reloads", async () => {
   const state = join(scratchDir(), "signal-fallback");
   await hosted("pi-sigfall", async () => {
-    await withEnv({ XDG_STATE_HOME: state }, async () => {
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
       const pi = new MockPi();
       factory(pi as never);
       await pi.sessionStarters[0]({ reason: "startup" });
       const sig = join(state, "pi-pty-host", "extensions-reload",
-        "pi-sigfall.json");
-      writeFileSync(sig, JSON.stringify({ token: "round-2" }));
+        "pi-sigfall", "round-2.json");
+      writeReloadRequest(sig, "round-2");
       await waitFor(() => pi.messages.length === 1, "queued reload command");
-      // the daemon timed out: it deleted the file and typed /reload
+      // the daemon timed out: it claimed the request and typed /reload
       rmSync(sig, { force: true });
       let reloaded = 0;
       const c = ctx() as never as { reload: () => Promise<void> };
@@ -483,7 +582,7 @@ test("daemon: unconsumed token (daemon fallback) never double-reloads", async ()
       const cmd = pi.commands.get("daemon-reload") as {
         handler: (args: unknown[], ctx: unknown) => Promise<void>;
       };
-      await cmd.handler([], c);
+      await cmd.handler(["--signal", "round-2"], c);
       assertEq(reloaded, 0, "typed fallback wins, no second reload");
       // an expired signal is inert, never the manual restart path
       assertEq(pi.execCalls.length, 0, "no service restart was attempted");
@@ -495,7 +594,7 @@ test("daemon: unconsumed token (daemon fallback) never double-reloads", async ()
 test("daemon: session start auto-starts the service and says so", async () => withPlatform("linux", async () => {
   const state = join(scratchDir(), "autostart");
   await hosted("pi-autostart", async () => {
-    await withEnv({ XDG_STATE_HOME: state }, async () => {
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
       const exe = new ExecScript([
         (args: string[]) => {
           if (args[0] === "--user" && args[1] === "is-active") {
@@ -536,7 +635,7 @@ test("daemon: session start auto-starts the service and says so", async () => wi
 test("daemon: session_shutdown stops the watcher (no leaked watchers)", async () => {
   const state = join(scratchDir(), "signal-shutdown");
   await hosted("pi-sigstop", async () => {
-    await withEnv({ XDG_STATE_HOME: state }, async () => {
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
       const pi = new MockPi();
       factory(pi as never);
       await pi.sessionStarters[0]({ reason: "startup" });
@@ -544,8 +643,8 @@ test("daemon: session_shutdown stops the watcher (no leaked watchers)", async ()
       assertEq(pi.shutdownHandlers.length, 3);
       await pi.shutdownHandlers[0]({ reason: "reload" });
       const sig = join(state, "pi-pty-host", "extensions-reload",
-        "pi-sigstop.json");
-      writeFileSync(sig, JSON.stringify({ token: "round-3" }));
+        "pi-sigstop", "round-3.json");
+      writeReloadRequest(sig, "round-3");
       await new Promise((resolve) => setTimeout(resolve, 200));
       assertEq(pi.messages.length, 0, "no watcher left after shutdown");
     });
@@ -555,7 +654,7 @@ test("daemon: session_shutdown stops the watcher (no leaked watchers)", async ()
 test("daemon: gc reap request steers the agent once per request", async () => {
   const state = join(scratchDir(), "gc-reap-state");
   await hosted("pi-gcq", async () => {
-    await withEnv({ XDG_STATE_HOME: state }, async () => {
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
       const pi = new MockPi();
       factory(pi as never);
       // session_start listeners: [reload watcher, gc reap watcher]
@@ -597,7 +696,7 @@ test("daemon: gc reap request steers the agent once per request", async () => {
 test("daemon: a canceled hosted switch keeps the gc reap watcher", async () => {
   const state = join(scratchDir(), "gc-reap-switch");
   await hosted("pi-gcsw", async () => {
-    await withEnv({ XDG_STATE_HOME: state }, async () => {
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
       const pi = new MockPi();
       factory(pi as never);
       // session_start listeners: [reload watcher, gc reap watcher]
@@ -628,7 +727,7 @@ test("daemon: a canceled hosted switch keeps the gc reap watcher", async () => {
 test("daemon: daemon_gc_reap acknowledges and shuts the session down", async () => {
   const state = join(scratchDir(), "gc-reap-tool");
   await hosted("pi-gctool", async () => {
-    await withEnv({ XDG_STATE_HOME: state }, async () => {
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
       const pi = new MockPi();
       factory(pi as never);
       const tool = pi.tools.get("daemon_gc_reap");
@@ -648,7 +747,7 @@ test("daemon: daemon_gc_reap acknowledges and shuts the session down", async () 
 test("daemon: daemon_gc_reap never shuts an unhosted session down", async () => {
   const state = join(scratchDir(), "gc-reap-unhosted");
   await hosted("", async () => {
-    await withEnv({ XDG_STATE_HOME: state }, async () => {
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
       const pi = new MockPi();
       factory(pi as never);
       const tool = pi.tools.get("daemon_gc_reap");
@@ -666,7 +765,7 @@ test("daemon: daemon_gc_reap never shuts an unhosted session down", async () => 
 test("daemon: a quit silences publishing, the next session start lifts it", async () => {
   const state = join(scratchDir(), "publish-lifecycle");
   await hosted("pi-lifecycle", async () => {
-    await withEnv({ XDG_STATE_HOME: state }, async () => {
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
       const pi = new MockPi();
       factory(pi as never);
       const publishes = () => pi.execCalls.filter(
@@ -694,15 +793,14 @@ test("daemon: a quit silences publishing, the next session start lifts it", asyn
 test("daemon: reload signal is a no-op outside hosting", async () => {
   const state = join(scratchDir(), "signal-unhosted");
   await hosted("", async () => {
-    await withEnv({ XDG_STATE_HOME: state }, async () => {
-      assertEq(reloadSignalPath(), "", "no signal path without hosting");
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
+      assertEq(reloadSignalDir(), "", "no signal path without hosting");
       const pi = new MockPi();
       factory(pi as never);
       await pi.sessionStarters[0]({ reason: "startup" });
-      const dir = join(state, "pi-pty-host", "extensions-reload");
+      const dir = join(state, "pi-pty-host", "extensions-reload", "pi-other");
       mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, "pi-other.json"),
-        JSON.stringify({ token: "t" }));
+      writeReloadRequest(join(dir, "unhosted.json"), "unhosted");
       await new Promise((resolve) => setTimeout(resolve, 100));
       assertEq(pi.messages.length, 0, "unhosted sessions are never signaled");
     });
@@ -713,22 +811,22 @@ test("daemon: the signal follows the state root of the hosting daemon", async ()
   const legacy = join(scratchDir(), "legacy-state");
   const service = join(scratchDir(), "service-state");
   await hosted("pi-servicetest", async () => {
-    await withEnv({ XDG_STATE_HOME: legacy, PI_DAEMON_STATE_DIR: service },
+    await withEnv({ XDG_STATE_HOME: legacy, PI_DAEMON_STATE_DIR: service,
+      ...HOSTED_ENV },
       async () => {
-        assertEq(reloadSignalPath(),
-          join(service, "extensions-reload", "pi-servicetest.json"),
+        assertEq(reloadSignalDir(),
+          join(service, "extensions-reload", "pi-servicetest"),
           "the service's root wins over the legacy one");
         const pi = new MockPi();
         factory(pi as never);
         await pi.sessionStarters[0]({ reason: "startup" });
-        const sig = join(service, "extensions-reload",
-          "pi-servicetest.json");
-        writeFileSync(sig, JSON.stringify({ token: "round-1" }));
+        const dir = join(service, "extensions-reload", "pi-servicetest");
+        writeReloadRequest(join(dir, "round-1.json"), "round-1");
         await waitFor(() => pi.messages.length === 1, "queued reload command");
-        const stale = join(legacy, "pi-pty-host", "extensions-reload");
+        const stale = join(legacy, "pi-pty-host", "extensions-reload",
+          "pi-servicetest");
         mkdirSync(stale, { recursive: true });
-        writeFileSync(join(stale, "pi-servicetest.json"),
-          JSON.stringify({ token: "round-1" }));
+        writeReloadRequest(join(stale, "round-1.json"), "round-1");
         await new Promise((resolve) => setTimeout(resolve, 100));
         assertEq(pi.messages.length, 1, "the legacy root is not watched");
       });
@@ -762,7 +860,7 @@ test("daemon: hasServiceUnit probes the unit only on POSIX", async () => {
 test("daemon: manual /daemon-reload prefers the unit where managed", async () => withPlatform("linux", async () => {
   const state = join(scratchDir(), "reload-unit");
   await hosted("pi-unit", async () => {
-    await withEnv({ XDG_STATE_HOME: state }, async () => {
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
       const exe = new ExecScript([
         (args: string[]) =>
           args[0] === "--user" && args[1] === "list-unit-files"
@@ -798,7 +896,7 @@ test("daemon: manual /daemon-reload prefers the unit where managed", async () =>
 test("daemon: manual /daemon-reload uses the successor without a unit", async () => {
   const state = join(scratchDir(), "reload-successor");
   await hosted("pi-succ", async () => {
-    await withEnv({ XDG_STATE_HOME: state }, async () => {
+    await withEnv({ XDG_STATE_HOME: state, ...HOSTED_ENV }, async () => {
       const exe = new ExecScript([
         (args: string[]) =>
           args[0] === "--user" && args[1] === "list-unit-files"

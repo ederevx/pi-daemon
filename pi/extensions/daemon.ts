@@ -82,6 +82,7 @@ import {
 	existsSync,
 	mkdirSync,
 	openSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	watch,
@@ -162,16 +163,17 @@ export function daemonStateDir(
 		|| join(stateHome(platform), "pi-pty-host");
 }
 
-/** The daemon's per-session reload-signal file, mirroring the service's
- *  SessionReload (state root/extensions-reload/<name>.json). Empty
- *  outside hosting: only hosted sessions are ever signaled. */
-export function reloadSignalPath(
+/** The directory the daemon leaves this session's reload requests in,
+ *  mirroring the service's SessionReload (state root/extensions-reload/
+ *  <name>/<round>.json: each round writes its own file, so a delayed
+ *  consumer can never take a later round's request). Empty outside
+ *  hosting: only hosted sessions are ever signaled. */
+export function reloadSignalDir(
 	session: string = process.env.PI_HOSTED_SESSION || "",
 	platform: string = process.platform,
 ): string {
 	if (!session) return "";
-	return join(daemonStateDir(platform), "extensions-reload",
-		`${session}.json`);
+	return join(daemonStateDir(platform), "extensions-reload", session);
 }
 
 /** The daemon's per-session GC reap-request file, mirroring the legacy
@@ -491,25 +493,27 @@ export class DaemonSupervisor {
 /** A token-stamped reload request the daemon left for this session. */
 interface ReloadSignal {
 	token?: unknown;
+	run?: unknown;
+	generation?: unknown;
 }
 
-/** Watches the daemon's per-session reload-signal file and turns the
- *  daemon's one-shot reload request into pi's own programmatic reload
- *  flow, without the daemon ever typing "/reload" into this TUI.
+/** Watches the daemon's reload requests for this run and turns one into
+ *  pi's own programmatic reload, without the daemon typing "/reload".
  *
- *  The daemon (extensions_reload) writes
- *  <state>/extensions-reload/<session>.json carrying a
- *  fresh round token, then waits briefly for the file to disappear.
- *  This class watches the directory: on the signal it records the
- *  token and queues the extension's own /daemon-reload command, whose
- *  handler consumes the signal (only while the file still carries that
- *  exact token — if it is gone, the daemon already timed out and typed
- *  /reload into the PTY instead) and then runs `await ctx.reload()` as
- *  a terminal handler. Tokens consumed in earlier rounds never fire
- *  again, so stale or repeated signals stay inert. The watcher is
- *  session-scoped: it is stopped on every session_shutdown (no leaked
- *  watchers across reloads or session switches) and re-armed by the
- *  next session_start. */
+ *  The daemon writes <state>/extensions-reload/<session>/<round>.json
+ *  carrying that round's token, the run it is for (id and generation),
+ *  and then waits briefly for the file to disappear. This class watches
+ *  the directory and, for a request that names its own run, queues
+ *  `/daemon-reload --signal <round>`; the handler then removes exactly
+ *  that file and only then runs pi's own reload. Whichever side removes
+ *  the file first owns the action - the daemon's claim is what lets it
+ *  fall back to typing /reload - and a round's pathname is unique, so
+ *  neither side can delete or answer another round's request. A request
+ *  naming another run is left alone: a successor that took the session
+ *  name must never answer its predecessor's reload. Consumed rounds
+ *  never fire again, and the watcher is session-scoped: it is stopped on
+ *  every session_shutdown and re-armed by the next session_start, which
+ *  re-scans the directory so a round a reload left on disk is answered. */
 export class HostedReloadWatcher {
 	private watcher: ReturnType<typeof watch> | null = null;
 	/** Token observed but not yet consumed by the reload command. */
@@ -518,27 +522,26 @@ export class HostedReloadWatcher {
 	private lastConsumed: string | null = null;
 
 	constructor(
-		private readonly signalFile: string,
-		private readonly queueReload: () => void,
+		private readonly signalDir: string,
+		private readonly queueReload: (token: string) => void,
+		private readonly run: string = process.env.PI_DAEMON_RUN_ID || "",
+		private readonly generation: string =
+			process.env.PI_DAEMON_RUN_GENERATION || "",
 	) {}
 
-	/** Watch the signal directory; a signal written before this point
+	/** Watch the signal directory; a request written before this point
 	 *  (between daemon write and watcher registration) is picked up by
-	 *  the initial peek. No-op outside hosting (empty signal path). */
+	 *  the scan. No-op outside hosting (empty signal path). */
 	start(): void {
-		if (!this.signalFile) return;
+		if (!this.signalDir) return;
 		this.stop();
 		try {
-			mkdirSync(dirname(this.signalFile), { recursive: true });
+			mkdirSync(this.signalDir, { recursive: true });
+			// Watch first, then scan: a request written between the two
+			// is either already on disk for the scan or arrives as an
+			// event, so neither order can lose it between them.
+			this.watcher = watch(this.signalDir, () => this.peek());
 			this.peek();
-			this.watcher = watch(dirname(this.signalFile),
-				(_event, filename) => {
-					// filename can be null on some platforms: peek is
-					// cheap and harmless, it reads only our own file.
-					if (!filename || filename === basename(this.signalFile)) {
-						this.peek();
-					}
-				});
 		} catch {
 			this.watcher = null;
 		}
@@ -562,54 +565,77 @@ export class HostedReloadWatcher {
 		return this.watcher !== null;
 	}
 
-	/** Read the signal file and, for a fresh token, record it and queue
-	 *  the reload command. The file itself stays on disk until the
-	 *  command consumes it — the deletion is the daemon's consumption
-	 *  ack, so an unloadable command path degrades to the daemon's
-	 *  PTY-typing fallback instead of a silently lost reload. */
+	/** Read the requests and, for the first one for this run, record its
+	 *  token and queue the command carrying it. The file stays on disk:
+	 *  the removal is the daemon's consumption ack, so a command that
+	 *  never runs degrades to the daemon's PTY-typing fallback instead of
+	 *  a silently lost reload. */
 	private peek(): void {
-		let token: string | null = null;
-		try {
-			const rec = JSON.parse(
-				readFileSync(this.signalFile, "utf8")) as ReloadSignal;
-			if (typeof rec.token === "string") token = rec.token;
-		} catch {
-			return; // gone or unreadable: nothing pending
-		}
-		if (!token || token === this.lastConsumed
-			|| token === this.pendingToken) {
+		for (const token of this.pendingTokens()) {
+			this.pendingToken = token;
+			this.queueReload(token);
 			return;
 		}
-		this.pendingToken = token;
-		this.queueReload();
 	}
 
-	/** Consume the pending signal: true only when this token is the one
-	 *  recorded from the watcher and the file still carries it; deletes
-	 *  the file so the daemon counts the round as consumed. */
+	/** Every request for this run the session has not answered yet. */
+	private pendingTokens(): string[] {
+		let entries: string[];
+		try {
+			entries = readdirSync(this.signalDir);
+		} catch {
+			return []; // gone or unreadable: nothing pending
+		}
+		const tokens: string[] = [];
+		for (const entry of entries) {
+			if (!entry.endsWith(".json")) continue;
+			const token = entry.slice(0, -".json".length);
+			if (token === this.lastConsumed || token === this.pendingToken) {
+				continue;
+			}
+			if (this.mine(this.readRequest(token))) tokens.push(token);
+		}
+		return tokens;
+	}
+
+	/** A request belongs to this run only when it names it: an unhosted
+	 *  runtime has no identity and answers nothing. */
+	private mine(request: ReloadSignal | null): boolean {
+		if (request === null || !this.run || !this.generation) return false;
+		return request.run === this.run
+			&& request.generation === this.generation;
+	}
+
+	/** Consume the pending request: true only when this call removed the
+	 *  file for exactly that token. The daemon may have claimed it first
+	 *  (its fallback typed /reload instead), which answers false and
+	 *  leaves the command inert. A removal that fails for any other
+	 *  reason is not an acknowledgement: the file stays and the round is
+	 *  not marked consumed, so a later peek may still answer it. */
 	consume(token: string): boolean {
-		if (token !== this.pendingToken || token === this.lastConsumed) {
+		if (token !== this.pendingToken) return false;
+		this.pendingToken = null;
+		try {
+			rmSync(this.requestPath(token));
+		} catch (err) {
+			if ((err as { code?: string }).code === "ENOENT") {
+				// The daemon claimed it first: it owns the action.
+				this.lastConsumed = token;
+			}
 			return false;
 		}
-		this.pendingToken = null;
 		this.lastConsumed = token;
-		if (this.readToken() !== token) return false;
-		try {
-			rmSync(this.signalFile, { force: true });
-		} catch {
-			// Gone already: the daemon counts absence as consumed.
-		}
-		// A newer round may have replaced the file between the token
-		// check and this delete: re-peek so its signal is not lost.
-		if (this.readToken() !== null) this.peek();
 		return true;
 	}
 
-	private readToken(): string | null {
+	private requestPath(token: string): string {
+		return join(this.signalDir, `${token}.json`);
+	}
+
+	private readRequest(token: string): ReloadSignal | null {
 		try {
-			const rec = JSON.parse(
-				readFileSync(this.signalFile, "utf8")) as ReloadSignal;
-			return typeof rec.token === "string" ? rec.token : null;
+			return JSON.parse(
+				readFileSync(this.requestPath(token), "utf8")) as ReloadSignal;
 		} catch {
 			return null;
 		}
@@ -1173,6 +1199,12 @@ export class RcBackground {
 	}
 }
 
+/** A command handler's arguments, whichever shape pi hands over. */
+function commandArgs(args: unknown): string {
+	if (Array.isArray(args)) return args.map((part) => String(part)).join(" ");
+	return String(args ?? "").trim();
+}
+
 export default function (pi: ExtensionAPI) {
 	const app = new RcBackground((file, args) => pi.exec(file, args));
 
@@ -1180,12 +1212,13 @@ export default function (pi: ExtensionAPI) {
 	// per-session signal file; the command below is the reload
 	// entrypoint (ctx.reload() is command-context-only per pi's docs),
 	// and the watcher queues it exactly once per fresh round token.
-	const reloadWatcher = new HostedReloadWatcher(reloadSignalPath(), () => {
+	const reloadWatcher = new HostedReloadWatcher(reloadSignalDir(), (token) => {
 		try {
-			// expandPromptTemplates dispatches extension commands: a bare
-			// "/daemon-reload" would otherwise be submitted as a plain
-			// user prompt instead of running the command.
-			pi.sendUserMessage("/daemon-reload", {
+			// The command carries its round, so a queued copy can never
+			// answer a later one. expandPromptTemplates dispatches
+			// extension commands: a bare slash message would otherwise be
+			// submitted as a plain user prompt instead of running it.
+			pi.sendUserMessage(`/daemon-reload --signal ${token}`, {
 				deliverAs: "followUp",
 				expandPromptTemplates: true,
 			});
@@ -1282,14 +1315,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("daemon-reload", {
 		description:
 			"Reload resources on the daemon's signal; without a pending signal, restart the pi-daemon to adopt a newly installed build (through the systemd unit where the service manager owns it, otherwise the in-daemon successor path)",
-		handler: async (_args, ctx) => {
-			const token = reloadWatcher.pendingToken;
-			if (token) {
-				// Signal-originated, and inert once expired: a token the
-				// daemon already took back means it gave up waiting and
-				// typed the command itself, so this queued copy must never
-				// fall through to the manual restart below.
-				if (reloadWatcher.consume(token)) await ctx.reload();
+		handler: async (args, ctx) => {
+			// " --signal <round>" is the watcher's own invocation, and it is
+			// terminal whatever consumption answers: once the daemon has
+			// taken the request back it typed the command itself, so this
+			// queued copy must never fall through to the restart below.
+			const signal = /^--signal\s+(\S+)$/.exec(commandArgs(args));
+			if (signal) {
+				if (reloadWatcher.consume(signal[1])) await ctx.reload();
 				return;
 			}
 			// Manual invocation: restart the daemon along the path the

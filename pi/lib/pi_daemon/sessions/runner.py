@@ -123,7 +123,22 @@ class SessionRunner:
         record = self._store.get(name)
         if record is None or not record.live():
             raise SessionError("no-session")
-        if not self._relay.input(record.id, data):
+        return self.send_run(record.id, record.generation, data)
+
+    def send_run(self, key, generation, data):
+        """Type into exactly the run this caller selected, never its heir.
+
+        The relay holds runs by id, and a name reserves a new id for every
+        generation, so the captured pair is what makes the delivery safe:
+        re-resolving the name here could hand the bytes to a session that
+        took the name while the caller was deciding.
+        """
+        name = self._store.name_of(key)
+        record = self._store.get(name) if name else None
+        if record is None or record.id != key \
+                or record.generation != generation or not record.live():
+            raise SessionError("write-failed")
+        if not self._relay.input(key, data):
             # Queued nowhere: the relay no longer holds this run, so the
             # caller must not report bytes it never handed to a child.
             raise SessionError("write-failed")
@@ -248,6 +263,11 @@ class SessionRunner:
         # holds the instance lock for, not whatever a caller remembered.
         if self._state_root:
             environment["PI_DAEMON_STATE_DIR"] = self._state_root
+        # The run this child is, so it answers only its own signals: a
+        # successor that takes the name has a different id and
+        # generation, and must never act on the previous run's request.
+        environment["PI_DAEMON_RUN_ID"] = record.id
+        environment["PI_DAEMON_RUN_GENERATION"] = record.generation
         return environment
 
 

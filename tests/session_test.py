@@ -329,6 +329,82 @@ class StubRelay:
         return None
 
 
+class RecordingRelay:
+    """A relay that records what reached a run's master, or refuses it."""
+
+    def __init__(self, accepting=True):
+        self.written = []
+        self.accepting = accepting
+
+    def input(self, key, data):
+        if not self.accepting:
+            return False
+        self.written.append((key, data))
+        return True
+
+
+class SendRunTests(unittest.TestCase):
+    """The fallback types into the run it selected, never into its heir."""
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="pi-sendrun-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.config = ServiceConfig(settle_grace=0.5, cancel_grace=0.2)
+        self.store = SessionStore(os.path.join(self.base, "sessions.json"),
+                                  os.path.join(self.base, "runs"),
+                                  self.config)
+        self.relay = RecordingRelay()
+        self.runner = SessionRunner(self.store, self.relay, self.config,
+                                    SpawnGateBackend(),
+                                    {"instance": "i-1"})
+
+    def test_a_child_is_told_which_run_it_is(self):
+        record, _created = reserve(self.store)
+        environment = self.runner._environment(
+            "pi-a", record, {"PI_DAEMON_RUN_ID": "a-caller-remembered"})
+        self.assertEqual(environment["PI_DAEMON_RUN_ID"], record.id,
+                         "the record's identity wins over the caller's")
+        self.assertEqual(environment["PI_DAEMON_RUN_GENERATION"],
+                         record.generation)
+
+    def test_a_send_run_reaches_exactly_the_run_it_names(self):
+        record, _created = reserve(self.store)
+        sent = self.runner.send_run(record.id, record.generation,
+                                    b"/reload\r")
+        self.assertEqual(sent, len(b"/reload\r"))
+        self.assertEqual(self.relay.written, [(record.id, b"/reload\r")])
+
+    def test_a_successor_that_took_the_name_is_never_written(self):
+        old, _created = reserve(self.store)
+        self.store.finish(old.id, "stop", 0)
+        heir, _created = reserve(self.store)
+        self.assertNotEqual(heir.id, old.id)
+        with self.assertRaises(SessionError):
+            self.runner.send_run(old.id, old.generation, b"/reload\r")
+        self.assertEqual(self.relay.written, [],
+                         "the successor received nothing")
+
+    def test_a_stale_generation_of_the_same_run_is_refused(self):
+        record, _created = reserve(self.store)
+        with self.assertRaises(SessionError):
+            self.runner.send_run(record.id, "an-earlier-round",
+                                 b"/reload\r")
+        self.assertEqual(self.relay.written, [])
+
+    def test_an_unknown_run_is_refused(self):
+        with self.assertRaises(SessionError):
+            self.runner.send_run("no-such-run", "no-such-round",
+                                 b"/reload\r")
+        self.assertEqual(self.relay.written, [])
+
+    def test_a_relay_that_dropped_the_run_is_reported(self):
+        record, _created = reserve(self.store)
+        self.relay.accepting = False
+        with self.assertRaises(SessionError):
+            self.runner.send_run(record.id, record.generation,
+                                 b"/reload\r")
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.base = tempfile.mkdtemp(prefix="pi-runner-")
@@ -1111,6 +1187,7 @@ class StubReload:
     def __init__(self, consumed=(), write_failed=(), claimed=False,
                  late_consumed=()):
         self.signals = []
+        self.runs = []
         self.claimed = []
         self.entries = 0
         self.inside = 0
@@ -1123,13 +1200,14 @@ class StubReload:
     def token(self):
         return "tok"
 
-    def signal(self, name, token):
+    def signal(self, name, token, run=None, generation=None):
         if name in self.write_failed:
             return False
         self.signals.append((name, token))
+        self.runs.append((name, run, generation))
         return True
 
-    def await_consumed(self, names):
+    def await_consumed(self, names, tokens=None):
         self.entries += 1
         self.inside += 1
         if self.inside > 1:
@@ -1148,10 +1226,11 @@ class StubReload:
 
 
 class StubSender:
-    def __init__(self, failing=(), raising=()):
+    def __init__(self, failing=(), raising=(), store=None):
         self.sent = []
         self.failing = set(failing)
         self.raising = set(raising)
+        self.store = store
 
     def send(self, name, data):
         if name in self.raising:
@@ -1161,6 +1240,13 @@ class StubSender:
         self.sent.append((name, data))
         return len(data)
 
+    def send_run(self, key, generation, data):
+        """The identity-scoped delivery: resolve the key for the report."""
+        name = self.store.name_of(key) if self.store is not None else None
+        if name is None:
+            raise SessionError("write-failed")
+        return self.send(name, data)
+
 
 class SignalTests(unittest.TestCase):
     def setUp(self):
@@ -1168,49 +1254,74 @@ class SignalTests(unittest.TestCase):
         self.reload = SessionReload(self.state, grace=0.0, poll=0.0,
                                     sleep=lambda _s: None)
 
-    def test_a_signal_carries_the_token_the_extension_reads(self):
-        self.assertTrue(self.reload.signal("pi-a", "tok-1"))
-        with open(self.reload.path("pi-a"), encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle)["token"], "tok-1")
-        self.assertEqual(os.listdir(os.path.dirname(self.reload.path("pi-a"))),
-                         ["pi-a.json"])
+    def test_a_signal_carries_its_round_in_the_filename_and_the_body(self):
+        self.assertTrue(self.reload.signal("pi-a", "round-1", "run-1", "gen-1"))
+        path = self.reload.path("pi-a", "round-1")
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertEqual(payload["token"], "round-1")
+        self.assertEqual((payload["run"], payload["generation"]),
+                         ("run-1", "gen-1"), "the request names its run")
+        self.assertEqual(os.listdir(self.reload.directory("pi-a")),
+                         ["round-1.json"])
 
-    def test_each_round_carries_a_fresh_token(self):
+    def test_each_round_carries_a_fresh_name(self):
         self.assertNotEqual(self.reload.token(), self.reload.token())
 
-    def test_consumption_is_the_deletion_of_the_file(self):
-        self.reload.signal("pi-a", "tok-1")
-        self.assertFalse(self.reload.consumed("pi-a"))
-        self.assertEqual(self.reload.await_consumed(["pi-a"]), [])
-        self.assertTrue(self.reload.claim("pi-a", "tok-1"))
-        self.assertTrue(self.reload.consumed("pi-a"))
-        self.assertEqual(self.reload.await_consumed(["pi-a"]), ["pi-a"])
+    def test_consumption_is_the_deletion_of_that_rounds_file(self):
+        self.reload.signal("pi-a", "round-1", "run-1", "gen-1")
+        self.assertFalse(self.reload.consumed("pi-a", "round-1"))
+        self.assertEqual(
+            self.reload.await_consumed(["pi-a"], {"pi-a": "round-1"}), [])
+        self.assertTrue(self.reload.claim("pi-a", "round-1"))
+        self.assertTrue(self.reload.consumed("pi-a", "round-1"))
+        self.assertEqual(
+            self.reload.await_consumed(["pi-a"], {"pi-a": "round-1"}),
+            ["pi-a"])
 
     def test_a_claim_never_deletes_another_rounds_request(self):
-        self.reload.signal("pi-a", "tok-2")
-        self.assertFalse(self.reload.claim("pi-a", "tok-1"))
-        self.assertFalse(self.reload.consumed("pi-a"))
-        self.assertTrue(self.reload.claim("pi-a", "tok-2"))
+        self.reload.signal("pi-a", "round-2", "run-1", "gen-1")
+        self.assertFalse(self.reload.claim("pi-a", "round-1"))
+        self.assertFalse(self.reload.consumed("pi-a", "round-2"))
+        self.assertTrue(self.reload.claim("pi-a", "round-2"))
 
-    def test_a_claim_of_a_consumed_request_answers_so(self):
-        self.assertFalse(self.reload.claim("pi-a", "tok-1"))
+    def test_a_claim_of_an_absent_request_answers_so(self):
+        self.assertFalse(self.reload.claim("pi-a", "round-1"))
+
+    def test_an_unreadable_request_is_not_an_acknowledgement(self):
+        self.assertTrue(self.reload.signal("pi-a", "round-1", "run-1",
+                                           "gen-1"))
+        directory = self.reload.directory("pi-a")
+        if os.name != "posix" or os.geteuid() == 0:
+            self.skipTest("permissions are not enforced here")
+        os.chmod(directory, 0o000)
+        try:
+            self.assertFalse(self.reload.consumed("pi-a", "round-1"))
+        finally:
+            os.chmod(directory, 0o700)
+        self.assertFalse(self.reload.consumed("pi-a", "round-1"))
+        self.assertTrue(self.reload.claim("pi-a", "round-1"))
 
     def test_a_name_the_directory_cannot_hold_is_refused(self):
-        self.assertFalse(self.reload.signal("../pi-a", "tok"))
-        self.assertFalse(self.reload.signal("", "tok"))
+        self.assertFalse(self.reload.signal("../pi-a", "round-1", "run-1", "gen-1"))
+        self.assertFalse(self.reload.signal("", "round-1", "run-1", "gen-1"))
 
     def test_a_purge_drops_what_a_previous_run_left(self):
-        self.reload.signal("pi-a", "tok")
-        self.reload.signal("pi-b", "tok")
+        self.reload.signal("pi-a", "round-1", "run-1", "gen-1")
+        self.reload.signal("pi-a", "round-2", "run-1", "gen-1")
+        self.reload.signal("pi-b", "round-3", "run-2", "gen-2")
         self.reload.purge()
-        self.assertEqual(self.reload.await_consumed(["pi-a", "pi-b"]),
-                         ["pi-a", "pi-b"])
+        self.assertEqual(
+            self.reload.await_consumed(["pi-a", "pi-b"],
+                                       {"pi-a": "round-1",
+                                        "pi-b": "round-3"}),
+            ["pi-a", "pi-b"])
 
     def test_a_purge_drops_a_half_written_request(self):
-        directory = os.path.dirname(self.reload.path("pi-a"))
+        directory = self.reload.directory("pi-a")
         os.makedirs(directory, exist_ok=True)
-        half = os.path.join(directory, "pi-a.json.tok.tmp")
-        with open(half, "w", encoding="utf-8") as handle:
+        with open(os.path.join(directory, "round-1.json.tmp"), "w",
+                  encoding="utf-8") as handle:
             handle.write("{")
         self.reload.purge()
         self.assertEqual(os.listdir(directory), [])
@@ -1221,7 +1332,21 @@ class SignalTests(unittest.TestCase):
             handle.write("x")
         reload = SessionReload(os.path.join(blocked, "state"), grace=0.0,
                                poll=0.0)
-        self.assertFalse(reload.signal("pi-a", "tok"))
+        self.assertFalse(reload.signal("pi-a", "round-1", "run-1", "gen-1"))
+
+    def test_the_poll_never_overshoots_the_grace(self):
+        now = [0.0]
+        slept = []
+
+        def sleep(seconds):
+            slept.append(seconds)
+            now[0] += seconds
+
+        reload = SessionReload(self.state, grace=0.05, poll=60.0,
+                               clock=lambda: now[0], sleep=sleep)
+        reload.signal("pi-a", "round-1", "run-1", "gen-1")
+        reload.await_consumed(["pi-a"], {"pi-a": "round-1"})
+        self.assertEqual(slept, [0.05], "one wait, capped at the grace")
 
 
 class ReloadRoundTests(unittest.TestCase):
@@ -1250,6 +1375,10 @@ class ReloadRoundTests(unittest.TestCase):
         self.assertNotIn({"id": "pi-idle", "reason": "not-idle"},
                          reply["skipped"])
         self.assertEqual(reload.signals, [("pi-idle", "tok")])
+        record = self.store.get("pi-idle")
+        self.assertEqual(reload.runs, [("pi-idle", record.id,
+                                       record.generation)],
+                         "the request names the run, not only the name")
 
     def test_a_busy_session_is_skipped_and_nothing_retries_it(self):
         reload = StubReload(consumed=["pi-idle"])
@@ -1270,7 +1399,7 @@ class ReloadRoundTests(unittest.TestCase):
 
     def test_an_unconsumed_signal_falls_back_to_typing_the_command(self):
         reload = StubReload(claimed=True)
-        sender = StubSender()
+        sender = StubSender(store=self.store)
         reply = self.service(reload, sender).reload()
         self.assertEqual(reload.claimed, [("pi-idle", "tok")])
         self.assertEqual(sender.sent, [("pi-idle", b"/reload\r")])
@@ -1278,7 +1407,7 @@ class ReloadRoundTests(unittest.TestCase):
 
     def test_a_request_consumed_at_the_deadline_is_not_typed_into(self):
         reload = StubReload(late_consumed=["pi-idle"])
-        sender = StubSender()
+        sender = StubSender(store=self.store)
         reply = self.service(reload, sender).reload()
         self.assertEqual(sender.sent, [])
         self.assertEqual(reply["reloaded"], ["pi-idle"])
@@ -1290,15 +1419,14 @@ class ReloadRoundTests(unittest.TestCase):
 
         class Busying(StubSender):
             def __init__(self, store):
-                super().__init__()
-                self.store = store
+                super().__init__(store=store)
 
         sender = Busying(self.store)
         original = reload.await_consumed
 
-        def await_and_busy(names):
+        def await_and_busy(names, tokens):
             self.store.publish("pi-idle", "busy")
-            return original(names)
+            return original(names, tokens)
 
         reload.await_consumed = await_and_busy
         reply = self.service(reload, sender).reload()
@@ -1310,20 +1438,20 @@ class ReloadRoundTests(unittest.TestCase):
 
     def test_a_failed_fallback_is_reported_not_raised(self):
         reply = self.service(StubReload(claimed=True),
-                             StubSender(["pi-idle"])).reload()
+                             StubSender(["pi-idle"], store=self.store)).reload()
         self.assertEqual(reply["reloaded"], [])
         self.assertIn({"id": "pi-idle", "reason": "write-failed"},
                       reply["skipped"])
 
     def test_a_relay_that_never_answers_is_reported_not_raised(self):
         reply = self.service(StubReload(claimed=True),
-                             StubSender(raising=["pi-idle"])).reload()
+                             StubSender(raising=["pi-idle"], store=self.store)).reload()
         self.assertEqual(reply["reloaded"], [])
         self.assertIn({"id": "pi-idle", "reason": "write-failed"},
                       reply["skipped"])
 
     def test_an_unwritable_signal_is_reported_and_never_typed_into(self):
-        sender = StubSender()
+        sender = StubSender(store=self.store)
         reply = self.service(StubReload(write_failed=["pi-idle"]),
                              sender).reload()
         self.assertEqual(sender.sent, [])
@@ -1364,22 +1492,32 @@ class ReloadRoundTests(unittest.TestCase):
         release = threading.Event()
         original = reload.await_consumed
 
-        def slow(names):
+        failures = []
+
+        def slow(names, tokens):
             entered.set()
             release.wait(2.0)
-            return original(names)
+            return original(names, tokens)
+
+        def round_():
+            try:
+                service.reload()
+            except Exception as exc:  # a stub mismatch must fail the test
+                failures.append(exc)
 
         reload.await_consumed = slow
         service = self.service(reload)
-        first = threading.Thread(target=service.reload)
-        second = threading.Thread(target=service.reload)
+        first = threading.Thread(target=round_)
+        second = threading.Thread(target=round_)
         first.start()
-        entered.wait(2.0)
+        self.assertTrue(entered.wait(2.0), "the first round is inside")
         second.start()
         release.set()
         first.join()
         second.join()
+        self.assertEqual(failures, [])
         self.assertFalse(reload.overlapped)
+        self.assertEqual(reload.entries, 2, "both rounds ran")
 
 
 if __name__ == "__main__":
