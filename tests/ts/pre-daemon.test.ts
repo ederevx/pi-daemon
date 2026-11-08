@@ -11,6 +11,20 @@ import { PreDaemonTool, default as factory } from "../../pi/extensions/pre-daemo
 
 type Handler = (event: any, ctx?: any) => any;
 
+/** Every tool the extension gates; `pre_daemon` is the way in. */
+const GATED = [
+  "bash",
+  "daemon_tasks",
+  "daemon_gc_reap",
+  "transcript_read",
+  "comms_send",
+  "comms_wait",
+  "comms_replay",
+  "comms_ack",
+  "comms_spawn",
+  "peers",
+];
+
 class MockPi {
   readonly tools = new Map<string, any>();
   readonly handlers = new Map<string, Handler[]>();
@@ -93,7 +107,7 @@ test("pre-daemon: registers the catalog tool, gate, and session reset", () => {
 test("pre-daemon: gate blocks its own tools, bash included, until the catalog is read", async () => {
   const { pi } = mount();
   const gate = pi.gate();
-  for (const name of ["bash", "daemon_tasks", "daemon_gc_reap", "transcript_read"]) {
+  for (const name of GATED) {
     const result = await gate({ toolName: name });
     assertEq(result?.block, true, `${name} blocked before pre_daemon`);
   }
@@ -146,6 +160,10 @@ test("pre-daemon: the gate acknowledges a direct call and session_start resets i
   assertEq((await pi.gate()({ toolName: "bash" }))?.block, true, "blocked after a reset");
   assertEq(await pi.gate()({ toolName: "pre_daemon" }), undefined, "ack via gate");
   assertEq(await pi.gate()({ toolName: "bash" }), undefined, "unlocked again");
+  for (const name of GATED.filter((each) => each !== "bash")) {
+    const result = await pi.gate()({ toolName: name });
+    assertEq(result, undefined, `${name} unlocked`);
+  }
   await pi.sessionStart()({}, { hasUI: false });
   assertEq(
     (await pi.gate()({ toolName: "daemon_tasks" }))?.block,
@@ -156,7 +174,7 @@ test("pre-daemon: the gate acknowledges a direct call and session_start resets i
 
 test("pre-daemon: catalog states the tools, the conditional prerequisite, and the fallback", () => {
   const catalog = new PreDaemonTool().catalog();
-  for (const name of ["bash", "daemon_tasks", "daemon_gc_reap", "transcript_read"]) {
+  for (const name of GATED) {
     assert(catalog.includes(name), `catalog names ${name}`);
   }
   assert(catalog.includes("Conventions:"), "catalog has conventions");

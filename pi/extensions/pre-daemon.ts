@@ -97,7 +97,7 @@ export class PreDaemonTool {
 			"- peers: list the peer links this node reaches out over.",
 			"",
 			"Conventions:",
-			"- Call pre_daemon once per session before daemon_tasks, daemon_gc_reap, transcript_read, or any comms tool, and before bash when offloading is enabled. When offloading is disabled, bash runs locally without this prerequisite.",
+			"- Call pre_daemon once per session before daemon_tasks, daemon_gc_reap, transcript_read, any comms_* tool, or peers, and before bash when offloading is enabled. When offloading is disabled, bash runs locally without this prerequisite.",
 			"- Every bash call is already daemon-owned and non-blocking; pass the bash timeout to bound it daemon-side, and use daemon_tasks result <id> wait=<seconds> only to block for a result deliberately.",
 			"- A blocking result wait is interruptible and steerable: Escape or a queued message releases it; the ticket keeps running and still delivers on completion.",
 			"- Call daemon_gc_reap only when pi-daemon asks this idle detached session to reap, or when you are deliberately done.",
