@@ -170,6 +170,26 @@ class StoreTests(unittest.TestCase):
         self.store.finish(record.id, "stop", 0)
         self.assertFalse(self.store.publish("pi-a", "busy"))
 
+    def test_a_snapshot_leaves_stopped_records_out_unless_asked(self):
+        live, _ = reserve(self.store, "pi-a")
+        gone, _ = reserve(self.store, "pi-b")
+        self.store.finish(gone.id, "exit", 0)
+        self.assertEqual([view["name"] for view in self.store.snapshot()],
+                         ["pi-a"])
+        self.assertEqual(sorted(view["name"]
+                                for view in self.store.snapshot(True)),
+                         ["pi-a", "pi-b"])
+        self.assertEqual(self.store.stopped_count(), 1)
+        self.assertEqual(live.name, "pi-a")
+
+    def test_a_view_says_what_the_record_is_meant_to_be_doing(self):
+        reserve(self.store, "pi-a")
+        view = [v for v in self.store.snapshot(True)
+                if v["name"] == "pi-a"][0]
+        self.assertIn(view["phase"], ("spawning", "running"))
+        self.assertEqual(view["desired"], "running")
+        self.assertIn("file", view)
+
     def test_replace_all_removes_unnamed_runs_and_answers_run_state(self):
         record, _ = reserve(self.store, "pi-a")
         self.store.finish(record.id, "stop", 0)
@@ -535,6 +555,9 @@ class StubService:
     def recorded_file(self, name):
         return "/conv.jsonl"
 
+    def recorded(self, name):
+        return {"name": name, "dir": "/s", "file": "/conv.jsonl"}
+
 
 class OperationsTests(unittest.TestCase):
     def operations(self, service=None):
@@ -569,6 +592,31 @@ class OperationsTests(unittest.TestCase):
             .attach({"cmd": "attach", "name": "pi-a"}, None)
         self.assertEqual(reply["error"], "no-session")
         self.assertEqual(reply["file"], "/conv.jsonl")
+        self.assertEqual(reply["recorded"], "pi-a")
+        self.assertEqual(reply["dir"], "/s")
+
+    def test_a_listing_counts_the_stopped_records_it_leaves_out(self):
+        service = StubService()
+        service.sessions = lambda include_stopped=False: [
+            {"name": "pi-a", "phase": "running"}]
+        service.stopped_count = lambda: 3
+        reply = self.operations(service).list({"cmd": "list"})
+        self.assertEqual(reply["stopped"], 3)
+        self.assertEqual(len(reply["sessions"]), 1)
+
+    def test_an_all_listing_carries_no_stopped_count(self):
+        service = StubService()
+        service.sessions = lambda include_stopped=False: [
+            {"name": "pi-a", "phase": "running"},
+            {"name": "pi-b", "phase": "exited"}]
+        service.stopped_count = lambda: 1
+        reply = self.operations(service).list({"cmd": "list", "all": True})
+        self.assertNotIn("stopped", reply)
+        self.assertEqual(len(reply["sessions"]), 2)
+
+    def test_an_all_listing_needs_a_boolean(self):
+        with self.assertRaises(ValueError):
+            self.operations().list({"cmd": "list", "all": "yes"})
 
     def test_an_attach_with_a_handoff_never_upgrades(self):
         service = StubService()

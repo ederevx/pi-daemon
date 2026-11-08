@@ -92,10 +92,16 @@ class SessionStore:
             return [record for record in self._sessions.values()
                     if record.live()]
 
-    def snapshot(self):
+    def snapshot(self, include_stopped=False):
         with self._lock:
             return [record.view() for record in self._sessions.values()
-                    if record.live()]
+                    if include_stopped or record.live()]
+
+    def stopped_count(self):
+        """How many records a stopped-session listing would add."""
+        with self._lock:
+            return sum(1 for record in self._sessions.values()
+                       if not record.live())
 
     def live_files(self):
         """Conversation files a live hosted session backs: the announced

@@ -1,5 +1,6 @@
 """The sessions domain's surface: one method per published operation."""
 
+import os
 import threading
 import time
 
@@ -48,14 +49,20 @@ class SessionService:
         return {"name": record.name, "created": created,
                 "session": record.view()}
 
-    def sessions(self):
-        views = self._store.snapshot()
+    def sessions(self, include_stopped=False):
+        views = self._store.snapshot(include_stopped)
         for view in views:
             clients = self._relay.viewer_count(view["name"] and
                                                self._key(view["name"]))
             view["clients"] = clients
             view["attached"] = bool(clients)
+            if include_stopped:
+                view["fileExists"] = bool(view["file"]) \
+                    and os.path.isfile(view["file"])
         return views
+
+    def stopped_count(self):
+        return self._store.stopped_count()
 
     def which(self, file):
         holders = self._holders(file)
@@ -71,6 +78,15 @@ class SessionService:
     def recorded_file(self, name):
         canonical = self._store.resolve(name)
         return self._store.file_of(canonical) if canonical else None
+
+    def recorded(self, name):
+        """What a name that is not live left behind, for an honest revive."""
+        canonical = self._store.resolve(name)
+        if canonical is None:
+            return None
+        record = self._store.get(canonical)
+        return {"name": canonical, "dir": record.dir if record else None,
+                "file": self._store.file_of(canonical)}
 
     def attach_plan(self, name, cols, rows):
         """Resolve an attach without taking the socket yet."""

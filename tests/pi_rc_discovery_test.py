@@ -196,8 +196,12 @@ class SessionNameTests(unittest.TestCase):
                          "pi-sfworkload-owner")
 
     def test_a_revive_reopens_the_record_the_daemon_resolved(self):
+        base = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, base, True)
+        stored = os.path.join(base, "legacy.jsonl")
+        open(stored, "w").close()
         replies = iter([
-            {"ok": False, "error": "no-session", "file": "/s/legacy.jsonl"},
+            {"ok": False, "error": "no-session", "file": stored},
             {"ok": True, "name": "sfworkload-owner"},
             {"ok": True, "created": True},
             {"ok": True, "name": "sfworkload-owner", "state": "idle"},
@@ -216,8 +220,73 @@ class SessionNameTests(unittest.TestCase):
         start = [request for request in sent
                  if request["cmd"] == "start"][0]
         self.assertEqual(start["name"], "sfworkload-owner")
-        self.assertEqual(start["argv"],
-                         ["pi", "--session", "/s/legacy.jsonl"])
+        self.assertEqual(start["argv"], ["pi", "--session", stored])
+
+    def test_a_revive_stores_the_typed_name_under_the_daemon_spelling(self):
+        base = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, base, True)
+        stored = os.path.join(base, "legacy.jsonl")
+        open(stored, "w").close()
+        replies = iter([
+            {"ok": False, "error": "no-session", "file": stored,
+             "recorded": "pi-a", "dir": base},
+            {"ok": True, "created": True},
+            {"ok": True, "name": "pi-a", "state": "idle"},
+        ])
+        sent = []
+        flow = pi_rc.AttachFlow(None, "pi-a", 80, 24, dir_="/tmp")
+        with mock.patch.object(pi_rc, "send_json",
+                               lambda sock, obj: sent.append(obj)), \
+                mock.patch.object(pi_rc, "read_json_line",
+                                  lambda sock: (next(replies), b"")), \
+                mock.patch.object(pi_rc.PROCESS, "pi_argv",
+                                  lambda args=(): ["pi"] + list(args)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            flow.handshake(None)
+        start = [request for request in sent
+                 if request["cmd"] == "start"][0]
+        # The record's own spelling and directory win over what was typed.
+        self.assertEqual(start["name"], "pi-a")
+        self.assertEqual(start["dir"], base)
+
+    def test_a_revive_without_a_conversation_refuses_to_start_fresh(self):
+        replies = iter([{"ok": False, "error": "no-session",
+                         "recorded": "pi-a"}])
+        sent = []
+        flow = pi_rc.AttachFlow(None, "pi-a", 80, 24, dir_="/tmp")
+        errors = io.StringIO()
+        with mock.patch.object(pi_rc, "send_json",
+                               lambda sock, obj: sent.append(obj)), \
+                mock.patch.object(pi_rc, "read_json_line",
+                                  lambda sock: (next(replies), b"")), \
+                contextlib.redirect_stderr(errors), \
+                self.assertRaises(SystemExit) as caught:
+            flow.handshake(None)
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual([request for request in sent
+                          if request["cmd"] == "start"], [],
+                         "nothing is started")
+        self.assertIn("never recorded a conversation", errors.getvalue())
+
+    def test_a_revive_whose_conversation_is_gone_refuses_to_start_fresh(self):
+        missing = os.path.join(tempfile.gettempdir(), "no-such-conv.jsonl")
+        replies = iter([{"ok": False, "error": "no-session",
+                         "file": missing, "recorded": "pi-a"}])
+        sent = []
+        flow = pi_rc.AttachFlow(None, "pi-a", 80, 24, dir_="/tmp")
+        errors = io.StringIO()
+        with mock.patch.object(pi_rc, "send_json",
+                               lambda sock, obj: sent.append(obj)), \
+                mock.patch.object(pi_rc, "read_json_line",
+                                  lambda sock: (next(replies), b"")), \
+                contextlib.redirect_stderr(errors), \
+                self.assertRaises(SystemExit) as caught:
+            flow.handshake(None)
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual([request for request in sent
+                          if request["cmd"] == "start"], [],
+                         "nothing is started")
+        self.assertIn("nothing to resume", errors.getvalue())
 
     def test_stopping_a_session_that_is_not_running_says_so(self):
         client = mock.Mock()
@@ -231,6 +300,62 @@ class SessionNameTests(unittest.TestCase):
         self.assertNotIn("stopped", out.getvalue())
         client.control.assert_called_once_with({"cmd": "stop",
                                                 "name": "pi-x"})
+
+
+class ListingTests(unittest.TestCase):
+    def listing(self, reply, args=()):
+        client = mock.Mock()
+        client.control.return_value = reply
+        out, errors = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(errors):
+            pi_rc.cmd_ls(list(args), client)
+        return out.getvalue(), errors.getvalue(), client
+
+    def test_the_default_listing_prints_live_rows_and_mentions_the_rest(self):
+        out, errors, client = self.listing({
+            "ok": True, "stopped": 2,
+            "sessions": [{"name": "pi-workload", "dir": "/s", "pid": 7,
+                          "phase": "running", "state": "idle",
+                          "attached": True, "clients": 1,
+                          "file": "/s/conv.jsonl"}]})
+        client.control.assert_called_once_with({"cmd": "list",
+                                                "all": False})
+        # The listing prints the short name a caller can type back.
+        self.assertIn("workload\t/s\tpid 7\tattached\tidle\t/s/conv.jsonl",
+                      out)
+        self.assertIn("2 stopped session(s) not shown", errors)
+
+    def test_all_asks_the_daemon_for_the_stopped_records(self):
+        out, errors, client = self.listing(normal_all_reply(), ["--all"])
+        client.control.assert_called_once_with({"cmd": "list", "all": True})
+        self.assertIn("stopped:resumable", out)
+        self.assertIn("stopped:no-conversation", out)
+        self.assertIn("stopped:file-missing", out)
+        self.assertIn("stopped:resumable:unfinished", out)
+        self.assertEqual(errors, "", "nothing is left out to mention")
+
+    def test_a_listing_rejects_a_flag_it_does_not_know(self):
+        with self.assertRaises(SystemExit):
+            self.listing({"ok": True, "sessions": []}, ["--nope"])
+
+
+def normal_all_reply():
+    # One of each state a stopped record can be in, in the daemon's own
+    # words: a conversation to resume, none ever recorded, or one the
+    # directory no longer holds.
+    stopped = {"pid": None, "attached": False, "clients": 0,
+               "phase": "exited", "state": None}
+    return {"ok": True, "sessions": [
+        dict(stopped, name="pi-a", desired="stopped", dir="/s",
+             file="/s/conv.jsonl", fileExists=True),
+        dict(stopped, name="pi-b", desired="stopped", dir="/s",
+             file=None, fileExists=False),
+        dict(stopped, name="pi-c", desired="stopped", dir="/s",
+             file="/s/gone.jsonl", fileExists=False),
+        dict(stopped, name="pi-d", desired="running", dir="/s",
+             file="/s/conv.jsonl", fileExists=True),
+    ]}
 
 
 if __name__ == "__main__":

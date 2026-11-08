@@ -48,6 +48,8 @@ class SessionRecord:
             "clients": int(self.child.get("clients") or 0),
             "file": self.file,
             "state": self.state(),
+            "phase": self.phase,
+            "desired": self.desired,
             "argv": list(self.argv),
         }
 
