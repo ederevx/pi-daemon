@@ -16,7 +16,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { delimiter, join } from "node:path";
+import { join } from "node:path";
 import {
 	scratchDir,
 	test,
@@ -38,10 +38,6 @@ const ROW_IDS = [
 	"reloadSignalGraceSeconds",
 	"ticketTtlHours",
 	"ticketGcSeconds",
-	"extWatch",
-	"extWatchIntervalSeconds",
-	"extWatchDebounceSeconds",
-	"extWatchRoots",
 	"transcriptIndex",
 	"transcriptIndexIntervalSeconds",
 	"transcriptIndexMaxMb",
@@ -61,9 +57,6 @@ const ALL_ENV = {
 	PI_PTYD_TICKET_TTL_HOURS: undefined,
 	PI_PTYD_TICKET_GC: undefined,
 	PI_PTYD_EXT_WATCH: undefined,
-	PI_PTYD_EXT_WATCH_INTERVAL: undefined,
-	PI_PTYD_EXT_WATCH_DEBOUNCE: undefined,
-	PI_PTYD_EXT_WATCH_ROOTS: undefined,
 	PI_PTYD_TRANSCRIPT_INDEX: undefined,
 	PI_PTYD_TRANSCRIPT_INDEX_INTERVAL: undefined,
 	PI_PTYD_TRANSCRIPT_INDEX_MAX_MB: undefined,
@@ -96,14 +89,13 @@ test("settings: rows cover every piDaemon setting in order", async () => {
 		const rows = new DaemonSettingsPresenter().rows();
 		assertEq(rows.map((row) => row.id).join(","), ROW_IDS.join(","),
 			"row ids and order");
-		const watch = rows.find((row) => row.id === "extWatch")!;
-		assertEq((watch.values ?? []).join(","), "off,on", "flag cycles off/on");
-		assertEq(watch.value, "on", "extWatch default is on");
+		const offload = rows.find((row) => row.id === "offload.enabled")!;
+		assertEq((offload.values ?? []).join(","), "off,on",
+			"flag cycles off/on");
+		assertEq(offload.value, "on", "offload default is on");
 		const reap = rows.find((row) => row.id === "gcIdleHours")!;
 		assert(reap.submenu !== undefined, "number row opens an editor");
 		assertEq(reap.value, "24", "gc idle default");
-		const roots = rows.find((row) => row.id === "extWatchRoots")!;
-		assert(roots.value.includes(delimiter), "roots render path-joined");
 		const restore = rows.find((row) => row.id === "restoreDefaults");
 		assert(restore !== undefined, "restore action row appended");
 		assertEq(restore.label, "Restore default configuration", "restore label");
@@ -118,15 +110,15 @@ test("settings: env vars pin rows and win the effective value", async () => {
 		...ALL_ENV,
 		PI_CODING_AGENT_DIR: dir,
 		PI_DAEMON_GC_IDLE_HOURS: "99",
-		PI_PTYD_EXT_WATCH: "off",
+		PI_OFFLOAD: "off",
 	}, () => {
 		const rows = new DaemonSettingsPresenter().rows();
 		const reap = rows.find((row) => row.id === "gcIdleHours")!;
 		assertEq(reap.label, "GC idle (h) (env-pinned)");
 		assertEq(reap.value, "99");
-		const watch = rows.find((row) => row.id === "extWatch")!;
-		assertEq(watch.label, "Extension watch (env-pinned)");
-		assertEq(watch.value, "off");
+		const offload = rows.find((row) => row.id === "offload.enabled")!;
+		assertEq(offload.label, "Offload enabled (env-pinned)");
+		assertEq(offload.value, "off");
 	});
 });
 
@@ -169,7 +161,7 @@ test("settings: TUI present renders the rows through ui.custom", async () => {
 		assertEq(customCalls, 1, "ui.custom used once");
 		const text = rendered.join("\n");
 		assertMatches(text, /GC idle/);
-		assertMatches(text, /Extension watch/);
+		assertMatches(text, /Offload enabled/);
 		assertMatches(text, /\bon\b/);
 	});
 });
@@ -264,15 +256,29 @@ test("settings: invalid input is rejected without persisting", async () => {
 	});
 });
 
-test("settings: the roots list row stores a platform-split array", async () => {
-	const dir = join(scratchDir(), "list-row-agent");
-	await withEnv({ ...ALL_ENV, PI_CODING_AGENT_DIR: dir }, () => {
-		const outcome = new DaemonSettingsPresenter()
-			.apply("extWatchRoots", ["/one", "/two"].join(delimiter));
-		assert("label" in outcome, "list accepted");
+test("settings: retired watch rows are gone and cannot be written", async () => {
+	const dir = join(scratchDir(), "retired-agent");
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "settings.json"), JSON.stringify({
+		piDaemon: { extWatch: false },
+	}) + "\n");
+	await withEnv({
+		...ALL_ENV, PI_CODING_AGENT_DIR: dir, PI_PTYD_EXT_WATCH: "off",
+	}, () => {
+		const presenter = new DaemonSettingsPresenter();
+		const ids = presenter.rows().map((row) => row.id);
+		for (const retired of [
+			"extWatch", "extWatchIntervalSeconds",
+			"extWatchDebounceSeconds", "extWatchRoots",
+		]) {
+			assert(!ids.includes(retired), `${retired} is not offered`);
+			const outcome = presenter.apply(retired, "on");
+			assert("error" in outcome, `${retired} is refused`);
+		}
 	});
 	const written = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
-	assertEq(written.piDaemon.extWatchRoots.join(","), "/one,/two");
+	assertEq(written.piDaemon.extWatch, false,
+		"a legacy key stays untouched and ignored");
 });
 
 test("settings: reset removes only the piDaemon namespace", async () => {
@@ -314,7 +320,7 @@ test("settings: restoreDefaults clears the stored overrides", async () => {
 	const dir = join(scratchDir(), "restore-agent");
 	await withEnv({ ...ALL_ENV, PI_CODING_AGENT_DIR: dir }, () => {
 		const store = new SettingsStore();
-		store.set("extWatch", false);
+		store.set("offload.enabled", false);
 		store.set("gcIdleHours", 7);
 		const notices: Array<{ message: string; kind?: string }> = [];
 		new DaemonSettingsPresenter(store).restoreDefaults(
@@ -336,7 +342,7 @@ test("settings: the command restore argument clears the overrides", async () => 
 		const dir = join(scratchDir(), `command-${argument}-agent`);
 		mkdirSync(dir, { recursive: true });
 		writeFileSync(join(dir, "settings.json"), JSON.stringify({
-			theme: "dark", piDaemon: { extWatch: false },
+			theme: "dark", piDaemon: { offload: { enabled: false } },
 		}) + "\n");
 		const notices: Array<{ message: string; kind?: string }> = [];
 		await withEnv({ ...ALL_ENV, PI_CODING_AGENT_DIR: dir }, async () => {
@@ -383,16 +389,15 @@ test("settings: the command persists a change and reports the save", async () =>
 			},
 		};
 		await command.handler([], ctx);
-		view!.selectItem("extWatch");
+		view!.selectItem("offload.enabled");
 		view!.handleInput("\r");
 	});
 	assertEq(notices.length, 1, "exactly one notice");
 	assertEq(notices[0].kind, "info");
-	assertEq(notices[0].message,
-		"Saved Extension watch. pi reloads extensions when settings.json " +
-		"changes; daemon-owned values apply on the next daemon restart.");
+	assertEq(notices[0].message, "Saved Offload enabled.",
+		"the notice promises no automatic reload");
 	const written = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
-	assertEq(written.piDaemon.extWatch, false, "change persisted");
+	assertEq(written.piDaemon.offload.enabled, false, "change persisted");
 });
 test("settings: a row that throws on input is reported, not thrown", async () => {
 	const dir = join(scratchDir(), "row-throw-agent");

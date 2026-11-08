@@ -15,8 +15,7 @@ import {
 	ExtensionInputComponent,
 	ExtensionSelectorComponent,
 } from "@earendil-works/pi-coding-agent";
-import { delimiter, join } from "node:path";
-import { homedir } from "node:os";
+import { delimiter } from "node:path";
 import type { Component } from "@earendil-works/pi-tui";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { DaemonSettingsView } from "./view.ts";
@@ -79,8 +78,6 @@ export class DaemonSettingsPresenter {
 
 	/** Every piDaemon setting, in dock order. */
 	specs(): SettingSpec[] {
-		const agent = process.env.PI_CODING_AGENT_DIR
-			|| join(homedir(), ".pi", "agent");
 		return [
 			this.number("gcIdleHours", "GC idle (h)",
 				"Reap detached model-idle sessions and age-unheld conversations after this many hours; 0 disables",
@@ -103,28 +100,6 @@ export class DaemonSettingsPresenter {
 			this.number("ticketGcSeconds", "Ticket GC tick",
 				"Ticket garbage-collection cadence",
 				"PI_PTYD_TICKET_GC", 60),
-			{
-				id: "extWatch", label: "Extension watch",
-				description: "Watch extension roots and reload hosted sessions",
-				key: "extWatch", kind: "flag", defaultValue: true,
-				env: "PI_PTYD_EXT_WATCH",
-			},
-			this.number("extWatchIntervalSeconds", "Extension watch interval",
-				"Extension-root poll cadence",
-				"PI_PTYD_EXT_WATCH_INTERVAL", 3),
-			this.number("extWatchDebounceSeconds", "Extension watch debounce",
-				"Minimum gap between reload bursts",
-				"PI_PTYD_EXT_WATCH_DEBOUNCE", 4),
-			{
-				id: "extWatchRoots", label: "Extension watch roots",
-				description: `Roots to watch, joined by "${delimiter}"`,
-				key: "extWatchRoots", kind: "list",
-				defaultValue: [
-					join(agent, "extensions"), join(agent, "npm"),
-					join(agent, "git"), join(agent, "settings.json"),
-				],
-				env: "PI_PTYD_EXT_WATCH_ROOTS",
-			},
 			{
 				id: "transcriptIndex", label: "Conversation index",
 				description: "Keep a .jsonl.idx sidecar so a reader avoids a full parse",

@@ -91,7 +91,6 @@ import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import type {
 	ExecOptions,
 	ExtensionAPI,
@@ -103,35 +102,16 @@ import { DaemonSettingsPresenter } from "./settings/presenter.ts";
 import { RunStatePublisher } from "./session-state/publisher.ts";
 import { resolveEndpointPath } from "./services/discovery.ts";
 
-/** Directory of this extension module, when loaded as an ES module. */
-function moduleDir(): string {
-	try {
-		return dirname(fileURLToPath(import.meta.url));
-	} catch {
-		return "";
-	}
-}
-
-/** A bundled repo path relative to the extension, or "" when absent. */
-function bundledPath(relative: string): string {
-	const here = moduleDir();
-	if (!here) return "";
-	const candidate = join(here, relative);
-	return existsSync(candidate) ? candidate : "";
-}
-
-/** pi-rc: the package-bundled pi/bin/pi-rc next to the extension, else
- *  the installed ~/.local/bin/pi-rc. */
+/** pi-rc: always the installed launcher, which selects the active
+ *  generation from the installer's manifest. A clone's own copy would
+ *  follow the checkout rather than the installed release and skip the
+ *  installed defaults. */
 export function resolvePiRc(): string {
-	const bundled = bundledPath(join("..", "bin", "pi-rc"));
-	if (bundled) return bundled;
 	return join(process.env.HOME || homedir(), ".local", "bin", "pi-rc");
 }
 
-/** The daemon script: bundled pi/daemon/pi-daemon, else installed. */
+/** The daemon entry: the installed launcher for the same reason. */
 function resolveDaemon(): string {
-	const bundled = bundledPath(join("..", "daemon", "pi-daemon"));
-	if (bundled) return bundled;
 	return join(process.env.HOME || homedir(), ".local", "bin", "pi-daemon");
 }
 
@@ -1406,9 +1386,7 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					ctx.ui?.notify?.(
-						`Saved ${outcome.label}. pi reloads extensions when ` +
-						"settings.json changes; daemon-owned values apply on the " +
-						"next daemon restart.", "info");
+						`Saved ${outcome.label}.`, "info");
 				});
 			} catch {
 				console.error("pi-daemon: could not render settings");
