@@ -183,7 +183,7 @@ class MailboxStore:
             addresses = self._resolve_locked(descriptor, sender_address)
             candidate = {agent_id: self._copy_state(state)
                          for agent_id, state in self._recipients.items()}
-            accepted, undeliverable = [], []
+            accepted, undeliverable, envelopes = [], [], []
             for address in addresses:
                 agent_id = address["agentId"]
                 state = candidate.get(agent_id)
@@ -205,6 +205,7 @@ class MailboxStore:
                     "expiresAt": now + ttl,
                 }
                 state["messages"].append(envelope)
+                envelopes.append(self._detach(envelope))
                 accepted.append({"to": address,
                                  "messageId": envelope["messageId"],
                                  "sequence": envelope["sequence"]})
@@ -219,6 +220,7 @@ class MailboxStore:
                       "receipt": self._detach(receipt)}
             if accepted:
                 result["messages"] = self._detach(accepted)
+                result["envelopes"] = envelopes
             if undeliverable:
                 result["undeliverable"] = self._detach(undeliverable)
             return result

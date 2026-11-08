@@ -18,6 +18,7 @@ class ServiceConfig:
     frame_bytes: int = 65536
     read_chunk_bytes: int = 8192
     backlog: int = 16
+    accept_poll: float = 0.25
     connect_timeout: float = 2.0
     probe_timeout: float = 1.0
     drain_grace: float = 2.0
@@ -47,6 +48,7 @@ class ServiceConfig:
     comms_recipient_cap: int = 256
     comms_messages_per_recipient: int = 256
     comms_page_messages: int = 64
+    comms_notification_queue: int = 256
     revision: int = 0
 
     @classmethod

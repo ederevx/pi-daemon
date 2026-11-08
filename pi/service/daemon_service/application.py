@@ -5,6 +5,8 @@ import secrets
 import signal
 import threading
 
+from .comms.mailbox_store import MailboxStore
+from .comms.service import CommsService
 from .config import ServiceConfig
 from .lifecycle.instance_coordinator import InstanceCoordinator
 from .runtime_layout import RuntimeLayout
@@ -22,6 +24,8 @@ from .tasks.store import TicketStore
 from .transport.control_endpoint import ControlEndpoint
 from .transport.control_handshake import ControlHandshake
 from .transport.control_router import ControlRouter
+from .transport.rpc_codec import RpcCodec
+from .transport.rpc_listener import RpcListener
 from .wire import WireCodec
 
 
@@ -43,6 +47,9 @@ class DaemonApplication:
         self._session_runner = None
         self._relay = None
         self._endpoint = None
+        self._comms = None
+        self._comms_store = None
+        self._comms_listener = None
 
     @classmethod
     def from_environment(cls, environ=None):
@@ -73,6 +80,7 @@ class DaemonApplication:
             handlers.update(SessionOperations(
                 sessions, self.request_stop, self._config).handlers())
             token = secrets.token_hex(16)
+            comms, comms_listener = self._compose_comms(token)
             codec = WireCodec()
             endpoint = ControlEndpoint(
                 self._layout, self._config, ControlHandshake(token),
@@ -85,6 +93,7 @@ class DaemonApplication:
         self._store, self._runner = store, runner
         self._tasks, self._endpoint = tasks, endpoint
         self._sessions = sessions
+        self._comms, self._comms_listener = comms, comms_listener
         return self
 
     def _compose_sessions(self):
@@ -101,6 +110,15 @@ class DaemonApplication:
         runner.recover()
         self._session_runner = runner
         return SessionService(store, runner, relay, self._config)
+
+    def _compose_comms(self, token):
+        store = MailboxStore(self._layout.comms_mailbox_path(), self._config)
+        service = CommsService(store, self._config, token)
+        service.start()
+        listener = RpcListener(self._config, RpcCodec(), service)
+        listener.start()
+        self._comms_store = store
+        return service, listener
 
     def run(self):
         self.start()
@@ -120,6 +138,8 @@ class DaemonApplication:
             self._tasks.begin_shutdown()
         if self._sessions is not None:
             self._sessions.begin_shutdown(self._mode)
+        if self._comms_listener is not None:
+            self._comms_listener.stop()
         if self._endpoint is not None:
             self._endpoint.stop()
         if self._sessions is not None:
@@ -130,6 +150,8 @@ class DaemonApplication:
             self._relay.stop()
         if self._store is not None:
             self._store.save()
+        if self._comms is not None:
+            self._comms.stop()
         if self._session_store is not None:
             self._session_store.save()
         self._coordinator.release()
@@ -141,6 +163,9 @@ class DaemonApplication:
         self._session_store = None
         self._session_runner = None
         self._relay = None
+        self._comms = None
+        self._comms_store = None
+        self._comms_listener = None
 
     def _unwind(self):
         try:

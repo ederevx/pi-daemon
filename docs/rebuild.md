@@ -276,6 +276,20 @@ and is bound to that identity for its life; a second connection with
 the same ID shares the same mailbox and acknowledgement state, and
 disconnecting one revokes nothing of the other.
 
+Comms speaks `pi-rpc/1` on its own loopback listener. A connection
+presents `{token, version, agent}` at `rpc.hello` and is bound to that
+agent for its life; the greeting returns the methods, the subscribeable
+topics (`comms.message`), the bound agent, its mailbox cursor and the
+frame limit. The published methods are `comms.send`, `comms.broadcast`,
+`comms.replay` and `comms.ack`, over the profile's `rpc.subscribe`,
+`rpc.unsubscribe` and `rpc.cancel`; there is no `comms.list`,
+`comms.register` or `comms.unregister`.
+
+Live notifications are hints, never the record: mail is delivered to a
+subscribed connection in sequence order, and a subscriber that falls
+behind its bounded queue is disconnected rather than served a gap, so it
+reconnects and replays from its own cursor.
+
 Mail is durable before anyone is told about it. Acceptance commits the
 envelopes and a send receipt in one write, so a retried `requestId`
 replays its first outcome instead of delivering twice, and an agent that
