@@ -289,7 +289,6 @@ class SessionNameTests(unittest.TestCase):
         self.assertIn("nothing to resume", errors.getvalue())
 
     def test_a_revive_whose_name_is_still_held_claims_no_recreate(self):
-        missing = os.path.join(tempfile.gettempdir(), "no-such-conv.jsonl")
         base = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, base, True)
         stored = os.path.join(base, "legacy.jsonl")
@@ -318,7 +317,6 @@ class SessionNameTests(unittest.TestCase):
                           if request["cmd"] == "attach"],
                          [sent[0]], "nothing is attached twice")
         self.assertIn("nothing was started", errors.getvalue())
-        self.assertTrue(missing)
 
     def test_a_revive_in_a_gone_directory_says_where_it_lands(self):
         base = tempfile.mkdtemp()
