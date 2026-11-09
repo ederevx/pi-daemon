@@ -3,8 +3,8 @@
  *
  * One responsibility: refuse a shell command that uses ssh to do work,
  * because ssh from this session is for moving files only. Coordination
- * with another host goes through pi-teams (team_spawn/team_send) where
- * it is installed. It reads the command only and never runs it.
+ * with another host goes through the daemon's comms (comms_spawn and
+ * comms_send over a peer link). It reads the command only and never runs it.
  *
  * The guard is a `tool_call` handler, so it also covers nested calls
  * (another tool issuing `bash` with `ctx.executeTool`) and `daemon_tasks
@@ -74,8 +74,8 @@ export class RemoteWorkGuard {
 	private reason(): string {
 		return "[pi-daemon] refused ssh remote work: ssh from this session " +
 			"is for moving files only - use scp, sftp, rsync -e ssh, or a " +
-			"cat/tar pipe. Delegate work on another host through pi-teams " +
-			"(team_spawn/team_send) if installed. Not run locally or " +
-			"submitted to the daemon. (PI_REMOTE_GUARD=off disables.)";
+			"cat/tar pipe. Delegate work on another host through the daemon's " +
+			"comms (comms_spawn, comms_send over a peer link). Not run locally " +
+			"or submitted to the daemon. (PI_REMOTE_GUARD=off disables.)";
 	}
 }

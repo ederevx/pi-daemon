@@ -2,10 +2,9 @@
  * Remote-work classifier: decides what one shell command does to another
  * host.
  *
- * Mirrored in pi-teams/extensions/pi-teams/remote-work-classifier.ts;
- * keep the two copies in sync. It knows only the command shapes the
- * remote-work guards act on - the ssh family, file-transfer clients, and
- * a headless pi - and never runs anything.
+ * It knows only the command shapes the remote-work guards act on - the ssh
+ * family, file-transfer clients, and a headless pi - and never runs
+ * anything.
  *
  * Verdicts:
  *   transfer    - moving bytes to or from another host
