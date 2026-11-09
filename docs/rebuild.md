@@ -710,7 +710,10 @@ The order follows from the generation being built before anything public
 changes: the installer builds the candidate release, runs
 `pi-daemon-migrate --dry-run` and then `pi-daemon-migrate` from inside it
 with the roots the unit will declare, and only afterwards replaces the
-launchers and the unit and runs `systemctl --user enable --now`. When the
+launchers and the unit, enables it, and starts it only where no daemon
+holds the runtime root: a start beside one would restart onto the lock,
+so a lock over an already-translated root leaves the unit enabled and
+not started, and the install warns once. When the
 lock is held and the plan's intent is `current`, no store needs writing,
 so the installer publishes the generation and skips the translation
 altogether; a lock over an untranslated or moved legacy root still stops
@@ -759,8 +762,9 @@ written:
    generation there and stops maintaining the directory, so the rollback
    removes what this install published.
 5. `systemctl --user start pi-daemon.service`, unless step 2 already did:
-   the postinstall runs `enable --now`, so this step only matters where
-   systemd is absent and that call did nothing.
+   a start is the installer's where no daemon holds the runtime root, so
+   this step only matters where systemd is absent and that call did
+   nothing.
 
 The new state root stays in place as evidence. A rollback moves the
 legacy state again, because the legacy daemon keeps writing it, so the

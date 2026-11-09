@@ -47,6 +47,7 @@ class ScratchHome:
         # `is-active` answers what a stopped unit answers. A case overrides
         # either through the environment.
         self._write_exe("systemctl", (
+            'printf \'%s\\n\' "$*" >> "${FAKE_SYSTEMCTL_LOG:-/dev/null}"\n'
             'case "$*" in\n'
             '  *show*) printf \'%s\\n\' "${FAKE_SYSTEMCTL_FRAGMENT:-}" ;;\n'
             '  *is-active*) exit "${FAKE_SYSTEMCTL_ACTIVE:-3}" ;;\n'
@@ -433,12 +434,29 @@ class InstallScriptTests(unittest.TestCase):
             handle.write("\n# a new build\n")
         holder = self.scratch.hold_instance_lock()
         self.addCleanup(holder.release)
+        log = self.scratch.path("systemctl.log")
+        self.scratch.env_extra = {"FAKE_SYSTEMCTL_LOG": log,
+                                  "FAKE_SYSTEMCTL_ACTIVE": "3"}
         result = self.scratch.package(clone)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotEqual(self.scratch.manifest()["active_root"], first)
         self.assertIn(first, self.scratch.manifest()["retained"])
         self.assertEqual(
             self.scratch.path("daemon-state/migration.json").read_bytes(), marker)
+        # A held lock means a daemon already serves this root: the unit is
+        # enabled, and a start would only restart it into the lock.
+        calls = log.read_text().splitlines()
+        self.assertIn("--user enable pi-daemon.service", calls)
+        self.assertNotIn("--user start pi-daemon.service", calls)
+        self.assertIn("the unit is enabled, not started", result.stderr)
+
+    def test_a_first_install_enables_and_starts_the_unit(self):
+        log = self.scratch.path("systemctl.log")
+        self.scratch.env_extra = {"FAKE_SYSTEMCTL_LOG": log}
+        self.assertEqual(self.scratch.package().returncode, 0)
+        calls = log.read_text().splitlines()
+        self.assertIn("--user enable pi-daemon.service", calls)
+        self.assertIn("--user start pi-daemon.service", calls)
 
     def test_an_untranslated_install_still_refuses_beside_a_running_daemon(self):
         holder = self.scratch.hold_instance_lock()

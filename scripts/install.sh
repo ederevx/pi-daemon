@@ -11,7 +11,8 @@
 #
 # A bare run writes nothing. Idempotent: re-running either republishes the
 # same generation or publishes a new one. Existing unrelated files are never
-# touched, and the installer never stops or starts a daemon implicitly.
+# touched, and the installer starts the unit exactly when no daemon holds the
+# runtime root, never beside one.
 set -euo pipefail
 
 usage() {
@@ -744,7 +745,18 @@ if command -v systemctl >/dev/null 2>&1; then
   # makes the user manager start at boot; already-enabled linger is a no-op.
   loginctl enable-linger "${USER:-$(id -un)}" 2>/dev/null || \
     echo "install: warning — could not enable linger; the service starts at login only" >&2
-  systemctl --user enable --now pi-daemon.service
+  systemctl --user enable pi-daemon.service
+  # A held lock at preview (3) means a daemon already serves this root: the
+  # unit's own is running and needs no start, and one outside the unit would
+  # turn a start into a restart loop on the lock. A first install, or one
+  # after a stop, has no holder and starts the unit.
+  if [[ $preview -ne 3 ]]; then
+    systemctl --user start pi-daemon.service
+  elif ! service_active; then
+    echo "install: warning — a daemon outside pi-daemon.service serves" \
+      "$new_runtime; the unit is enabled, not started (docs/rebuild.md," \
+      "Takeover)" >&2
+  fi
 else
   # No systemd (for example Windows/Git Bash): the daemon extension starts
   # the daemon on demand, so no unit is needed here.
