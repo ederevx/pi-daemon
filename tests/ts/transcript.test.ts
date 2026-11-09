@@ -27,6 +27,9 @@ class StubControlServer {
 	readonly commands: Array<Record<string, unknown>> = [];
 	rejectHello = false;
 	closeWithoutReply = false;
+	/** Verbatim frames, written instead of the JSON greeting or reply. */
+	rawGreeting: string | null = null;
+	rawReply: string | null = null;
 
 	constructor(replies: Array<Record<string, unknown>>) {
 		this.replies = replies;
@@ -72,11 +75,11 @@ class StubControlServer {
 				if (!line.trim()) continue;
 				if (!greeted) {
 					greeted = true;
-					socket.write(JSON.stringify({
+					socket.write((this.rawGreeting ?? JSON.stringify({
 						ok: !this.rejectHello,
 						proto: 1,
 						caps: ["transcript.v1"],
-					}) + "\n");
+					})) + "\n");
 					continue;
 				}
 				this.commands.push(JSON.parse(line) as Record<string, unknown>);
@@ -86,7 +89,7 @@ class StubControlServer {
 				}
 				const reply = this.replies[this.cursor] ?? { ok: true };
 				this.cursor++;
-				socket.write(JSON.stringify(reply) + "\n");
+				socket.write((this.rawReply ?? JSON.stringify(reply)) + "\n");
 				return;
 			}
 		});
@@ -178,6 +181,29 @@ test("client: a socket that closes without a reply is unavailable", async () => 
 		await server.stop();
 	}
 });
+
+// A frame that parses but is not an object would otherwise reach `.ok`
+// outside every catch and throw from the socket callback.
+for (const [name, raw, greeting] of [
+	["null greeting", "null", true],
+	["null reply", "null", false],
+	["array reply", "[1,2]", false],
+] as Array<[string, string, boolean]>) {
+	test(`client: a ${name} is a bad control line, not a thrown frame`, async () => {
+		const server = new StubControlServer([{ ok: true }]);
+		if (greeting) server.rawGreeting = raw;
+		else server.rawReply = raw;
+		const path = await server.start(`bad-${greeting ? "greeting" : "reply"}-${raw.length}`);
+		try {
+			const reply = await new ControlClient(path).request({ cmd: "transcript-stat" });
+			assertEq(reply.ok, false, "not ok");
+			assertEq(reply.error, "daemon-unavailable", "error kind");
+			assertEq(reply.message, "bad-control-line", "reason");
+		} finally {
+			await server.stop();
+		}
+	});
+}
 
 // -- TranscriptTool --------------------------------------------------------
 

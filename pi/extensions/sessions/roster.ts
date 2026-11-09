@@ -58,7 +58,11 @@ export class SessionRoster {
 	/** Issue the list and render it. */
 	private async run(
 		params: { all?: boolean },
-	): Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }> {
+	): Promise<{
+		content: Array<{ type: "text"; text: string }>;
+		details: unknown;
+		isError: boolean;
+	}> {
 		const includeStopped = params.all === true;
 		const response = await this.client.request({
 			cmd: "list",
@@ -83,24 +87,33 @@ export class SessionRoster {
 		return this.message([header, ...lines].join("\n") + footer, response, sessions);
 	}
 
-	/** One record as a line: name, state, attachment, directory. */
+	/** One record as a line: name, state, the phase a stopped record ended
+	 *  in, attachment, directory, conversation file. */
 	private line(view: SessionView, includeStopped: boolean): string {
 		const name = view.name ?? "(unnamed)";
-		const state = view.state ?? view.phase ?? "unknown";
+		const state = view.state ?? "unknown";
+		const phase = includeStopped && view.phase ? ` phase=${view.phase}` : "";
 		const attached = view.attached === true
 			? `attached${view.clients && view.clients > 1 ? ` x${view.clients}` : ""}`
 			: "detached";
 		const dir = view.dir ? ` ${view.dir}` : "";
-		const stored = includeStopped && view.fileExists === false ? " (no conversation file)" : "";
-		return `- ${name} ${state} ${attached}${dir}${stored}`;
+		const file = view.file
+			? ` file=${view.file}${view.fileExists === false ? " (missing)" : ""}`
+			: " file=none";
+		return `- ${name} ${state}${phase} ${attached}${dir}${file}`;
 	}
 
-	/** Build the tool result, keeping `details` small. */
+	/** Build the tool result, keeping `details` small. A failed request is a
+	 *  tool error, and still one readable line. */
 	private message(
 		text: string,
 		response: Record<string, unknown>,
 		sessions: SessionView[],
-	): { content: Array<{ type: "text"; text: string }>; details: unknown } {
+	): {
+		content: Array<{ type: "text"; text: string }>;
+		details: unknown;
+		isError: boolean;
+	} {
 		return {
 			content: [{ type: "text", text }],
 			details: {
@@ -109,6 +122,7 @@ export class SessionRoster {
 				count: sessions.length,
 				names: sessions.map((view) => view.name ?? ""),
 			},
+			isError: response.ok !== true,
 		};
 	}
 }

@@ -1,5 +1,5 @@
 /**
- * pi-daemon control transport for the transcript tool.
+ * pi-daemon control transport shared by the extension tools.
  *
  * One authenticated JSONL request per connection: read the loopback
  * endpoint file, send the mandatory `hello`+token handshake, send the
@@ -108,9 +108,16 @@ export class ControlClient implements ControlRequester {
 					const line = buffer.slice(0, index);
 					buffer = buffer.slice(index + 1);
 					if (!line.trim()) continue;
+					// A frame is an object or it is nothing: JSON `null`, an array
+					// or a bare scalar would reach `message.ok` outside every catch.
 					let message: ControlResponse;
 					try {
-						message = JSON.parse(line) as ControlResponse;
+						const parsed: unknown = JSON.parse(line);
+						if (parsed === null || typeof parsed !== "object"
+							|| Array.isArray(parsed)) {
+							throw new Error("bad-control-line");
+						}
+						message = parsed as ControlResponse;
 					} catch {
 						fail(new Error("bad-control-line"));
 						return;

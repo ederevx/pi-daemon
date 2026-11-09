@@ -154,7 +154,10 @@ pi/
   extensions/pre-daemon.ts # pre_daemon onboarding: catalog + first-call gate
   extensions/provision.ts # session-start provisioning reconciliation
   extensions/transcript.ts # transcript_read: index-backed conversation reads
-  extensions/transcript/ # control client + transcript_read implementation
+  extensions/transcript/ # transcript_read implementation
+  extensions/control/    # shared authenticated control client
+  extensions/sessions.ts # sessions and session_stop registration
+  extensions/sessions/   # roster and stop implementations
   extensions/comms/      # comms_* + peers tools over the pi-comms CLI
   extensions/services/   # session-host discovery for the control endpoint
   bin/pi-rc              # client: tickets, bridge, input, reload,
