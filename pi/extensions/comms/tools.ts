@@ -141,7 +141,9 @@ export class CommsTools {
 			description:
 				"Launch another agent through the pi-daemon's comms launcher: " +
 				"a directory and the argv to run there, optionally under an " +
-				"explicit agent id.",
+				"explicit agent id. Use it to run the independently bounded " +
+				"units of one task in parallel sessions, coordinated by " +
+				"comms_send, comms_wait and comms_replay.",
 			parameters: Type.Object({
 				agentId: Type.Optional(Type.String({
 					description: "The identity the launched agent binds.",

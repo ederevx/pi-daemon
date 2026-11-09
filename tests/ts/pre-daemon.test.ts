@@ -191,4 +191,13 @@ test("pre-daemon: catalog states the tools, the conditional prerequisite, and th
     catalog.includes("after the acknowledgement, while offloading is enabled"),
     "the unreachable fallback is scoped to an acknowledged session",
   );
+  assert(catalog.includes("Delegation:"), "catalog advertises delegation");
+  assert(
+    catalog.includes("spawn one session per unit with comms_spawn"),
+    "the delegation section names the spawn path",
+  );
+  assert(
+    catalog.includes("Keep integration, verification, and every write to shared state"),
+    "the spawning session keeps integration and shared-state writes",
+  );
 });
