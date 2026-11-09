@@ -394,6 +394,23 @@ class ListingTests(unittest.TestCase):
         self.assertIn("stopped:resumable:unfinished", out)
         self.assertEqual(errors, "", "nothing is left out to mention")
 
+    def test_a_double_prefixed_record_is_printed_under_its_own_name(self):
+        # pi-pi-x is the twin a pre-fix client created; printed as "pi-x"
+        # its neighbour's live session would be attached instead, so the
+        # listing may only shorten a name that resolves to the same record.
+        out, errors, client = self.listing({"ok": True, "sessions": [
+            {"name": "pi-pi-x", "dir": "/s", "pid": None,
+             "phase": "exited", "desired": "stopped", "attached": False,
+             "clients": 0, "state": None, "file": "/s/conv.jsonl",
+             "fileExists": True},
+            {"name": "pi-x", "dir": "/s", "pid": 9,
+             "phase": "running", "desired": "running", "state": "idle",
+             "attached": False, "clients": 0, "file": "/s/x.jsonl"},
+        ]}, ["--all"])
+        self.assertIn("pi-pi-x\t/s\t-\t-\tstopped:resumable", out)
+        self.assertIn("x\t/s\tpid 9", out)
+        self.assertEqual(errors, "")
+
     def test_a_listing_rejects_a_flag_it_does_not_know(self):
         with self.assertRaises(SystemExit):
             self.listing({"ok": True, "sessions": []}, ["--nope"])

@@ -283,6 +283,15 @@ def short_name(full):
 	return full[3:] if full.startswith("pi-") else full
 
 
+def typable_name(full):
+	# The name a caller types back to reach exactly this record: the short
+	# form only when it resolves to the same stored name, so a record stored
+	# as pi-pi-x (the twin a pre-fix client created) is never printed as
+	# pi-x, which the daemon resolves to its live neighbour instead.
+	short = short_name(full)
+	return short if session_name(short) == full else full
+
+
 def session_base(name):
 	# tmux-era target naming: ':' is special, a leading '=' is special
 	name = name.replace(":", "_")
@@ -729,7 +738,7 @@ class AttachFlow:
 					# Said only after the revive is known to go ahead, so a
 					# refusal never first claims where it would land.
 					print("pi-rc: '%s' ran in %s, which is gone; reviving in %s"
-						  % (short_name(self.session), dir_, self.dir_),
+						  % (typable_name(self.session), dir_, self.dir_),
 						  file=sys.stderr)
 				return self._recreate(sock, file_)
 			die("attach failed: %s" % error)
@@ -742,13 +751,13 @@ class AttachFlow:
 			die("'%s' never recorded a conversation (it ran without the "
 				"daemon extension, e.g. --no-extensions); nothing to resume. "
 				"Start fresh: pi-rc start --fresh %s"
-				% (short_name(self.session), short_name(self.session)))
+				% (typable_name(self.session), typable_name(self.session)))
 		if not os.path.isfile(file_):
 			die("'%s' recorded %s, which no message ever saved or which was "
 				"deleted; nothing to resume. Start fresh: "
 				"pi-rc start --fresh %s"
-				% (short_name(self.session), file_,
-				   short_name(self.session)))
+				% (typable_name(self.session), file_,
+				   typable_name(self.session)))
 
 	def _recorded_name(self, sock):
 		# The daemon answers run-state with the spelling it stored a name
@@ -774,7 +783,7 @@ class AttachFlow:
 			# which the daemon has not settled yet: nothing was started,
 			# so claiming a recreate would be a lie.
 			die("'%s' is still held by a run the daemon has not settled yet; "
-				"nothing was started. Retry shortly" % short_name(self.session))
+				"nothing was started. Retry shortly" % typable_name(self.session))
 		print("pi-rc: recreated '%s' in %s (resuming %s)"
 			  % (self.session, self.dir_,
 				 "its recorded conversation" if file_ else "latest session"))
@@ -1091,7 +1100,7 @@ def cmd_ls(args, client):
 			if s.get("desired") == "running":
 				state += ":unfinished"
 			print("%s\t%s\t-\t-\t%s\t%s"
-				  % (short_name(s.get("name", "")), s.get("dir") or "-",
+				  % (typable_name(s.get("name", "")), s.get("dir") or "-",
 					 state, file))
 			continue
 		marker = "attached" if s.get("attached") else "detached"
@@ -1100,7 +1109,7 @@ def cmd_ls(args, client):
 			marker += " x%d" % nclients
 		state = s.get("state") or "idle"
 		print("%s\t%s\tpid %d\t%s\t%s\t%s"
-			  % (short_name(s.get("name", "")), s.get("dir", ""),
+			  % (typable_name(s.get("name", "")), s.get("dir", ""),
 				 s.get("pid", 0), marker, state, file))
 	if not show_all and resp.get("stopped"):
 		print("pi-rc: %d stopped session(s) not shown (pi-rc ls --all; "
