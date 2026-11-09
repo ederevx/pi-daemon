@@ -317,7 +317,9 @@ one that cannot be classified is left open as unsealed evidence.
 Shutdown marks every record `stopped`, terminates each child, lets each
 watcher seal its run `daemon-stopped`, drains the relay, then persists
 both stores. A `reboot` mode keeps `desired: running` for the next
-instance.
+instance. Every stop writes its mode and cause to stderr, which is the
+unit's journal, so `journalctl --user -u pi-daemon` names the signal or
+the client that asked for a stop no supervisor requested.
 
 ## Configuration
 

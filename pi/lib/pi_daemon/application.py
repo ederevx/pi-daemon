@@ -285,10 +285,24 @@ class DaemonApplication:
             self.stop()
         return 0
 
-    def request_stop(self, mode="shutdown"):
-        """Ask the run to end; the mode names what the sessions become."""
+    def request_stop(self, mode="shutdown", cause="request"):
+        """Ask the run to end; the mode names what the sessions become.
+
+        The cause goes to stderr, which is the unit's journal, so a stop no
+        supervisor asked for still names its origin.
+        """
+        self._note_stop(mode, cause)
         self._mode = mode
         self._stopping.set()
+
+    @staticmethod
+    def _note_stop(mode, cause):
+        try:
+            sys.stderr.write("pi-daemon: stopping (mode=%s, cause=%s)\n"
+                             % (mode, cause))
+            sys.stderr.flush()
+        except Exception:
+            pass
 
     def stop(self):
         self._unpublish()
@@ -348,4 +362,4 @@ class DaemonApplication:
                 pass
 
     def _on_signal(self, number, frame):
-        self.request_stop()
+        self.request_stop(cause="signal %s" % signal.Signals(number).name)
