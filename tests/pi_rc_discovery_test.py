@@ -416,6 +416,39 @@ class ListingTests(unittest.TestCase):
             self.listing({"ok": True, "sessions": []}, ["--nope"])
 
 
+class WrapperNameTests(unittest.TestCase):
+    # owned and which feed the pi wrapper's guard and its attach fallback, so
+    # what they print must name the record itself and not its neighbour.
+    def output(self, command, reply):
+        client = mock.Mock()
+        client.control.return_value = reply
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            command(client)
+        return out.getvalue()
+
+    def test_owned_names_a_double_prefixed_record_in_full(self):
+        conversation = os.path.join(SCRATCH, "owned.jsonl")
+        open(conversation, "w").close()
+        cwd = os.getcwd()
+        os.chdir(SCRATCH)
+        try:
+            out = self.output(
+                lambda client: pi_rc.cmd_owned([], client),
+                {"ok": True, "sessions": [
+                    {"name": "pi-pi-x", "dir": SCRATCH, "state": "idle",
+                     "phase": "running", "file": conversation}]})
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(out, "pi-pi-x\n")
+
+    def test_which_names_a_double_prefixed_record_in_full(self):
+        out = self.output(
+            lambda client: pi_rc.cmd_which(["/s/conv.jsonl"], client),
+            {"ok": True, "name": "pi-pi-x"})
+        self.assertEqual(out, "pi-pi-x\n")
+
+
 def normal_all_reply():
     # One of each state a stopped record can be in, in the daemon's own
     # words: a conversation to resume, none ever recorded, or one the

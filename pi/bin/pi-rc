@@ -897,7 +897,7 @@ class AttachFlow:
 				except SystemExit:
 					note = "session state unknown (daemon unreachable)"
 			print("pi-rc: detached '%s' (%s; return with: pi-rc attach %s)"
-				  % (self.session, note, short_name(self.session)))
+				  % (self.session, note, typable_name(self.session)))
 		elif status == "lost":
 			print("pi-rc: connection to '%s' lost" % self.session)
 
@@ -1051,10 +1051,10 @@ def cmd_start(args, client):
 		die("start failed: %s" % resp.get("error"))
 	if not resp.get("created", True):
 		print("pi-rc: session '%s' already exists (attach: pi-rc attach %s)"
-			  % (session, short_name(session)))
+			  % (session, typable_name(session)))
 		return
 	print("pi-rc: started '%s' in %s (attach: pi-rc attach %s; background: /bg)"
-		  % (session, dir_, short_name(session)))
+		  % (session, dir_, typable_name(session)))
 
 
 def cmd_detach(args, client):
@@ -1161,12 +1161,12 @@ def cmd_owned(args, client):
 	resp = client.control({"cmd": "list"})
 	newest = pick_owned_session(resp.get("sessions") or [], os.getcwd())
 	if newest is not None:
-		print(short_name(newest.get("name", "")))
+		print(typable_name(newest.get("name", "")))
 
 
 def cmd_which(args, client):
 	# Used by the pi wrapper's resume guard: does any live hosted session
-	# back this conversation file? Prints the short session name when one
+	# back this conversation file? Prints the name to attach by when one
 	# does, stays silent with exit 0 otherwise, and reuses the existing
 	# exit-code semantics (4 = daemon unreachable) on the way there.
 	if len(args) != 1:
@@ -1176,7 +1176,7 @@ def cmd_which(args, client):
 		die("which failed: %s" % resp.get("error"))
 	name = resp.get("name")
 	if name:
-		print(short_name(name))
+		print(typable_name(name))
 
 
 def cmd_whichall(args, client):
@@ -1517,14 +1517,14 @@ def cmd_handover(args, client):
 		sock.close()
 		sys.stderr.write(
 			"pi-rc: '%s' already hosts this session "
-			"(attach: pi-rc attach %s)\n" % (session, short_name(session)))
+			"(attach: pi-rc attach %s)\n" % (session, typable_name(session)))
 		sys.exit(EXIT_HOSTED)
 	if kind != "target":
 		sock.close()
 		die("unexpected handover verdict: %s" % verdict)
 	print("pi-rc: hosting '%s' resumed from %s (attach: pi-rc attach %s; "
 		  "background: /bg)"
-		  % (session, os.path.basename(file), short_name(session)))
+		  % (session, os.path.basename(file), typable_name(session)))
 	if after_pid is not None:
 		# Hold the control connection open until the handing-over pi has
 		# exited; closing it is the daemon's exit signal and it hosts the
