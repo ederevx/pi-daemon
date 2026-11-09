@@ -740,6 +740,97 @@ decides on the installer's status:
 means a daemon came back and the legacy unit is still in place to start,
 and a failed migration installs nothing.
 
+Who starts a daemon follows from the unit's own declaration: `pi-rc
+daemon-start` starts the unit when it is loaded and declares this
+runtime root, and spawns a detached daemon only where no such unit
+exists. The `pi` wrapper calls it instead of deciding for itself, so the
+choice is made once and cannot disagree with the unit that owns the
+root. Where a daemon already holds the lock, neither starts anything
+(see Takeover).
+
+## Takeover
+
+A daemon can serve the root the unit declares without being the unit's
+own. A detached daemon started before the unit existed keeps the
+instance lock and keeps serving its release; the installer leaves it
+alone, enables the unit and does not start it, and says so once, because
+a start beside a held lock only restarts onto that lock. Moving the root
+to the unit is an operator step, and it runs from a transient unit so
+the stop below cannot end the session issuing it (see Cutover for the
+`systemd-run --user` invocation and the environment it needs).
+
+1. Publish the release and let it prove the lock exit. `pi install
+git:github.com:ederevx/pi-daemon@<tag>` starts nothing here: the unit is
+re-rendered and reloaded, its next attempt runs the new release, exits
+3 on the held lock and stays failed, so `SubState` reads `failed` and
+`NRestarts` stops growing instead of the unit restarting every two
+seconds.
+2. Record the sessions to re-attach afterwards: `pi-rc ls` gives each
+one's name, directory and file.
+3. Stop the old daemon and wait for it to release the lock. It settles
+its sessions, persists them and only then exits, so the wait is the
+lock's own answer, not a fixed sleep:
+
+```bash
+RT=${PI_DAEMON_RUNTIME_DIR:-/run/user/$(id -u)/pi-daemon}
+RC=~/.local/bin/pi-rc
+MANIFEST=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/.pi-daemon/manifest.json
+LIB=$(python3 -I -c 'import json, sys
+print(json.load(open(sys.argv[1]))["active_root"] + "/lib")' "$MANIFEST")
+"$RC" --endpoint "$RT/control.json" daemon-stop
+for _ in $(seq 1 60); do
+	python3 -I -c 'import sys
+sys.path.insert(0, sys.argv[2])
+from pi_daemon.lifecycle.instance_coordinator import InstanceCoordinator
+sys.exit(1 if InstanceCoordinator(sys.argv[1]).held() else 0)' \
+		"$RT/instance.lock" "$LIB" && break
+	sleep 0.5
+done
+systemctl --user start pi-daemon.service
+```
+
+Anything that tries to start a daemon in that gap goes to the unit,
+because activation defers to it; `-I` keeps the probe from importing
+anything out of the working directory. The start returns once the
+instance lock is taken; confirm `MainPID` is non-zero and equal to the
+`pid` in `$RT/control.json`.
+
+4. Prove supervision before any session is re-attached. `KillMode`
+is `control-group`, so a hosted child dies with the main process, and
+the restart that follows is the unit's:
+
+```bash
+MAIN0=$(systemctl --user show -p MainPID --value pi-daemon.service)
+R0=$(systemctl --user show -p NRestarts --value pi-daemon.service)
+kill -KILL "$MAIN0"
+# a SIGKILL leaves a stale descriptor; the new instance overwrites it
+for _ in $(seq 1 30); do
+	MAIN=$(systemctl --user show -p MainPID --value pi-daemon.service)
+	PID=$(python3 -I -c 'import json, sys
+print(json.load(open(sys.argv[1])).get("pid"))' "$RT/control.json")
+	[[ -n $MAIN && $MAIN != 0 && $MAIN != "$MAIN0" && $MAIN == "$PID" ]] && break
+	sleep 1
+done
+test "$(systemctl --user show -p NRestarts --value pi-daemon.service)" \
+	-eq $((R0 + 1))
+for pid in $(pgrep -f '/daemon/pi-daemon$|\.local/bin/pi-daemon$'); do
+	grep -q '/pi-daemon.service$' "/proc/$pid/cgroup" || echo "unowned: $pid"
+done
+"$RC" --endpoint "$RT/control.json" ls
+```
+
+5. Re-attach each recorded session with `pi-rc start <name> <dir>`; an
+explicit name reopens its record rather than making a twin, and `pi-rc
+ls` shows the result.
+6. Soak: ten minutes later, re-read `MainPID` and `NRestarts`, the
+`pid` in `control.json` and the cgroup of the daemon's processes, and
+confirm they still agree.
+
+`daemon-stop` stays a plain client stop. Routing it through
+`systemctl stop` would recurse from the unit's own `ExecStop`, and
+`INVOCATION_ID` cannot tell that apart from a hosted session, because
+hosted sessions inherit the daemon's environment.
+
 ## Rollback
 
 Rollback never depends on the new code, because the legacy root was never

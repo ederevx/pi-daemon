@@ -85,6 +85,14 @@ the installer refuses to translate beside it; nothing is changed when it
 refuses. Stop the unit and re-run the same command: that run translates
 the legacy root, promotes the release and starts the unit itself.
 
+Where a daemon serves the root without the unit being the one holding
+it, the install enables the unit and does not start it, since a start
+only restarts onto the lock; moving the root to the unit is the
+operator step `docs/rebuild.md` records under Takeover. What a start
+means is `pi-rc daemon-start`'s decision alone — the unit when it is
+loaded and declares this runtime root, a detached daemon only where it
+is not — and the `pi` wrapper calls it rather than choosing.
+
 On a host whose daemon hosts the session running the install, the stop
 kills the install too: the unit's default `KillMode=control-group`
 reaches every process in its cgroup, and a `setsid` child cannot leave
