@@ -170,9 +170,10 @@ shutdown
 * `which` names the session a conversation is hosted by; `whichall`
   answers `names`, one `name`/`state` entry per live holder.
 * `start` answers `created` (a live name is replayed, never replaced);
-  the child environment is `os.environ` with `PI_HOSTED=1` and the
-  record's name in `PI_HOSTED_SESSION`, then the stored `env`, then the
-  transient `env_once` overlay, and last
+  the child environment is `os.environ`, then the stored `env`, then the
+  transient `env_once` overlay, then - never overlaid - `PI_HOSTED=1` and
+  the record's name in `PI_HOSTED_SESSION`, so a caller cannot name itself
+  another session, and last
   of all - never overlaid - `PI_DAEMON_STATE_DIR`, which the daemon sets
   to the state root it resolved, so a hosted session's extensions read
   the reload and reap signals of the daemon that hosts them and a

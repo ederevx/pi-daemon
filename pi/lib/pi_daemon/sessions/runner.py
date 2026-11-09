@@ -248,16 +248,16 @@ class SessionRunner:
         self._store.discard(key)
 
     def _environment(self, name, record, env_once):
-        # The legacy order: the hosted markers first, then the durable
-        # environment a caller passed, then the one-shot additions. A
-        # respawn reconstitutes a child from the durable record, so the
-        # markers there must already be in place.
+        # The durable environment a caller passed, then the one-shot
+        # additions, then the hosted identity: a caller's environment must
+        # not be able to name the session its child is not, because the
+        # tools read that name to refuse a stop that would end the caller.
         environment = dict(os.environ)
-        environment["PI_HOSTED"] = "1"
-        environment["PI_HOSTED_SESSION"] = name
         environment.update(record.env)
         if env_once:
             environment.update(env_once)
+        environment["PI_HOSTED"] = "1"
+        environment["PI_HOSTED_SESSION"] = name
         # Last, never overlaid: the session's extension reads this to find
         # the reload and reap signals, so it must be the root this daemon
         # holds the instance lock for, not whatever a caller remembered.

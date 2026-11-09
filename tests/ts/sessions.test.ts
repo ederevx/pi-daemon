@@ -118,7 +118,9 @@ test("session_stop: a record already ended says so and stays resumable", async (
 		{ name: "pi-beta" }, { ok: true, queued: false, alive: false, state: "idle" });
 	const text = result.content[0].text as string;
 	assert(text.includes("pi-beta: run ended (state=idle)"), `text: ${text}`);
-	assert(text.includes("pi-rc attach pi-beta"), `resume hint: ${text}`);
+	// Only a conversation file on disk can be resumed, and this reply cannot
+	// see one, so it points at the roster instead of promising a resume.
+	assert(text.includes("all: true shows whether its conversation file"), `file hint: ${text}`);
 	assertEq(result.details.ended, true, "ended");
 });
 
@@ -134,6 +136,11 @@ test("session_stop: refuses its own session in either spelling, without asking",
 	assertEq(prefixed.result.details.error, "own-session", "prefixed spelling refused");
 	const exact = await stop({ name: "pi-alpha" }, { ok: true }, "pi-alpha");
 	assertEq(exact.result.details.error, "own-session", "full name refused too");
+	// The store resolves exactly one alias step, so a doubled spelling
+	// reaches the session that already carries the prefix.
+	const doubled = await stop({ name: "pi-pi-alpha" }, { ok: true }, "pi-alpha");
+	assertEq(doubled.client.requests.length, 0, "no request for the doubled name");
+	assertEq(doubled.result.details.error, "own-session", "doubled spelling refused");
 });
 
 test("session_stop: a missing name and a daemon refusal are tool errors", async () => {

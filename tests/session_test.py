@@ -581,6 +581,18 @@ class RunnerTests(unittest.TestCase):
         record = self.store.get("pi-a")
         self.assertEqual(self.store.stop_reason(record.id), "shutdown")
 
+    def test_a_caller_environment_cannot_rename_the_hosted_session(self):
+        # The tools refuse a stop that would end the caller by comparing
+        # this name, so neither durable nor one-shot environment may set it.
+        record = SessionRecord(id="s-1", generation="g-1", name="pi-a",
+                              dir=self.base,
+                              env={"PI_HOSTED_SESSION": "pi-b",
+                                   "PI_HOSTED": "0"})
+        environment = self.runner._environment(
+            "pi-a", record, {"PI_HOSTED_SESSION": "pi-c"})
+        self.assertEqual(environment["PI_HOSTED_SESSION"], "pi-a")
+        self.assertEqual(environment["PI_HOSTED"], "1")
+
 
 class StubService:
     def __init__(self, failure=None):

@@ -938,8 +938,11 @@ class CommsSpawnTests(unittest.TestCase):
 
     def spawn(self, **changes):
         service = self.app._comms
+        # The default child outlives the assertions: `sessions` lists live
+        # runs, so a child that exits first is a race, not a result.
         spec = {"agentId": "kid", "name": None, "dir": self.scratch,
-                "argv": [sys.executable, "-c", "pass"],
+                "argv": [sys.executable, "-c",
+                         "import time; time.sleep(30)"],
                 "cols": None, "rows": None, "env": None, "envOnce": None}
         spec.update(changes)
         return service.spawn({"nodeId": service.node_id(),
@@ -961,8 +964,9 @@ class CommsSpawnTests(unittest.TestCase):
 
     def test_a_launch_reaches_the_real_sessions_domain_with_its_env(self):
         report = os.path.join(self.scratch, "env.txt")
-        script = ("import os, json\n"
-                  "open(%r, 'w').write(json.dumps(dict(os.environ)))\n" % report)
+        script = ("import os, json, time\n"
+                  "open(%r, 'w').write(json.dumps(dict(os.environ)))\n"
+                  "time.sleep(30)\n" % report)
         result = self.spawn(argv=[sys.executable, "-c", script],
                             envOnce={"PI_TEST_ONCE": "once"})
         self.assertEqual(result["status"], "spawned")
