@@ -48,6 +48,8 @@ def main():
                    [sys.executable, "tests/pi_comms_test.py"])
     all_ok &= step("pi-rc discovery tests",
                    [sys.executable, "tests/pi_rc_discovery_test.py"])
+    all_ok &= step("pi-rc activation tests",
+                   [sys.executable, "tests/pi_rc_activation_test.py"])
     all_ok &= step("extension tests (TS)",
                    ["node", "--experimental-strip-types",
                     "--experimental-transform-types", "tests/ts/run.ts"])

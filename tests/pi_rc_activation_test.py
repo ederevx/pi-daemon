@@ -75,7 +75,8 @@ class ActivationTests(unittest.TestCase):
         self.spawns = []
         self.patchers = [
             mock.patch.dict(os.environ, self.environ, clear=False),
-            mock.patch.object(pi_rc, "DAEMON_RESTART_WAIT", 0.2),
+            # Long enough for the fake systemctl's fork on a loaded host.
+            mock.patch.object(pi_rc, "DAEMON_RESTART_WAIT", 2.0),
             mock.patch.object(
                 pi_rc.PROCESS, "launch_detached",
                 side_effect=lambda *args: self.spawns.append(args)),

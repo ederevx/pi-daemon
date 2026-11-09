@@ -751,13 +751,14 @@ root. Where a daemon already holds the lock, neither starts anything
 ## Takeover
 
 A daemon can serve the root the unit declares without being the unit's
-own. A detached daemon started before the unit existed keeps the
-instance lock and keeps serving its release; the installer leaves it
-alone, enables the unit and does not start it, and says so once, because
-a start beside a held lock only restarts onto that lock. Moving the root
-to the unit is an operator step, and it runs from a transient unit so
-the stop below cannot end the session issuing it (see Cutover for the
-`systemd-run --user` invocation and the environment it needs).
+own. A detached daemon started while the unit was down, by an activation
+that did not defer to it, keeps the instance lock and keeps serving its
+release; the installer leaves it alone, enables the unit and does not
+start it, and says so once, because a start beside a held lock only
+restarts onto that lock. Moving the root to the unit is an operator step,
+and it runs from a transient unit so the stop below cannot end the
+session issuing it (see Cutover for the `systemd-run --user` invocation
+and the environment it needs).
 
 1. Publish the release and let it prove the lock exit. `pi install
 git:github.com:ederevx/pi-daemon@<tag>` starts nothing here: the unit is
@@ -791,9 +792,9 @@ systemctl --user start pi-daemon.service
 
 Anything that tries to start a daemon in that gap goes to the unit,
 because activation defers to it; `-I` keeps the probe from importing
-anything out of the working directory. The start returns once the
-instance lock is taken; confirm `MainPID` is non-zero and equal to the
-`pid` in `$RT/control.json`.
+anything out of the working directory. The start returns once the unit
+is up, not once the daemon serves; confirm `MainPID` is non-zero and
+equal to the `pid` in `$RT/control.json`.
 
 4. Prove supervision before any session is re-attached. `KillMode`
 is `control-group`, so a hosted child dies with the main process, and

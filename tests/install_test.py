@@ -458,6 +458,29 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("--user enable pi-daemon.service", calls)
         self.assertIn("--user start pi-daemon.service", calls)
 
+    def test_a_held_lock_with_the_unit_serving_starts_nothing(self):
+        # The normal state after a takeover: the lock is held and the unit
+        # is the holder, so there is no untaken root for the install to
+        # report and nothing to start.
+        clone = self.scratch.clone()
+        self.assertEqual(self.scratch.package(clone).returncode, 0)
+        with open(clone / "pi" / "bin" / "pi-rc", "a", encoding="utf-8") as handle:
+            handle.write("\n# a new build\n")
+        holder = self.scratch.hold_instance_lock()
+        self.addCleanup(holder.release)
+        log = self.scratch.path("systemctl.log")
+        self.scratch.env_extra = {
+            "FAKE_SYSTEMCTL_LOG": log,
+            "FAKE_SYSTEMCTL_ACTIVE": "0",
+            "FAKE_SYSTEMCTL_FRAGMENT": self.scratch.path(
+                ".config/systemd/user/pi-daemon.service")}
+        result = self.scratch.package(clone)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = log.read_text().splitlines()
+        self.assertIn("--user enable pi-daemon.service", calls)
+        self.assertNotIn("--user start pi-daemon.service", calls)
+        self.assertNotIn("the unit is enabled, not started", result.stderr)
+
     def test_an_untranslated_install_still_refuses_beside_a_running_daemon(self):
         holder = self.scratch.hold_instance_lock()
         self.addCleanup(holder.release)
