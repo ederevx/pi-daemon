@@ -175,6 +175,7 @@ import hashlib
 import json
 import os
 import select
+import shlex
 import signal
 import socket
 import subprocess
@@ -209,21 +210,26 @@ PROCESS = pi_platform.ProcessControl()
 STATE_HOME = LAYOUT.state_home()
 
 
-def daemon_log_path():
-	# The service's own log lives in the state root the entry resolves:
-	# the generation's installed defaults over this environment. A
-	# checkout has no defaults file and no explicit roots, so it keeps the
-	# legacy path and stays runnable from the repo.
+def installed_layout():
+	# The layout the installed defaults declare, else None. A checkout has
+	# no defaults file and no explicit roots, and stays runnable from the
+	# repo.
 	try:
 		from pi_daemon.environment import EntryEnvironment
 		from pi_daemon.runtime_layout import RuntimeLayout
 
 		environment = EntryEnvironment().resolve()
-		layout = RuntimeLayout(environment["PI_DAEMON_STATE_DIR"],
-							   environment["PI_DAEMON_RUNTIME_DIR"])
-		return layout.daemon_log_path()
+		return RuntimeLayout(environment["PI_DAEMON_STATE_DIR"],
+							 environment["PI_DAEMON_RUNTIME_DIR"])
 	except (ImportError, ValueError):
-		return LAYOUT.daemon_log_path()
+		return None
+
+
+def daemon_log_path():
+	# The service's own log lives in the state root the entry resolves:
+	# the generation's installed defaults over this environment.
+	layout = installed_layout()
+	return (layout or LAYOUT).daemon_log_path()
 
 
 LOG_PATH = daemon_log_path()
@@ -889,10 +895,61 @@ class AttachFlow:
 
 # ------------------------------------------------------------------ daemon
 
+def unit_layout():
+	# The installed layout when the systemd user unit owns its runtime root,
+	# else None. The unit owns the root it declares: a start is then
+	# systemd's, never a detached daemon beside it. No systemctl, no user
+	# manager, or a unit declaring another root all answer None, and the
+	# detached spawn stays the mechanism.
+	layout = installed_layout()
+	if layout is None:
+		return None
+	try:
+		shown = subprocess.run(
+			["systemctl", "--user", "show", "-p", "LoadState",
+			 "-p", "Environment", "pi-daemon.service"],
+			capture_output=True, text=True, timeout=CONTROL_TIMEOUT)
+	except (OSError, subprocess.SubprocessError):
+		return None
+	fields = dict(line.split("=", 1) for line in shown.stdout.splitlines()
+				  if "=" in line)
+	if fields.get("LoadState") != "loaded":
+		return None
+	declared = "PI_DAEMON_RUNTIME_DIR=" + layout.runtime_root()
+	try:
+		environment = shlex.split(fields.get("Environment", ""))
+	except ValueError:
+		return None
+	return layout if declared in environment else None
+
+
 def cmd_daemon_start(_args, client):
 	# already up: done silently
 	if client.alive():
 		return
+	layout = unit_layout()
+	if layout is not None:
+		# Systemd owns this root: start the unit and wait on the endpoint
+		# it publishes. Discovery cannot find a daemon that is down, so
+		# the wait dials the unit's own descriptor.
+		try:
+			subprocess.run(["systemctl", "--user", "start",
+							"pi-daemon.service"],
+						   timeout=DAEMON_RESTART_WAIT)
+		except (OSError, subprocess.SubprocessError):
+			die("pi-daemon.service did not start (journalctl --user -u "
+				"pi-daemon)", EXIT_NO_DAEMON)
+		unit = pi_platform.ControlClient(
+			pi_platform.EndpointFile(layout.endpoint_path()))
+		deadline = time.time() + DAEMON_RESTART_WAIT
+		while time.time() < deadline:
+			try:
+				unit.connect(CONTROL_TIMEOUT).close()
+				return
+			except OSError:
+				time.sleep(0.05)
+		die("pi-daemon.service did not come up (journalctl --user -u "
+			"pi-daemon)", EXIT_NO_DAEMON)
 	daemon = find_daemon()
 	if daemon is None:
 		die("cannot find the pi-daemon script next to %s"
