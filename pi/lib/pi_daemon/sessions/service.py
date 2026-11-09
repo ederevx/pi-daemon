@@ -62,6 +62,7 @@ class SessionService:
         return views
 
     def stopped_count(self):
+        """How many stopped records a live-only listing leaves out."""
         return self._store.stopped_count()
 
     def which(self, file):

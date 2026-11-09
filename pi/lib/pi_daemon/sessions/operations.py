@@ -50,6 +50,10 @@ class SessionOperations:
     # -- reads -------------------------------------------------------------
 
     def list(self, request):
+        # `all` adds the records whose run ended — the names a caller can
+        # still revive — with whether each one's conversation is still on
+        # disk. Without it the reply counts what it left out, so a name is
+        # never invisible: stopped sessions are resumed by name.
         include = request.get("all", False)
         if not isinstance(include, bool):
             raise ValueError("all must be a boolean")

@@ -320,6 +320,47 @@ class ViewerRelay:
                                 + self.viewers.pop(key, 0))
 
 
+class ListingTests(unittest.TestCase):
+    """The listing a revive is chosen from: what is live, what is left."""
+
+    def setUp(self):
+        self.base = roots()
+        self.addCleanup(shutil.rmtree, self.base[0], True)
+        self.store, self.config = store_for(self.base)
+        self.saved = os.path.join(self.base[0], "conv.jsonl")
+        open(self.saved, "w").close()
+
+    def service(self):
+        return SessionService(self.store, None, ViewerRelay({}), self.config)
+
+    def stop(self, name, file):
+        record, _ = reserve(self.store, name, file)
+        self.store.finish(record.id, "exit", 0)
+        return record
+
+    def test_a_stopped_record_says_whether_it_can_be_resumed(self):
+        self.stop("pi-a", self.saved)
+        self.stop("pi-b", os.path.join(self.base[0], "gone.jsonl"))
+        self.stop("pi-c", None)
+        rows = {view["name"]: view
+                for view in self.service().sessions(include_stopped=True)}
+        self.assertTrue(rows["pi-a"]["fileExists"])
+        self.assertFalse(rows["pi-b"]["fileExists"], "the file is gone")
+        self.assertFalse(rows["pi-c"]["fileExists"], "nothing was recorded")
+        self.assertEqual(rows["pi-a"]["phase"], "exited")
+        self.assertEqual(self.service().sessions(), [],
+                         "a live-only listing leaves them out")
+        self.assertEqual(self.service().stopped_count(), 3)
+
+    def test_a_recorded_name_answers_its_stored_spelling_and_directory(self):
+        self.stop("pi-a", self.saved)
+        self.assertEqual(self.service().recorded("a"),
+                         {"name": "pi-a", "dir": "/tmp",
+                          "file": self.saved})
+        self.assertIsNone(self.service().recorded("nobody"),
+                          "a name with no record promises nothing")
+
+
 class AnnounceTests(unittest.TestCase):
     """A takeover gives the conversation to whichever holder is busiest."""
 
@@ -594,6 +635,24 @@ class OperationsTests(unittest.TestCase):
         self.assertEqual(reply["file"], "/conv.jsonl")
         self.assertEqual(reply["recorded"], "pi-a")
         self.assertEqual(reply["dir"], "/s")
+
+    def test_an_attach_failure_with_a_recorded_name_answers_no_file(self):
+        service = StubService(SessionError("no-session"))
+        service.recorded = lambda name: {"name": "pi-a", "dir": "/s",
+                                         "file": None}
+        reply = self.operations(service).attach(
+            {"cmd": "attach", "name": "pi-a"}, None)
+        self.assertEqual(reply["error"], "no-session")
+        self.assertEqual(reply["recorded"], "pi-a")
+        self.assertNotIn("file", reply,
+                         "a record with no conversation promises none")
+
+    def test_an_attach_failure_without_a_record_answers_no_record(self):
+        service = StubService(SessionError("no-session"))
+        service.recorded = lambda name: None
+        reply = self.operations(service).attach(
+            {"cmd": "attach", "name": "pi-a"}, None)
+        self.assertEqual(reply, {"ok": False, "error": "no-session"})
 
     def test_a_listing_counts_the_stopped_records_it_leaves_out(self):
         service = StubService()
