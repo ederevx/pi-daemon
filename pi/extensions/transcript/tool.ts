@@ -13,7 +13,7 @@
 import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import type { ControlRequester } from "./client.ts";
+import type { ControlRequester } from "../control/client.ts";
 
 /** The five read views and their knobs. */
 export interface TranscriptParams {

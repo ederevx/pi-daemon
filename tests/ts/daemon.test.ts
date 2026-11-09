@@ -160,6 +160,9 @@ async function hosted(session: string, fn: () => Promise<void>): Promise<void> {
     {
       PI_HOSTED_SESSION: session,
       PI_HOSTED: session ? "1" : "",
+      // A hosted shell inherits the daemon's own state root, which the
+      // signal watcher prefers over the legacy path these tests write.
+      PI_DAEMON_STATE_DIR: undefined,
       HOME: "/home/x",
       XDG_RUNTIME_DIR: join(scratchDir(), "runtime"),
     },

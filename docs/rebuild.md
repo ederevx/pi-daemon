@@ -327,6 +327,18 @@ instance. Every stop writes its mode and cause to stderr, which is the
 unit's journal, so `journalctl --user -u pi-daemon` names the signal or
 the client that asked for a stop no supervisor requested.
 
+### The tools a hosted pi carries
+
+A pi inside a hosted session reaches this domain through two extension
+tools, and neither keeps state of its own: they name a target and
+render what the domain answered. `sessions` issues `list` (with `all`
+for the records whose run ended, the names `pi-rc attach` still
+revives) and says how many stopped records it left out, so a name is
+never silently invisible; `session_stop` issues `stop` and reports the
+projected record. The tool refuses the session it runs in - a stop
+request from inside would end the turn that asked for it - and both
+degrade to one line when the daemon is not there.
+
 ## Configuration
 
 Every operational value is a `ServiceConfig` field, resolved once from

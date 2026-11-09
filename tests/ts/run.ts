@@ -23,6 +23,7 @@ import "./discovery.test.ts";
 import "./comms-tools.test.ts";
 import "./settings-reconciler.test.ts";
 import "./transcript.test.ts";
+import "./sessions.test.ts";
 // Isolated from the process-wide state each test needs: this file drives
 // its own SharedState instances, and its last test stops publishing.
 import "./session-state.test.ts";

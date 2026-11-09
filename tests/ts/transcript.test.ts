@@ -13,7 +13,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { test, assert, assertEq, scratchDir } from "./harness.ts";
-import { ControlClient } from "../../pi/extensions/transcript/client.ts";
+import { ControlClient } from "../../pi/extensions/control/client.ts";
 import { TranscriptTool } from "../../pi/extensions/transcript/tool.ts";
 
 /** A loopback control stub: one authenticated JSONL reply per command. */

@@ -8,7 +8,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { ControlClient } from "./transcript/client.ts";
+import { ControlClient } from "./control/client.ts";
 import { TranscriptTool } from "./transcript/tool.ts";
 
 export default function (pi: ExtensionAPI) {
