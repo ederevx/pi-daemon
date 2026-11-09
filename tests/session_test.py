@@ -769,7 +769,7 @@ class OperationsTests(unittest.TestCase):
         action = self.operations().shutdown({"cmd": "shutdown"})
         self.assertFalse(self.stopped)
         action.after_send()
-        self.assertEqual(self.stopped, [("shutdown",)])
+        self.assertEqual(self.stopped, [("shutdown", "control shutdown")])
 
     def test_input_is_projected_with_its_byte_count(self):
         service = StubService()
