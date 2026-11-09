@@ -313,7 +313,8 @@ test("remote guard: the refusal names the sanctioned paths", () => {
 	const { gate } = guard();
 	const reason = String(gate(bash("ssh host make"))?.reason ?? "");
 	assert(/scp|sftp|rsync/.test(reason), "names the file-transfer clients");
-	assert(/comms_spawn|comms_send/.test(reason), "names the coordination path");
+	assert(/\bcomms_send\b/.test(reason), "names the coordination path");
+	assert(/configured peer link/.test(reason), "names the prerequisite");
 	assert(/PI_REMOTE_GUARD=off/.test(reason), "names the switch");
 });
 
