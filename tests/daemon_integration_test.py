@@ -147,6 +147,20 @@ def _main():
     else:
         ok("service descriptor published under SCRATCH")
 
+    # -- held lock ---------------------------------------------------------
+    # A second daemon on the same roots refuses with the held-lock exit,
+    # so a unit starting beside a live daemon fails once instead of
+    # restarting forever.
+    second = subprocess.run([sys.executable, DAEMON_PATH], env=ENV,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, text=True, timeout=20)
+    if second.returncode != 3:
+        fail("held lock exit", f"rc={second.returncode} err={second.stderr!r}")
+    elif "another instance owns this runtime root" not in second.stderr:
+        fail("held lock message", second.stderr)
+    else:
+        ok("a second daemon exits 3 on a held root")
+
     # -- tickets -----------------------------------------------------------
     r = pi_rc("ticket-submit", "--cwd", SCRATCH, "--", "echo hello-from-ticket")
     if r.returncode != 0 or not r.stdout.strip().startswith("ticket t-"):

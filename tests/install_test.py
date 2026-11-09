@@ -491,6 +491,8 @@ class InstallScriptTests(unittest.TestCase):
             f"Environment=\"PI_DAEMON_STATE_DIR="
             f"{self.scratch.path('daemon-state')}\"", rendered,
             "this home's unit was rendered by this install")
+        self.assertIn("RestartPreventExitStatus=3", rendered,
+                      "a held lock must not be restarted")
 
     def test_a_v2_install_retires_its_flat_seam_module(self):
         # A manifest-only (v2) install owned the seams beside the binaries;

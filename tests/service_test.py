@@ -2,6 +2,9 @@
 """The unified service: configuration, tasks, framing and the endpoint."""
 
 import base64
+import contextlib
+import errno
+import io
 import json
 import os
 import shutil
@@ -19,6 +22,8 @@ sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 from pi_daemon.application import DaemonApplication
 from pi_daemon.atomic_state_file import AtomicStateFile
 from pi_daemon.config import ServiceConfig
+from pi_daemon.entry import DaemonEntry
+from pi_daemon.lifecycle.error import InstanceHeldError
 from pi_daemon.lifecycle.instance_coordinator import InstanceCoordinator
 from pi_daemon.runtime_layout import RuntimeLayout
 from pi_daemon.tasks.error import TaskError
@@ -215,11 +220,23 @@ class InstanceTests(unittest.TestCase):
         path = os.path.join(tempfile.mkdtemp(dir=SCRATCH), "instance.lock")
         first, second = InstanceCoordinator(path), InstanceCoordinator(path)
         first.acquire()
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(InstanceHeldError):
             second.acquire()
         first.release()
         second.acquire()
         second.release()
+
+    def test_a_lock_error_that_is_not_held_propagates(self):
+        # Only "would block" means another instance holds the root; a
+        # filesystem or node-limit refusal is a real failure, and the unit
+        # may retry it.
+        path = os.path.join(tempfile.mkdtemp(dir=SCRATCH), "instance.lock")
+        coordinator = InstanceCoordinator(path)
+        with mock.patch.object(coordinator, "_lock",
+                               side_effect=OSError(errno.ENOLCK, "")):
+            with self.assertRaises(OSError) as raised:
+                coordinator.acquire()
+        self.assertNotIsInstance(raised.exception, InstanceHeldError)
 
     def test_the_probe_never_creates_or_keeps_the_lock(self):
         path = os.path.join(tempfile.mkdtemp(dir=SCRATCH), "instance.lock")
@@ -967,6 +984,27 @@ class CommsSpawnTests(unittest.TestCase):
         second = self.spawn()
         self.assertEqual(second["spawnId"], first["spawnId"])
         self.assertFalse(second["created"])
+
+
+class EntryTests(unittest.TestCase):
+    def test_a_held_root_exits_3_and_says_why(self):
+        # The unit's RestartPreventExitStatus names this code: no restart
+        # can clear a held lock, so the failure must not look retryable.
+        state, runtime = roots()
+        held = mock.Mock()
+        held.run.side_effect = InstanceHeldError(
+            "another instance owns this runtime root")
+        entry = DaemonEntry(
+            environ={"PI_DAEMON_STATE_DIR": state,
+                     "PI_DAEMON_RUNTIME_DIR": runtime},
+            application_factory=lambda **_kwargs: held)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = entry.main([])
+        self.assertEqual(code, DaemonEntry.EXIT_HELD)
+        self.assertEqual(stderr.getvalue(),
+                         "pi-daemon: another instance owns this runtime "
+                         "root\n")
 
 
 class StopTests(unittest.TestCase):
