@@ -143,7 +143,10 @@ export class CommsTools {
 				"a directory and the argv to run there, optionally under an " +
 				"explicit agent id. Use it to run the independently bounded " +
 				"units of one task in parallel sessions, coordinated by " +
-				"comms_send, comms_wait and comms_replay.",
+				"comms_send, comms_wait and comms_replay. It is the stand-in " +
+				"for the in-session child-agent tool, and the more independent " +
+				"one: a spawned session keeps its own conversation and can be " +
+				"reached again after it answers.",
 			parameters: Type.Object({
 				agentId: Type.Optional(Type.String({
 					description: "The identity the launched agent binds.",

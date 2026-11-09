@@ -200,4 +200,8 @@ test("pre-daemon: catalog states the tools, the conditional prerequisite, and th
     catalog.includes("Keep integration, verification, and every write to shared state"),
     "the spawning session keeps integration and shared-state writes",
   );
+  assert(
+    catalog.includes("stand-in for the in-session child-agent tool"),
+    "the catalog names spawning as the child-agent stand-in",
+  );
 });

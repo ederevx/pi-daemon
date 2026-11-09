@@ -107,6 +107,8 @@ export class PreDaemonTool {
 			"- When a task splits into two or more independently bounded units, spawn one session per unit with comms_spawn instead of working them in series; give each its own directory, the argv to run there, and the agent id it binds, and name the parent agent id it reports back to.",
 			"- Keep integration, verification, and every write to shared state in the spawning session; a spawned agent works its own directory and reports by mail (comms_send), and never writes memory.",
 			"- Follow a worker with comms_wait, comms_replay and comms_send: a unit that has not reported is followed up, never assumed finished, and its artifacts are read and verified before they are used.",
+			"- comms_spawn is the daemon's stand-in for the in-session child-agent tool, and the more flexible and independent one: a spawned session has its own conversation, terminal, model and working directory, keeps running after the spawning turn ends, can be messaged again or revived later, and is listed by the sessions tools, while a child run shares its parent's conversation, returns one bounded answer inside that turn, and cannot be reached afterwards.",
+			"",
 			"Features:",
 			"- Hosted sessions run headless in the pi-daemon and survive terminal exit, SSH logout, and reboot; /bg detaches or hands over, pi-rc attach resumes.",
 			"- Offloaded commands become daemon-owned tickets that outlive the submitting session and persist in tickets.json.",
