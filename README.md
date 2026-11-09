@@ -245,9 +245,10 @@ name backed so a later `pi-rc attach <name>` resumes that conversation
 rather than the directory's latest. A name that recorded no conversation
 (a run without the daemon extension) or whose recorded file is gone is
 refused with the reason instead of being started fresh under the old
-name: `--fresh` is the only way to abandon a conversation, and
-`pi-rc ls --all` lists the stopped names with whether each one can still
-be resumed. The session store GC is what
+name: an attach never replaces a name's conversation, only `pi-rc start`
+does (`--fresh` starts an empty one, a plain `pi-rc start <stopped-name>`
+the directory's latest), and `pi-rc ls --all` lists the stopped names
+with whether each one can still be resumed. The session store GC is what
 eventually reclaims conversations: it sweeps pi's conversation store
 and discards `.jsonl` files untouched past `gcIdleHours` that no live
 hosted session backs, so pi-daemon remains the owner of cleanup; a

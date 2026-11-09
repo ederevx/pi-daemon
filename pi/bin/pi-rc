@@ -14,9 +14,11 @@
 # hosted pi is ever gone (reboot, daemon restart), the next attach revives
 # that name's recorded conversation in its recorded directory, and refuses
 # (exit 1, nothing started) when it never recorded one or the file is gone:
-# `--fresh` is the only way to abandon a conversation. A name the daemon
-# never recorded resumes the directory's latest pi session. `ls --all`
-# shows the stopped records and whether each one can still be resumed. A
+# an attach never abandons a conversation. `start` does: `--fresh` starts an
+# empty one, and a plain `start` resumes the directory's latest pi session
+# under that name. A name the daemon never recorded resumes the directory's
+# latest pi session on attach too. `ls --all` shows the stopped records and
+# whether each one can still be resumed. A
 # pi started outside the daemon (non-wrapped) hands its saved session over
 # through "handover" instead of being left behind.
 #
@@ -688,9 +690,10 @@ class AttachFlow:
 		return sock
 
 	def handshake(self, sock):
-		# Attach the current connection to self.session; recreates the
-		# session (resuming the conversation the daemon recorded for its
-		# name, else the latest) when it is gone.
+		# Attach the current connection to self.session; when it is gone,
+		# revive the name's recorded conversation, refuse when a recorded
+		# name has none left, and resume the directory's latest only for a
+		# name the daemon never recorded.
 		send_json(sock, {"cmd": "attach", "name": self.session,
 						 "cols": self.cols, "rows": self.rows})
 		resp, rest = read_json_line(sock)
@@ -714,12 +717,14 @@ class AttachFlow:
 				if dir_ and os.path.isdir(dir_):
 					# Revive where the record ran, not where this command ran.
 					self.dir_ = dir_
-				elif dir_ and recorded:
+				if recorded or file_:
+					self._resumable(file_)
+				if dir_ and recorded and not os.path.isdir(dir_):
+					# Said only after the revive is known to go ahead, so a
+					# refusal never first claims where it would land.
 					print("pi-rc: '%s' ran in %s, which is gone; reviving in %s"
 						  % (short_name(self.session), dir_, self.dir_),
 						  file=sys.stderr)
-				if recorded or file_:
-					self._resumable(file_)
 				return self._recreate(sock, file_)
 			die("attach failed: %s" % error)
 		return resp, rest
