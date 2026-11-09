@@ -21,6 +21,10 @@ ExecStart="@LAUNCHER@"
 # root the unit declares, never one discovered from another install.
 ExecStop="@LAUNCHER_RC@" --endpoint "@ENDPOINT@" daemon-stop
 Restart=on-failure
+# Exit 3 is a held instance lock: another process owns this runtime root,
+# and no restart can clear it. Activation starts the unit again once the
+# root is free.
+RestartPreventExitStatus=3
 RestartSec=2
 
 [Install]

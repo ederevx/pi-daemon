@@ -4,6 +4,7 @@ import sys
 
 from .application import DaemonApplication
 from .environment import EntryEnvironment
+from .lifecycle.error import InstanceHeldError
 from .runtime_layout import RuntimeLayout
 from .transport.service_descriptor import ServiceDescriptor
 
@@ -21,6 +22,10 @@ class DaemonEntry:
     def __init__(self, environ=None, application_factory=None):
         self._environment = EntryEnvironment(environ)
         self._application_factory = application_factory
+
+    # The migration already answers 3 for a held instance lock, so the
+    # unit's RestartPreventExitStatus names the same code.
+    EXIT_HELD = 3
 
     def main(self, argv=None):
         argv = sys.argv[1:] if argv is None else list(argv)
@@ -41,7 +46,11 @@ class DaemonEntry:
         application = factory(
             environ=environment,
             services_root=ServiceDescriptor.root_for(environment))
-        return application.run()
+        try:
+            return application.run()
+        except InstanceHeldError as held:
+            self._error("pi-daemon: %s\n" % held)
+            return self.EXIT_HELD
 
     @staticmethod
     def _error(message):

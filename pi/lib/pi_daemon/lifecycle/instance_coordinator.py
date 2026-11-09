@@ -3,6 +3,8 @@
 import os
 import uuid
 
+from .error import InstanceHeldError
+
 
 class InstanceCoordinator:
     """One lock file, one generation; a probe never grants ownership."""
@@ -20,9 +22,13 @@ class InstanceCoordinator:
         handle = open(self._path, "a+b")
         try:
             self._lock(handle)
+        except (BlockingIOError, PermissionError):
+            # flock answers EWOULDBLOCK; msvcrt.locking answers EACCES.
+            handle.close()
+            raise InstanceHeldError("another instance owns this runtime root")
         except OSError:
             handle.close()
-            raise RuntimeError("another instance owns this runtime root")
+            raise
         instance = uuid.uuid4().hex
         handle.seek(0)
         handle.truncate()
