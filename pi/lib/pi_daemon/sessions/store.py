@@ -29,6 +29,7 @@ class SessionStore:
         self._run_keys = {}
         self._run_states = {}
         self._handoffs = {}
+        self._displaced = {}
 
     # -- loading and saving ------------------------------------------------
 
@@ -36,6 +37,7 @@ class SessionStore:
         with self._lock:
             document = self._read_document()
             self._sessions = {}
+            self._displaced = {}
             self._files = dict(document.get("files") or {})
             self._handoffs = dict(document.get("handoffs") or {})
             self._run_keys = dict(document.get("run_keys") or {})
@@ -160,6 +162,8 @@ class SessionStore:
             if existing is not None and existing.live():
                 return existing, False
             previous = self._run_state_for(self._run_keys.get(name))
+            displaced = (existing, self._run_keys.get(name),
+                         self._handoffs.get(name))
             record = SessionRecord(
                 id=uuid.uuid4().hex,
                 generation=uuid.uuid4().hex,
@@ -180,7 +184,9 @@ class SessionStore:
             )
             self._sessions[name] = record
             self._run_keys[name] = record.id
-            # A new generation inherits no redirect a previous run left.
+            # A new generation inherits no redirect a previous run left,
+            # and a revive keeps what it displaced until it has started.
+            self._displaced[record.id] = displaced
             self._handoffs.pop(name, None)
             self._open_run_state(record, previous, now)
             self._write_document()
@@ -217,6 +223,7 @@ class SessionStore:
                 raise LookupError(key)
             record.phase = "running"
             record.started = now
+            self._displaced.pop(key, None)
             record.child = {"pid": int(pid), "identity": identity.to_dict(),
                             "clients": 0}
             state = self._run_states.get(key)
@@ -365,14 +372,24 @@ class SessionStore:
             return verdict
 
     def discard(self, key):
-        """Drop a reservation that never became a run."""
+        """Drop a reservation that never became a run, and restore what it
+        displaced: a revive leaves its stopped record as it found it."""
         with self._lock:
             record = self._by_id(key)
             if record is None:
                 return False
-            self._sessions.pop(record.name, None)
-            if self._run_keys.get(record.name) == key:
-                self._run_keys.pop(record.name, None)
+            old, old_key, old_handoff = self._displaced.pop(
+                key, (None, None, None))
+            if old is None:
+                self._sessions.pop(record.name, None)
+                if self._run_keys.get(record.name) == key:
+                    self._run_keys.pop(record.name, None)
+            else:
+                self._sessions[record.name] = old
+                if old_key is not None:
+                    self._run_keys[record.name] = old_key
+                if old_handoff is not None:
+                    self._handoffs[record.name] = old_handoff
             self._run_states.pop(key, None)
             self._remove_run_state(key)
             self._write_document()

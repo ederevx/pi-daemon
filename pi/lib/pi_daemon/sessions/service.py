@@ -239,6 +239,8 @@ class SessionService:
     def resume(self, name, file):
         """Point a conversation's viewers at its live holder, or host it."""
         record = self._record(name)
+        if record.live() and record.file == file:
+            return {"name": record.name, "state": record.state()}
         holders = [holder for holder in self._holders(file)
                    if holder[0] != record.name]
         if not holders:

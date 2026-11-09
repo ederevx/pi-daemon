@@ -192,8 +192,14 @@ shutdown
   hands its viewers to the busier holder (`handoff`) or takes the other
   holder over (`tookOver`), and always names `alsoLive`.
 * `resume` moves a session's viewers to the live holder of a
-  conversation; with no live holder it answers `no-session` (a fresh
-  resume is the client's own `start`, which pi-rc already performs).
+  conversation (the most viewed holder first). With no live holder it
+  hosts the file itself: under the newest stopped name that recorded
+  it, in that name's directory when it still exists and the source's
+  otherwise, or under a fresh `pi-<dirbase>-<4hex>`; the source keeps
+  running headless. A conversation the source already holds is left
+  alone. It answers `no-file`, `name-taken`, `no-free-name` and
+  `spawn-failed`, and `no-session` when the source is not live or the
+  handover is refused, which stops the run it started.
 * `detach` closes every viewer and leaves the child running; `stop`
   asks the child to end and answers `queued`, `alive`, `state`.
 * `daemon-purge` stops idle sessions with no viewer; `extensions-reload`
@@ -250,9 +256,9 @@ which says only that some selected session was left alone because it was
 not idle; nothing is scheduled.
 
 Deferred to the next increment, and answered `bad-request` today:
-`carry`, `handover`, `daemon-restart`. A restart is a handover to a
-successor process, so promising it before a successor exists would
-leave pi-rc waiting for an endpoint that never comes.
+`daemon-restart`. A restart is a handover to a successor process, so
+promising it before a successor exists would leave pi-rc waiting for
+an endpoint that never comes.
 
 ### Durable records
 
@@ -870,8 +876,8 @@ share a runtime directory.
 
 ## Open work
 
-* The deferred session operations (`carry`, `handover`,
-  `daemon-restart`). Transcripts are served: the seven
+* `daemon-restart`, still answered `bad-request`. `carry` and
+  `handover` are served, as are transcripts: the seven
   `transcript-*` verbs, the `transcript.v1` capability and the sweep.
 * The relay uses `select()`, so a descriptor numbered 1024 or higher
   would stall it; move to `selectors` before that is reachable.

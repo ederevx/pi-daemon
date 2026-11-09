@@ -1118,6 +1118,13 @@ class ResumeRelay(ViewerRelay):
         return self.result
 
 
+class FailingBackend:
+    """A backend whose spawn fails, so a revive never reaches a child."""
+
+    def spawn(self, argv, cwd, env, cols, rows):
+        raise OSError("no terminal to spawn")
+
+
 class ResumeTests(unittest.TestCase):
     """/resume opens any conversation: its live holder, or one it hosts."""
 
@@ -1163,18 +1170,48 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(self.relay.moved, [(self.source.id, holder.id)])
 
     def test_a_stopped_name_is_revived_under_its_stored_spelling(self):
-        old, _ = self.store.reserve("pi-old", self.dir, ["sh"], 80, 24, None,
+        old, _ = self.store.reserve("old", self.dir, ["sh"], 80, 24, None,
                                     self.file, ["sh"], owner())
-        self.store.set_handoff("pi-old", "pi-a")
+        self.store.set_handoff("old", "pi-a")
         self.store.finish(old.id, "done", None)
         reply = self.service.resume("pi-a", self.file)
-        self.assertEqual(reply["name"], "pi-old")
+        self.assertEqual(reply["name"], "old")
         self.assertEqual(self.runner.started[0][1], self.dir)
-        self.assertNotEqual(self.store.get("pi-old").generation,
+        self.assertNotEqual(self.store.get("old").generation,
                             old.generation)
-        self.assertIsNone(self.store.handoff("pi-old"))
+        self.assertIsNone(self.store.handoff("old"))
         names = {view["name"] for view in self.store.snapshot(True)}
-        self.assertEqual(names, {"pi-a", "pi-old"})
+        self.assertEqual(names, {"pi-a", "old"})
+
+    def test_the_newest_stopped_holder_names_the_conversation(self):
+        older, _ = self.store.reserve("pi-older", self.dir, ["sh"], 80, 24,
+                                      None, self.file, ["sh"], owner(),
+                                      now=1.0)
+        newer, _ = self.store.reserve("pi-newer", self.dir, ["sh"], 80, 24,
+                                      None, self.file, ["sh"], owner(),
+                                      now=2.0)
+        self.store.finish(older.id, "done", None)
+        self.store.finish(newer.id, "done", None)
+        reply = self.service.resume("pi-a", self.file)
+        self.assertEqual(reply["name"], "pi-newer")
+
+    def test_a_deleted_recorded_directory_falls_back_to_the_source(self):
+        gone = tempfile.mkdtemp(prefix="gone-", dir=SCRATCH)
+        old, _ = self.store.reserve("pi-old", gone, ["sh"], 80, 24, None,
+                                    self.file, ["sh"], owner())
+        self.store.finish(old.id, "done", None)
+        shutil.rmtree(gone)
+        reply = self.service.resume("pi-a", self.file)
+        self.assertEqual(reply["name"], "pi-old")
+        self.assertEqual(self.runner.started[0][1], self.source.dir)
+
+    def test_a_source_holding_the_conversation_is_left_alone(self):
+        reply = self.service.resume("pi-a", self.source.file)
+        self.assertEqual(reply, {"name": "pi-a",
+                                 "state": self.store.get("pi-a").state()})
+        self.assertEqual(self.runner.started, [])
+        self.assertEqual(self.relay.calls, [])
+        self.assertEqual(self.relay.moved, [])
 
     def test_a_failed_spawn_moves_no_viewer(self):
         self.runner.failure = "spawn-failed"
@@ -1201,6 +1238,43 @@ class ResumeTests(unittest.TestCase):
             self.service.resume("pi-a", self.file)
         self.assertEqual(caught.exception.code, "no-file")
         self.assertEqual(self.runner.started, [])
+        self.assertEqual(self.relay.calls, [])
+        self.assertEqual(self.relay.moved, [])
+
+    def test_a_stopped_source_is_no_session(self):
+        self.store.finish(self.source.id, "done", None)
+        with self.assertRaises(SessionError) as caught:
+            self.service.resume("pi-a", self.file)
+        self.assertEqual(caught.exception.code, "no-session")
+        self.assertEqual(self.runner.started, [])
+
+    def test_no_free_name_is_answered_without_spawning(self):
+        with mock.patch.object(self.carry, "_free_name", return_value=None):
+            with self.assertRaises(SessionError) as caught:
+                self.service.resume("pi-a", self.file)
+        self.assertEqual(caught.exception.code, "no-free-name")
+        self.assertEqual(self.runner.started, [])
+
+    def test_a_failed_start_leaves_a_stopped_name_intact(self):
+        store, config = store_for(roots())
+        old, _ = store.reserve("pi-old", self.dir, ["sh"], 80, 24, None,
+                               self.file, ["sh"], owner())
+        store.finish(old.id, "done", None)
+        reserve(store, "pi-a", "/current.jsonl")
+        relay = ResumeRelay()
+        runner = SessionRunner(store, StubRelay(), config, FailingBackend(),
+                               {"instance": "i-1"})
+        carry = SessionCarry(store, runner, relay, PiCommand({}))
+        service = SessionService(store, runner, relay, config, carry)
+        with self.assertRaises(SessionError) as caught:
+            service.resume("pi-a", self.file)
+        self.assertEqual(caught.exception.code, "spawn-failed")
+        kept = store.get("pi-old")
+        self.assertEqual(kept.generation, old.generation)
+        self.assertFalse(kept.live())
+        self.assertTrue(store.handoff("pi-old") is None)
+        self.assertEqual({view["name"] for view in store.snapshot(True)},
+                         {"pi-a", "pi-old"})
 
     def test_a_lost_name_race_is_name_taken(self):
         self.runner.created = False
