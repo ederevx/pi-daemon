@@ -1259,6 +1259,7 @@ class ResumeTests(unittest.TestCase):
         store, config = store_for(roots())
         old, _ = store.reserve("pi-old", self.dir, ["sh"], 80, 24, None,
                                self.file, ["sh"], owner())
+        store.set_handoff("pi-old", "pi-a")
         store.finish(old.id, "done", None)
         reserve(store, "pi-a", "/current.jsonl")
         relay = ResumeRelay()
@@ -1272,7 +1273,8 @@ class ResumeTests(unittest.TestCase):
         kept = store.get("pi-old")
         self.assertEqual(kept.generation, old.generation)
         self.assertFalse(kept.live())
-        self.assertTrue(store.handoff("pi-old") is None)
+        self.assertEqual(store._run_keys["pi-old"], old.id)
+        self.assertEqual(store.handoff("pi-old"), {"name": "pi-a"})
         self.assertEqual({view["name"] for view in store.snapshot(True)},
                          {"pi-a", "pi-old"})
 

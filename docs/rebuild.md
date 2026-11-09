@@ -622,9 +622,9 @@ Order matters, and each step is reversible on its own:
    (session hosting, run state, revive, transcripts), then comms
    (mailbox, relay, waits, spawn, peers) as the `agent-comms`
    capability over `pi-rpc/1` on its own listener. Hosting, run state,
-   attach/detach, announce/handoff and recovery are in place; revive
-   by name is the client's own `start`, and transcripts plus the
-   deferred operations above are the remaining work in this step.
+   attach/detach, announce/handoff, revive and recovery are in place,
+   and transcripts are served; the deferred operations named above are
+   the remaining work in this step.
 4. Ship the new client beside the old one and rewire `pi-rc` and the
    extensions to it, keeping it compatible with both servers, then
    remove the legacy aliases from the migration translator.
