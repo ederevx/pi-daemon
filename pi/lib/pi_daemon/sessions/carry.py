@@ -4,7 +4,7 @@ import hashlib
 import os
 import time
 
-from ..wire import NAME_TAKEN, NO_SESSION, SPAWN_FAILED
+from ..wire import NAME_TAKEN, NO_FILE, NO_SESSION, SPAWN_FAILED
 from .error import SessionError
 
 NO_FREE_NAME = "no-free-name"
@@ -18,7 +18,9 @@ class SessionCarry:
 
     The source keeps running headless with its own conversation; only the
     viewers move. A target this call spawned is torn down again when the
-    handover cannot happen, and never one it merely selected.
+    handover cannot happen, and never one it merely selected. /resume of a
+    conversation nobody holds hosts it here, under its stopped name when
+    it has one.
     """
 
     def __init__(self, store, runner, relay, command):
@@ -30,16 +32,15 @@ class SessionCarry:
     def carry(self, name, to=None, argv=None):
         source = self._live(name)
         target, created = self._target(source, to, argv)
-        moved = self._relay.carry_viewers(
-            source.id, source.generation, target.id, target.generation,
-            source.cols, source.rows)
-        if moved is None:
-            # The source died, the target was replaced, or the target is
-            # already closing: no viewer changed hands.
-            if created:
-                self._runner.stop_run(target.id, target.generation)
-            raise SessionError(NO_SESSION)
-        return {"name": target.name}
+        return {"name": self._hand_over(source, target, created).name}
+
+    def resume(self, name, file):
+        """/resume without termination: host a conversation nobody holds
+        and hand the viewers to it."""
+        source = self._live(name)
+        target, created = self._host(source, file)
+        self._hand_over(source, target, created)
+        return {"name": target.name, "state": target.state()}
 
     # -- internals ---------------------------------------------------------
 
@@ -59,10 +60,31 @@ class SessionCarry:
         name = self._free_name(source.dir, source.name)
         if name is None:
             raise SessionError(NO_FREE_NAME)
+        return self._spawn(name, source.dir, self._command.fresh(argv), source)
+
+    def _host(self, source, file):
+        """The target resuming a conversation no live session holds."""
+        if not os.path.isfile(file):
+            raise SessionError(NO_FILE)
+        name = self._store.stopped_holder(file)
+        dir_ = source.dir
+        if name is not None:
+            recorded = self._store.get(name).dir
+            if recorded and os.path.isdir(recorded):
+                dir_ = recorded
+        else:
+            name = self._free_name(source.dir, source.name)
+            if name is None:
+                raise SessionError(NO_FREE_NAME)
+        argv, durable = self._command.resume(file)
+        return self._spawn(name, dir_, argv, source, file=file,
+                           durable_argv=durable)
+
+    def _spawn(self, name, dir_, argv, source, file=None, durable_argv=None):
         try:
             record, created = self._runner.start(
-                name, source.dir, self._command.fresh(argv),
-                source.cols, source.rows)
+                name, dir_, argv, source.cols, source.rows, file=file,
+                durable_argv=durable_argv)
         except SessionError as failure:
             raise SessionError(failure.code or SPAWN_FAILED) from failure
         if not created:
@@ -71,6 +93,18 @@ class SessionCarry:
         # The reservation itself, not the name: a rollback must end this
         # run and never whatever holds the name by then.
         return record, True
+
+    def _hand_over(self, source, target, created):
+        moved = self._relay.carry_viewers(
+            source.id, source.generation, target.id, target.generation,
+            source.cols, source.rows)
+        if moved is None:
+            # The source died, the target was replaced, or the target is
+            # already closing: no viewer changed hands.
+            if created:
+                self._runner.stop_run(target.id, target.generation)
+            raise SessionError(NO_SESSION)
+        return target
 
     def _free_name(self, dir_, exclude):
         """A unique `pi-<dirbase>-<4hex>`, as the legacy daemon names one."""
@@ -82,8 +116,6 @@ class SessionCarry:
                 ("%d-%d-%d" % (time.time_ns(), os.getpid(),
                                attempt)).encode()).hexdigest()[:4]
             candidate = "pi-%s-%s" % (base, digest)
-            existing = self._store.resolve(candidate)
-            holder = self._store.get(existing) if existing else None
-            if candidate != exclude and (holder is None or not holder.live()):
+            if candidate != exclude and self._store.resolve(candidate) is None:
                 return candidate
         return None

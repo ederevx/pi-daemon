@@ -135,6 +135,15 @@ class SessionStore:
             found.sort(key=lambda record: -int(record.child.get("clients") or 0))
             return [(record.name, record.state()) for record in found]
 
+    def stopped_holder(self, file):
+        """The stopped name whose conversation this is, its newest run first."""
+        with self._lock:
+            found = [record for record in self._sessions.values()
+                     if not record.live()
+                     and self.file_of(record.name) == file]
+            found.sort(key=lambda record: -(record.created or 0))
+            return found[0].name if found else None
+
     def announced(self, file):
         with self._lock:
             return [record.name for record in self._sessions.values()
@@ -171,6 +180,8 @@ class SessionStore:
             )
             self._sessions[name] = record
             self._run_keys[name] = record.id
+            # A new generation inherits no redirect a previous run left.
+            self._handoffs.pop(name, None)
             self._open_run_state(record, previous, now)
             self._write_document()
             return record, True

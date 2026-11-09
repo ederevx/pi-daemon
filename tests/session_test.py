@@ -2,6 +2,7 @@
 """The sessions domain: run verdicts, durable records, the relay and a real
 hosted session end to end. Zero dependencies (stdlib only)."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -12,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
@@ -979,14 +981,17 @@ class CarryRelay:
 class CarryRunner:
     """A runner that reserves the target instead of spawning a process."""
 
-    def __init__(self, store, created=True):
+    def __init__(self, store, created=True, failure=None):
         self.store = store
         self.created = created
+        self.failure = failure
         self.started = []
         self.stopped = []
 
     def start(self, name, dir_, argv, cols, rows, env=None, env_once=None,
               file=None, durable_argv=None):
+        if self.failure:
+            raise SessionError(self.failure)
         self.started.append((name, dir_, argv, cols, rows, file))
         if not self.created:
             record, _ = self.store.reserve(name, dir_, argv, cols, rows, None,
@@ -1071,6 +1076,22 @@ class CarryTests(unittest.TestCase):
             self.carry.carry("pi-absent")
         self.assertEqual(caught.exception.code, "no-session")
 
+    def test_a_stopped_name_is_never_reused_for_a_fresh_target(self):
+        base = os.path.basename(self.source.dir).replace(":", "_")
+        if base.startswith("="):
+            base = base[1:]
+        with mock.patch("pi_daemon.sessions.carry.time.time_ns",
+                        return_value=7):
+            digest = hashlib.sha256(
+                ("%d-%d-%d" % (7, os.getpid(), 0)).encode()).hexdigest()[:4]
+            stopped = "pi-%s-%s" % (base, digest)
+        record, _ = reserve(self.store, stopped)
+        self.store.finish(record.id, "done", None)
+        reply = self.carry.carry("pi-a")
+        self.assertNotEqual(reply["name"], stopped)
+        self.assertEqual(self.store.get(stopped).generation, record.generation)
+        self.assertFalse(self.store.get(stopped).live())
+
     def test_the_pi_seam_keeps_an_explicit_argv_and_shims_a_bare_pi(self):
         command = PiCommand({})
         self.assertEqual(command.fresh(["sh", "-c", "true"]),
@@ -1082,6 +1103,110 @@ class CarryTests(unittest.TestCase):
         self.assertIn("/conv.jsonl", hosted)
         self.assertIn("carry on", hosted)
         self.assertNotIn("carry on", durable)
+
+
+class ResumeRelay(ViewerRelay):
+    """A relay that records the transfer instead of moving sockets."""
+
+    def __init__(self, result=None):
+        ViewerRelay.__init__(self)
+        self.result = {"moved": 1} if result is None else result
+        self.calls = []
+
+    def carry_viewers(self, *arguments):
+        self.calls.append(arguments)
+        return self.result
+
+
+class ResumeTests(unittest.TestCase):
+    """/resume opens any conversation: its live holder, or one it hosts."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="work-", dir=SCRATCH)
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.file = os.path.join(self.dir, "conversation.jsonl")
+        with open(self.file, "w", encoding="utf-8") as handle:
+            handle.write("{}\n")
+        self.store, self.config = store_for(roots())
+        self.source, _ = reserve(self.store, "pi-a", "/current.jsonl")
+        self.relay = ResumeRelay()
+        self.runner = CarryRunner(self.store)
+        self.carry = SessionCarry(self.store, self.runner, self.relay,
+                                  PiCommand({}))
+        self.service = SessionService(self.store, self.runner, self.relay,
+                                      self.config, self.carry)
+
+    def test_a_conversation_nobody_holds_is_hosted_and_the_viewers_follow(self):
+        reply = self.service.resume("pi-a", self.file)
+        name = reply["name"]
+        self.assertNotEqual(name, "pi-a")
+        spawned = self.runner.started[0]
+        self.assertEqual(spawned[0], name)
+        self.assertEqual(spawned[1], self.source.dir)
+        self.assertIn("--session", spawned[2])
+        self.assertIn(self.file, spawned[2])
+        self.assertEqual(spawned[5], self.file)
+        target = self.store.get(name)
+        self.assertEqual(self.relay.calls, [(
+            self.source.id, self.source.generation, target.id,
+            target.generation, self.source.cols, self.source.rows)])
+        self.assertEqual(reply, {"name": name, "state": target.state()})
+        self.assertTrue(self.store.get("pi-a").live())
+        self.assertIsNone(self.store.handoff("pi-a"))
+
+    def test_a_live_holder_is_joined_and_nothing_is_spawned(self):
+        holder, _ = reserve(self.store, "pi-b", self.file)
+        reply = self.service.resume("pi-a", self.file)
+        self.assertEqual(reply["name"], "pi-b")
+        self.assertEqual(self.runner.started, [])
+        self.assertEqual(self.relay.calls, [])
+        self.assertEqual(self.relay.moved, [(self.source.id, holder.id)])
+
+    def test_a_stopped_name_is_revived_under_its_stored_spelling(self):
+        old, _ = self.store.reserve("pi-old", self.dir, ["sh"], 80, 24, None,
+                                    self.file, ["sh"], owner())
+        self.store.set_handoff("pi-old", "pi-a")
+        self.store.finish(old.id, "done", None)
+        reply = self.service.resume("pi-a", self.file)
+        self.assertEqual(reply["name"], "pi-old")
+        self.assertEqual(self.runner.started[0][1], self.dir)
+        self.assertNotEqual(self.store.get("pi-old").generation,
+                            old.generation)
+        self.assertIsNone(self.store.handoff("pi-old"))
+        names = {view["name"] for view in self.store.snapshot(True)}
+        self.assertEqual(names, {"pi-a", "pi-old"})
+
+    def test_a_failed_spawn_moves_no_viewer(self):
+        self.runner.failure = "spawn-failed"
+        with self.assertRaises(SessionError) as caught:
+            self.service.resume("pi-a", self.file)
+        self.assertEqual(caught.exception.code, "spawn-failed")
+        self.assertEqual(self.relay.calls, [])
+        self.assertEqual(self.relay.moved, [])
+        self.assertEqual(self.runner.stopped, [])
+
+    def test_a_rejected_transfer_stops_only_the_hosted_run(self):
+        self.relay.result = None
+        with self.assertRaises(SessionError) as caught:
+            self.service.resume("pi-a", self.file)
+        self.assertEqual(caught.exception.code, "no-session")
+        target = self.store.get(self.runner.started[0][0])
+        self.assertEqual(self.runner.stopped,
+                         [(target.id, target.generation)])
+        self.assertTrue(self.store.get("pi-a").live())
+
+    def test_a_missing_conversation_is_not_hosted(self):
+        os.unlink(self.file)
+        with self.assertRaises(SessionError) as caught:
+            self.service.resume("pi-a", self.file)
+        self.assertEqual(caught.exception.code, "no-file")
+        self.assertEqual(self.runner.started, [])
+
+    def test_a_lost_name_race_is_name_taken(self):
+        self.runner.created = False
+        with self.assertRaises(SessionError) as caught:
+            self.service.resume("pi-a", self.file)
+        self.assertEqual(caught.exception.code, "name-taken")
 
 
 class HandoverTests(unittest.TestCase):

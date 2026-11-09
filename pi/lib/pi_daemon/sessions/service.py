@@ -237,12 +237,12 @@ class SessionService:
         return {"name": live.name, "state": live.state()}
 
     def resume(self, name, file):
-        """Point a conversation's viewers at its live holder, or refuse."""
+        """Point a conversation's viewers at its live holder, or host it."""
         record = self._record(name)
         holders = [holder for holder in self._holders(file)
                    if holder[0] != record.name]
         if not holders:
-            raise SessionError(NO_SESSION)
+            return self._carry.resume(record.name, file)
         target, target_state = holders[0]
         self._store.set_handoff(record.name, target)
         self._relay.move_viewers(record.id, self._key(target))
