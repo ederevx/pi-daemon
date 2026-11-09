@@ -258,6 +258,13 @@ class SessionRunner:
             environment.update(env_once)
         environment["PI_HOSTED"] = "1"
         environment["PI_HOSTED_SESSION"] = name
+        # The comms identity: the one the launch bound, else the name this
+        # session is hosted under. The comms tools and the operator CLI both
+        # read it, so a session that cannot name itself can neither send nor
+        # read mail. A durable or caller value never renames it, for the same
+        # reason it may not rename the hosted session.
+        environment["PI_COMMS_AGENT_ID"] = (
+            (env_once or {}).get("PI_COMMS_AGENT_ID") or name)
         # Last, never overlaid: the session's extension reads this to find
         # the reload and reap signals, so it must be the root this daemon
         # holds the instance lock for, not whatever a caller remembered.

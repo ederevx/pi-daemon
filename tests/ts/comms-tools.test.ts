@@ -105,6 +105,7 @@ function recorded(log: string): string[][] {
 /** One canned invocation: the stub script, a log, and its answer. */
 function invocation(stdout: unknown, exit = 0, stderr = ""): Record<string, string> {
 	return {
+		PI_COMMS_AGENT_ID: "pi-test",
 		PI_COMMS_BIN: stub(),
 		STUB_LOG: join(scratchDir(), `stub-${Math.random().toString(16).slice(2)}.log`),
 		STUB_STDOUT: stdout === undefined ? "" : JSON.stringify(stdout),
@@ -128,7 +129,7 @@ test("comms_send: a string payload uses --text and returns the answer", async ()
 			"structured answer");
 		assertEq(
 			recorded(env.STUB_LOG)[0].join(" "),
-			"--format json send bob --node=n2 --request-id=r1 --text=hello",
+			"--format json --agent pi-test send bob --node=n2 --request-id=r1 --text=hello",
 			"argv");
 	});
 });
@@ -142,7 +143,7 @@ test("comms_send: a non-string payload travels as positional JSON", async () => 
 		assert(!result.isError, "not an error");
 		assertEq(
 			recorded(env.STUB_LOG)[0].join(" "),
-			'--format json send bob --request-id=r2 {"n":1}',
+			'--format json --agent pi-test send bob --request-id=r2 {"n":1}',
 			"argv");
 	});
 });
@@ -164,7 +165,7 @@ test("comms_wait: returns the page and cursor", async () => {
 		sameJson(result.details.answer.cursor, { sequence: 5 }, "cursor kept");
 		assertEq(
 			recorded(env.STUB_LOG)[0].join(" "),
-			"--format json wait --after=4 --limit=2 --timeout-ms=1000",
+			"--format json --agent pi-test wait --after=4 --limit=2 --timeout-ms=1000",
 			"argv");
 	});
 });
@@ -195,8 +196,8 @@ test("comms_replay: after a cursor and with all", async () => {
 		assert(!all.isError, "replay all is not an error");
 		const lines = recorded(env.STUB_LOG);
 		assertEq(lines[0].join(" "),
-			"--format json replay --after=8 --limit=1", "after argv");
-		assertEq(lines[1].join(" "), "--format json replay --all", "all argv");
+			"--format json --agent pi-test replay --after=8 --limit=1", "after argv");
+		assertEq(lines[1].join(" "), "--format json --agent pi-test replay --all", "all argv");
 	});
 });
 
@@ -206,7 +207,7 @@ test("comms_ack: message ids are positional", async () => {
 		const result = await call("comms_ack", { messageIds: ["m1", "m2"] });
 		assert(!result.isError, "not an error");
 		assertEq(recorded(env.STUB_LOG)[0].join(" "),
-			"--format json ack m1 m2", "argv");
+			"--format json --agent pi-test ack m1 m2", "argv");
 	});
 });
 
@@ -218,11 +219,24 @@ test("comms_spawn: agent id, absolute directory, then argv", async () => {
 		});
 		assert(!result.isError, "not an error");
 		const argv = recorded(env.STUB_LOG)[0];
-		assertEq(argv.slice(0, 3).join(" "),
-			"--format json spawn", "prefix");
-		assertEq(argv[3], "--agent-id=aid", "agent id");
-		assertEq(argv[4], join(scratchDir(), "sub"), "resolved directory");
-		assertEq(argv.slice(5).join(" "), "-- pi --version", "argv after --");
+		assertEq(argv.slice(0, 5).join(" "),
+			"--format json --agent pi-test spawn", "prefix");
+		assertEq(argv[5], "--agent-id=aid", "agent id");
+		assertEq(argv[6], join(scratchDir(), "sub"), "resolved directory");
+		assertEq(argv.slice(7).join(" "), "-- pi --version", "argv after --");
+	});
+});
+
+test("comms_send: a hosted session names itself when no launch identity was set", async () => {
+	const env = invocation({ status: "accepted" });
+	env.PI_COMMS_AGENT_ID = "";
+	env.PI_HOSTED_SESSION = "pi-hosted";
+	await withEnv(env, async () => {
+		const result = await call("comms_send", { to: "bob", payload: "hi" });
+		assert(!result.isError, "not an error");
+		const argv = recorded(env.STUB_LOG)[0];
+		assertEq(argv.slice(0, 4).join(" "), "--format json --agent pi-hosted",
+			"the hosted name is the identity");
 	});
 });
 
@@ -232,7 +246,7 @@ test("peers: lists the configured peers", async () => {
 		const result = await call("peers", {});
 		assert(!result.isError, "not an error");
 		assertEq(recorded(env.STUB_LOG)[0].join(" "),
-			"--format json peer list", "argv");
+			"--format json --agent pi-test peer list", "argv");
 	});
 });
 

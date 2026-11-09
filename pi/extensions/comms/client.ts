@@ -44,11 +44,12 @@ export class CommsCli {
 		argv: string[],
 		options: ExecOptions = {},
 	): Promise<CommsOutcome> {
+		const argvWithAgent = this.withAgent(argv, this.identity());
 		const binary = this.binary();
 		if (!existsSync(binary)) {
 			return {
 				command,
-				argv,
+				argv: argvWithAgent,
 				exitCode: null,
 				stdout: "",
 				stderr: "",
@@ -61,13 +62,13 @@ export class CommsCli {
 		try {
 			result = await this.runner.run(
 				binary,
-				["--format", "json", ...argv],
+				["--format", "json", ...argvWithAgent],
 				options,
 			);
 		} catch (error) {
 			return {
 				command,
-				argv,
+				argv: argvWithAgent,
 				exitCode: null,
 				stdout: "",
 				stderr: error instanceof Error ? error.message : String(error),
@@ -79,13 +80,26 @@ export class CommsCli {
 		const stderr = result.stderr ?? "";
 		return {
 			command,
-			argv,
+			argv: argvWithAgent,
 			exitCode: result.killed ? null : (result.code ?? 0),
 			stdout,
 			stderr,
 			answer: CommsCli.parse(stdout),
 			killed: Boolean(result.killed),
 		};
+	}
+
+	/** The identity every command acts as: the one a launch bound this
+	 *  session to, else the daemon name it is hosted under. Without it the
+	 *  CLI refuses every command, so a session that cannot name itself can
+	 *  neither send nor read mail. */
+	identity(): string {
+		return this.env.PI_COMMS_AGENT_ID || this.env.PI_HOSTED_SESSION || "";
+	}
+
+	/** One command's argv with the identity in front of it, if there is one. */
+	private withAgent(argv: string[], identity: string): string[] {
+		return identity ? ["--agent", identity, ...argv] : argv;
 	}
 
 	/** `PI_COMMS_BIN`, else the bundled script, else the installed one. */

@@ -593,6 +593,19 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(environment["PI_HOSTED_SESSION"], "pi-a")
         self.assertEqual(environment["PI_HOSTED"], "1")
 
+    def test_a_hosted_session_is_named_for_comms(self):
+        # The comms tools and the operator CLI read this identity, so a
+        # session that cannot name itself can neither send nor read mail.
+        record = SessionRecord(id="s-1", generation="g-1", name="pi-a",
+                              dir=self.base,
+                              env={"PI_COMMS_AGENT_ID": "pi-durable"})
+        bound = self.runner._environment(
+            "pi-a", record, {"PI_COMMS_AGENT_ID": "pi-bound"})
+        self.assertEqual(bound["PI_COMMS_AGENT_ID"], "pi-bound")
+        self.assertEqual(
+            self.runner._environment("pi-a", record, None)["PI_COMMS_AGENT_ID"],
+            "pi-a")
+
 
 class StubService:
     def __init__(self, failure=None):
