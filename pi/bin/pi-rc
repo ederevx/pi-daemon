@@ -11,10 +11,14 @@
 # deletes the session through pi's own session manager. An abnormally
 # dying hosted pi (crash, SIGKILL, OOM) is revived headless from its
 # announced session file; clean exits and deleted files are final. If the
-# hosted pi is ever gone (reboot, daemon restart), the next attach
-# recreates it and resumes the latest pi session from disk. A pi started
-# outside the daemon (non-wrapped) hands its saved session over through
-# "handover" instead of being left behind.
+# hosted pi is ever gone (reboot, daemon restart), the next attach revives
+# that name's recorded conversation in its recorded directory, and refuses
+# (exit 1, nothing started) when it never recorded one or the file is gone:
+# `--fresh` is the only way to abandon a conversation. A name the daemon
+# never recorded resumes the directory's latest pi session. `ls --all`
+# shows the stopped records and whether each one can still be resumed. A
+# pi started outside the daemon (non-wrapped) hands its saved session over
+# through "handover" instead of being left behind.
 #
 # Usage:
 #   pi-rc [--endpoint PATH] <command> [args]
@@ -22,9 +26,11 @@
 #                                       (default name: dir basename; default
 #                                       command resumes the latest pi session,
 #                                       --fresh starts an empty one)
-#   pi-rc attach [name] [dir]           attach, recreating if gone (resuming
-#                                       that name's recorded conversation,
-#                                       else the directory's latest pi session)
+#   pi-rc attach [name] [dir]           attach, reviving if gone: a recorded
+#                                       name resumes its recorded
+#                                       conversation there or refuses when
+#                                       none is left; an unrecorded name
+#                                       resumes the directory's latest
 #   pi-rc attach --new [-- <pi args...>]  start a NEW hosted pi session (unique
 #                                       name; fresh conversation unless the
 #                                       pi args explicitly resume one) and
@@ -694,7 +700,8 @@ class AttachFlow:
 				# The daemon hands back what this name left behind: its
 				# recorded conversation, its directory and the spelling it
 				# is stored under, so a re-attach resumes that conversation
-				# instead of guessing the directory's latest.
+				# instead of guessing. A recorded name that has no
+				# conversation left is refused, never started fresh.
 				recorded = (resp or {}).get("recorded")
 				file_ = (resp or {}).get("file")
 				if recorded:
@@ -707,6 +714,10 @@ class AttachFlow:
 				if dir_ and os.path.isdir(dir_):
 					# Revive where the record ran, not where this command ran.
 					self.dir_ = dir_
+				elif dir_ and recorded:
+					print("pi-rc: '%s' ran in %s, which is gone; reviving in %s"
+						  % (short_name(self.session), dir_, self.dir_),
+						  file=sys.stderr)
 				if recorded or file_:
 					self._resumable(file_)
 				return self._recreate(sock, file_)
@@ -747,6 +758,12 @@ class AttachFlow:
 		if start_resp is None or not start_resp.get("ok"):
 			die("attach failed: start failed: %s"
 				% (start_resp or {}).get("error", "no response"))
+		if not start_resp.get("created", True):
+			# The name is still held by a run whose process is gone and
+			# which the daemon has not settled yet: nothing was started,
+			# so claiming a recreate would be a lie.
+			die("'%s' is still held by a run the daemon has not settled yet; "
+				"nothing was started. Retry shortly" % short_name(self.session))
 		print("pi-rc: recreated '%s' in %s (resuming %s)"
 			  % (self.session, self.dir_,
 				 "its recorded conversation" if file_ else "latest session"))
@@ -1009,7 +1026,7 @@ def cmd_ls(args, client):
 			state = "stopped:%s" % _revive_status(s)
 			if s.get("desired") == "running":
 				state += ":unfinished"
-			print("%s\t%s\t-\tdetached\t%s\t%s"
+			print("%s\t%s\t-\t-\t%s\t%s"
 				  % (short_name(s.get("name", "")), s.get("dir") or "-",
 					 state, file))
 			continue

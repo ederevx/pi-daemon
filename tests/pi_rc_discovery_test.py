@@ -288,6 +288,67 @@ class SessionNameTests(unittest.TestCase):
                          "nothing is started")
         self.assertIn("nothing to resume", errors.getvalue())
 
+    def test_a_revive_whose_name_is_still_held_claims_no_recreate(self):
+        missing = os.path.join(tempfile.gettempdir(), "no-such-conv.jsonl")
+        base = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, base, True)
+        stored = os.path.join(base, "legacy.jsonl")
+        open(stored, "w").close()
+        replies = iter([
+            {"ok": False, "error": "no-session", "file": stored,
+             "recorded": "pi-a", "dir": base},
+            {"ok": True, "created": False},
+        ])
+        sent = []
+        flow = pi_rc.AttachFlow(None, "pi-a", 80, 24, dir_="/tmp")
+        out, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(pi_rc, "send_json",
+                               lambda sock, obj: sent.append(obj)), \
+                mock.patch.object(pi_rc, "read_json_line",
+                                  lambda sock: (next(replies), b"")), \
+                mock.patch.object(pi_rc.PROCESS, "pi_argv",
+                                  lambda args=(): ["pi"] + list(args)), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(errors), \
+                self.assertRaises(SystemExit) as caught:
+            flow.handshake(None)
+        self.assertEqual(caught.exception.code, 1)
+        self.assertNotIn("recreated", out.getvalue())
+        self.assertEqual([request for request in sent
+                          if request["cmd"] == "attach"],
+                         [sent[0]], "nothing is attached twice")
+        self.assertIn("nothing was started", errors.getvalue())
+        self.assertTrue(missing)
+
+    def test_a_revive_in_a_gone_directory_says_where_it_lands(self):
+        base = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, base, True)
+        stored = os.path.join(base, "legacy.jsonl")
+        open(stored, "w").close()
+        gone = os.path.join(base, "gone-dir")
+        replies = iter([
+            {"ok": False, "error": "no-session", "file": stored,
+             "recorded": "pi-a", "dir": gone},
+            {"ok": True, "created": True},
+            {"ok": True, "name": "pi-a", "state": "idle"},
+        ])
+        sent = []
+        flow = pi_rc.AttachFlow(None, "pi-a", 80, 24, dir_=base)
+        errors = io.StringIO()
+        with mock.patch.object(pi_rc, "send_json",
+                               lambda sock, obj: sent.append(obj)), \
+                mock.patch.object(pi_rc, "read_json_line",
+                                  lambda sock: (next(replies), b"")), \
+                mock.patch.object(pi_rc.PROCESS, "pi_argv",
+                                  lambda args=(): ["pi"] + list(args)), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(errors):
+            flow.handshake(None)
+        start = [request for request in sent
+                 if request["cmd"] == "start"][0]
+        self.assertEqual(start["dir"], base, "it lands where it was run")
+        self.assertIn("which is gone", errors.getvalue())
+
     def test_stopping_a_session_that_is_not_running_says_so(self):
         client = mock.Mock()
         client.control.return_value = {"ok": True, "name": "pi-x",

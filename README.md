@@ -242,7 +242,12 @@ surfaces, and the session reaps itself by calling `daemon_gc_reap`. A
 reap, a clean quit, and an explicit `pi-rc stop` all keep the
 conversation resumable, and the daemon remembers which file a session
 name backed so a later `pi-rc attach <name>` resumes that conversation
-rather than the directory's latest. The session store GC is what
+rather than the directory's latest. A name that recorded no conversation
+(a run without the daemon extension) or whose recorded file is gone is
+refused with the reason instead of being started fresh under the old
+name: `--fresh` is the only way to abandon a conversation, and
+`pi-rc ls --all` lists the stopped names with whether each one can still
+be resumed. The session store GC is what
 eventually reclaims conversations: it sweeps pi's conversation store
 and discards `.jsonl` files untouched past `gcIdleHours` that no live
 hosted session backs, so pi-daemon remains the owner of cleanup; a
