@@ -248,8 +248,10 @@ class SessionOperations:
 
     def shutdown(self, request):
         mode = _mode(request)
-        return ControlAction(reply={"ok": True},
-                             after_send=lambda: self._request_stop(mode))
+        return ControlAction(
+            reply={"ok": True},
+            after_send=lambda: self._request_stop(
+                mode, "control shutdown%s" % _by(request)))
 
     # -- internals ---------------------------------------------------------
 
@@ -372,3 +374,12 @@ def _mode(request):
     if value not in ("shutdown", "update", "reboot"):
         raise ValueError("an unknown stop mode")
     return value
+
+
+def _by(request):
+    # Who asked, when the client said so: the token is the trust boundary,
+    # so this only names a stop that a session then finds in the journal.
+    pid = request.get("by")
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return ""
+    return " by pid %d" % pid

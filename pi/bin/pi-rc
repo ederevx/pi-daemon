@@ -915,7 +915,9 @@ def cmd_daemon_stop(_args, client):
 	# best-effort: a missing daemon is already the desired state
 	try:
 		sock = client.connect()
-		send_json(sock, {"cmd": "shutdown"})
+		# Who asked goes in the request for the journal line the daemon
+		# writes on its way down; the token is the trust boundary.
+		send_json(sock, {"cmd": "shutdown", "by": os.getpid()})
 		read_json_line(sock)
 		sock.close()
 	except (OSError, SystemExit):

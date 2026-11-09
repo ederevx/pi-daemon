@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import socket
+import signal
 import sys
 import tempfile
 import threading
@@ -1008,6 +1009,46 @@ class EntryTests(unittest.TestCase):
 
 
 class StopTests(unittest.TestCase):
+    def test_a_control_stop_names_who_asked(self):
+        # A stop that no supervisor asked for is what splits a host, so the
+        # journal line names the command that asked for it.
+        state, runtime = roots()
+        app = DaemonApplication.from_environment(
+            {"PI_DAEMON_STATE_DIR": state,
+             "PI_DAEMON_RUNTIME_DIR": runtime}).start()
+        coordinates = EndpointFile(app.endpoint_path()).read()
+        codec = WireCodec()
+        stderr = io.StringIO()
+        connection = socket.create_connection(
+            (coordinates["host"], coordinates["port"]), 2)
+        try:
+            with contextlib.redirect_stderr(stderr):
+                stream = JsonLineStream(connection, 65536, 8192)
+                stream.write(codec.encode(
+                    codec.hello_request(coordinates["token"])))
+                stream.read()
+                stream.write(codec.encode({"cmd": "shutdown", "by": 4242}))
+                self.assertEqual(json.loads(stream.read()), {"ok": True})
+                app._stopping.wait(5)
+        finally:
+            connection.close()
+            app.stop()
+        self.assertIn("cause=control shutdown by pid 4242",
+                      stderr.getvalue())
+
+    def test_a_signal_stop_names_the_signal(self):
+        state, runtime = roots()
+        app = DaemonApplication.from_environment(
+            {"PI_DAEMON_STATE_DIR": state,
+             "PI_DAEMON_RUNTIME_DIR": runtime}).start()
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                app._on_signal(signal.SIGTERM, None)
+        finally:
+            app.stop()
+        self.assertIn("cause=signal SIGTERM", stderr.getvalue())
+
     def test_stop_removes_the_descriptor_and_releases_ownership(self):
         state, runtime = roots()
         environment = {"PI_DAEMON_STATE_DIR": state,
