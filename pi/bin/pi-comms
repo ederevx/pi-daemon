@@ -30,9 +30,10 @@
 #   peer remove NODE_ID
 #
 # The identity comes from --agent, else PI_COMMS_AGENT_ID (which the
-# spawn ledger sets for a launched agent). There is no default: binding
-# an identity creates its mailbox, so a guessed one would be a mailbox
-# every later broadcast reaches.
+# spawn ledger sets for a launched agent), else the hosted name or the
+# daemon's own session registry for a run control session. Nothing is
+# guessed: binding an identity creates its mailbox, so a guessed one
+# would be a mailbox every later broadcast reaches.
 #
 # Exit codes: 0 ok, 1 usage, 2 declined by the service, 3 the wait timed
 # out, 4 no service (nothing was sent), 5 a JSON-RPC error, 6 the token
@@ -93,10 +94,45 @@ class Declined(Exception):
 
 
 def _identity(options):
+    """The identity this command acts as.
+
+    `--agent`, else the launch environment the spawn ledger writes, else the
+    daemon name this session is hosted under, else the daemon's own session
+    registry read through the session file the run carries. A session started
+    by the run control has the file but not the mailbox name, so the registry
+    is the one source that names it without a guess: binding a name creates
+    its mailbox, and a guessed one would be a mailbox every later broadcast
+    reaches.
+    """
     agent = options.agent or os.environ.get("PI_COMMS_AGENT_ID")
+    if agent:
+        return agent
+    agent = os.environ.get("PI_HOSTED_SESSION") or _registered()
     if not agent:
         raise Declined("an agent id is required: --agent or PI_COMMS_AGENT_ID")
     return agent
+
+
+def _registered():
+    """The daemon's name for this session, from its session registry."""
+    state = (os.environ.get("PI_DAEMON_STATE_DIR")
+             or os.path.join(os.environ.get("XDG_STATE_HOME")
+                             or os.path.join(os.path.expanduser("~"),
+                                             ".local", "state"),
+                             "pi-daemon"))
+    mine = os.environ.get("PI_SESSION_FILE")
+    if not mine:
+        return ""
+    try:
+        with open(os.path.join(state, "sessions", "sessions.json"),
+                  encoding="utf-8") as handle:
+            files = (json.load(handle) or {}).get("files") or {}
+    except (OSError, ValueError):
+        return ""
+    for name, path in files.items():
+        if path == mine:
+            return name
+    return ""
 
 
 def _endpoint(options):

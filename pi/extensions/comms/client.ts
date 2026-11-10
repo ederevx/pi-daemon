@@ -105,9 +105,11 @@ export class CommsCli {
 	 *  without this the tools cannot name the agent they act as and the CLI
 	 *  refuses every command. */
 	private registered(): string {
-		const state = this.env.PI_DAEMON_STATE_DIR;
+		const state = this.env.PI_DAEMON_STATE_DIR
+			|| join(this.env.XDG_STATE_HOME || join(homedir(), ".local", "state"),
+				"pi-daemon");
 		const mine = this.env.PI_SESSION_FILE;
-		if (!state || !mine) return "";
+		if (!mine) return "";
 		try {
 			const registry = JSON.parse(readFileSync(
 				join(state, "sessions", "sessions.json"), "utf8")) as {

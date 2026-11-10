@@ -64,7 +64,9 @@ class Fixture:
 
     def environment(self, agent="alice", **extra):
         environment = dict(os.environ)
-        for name in ("PI_COMMS_ENDPOINT", "PI_SERVICES_DIR"):
+        for name in ("PI_COMMS_ENDPOINT", "PI_SERVICES_DIR",
+                     "PI_COMMS_AGENT_ID", "PI_HOSTED_SESSION", "PI_SESSION_FILE",
+                     "PI_DAEMON_STATE_DIR"):
             environment.pop(name, None)
         environment["PI_SERVICES_DIR"] = self.services
         if agent is not None:
@@ -236,6 +238,27 @@ class DiscoveryTests(unittest.TestCase):
                                          agent=None))
         self.assertEqual(completed.returncode, 1, completed.stderr)
         self.assertIn("agent id", completed.stderr)
+
+    def test_a_hosted_session_names_itself(self):
+        environment = self.fixture.environment(agent=None,
+                                               PI_HOSTED_SESSION="pi-hosted")
+        completed = self.fixture.run("node", agent=None, environment=environment)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(output(completed)["agent"]["agentId"], "pi-hosted")
+
+    def test_a_session_the_registry_names_uses_that_name(self):
+        state = os.path.join(self.fixture.runtime, "state")
+        os.makedirs(os.path.join(state, "sessions"), exist_ok=True)
+        session = os.path.join(self.fixture.runtime, "session.jsonl")
+        with open(os.path.join(state, "sessions", "sessions.json"), "w",
+                  encoding="utf-8") as opened:
+            json.dump({"files": {"pi-registered": session,
+                                 "other": session + ".other"}}, opened)
+        environment = self.fixture.environment(
+            agent=None, PI_DAEMON_STATE_DIR=state, PI_SESSION_FILE=session)
+        completed = self.fixture.run("node", agent=None, environment=environment)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(output(completed)["agent"]["agentId"], "pi-registered")
 
     def test_an_unknown_option_is_a_usage_error(self):
         # Exit 2 is the service declining, so a typo must not borrow it.
