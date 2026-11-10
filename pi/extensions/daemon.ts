@@ -97,6 +97,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { CommsCli } from "./comms/client.ts";
+import { CommsMessageLog } from "./comms/message-log.ts";
 import { CommsTools } from "./comms/tools.ts";
 import { DaemonSettingsPresenter } from "./settings/presenter.ts";
 import { RunStatePublisher } from "./session-state/publisher.ts";
@@ -1283,7 +1284,7 @@ export default function (pi: ExtensionAPI) {
 	// tools shell out to it and return its JSON answer unchanged.
 	new CommsTools(new CommsCli(
 		new ProcessRunner((file, args, options) => pi.exec(file, args, options)),
-	)).register(pi);
+	), new CommsMessageLog(pi)).register(pi);
 
 	// Reload entrypoint queued by the signal watcher. With a fresh
 	// pending signal this is terminal per pi's ctx.reload() contract:

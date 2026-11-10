@@ -113,7 +113,20 @@ through it.
 pi-comms --agent me node               # identity and what the service answers
 pi-comms --agent me send reviewer --text "the rebuild branch is green"
 pi-comms --agent me wait --timeout-ms 600000   # the next mail for me
+pi-comms --agent me spawn --task "audit the gate" /work/repo
 ```
+
+`spawn` takes a directory and either a command (`spawn [opts] DIR --
+ARGV...`) or one `--task`, which opens a fresh `pi` on that task as
+literal text: the task follows `--`, so option-like and file-like words
+stay prompt text (a task that itself starts with `@` is sent with one
+leading space, so pi reads it as text and not as a file), and the child
+reads its own provider, model and thinking level.
+
+Each received envelope is also recorded on the session branch as a
+custom entry (`pi-agent-comms-log`), whole and once per message id, so a
+later reader quotes the envelope itself instead of the bounded
+rendering.
 
 The identity is `--agent` or `PI_COMMS_AGENT_ID`; there is no default,
 because binding an identity creates its mailbox. `--agent` is an option of

@@ -15,6 +15,7 @@ import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-codi
 import { Type } from "typebox";
 
 import { CommsCli, type CommsOutcome } from "./client.ts";
+import { CommsMessageLog } from "./message-log.ts";
 import {
 	CommsArgv,
 	CommsExit,
@@ -45,7 +46,10 @@ export class CommsTools {
 	 *  the transcript tool bounds a page. */
 	private static readonly MAX_TEXT = 60000;
 
-	constructor(private readonly cli: CommsCli) {}
+	constructor(
+		private readonly cli: CommsCli,
+		private readonly log: CommsMessageLog,
+	) {}
 
 	/** Register all six tools with pi. */
 	register(pi: ExtensionAPI): void {
@@ -66,6 +70,9 @@ export class CommsTools {
 				})),
 				requestId: Type.Optional(Type.String({
 					description: "Reuse this id to retry one send safely.",
+				})),
+				kind: Type.Optional(Type.String({
+					description: "The message kind (default: message).",
 				})),
 			}),
 			annotations: { readOnlyHint: false, openWorldHint: false },
@@ -93,8 +100,8 @@ export class CommsTools {
 				})),
 			}),
 			annotations: { readOnlyHint: true, openWorldHint: false },
-			execute: async (_toolCallId, params: CommsWaitParams, signal) =>
-				this.wait(params, signal),
+			execute: async (_toolCallId, params: CommsWaitParams, signal, _update, ctx) =>
+				this.wait(params, signal, ctx),
 		});
 
 		pi.registerTool({
@@ -115,8 +122,8 @@ export class CommsTools {
 				})),
 			}),
 			annotations: { readOnlyHint: true, openWorldHint: false },
-			execute: async (_toolCallId, params: CommsReplayParams, signal) =>
-				this.replay(params, signal),
+			execute: async (_toolCallId, params: CommsReplayParams, signal, _update, ctx) =>
+				this.replay(params, signal, ctx),
 		});
 
 		pi.registerTool({
@@ -140,8 +147,10 @@ export class CommsTools {
 			label: "comms spawn",
 			description:
 				"Launch another agent through the pi-daemon's comms launcher: " +
-				"a directory and the argv to run there, optionally under an " +
-				"explicit agent id. Use it to run the independently bounded " +
+				"a directory and either the argv to run there or one `task` for " +
+				"a fresh `pi`, optionally under an explicit agent id and a " +
+				"caller-chosen request id so a lost answer retries instead of " +
+				"launching twice. Use it to run the independently bounded " +
 				"units of one task in parallel sessions, coordinated by " +
 				"comms_send, comms_wait and comms_replay. It is the stand-in " +
 				"for the in-session child-agent tool, and the more independent " +
@@ -151,11 +160,17 @@ export class CommsTools {
 				agentId: Type.Optional(Type.String({
 					description: "The identity the launched agent binds.",
 				})),
+				requestId: Type.Optional(Type.String({
+					description: "Reuse this id to retry one launch safely.",
+				})),
 				dir: Type.String({ description: "The working directory." }),
-				argv: Type.Array(Type.String(), {
+				argv: Type.Optional(Type.Array(Type.String(), {
 					minItems: 1,
 					description: "The command and its arguments.",
-				}),
+				})),
+				task: Type.Optional(Type.String({
+					description: "One task for a fresh pi conversation.",
+				})),
 			}),
 			annotations: { readOnlyHint: false, openWorldHint: false },
 			execute: async (
@@ -186,10 +201,12 @@ export class CommsTools {
 
 	private async wait(
 		params: CommsWaitParams,
-		signal?: AbortSignal,
+		signal: AbortSignal | undefined,
+		ctx: ExtensionToolContext | undefined,
 	): Promise<CommsToolResult> {
 		const outcome = await this.cli.run(
 			CommsTools.WAIT, CommsArgv.wait(params), { signal });
+		this.log.record(outcome.answer, ctx);
 		const empty = outcome.exitCode === CommsExit.TIMED_OUT
 			&& outcome.answer !== undefined;
 		return this.result(outcome, { timedOut: empty }, empty);
@@ -197,10 +214,12 @@ export class CommsTools {
 
 	private async replay(
 		params: CommsReplayParams,
-		signal?: AbortSignal,
+		signal: AbortSignal | undefined,
+		ctx: ExtensionToolContext | undefined,
 	): Promise<CommsToolResult> {
 		const outcome = await this.cli.run(
 			CommsTools.REPLAY, CommsArgv.replay(params), { signal });
+		this.log.record(outcome.answer, ctx);
 		return this.result(outcome, {});
 	}
 
@@ -218,10 +237,31 @@ export class CommsTools {
 		signal: AbortSignal | undefined,
 		ctx: ExtensionToolContext | undefined,
 	): Promise<CommsToolResult> {
+		// One task means one of them: an empty argv is not a command, so it
+		// leaves `task` alone rather than reaching the CLI as a conflict.
+		const argv = params.argv && params.argv.length > 0
+			? params.argv
+			: undefined;
+		if ((params.task === undefined) === (argv === undefined)) {
+			return CommsTools.refusal(
+				"comms_spawn takes exactly one of argv or task.");
+		}
 		const dir = resolve(ctx?.cwd ?? process.cwd(), params.dir);
+		const requestId = params.requestId || randomUUID();
 		const outcome = await this.cli.run(
-			CommsTools.SPAWN, CommsArgv.spawn({ ...params, dir }), { signal });
-		return this.result(outcome, {});
+			CommsTools.SPAWN,
+			CommsArgv.spawn({ ...params, dir, requestId, argv }),
+			{ signal });
+		return this.result(outcome, { requestId });
+	}
+
+	/** A request the tool itself refuses, before any CLI runs. */
+	private static refusal(text: string): CommsToolResult {
+		return {
+			content: [{ type: "text", text }],
+			isError: true,
+			details: {},
+		};
 	}
 
 	private async peers(signal?: AbortSignal): Promise<CommsToolResult> {

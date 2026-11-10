@@ -13,6 +13,7 @@ export interface CommsSendParams {
 	to: string;
 	payload: unknown;
 	node?: string;
+	kind?: string;
 	requestId?: string;
 }
 
@@ -35,11 +36,14 @@ export interface CommsAckParams {
 	messageIds: string[];
 }
 
-/** `comms_spawn`: launch another agent through the daemon's launcher. */
+/** `comms_spawn`: launch another agent through the daemon's launcher, on
+ *  an explicit argv or on one task inside a fresh `pi`. */
 export interface CommsSpawnParams {
 	agentId?: string;
+	requestId?: string;
 	dir: string;
-	argv: string[];
+	argv?: string[];
+	task?: string;
 }
 
 /** The CLI's exit codes; they are the failure vocabulary of the profile. */
@@ -76,6 +80,7 @@ export class CommsArgv {
 	static send(params: CommsSendParams & { requestId: string }): string[] {
 		const argv = ["send", params.to];
 		if (params.node) argv.push(`--node=${params.node}`);
+		if (params.kind) argv.push(`--kind=${params.kind}`);
 		argv.push(`--request-id=${params.requestId}`);
 		if (typeof params.payload === "string") {
 			argv.push(`--text=${params.payload}`);
@@ -110,7 +115,12 @@ export class CommsArgv {
 	static spawn(params: CommsSpawnParams): string[] {
 		const argv = ["spawn"];
 		if (params.agentId) argv.push(`--agent-id=${params.agentId}`);
-		argv.push(params.dir, "--", ...params.argv);
+		if (params.requestId) argv.push(`--request-id=${params.requestId}`);
+		if (params.task !== undefined) argv.push(`--task=${params.task}`);
+		argv.push(params.dir);
+		if (params.task === undefined && params.argv) {
+			argv.push("--", ...params.argv);
+		}
 		return argv;
 	}
 

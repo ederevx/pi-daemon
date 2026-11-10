@@ -16,6 +16,10 @@ import { test, assert, assertEq, withEnv, scratchDir } from "./harness.ts";
 import { ProcessRunner } from "../../pi/extensions/daemon.ts";
 import { CommsCli } from "../../pi/extensions/comms/client.ts";
 import { CommsArgv } from "../../pi/extensions/comms/protocol.ts";
+import {
+	COMMS_LOG,
+	CommsMessageLog,
+} from "../../pi/extensions/comms/message-log.ts";
 import { CommsTools } from "../../pi/extensions/comms/tools.ts";
 
 /** A stub `pi-comms`: log argv, print the canned answer, exit as told. */
@@ -69,25 +73,61 @@ function execProcess(
 	});
 }
 
+/** The branch a received envelope is appended to, as the session manager
+ *  exposes it: the log reads it back on every call, and a navigation is a
+ *  different branch holding different entries. */
+class FakeSession {
+	private current: Array<Record<string, unknown>> = [];
+
+	get entries(): Array<Record<string, unknown>> {
+		return this.current;
+	}
+
+	getBranch(): Array<Record<string, unknown>> {
+		return this.current;
+	}
+
+	/** Navigate to a branch that holds nothing this one recorded. */
+	switchBranch(): void {
+		this.current = [];
+	}
+}
+
 /** Minimal ExtensionAPI stand-in, as the other extension tests use. */
 class FakePi {
 	readonly tools = new Map<string, any>();
+	readonly session = new FakeSession();
+	/** Appends to refuse before the branch takes one, as a full store does. */
+	refuseAppends = 0;
 
 	registerTool(definition: any): void {
 		this.tools.set(definition.name, definition);
 	}
+
+	/** One branch entry of the type the message log owns. */
+	appendEntry(customType: string, data: unknown): void {
+		if (this.refuseAppends > 0) {
+			this.refuseAppends -= 1;
+			throw new Error("the branch refused the entry");
+		}
+		this.session.entries.push({ type: "custom", customType, data });
+	}
 }
 
-/** Run one tool handler through the stub CLI. */
+/** Run one tool handler through the stub CLI, against one branch. */
 async function call(
 	name: string,
 	params: Record<string, unknown>,
+	pi: FakePi = new FakePi(),
 ): Promise<any> {
-	const pi = new FakePi();
-	new CommsTools(new CommsCli(new ProcessRunner(execProcess))).register(pi as never);
+	new CommsTools(
+		new CommsCli(new ProcessRunner(execProcess)),
+		new CommsMessageLog(pi as never),
+	).register(pi as never);
 	const tool = pi.tools.get(name);
 	return tool.execute("call1", params, undefined, undefined, {
 		cwd: scratchDir(),
+		sessionManager: pi.session,
 	});
 }
 
@@ -201,6 +241,105 @@ test("comms_replay: after a cursor and with all", async () => {
 	});
 });
 
+test("comms_wait: a received page is recorded whole and once on the branch", async () => {
+	const page = {
+		status: "ok",
+		messages: [
+			{
+				messageId: "m1", from: { agentId: "ann" },
+				to: { agentId: "bob" }, sequence: 1, kind: "message",
+				payload: "the verdict", acceptedAt: 10, expiresAt: 20,
+			},
+			{ messageId: "m2", sequence: 2, payload: { n: 1 } },
+		],
+		cursor: { sequence: 2 },
+		more: false,
+	};
+	const env = invocation(page);
+	await withEnv(env, async () => {
+		const pi = new FakePi();
+		await call("comms_wait", { timeoutMs: 100 }, pi);
+		assertEq(pi.session.entries.length, 2, "both envelopes recorded");
+		const first = pi.session.entries[0];
+		assertEq(first.customType, COMMS_LOG, "the log's own type");
+		// Every field the service put on the envelope is still there, so a
+		// reader that quotes the verdict quotes the envelope itself.
+		sameJson(first.data, {
+		...page.messages[0], direction: "received",
+		}, "the envelope is recorded whole");
+		// A reload reads the branch back, so the same delivery records once.
+		await call("comms_wait", { timeoutMs: 100 }, pi);
+		assertEq(pi.session.entries.length, 2, "one delivery records once");
+	});
+});
+
+test("comms_replay: every page of a replay-all is recorded, and repeats once", async () => {
+	const pages = [
+		{
+			status: "ok", cursor: { sequence: 2 }, more: true,
+			messages: [
+				{ messageId: "m1", sequence: 1, payload: "one" },
+				{ messageId: "m2", sequence: 2, payload: "two" },
+			],
+		},
+		{
+			status: "ok", cursor: { sequence: 3 }, more: false,
+			// The first message repeats across a page boundary: one delivery.
+			messages: [
+				{ messageId: "m2", sequence: 2, payload: "two" },
+				{ messageId: "m3", sequence: 3, payload: "three" },
+			],
+		},
+	];
+	const env = invocation(pages);
+	await withEnv(env, async () => {
+		const pi = new FakePi();
+		await call("comms_replay", { all: true }, pi);
+		assertEq(pi.session.entries.length, 3, "each message records once");
+		assertEq(
+			pi.session.entries.map((entry: any) => entry.data.messageId).join(","),
+			"m1,m2,m3", "in the order the pages carried them");
+	});
+});
+
+test("message log: one logger records on each branch that lacks the message, once each", async () => {
+	const page = { status: "ok", messages: [{ messageId: "m1" }] };
+	const pi = new FakePi();
+	const log = new CommsMessageLog(pi as never);
+	const ctx = { sessionManager: pi.session } as never;
+	// One logger across the whole case: a cache keyed by process would
+	// hide what the branch is asked on every call.
+	log.record(page, ctx);
+	assertEq(pi.session.entries.length, 1, "the first branch records it");
+	log.record(page, ctx);
+	assertEq(pi.session.entries.length, 1, "the branch that has it records once");
+	pi.session.switchBranch();
+	log.record(page, ctx);
+	assertEq(pi.session.entries.length, 1,
+		"another branch is this branch's to record");
+});
+
+test("message log: an append the branch refused claims nothing and is retried", async () => {
+	const page = { status: "ok", messages: [{ messageId: "m1" }] };
+	const pi = new FakePi();
+	const log = new CommsMessageLog(pi as never);
+	const ctx = { sessionManager: pi.session } as never;
+	pi.refuseAppends = 1;
+	log.record(page, ctx);
+	assertEq(pi.session.entries.length, 0, "nothing was recorded");
+	log.record(page, ctx);
+	assertEq(pi.session.entries.length, 1, "the same logger retries it");
+});
+
+test("comms_ack: an answer that carries no envelope records nothing", async () => {
+	const env = invocation({ status: "ok", acknowledged: 1 });
+	await withEnv(env, async () => {
+		const pi = new FakePi();
+		await call("comms_ack", { messageIds: ["m1"] }, pi);
+		assertEq(pi.session.entries.length, 0, "no mail, no record");
+	});
+});
+
 test("comms_ack: message ids are positional", async () => {
 	const env = invocation({ status: "ok", acknowledged: 2 });
 	await withEnv(env, async () => {
@@ -211,19 +350,106 @@ test("comms_ack: message ids are positional", async () => {
 	});
 });
 
-test("comms_spawn: agent id, absolute directory, then argv", async () => {
+test("comms_spawn: agent id, request id, absolute directory, then argv", async () => {
 	const env = invocation({ status: "spawned", requestId: "r3" });
 	await withEnv(env, async () => {
 		const result = await call("comms_spawn", {
-			agentId: "aid", dir: "sub", argv: ["pi", "--version"],
+			agentId: "aid", requestId: "r3", dir: "sub", argv: ["pi", "--version"],
 		});
 		assert(!result.isError, "not an error");
 		const argv = recorded(env.STUB_LOG)[0];
 		assertEq(argv.slice(0, 5).join(" "),
 			"--format json --agent pi-test spawn", "prefix");
 		assertEq(argv[5], "--agent-id=aid", "agent id");
-		assertEq(argv[6], join(scratchDir(), "sub"), "resolved directory");
-		assertEq(argv.slice(7).join(" "), "-- pi --version", "argv after --");
+		assertEq(argv[6], "--request-id=r3", "request id");
+		assertEq(argv[7], join(scratchDir(), "sub"), "resolved directory");
+		assertEq(argv.slice(8).join(" "), "-- pi --version", "argv after --");
+		assertEq(result.details.requestId, "r3", "the id is returned");
+	});
+});
+
+test("comms_spawn: a generated request id is returned so a retry reuses it", async () => {
+	const env = invocation({ status: "spawned" });
+	await withEnv(env, async () => {
+		const result = await call("comms_spawn", {
+			dir: "sub", argv: ["pi", "--version"],
+		});
+		assert(!result.isError, "not an error");
+		const id = result.details.requestId;
+		assert(typeof id === "string" && id.length > 0, "an id is returned");
+		const argv = recorded(env.STUB_LOG)[0];
+		assertEq(argv[5], `--request-id=${id}`, "the returned id is the one sent");
+	});
+});
+
+test("comms_spawn: one task is sent as --task before the directory, with no argv", async () => {
+	const env = invocation({ status: "spawned" });
+	await withEnv(env, async () => {
+		const result = await call("comms_spawn", {
+			dir: "sub", task: "audit this", requestId: "r5",
+		});
+		assert(!result.isError, "not an error");
+		const argv = recorded(env.STUB_LOG)[0];
+		assertEq(argv.slice(5).join(" "),
+			`--request-id=r5 --task=audit this ${join(scratchDir(), "sub")}`,
+			"the task, then the directory, and no argv");
+	});
+});
+
+test("comms_spawn: an argv and a task together are refused before any CLI runs", async () => {
+	const env = invocation({ status: "spawned" });
+	await withEnv(env, async () => {
+		for (const params of [
+			{ dir: "sub", argv: ["pi"], task: "audit this" },
+			{ dir: "sub" },
+		]) {
+			const result = await call("comms_spawn", params);
+			assertEq(result.isError, true, "is an error");
+			assert(result.content[0].text.includes("exactly one of argv or task"),
+				"the refusal names the choice");
+		}
+		assertEq(recorded(env.STUB_LOG).length, 0, "the CLI never ran");
+	});
+});
+
+test("comms_spawn: an empty argv is no command, so a task is still one task", async () => {
+	const env = invocation({ status: "spawned" });
+	await withEnv(env, async () => {
+		const result = await call("comms_spawn", {
+			dir: "sub", argv: [], task: "audit this", requestId: "r6",
+		});
+		assert(!result.isError, "not an error");
+		const argv = recorded(env.STUB_LOG)[0];
+		assertEq(argv.slice(5).join(" "),
+			`--request-id=r6 --task=audit this ${join(scratchDir(), "sub")}`,
+			"the task reached the CLI and no empty argv followed it");
+	});
+});
+
+test("comms_spawn: a launch nobody can confirm still returns the request id", async () => {
+	const env = invocation({ status: "unknown" }, 7, "the connection closed");
+	await withEnv(env, async () => {
+		const result = await call("comms_spawn", {
+			dir: "sub", task: "audit this",
+		});
+		assertEq(result.isError, true, "is an error");
+		const id = result.details.requestId;
+		assert(typeof id === "string" && id.length > 0,
+			"the id is returned so a retry reuses it");
+		assertEq(recorded(env.STUB_LOG)[0][5], `--request-id=${id}`,
+			"the returned id is the one it sent");
+	});
+});
+
+test("comms_send: the kind reaches the CLI", async () => {
+	const env = invocation({ status: "accepted" });
+	await withEnv(env, async () => {
+		await call("comms_send", {
+			to: "bob", payload: "hi", kind: "report", requestId: "r7",
+		});
+		assertEq(recorded(env.STUB_LOG)[0].join(" "),
+			"--format json --agent pi-test send bob --kind=report " +
+			"--request-id=r7 --text=hi", "argv");
 	});
 });
 

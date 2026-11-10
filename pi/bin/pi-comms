@@ -21,9 +21,12 @@
 #                                         hold until mail arrives
 #   ack MESSAGE_ID...                     acknowledge delivered mail
 #   spawn [--agent-id ID] [--name NAME] [--env K=V]... DIR -- ARGV...
+#         [--task TEXT]
 #                                         launch another agent; every
 #                                         option comes before DIR, and
-#                                         the command follows --
+#                                         the command follows --, while
+#                                         --task starts a fresh pi on one
+#                                         task instead of a command
 #   peer add NODE_ID --ssh TARGET --remote-port N
 #            [--local-port N] --credential FILE --verifier SHA256
 #   peer list
@@ -334,8 +337,12 @@ def _run_spawn(command, options):
     argv = list(options.argv or [])
     if argv and argv[0] == "--":
         argv = argv[1:]
-    if not argv:
-        raise Declined("spawn needs the command: spawn [opts] DIR -- ARGV...")
+    task = options.task
+    if task is not None and argv:
+        raise Declined("spawn takes a command or --task, never both")
+    if task is None and not argv:
+        raise Declined("spawn needs the command: spawn [opts] DIR -- ARGV..., "
+                       "or --task TEXT")
     environment = None
     for entry in options.env or []:
         name, _, value = entry.partition("=")
@@ -343,7 +350,11 @@ def _run_spawn(command, options):
             raise Declined("--env takes NAME=VALUE")
         environment = dict(environment or {}, **{name: value})
     params = {"requestId": options.request_id or uuid.uuid4().hex,
-              "dir": options.dir, "argv": argv}
+              "dir": options.dir}
+    if task is not None:
+        params["task"] = task
+    else:
+        params["argv"] = argv
     for name in ("agent_id", "name", "cols", "rows"):
         value = getattr(options, name)
         if value is not None:
@@ -485,6 +496,8 @@ def _parser():
     spawn.add_argument("--cols", type=int, metavar="N")
     spawn.add_argument("--rows", type=int, metavar="N")
     spawn.add_argument("--env", action="append", metavar="NAME=VALUE")
+    spawn.add_argument("--task", metavar="TEXT",
+                       help="start a fresh pi on this task instead of a command")
     spawn.add_argument("--request-id", metavar="ID")
     spawn.add_argument("argv", nargs=argparse.REMAINDER, metavar="ARGV")
 

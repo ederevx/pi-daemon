@@ -211,6 +211,7 @@ class CommsOperations:
                 "name": params.get("name"),
                 "dir": params.get("dir"),
                 "argv": params.get("argv"),
+                "task": params.get("task"),
                 "cols": params.get("cols"),
                 "rows": params.get("rows"),
                 "env": self._spawn_env(params.get("env"), "env"),
@@ -228,7 +229,15 @@ class CommsOperations:
         if not isinstance(spec["dir"], str) or not spec["dir"]:
             raise RpcError(INVALID_PARAMS, "dir is required")
         argv = spec["argv"]
-        if not isinstance(argv, list) or not argv or not all(
+        task = spec["task"]
+        if (argv is None) == (task is None):
+            raise RpcError(INVALID_PARAMS,
+                           "exactly one of argv or task is required")
+        if task is not None:
+            if not isinstance(task, str) or not task.strip() or "\x00" in task:
+                raise RpcError(INVALID_PARAMS,
+                               "task must be a non-empty string")
+        elif not isinstance(argv, list) or not argv or not all(
                 isinstance(item, str) and item for item in argv):
             raise RpcError(INVALID_PARAMS, "argv must be command words")
         for key in ("cols", "rows"):

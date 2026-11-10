@@ -162,6 +162,7 @@ class DaemonApplication:
         runner.recover()
         self._session_runner = runner
         command = PiCommand(self._environment)
+        self._pi_command = command
         carry = SessionCarry(store, runner, relay, command)
         handover = SessionHandover(store, runner, command, self._config)
         reload = SessionReload(self._layout.state_root(),
@@ -192,7 +193,8 @@ class DaemonApplication:
         spawns = SpawnLedger(self._layout.comms_spawns_path(), self._config,
                              identity.id())
         self._comms_spawns = spawns
-        launcher = SessionLauncher(self._sessions, self._config)
+        launcher = SessionLauncher(self._sessions, self._config,
+                                   self._pi_command)
         service = CommsService(store, self._config, token, identity.id(),
                                spawns, launcher)
         peers = PeerConfigStore(self._layout.comms_peers_path(), self._config)

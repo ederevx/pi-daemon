@@ -39,6 +39,7 @@ from pi_daemon.config import ServiceConfig
 from pi_daemon.runtime_layout import RuntimeLayout
 from pi_daemon.sessions.error import SessionError
 from pi_daemon.sessions.launcher import SessionLauncher
+from pi_daemon.sessions.pi_command import PiCommand
 from pi_daemon.transport.json_line_stream import JsonLineStream
 from pi_daemon.transport.rpc_codec import (CAPACITY, INVALID_PARAMS,
                                                 INVALID_REQUEST,
@@ -183,7 +184,8 @@ class Harness:
         launcher = None
         if spawns:
             ledger = SpawnLedger(layout.comms_spawns_path(), self.config, NODE)
-            launcher = SessionLauncher(self.sessions, self.config)
+            launcher = SessionLauncher(self.sessions, self.config,
+                                       PiCommand())
         self.service = CommsService(self.store, self.config, TOKEN, NODE,
                                     ledger, launcher)
         self.peer_store = None
@@ -795,6 +797,41 @@ class SpawnTests(SocketCase):
         self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
         self.assertEqual(len(self.harness.sessions.starts), 1)
 
+    def test_a_task_launch_reaches_the_session_as_one_pi_prompt(self):
+        client = self.harness.client("a")
+        answer = self.spawn(client, argv=None, task="audit this report")
+        self.assertNotIn("error", answer)
+        launched = self.harness.sessions.starts[0]["argv"]
+        self.assertEqual(launched[-3:], ["pi", "--", "audit this report"])
+
+    def test_a_task_retry_starts_once_and_a_changed_task_is_refused(self):
+        client = self.harness.client("a")
+        first = self.spawn(client, argv=None, task="audit this")["result"]
+        retried = self.spawn(client, argv=None, task="audit this")["result"]
+        self.assertEqual(retried["spawnId"], first["spawnId"])
+        self.assertEqual(len(self.harness.sessions.starts), 1)
+        changed = self.spawn(client, argv=None, task="audit that")
+        self.assertEqual(changed["error"]["code"], INVALID_PARAMS)
+        self.assertEqual(len(self.harness.sessions.starts), 1)
+
+    def test_a_task_and_an_argv_together_are_refused(self):
+        client = self.harness.client("a")
+        answer = self.spawn(client, task="audit this")
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+        self.assertEqual(self.harness.sessions.starts, [])
+
+    def test_a_launch_needs_an_argv_or_a_task(self):
+        client = self.harness.client("a")
+        answer = self.spawn(client, argv=None)
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+        self.assertEqual(self.harness.sessions.starts, [])
+
+    def test_a_blank_task_is_refused(self):
+        client = self.harness.client("a")
+        answer = self.spawn(client, argv=None, task="   ")
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+        self.assertEqual(self.harness.sessions.starts, [])
+
     def test_a_taken_session_name_leaves_no_mailbox(self):
         self.harness.sessions.created = False
         client = self.harness.client("a")
@@ -1085,6 +1122,53 @@ class PeerWireTests(SocketCase):
         answer = peer.call("comms.peer.ping", {})
         self.assertEqual(answer["error"]["code"], UNAUTHORIZED)
         self.assertIn("peer-stale", answer["error"]["message"])
+
+
+class LauncherTaskTests(unittest.TestCase):
+    """A launch runs an argv, or opens one fresh `pi` on a task."""
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="pi-launcher-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.config = ServiceConfig.load()
+        self.sessions = StubSessions()
+        self.launcher = SessionLauncher(self.sessions, self.config,
+                                        PiCommand())
+
+    def _check(self, **spec):
+        return self.launcher.check(dict({"name": "kid", "dir": self.base},
+                                        **spec))
+
+    def test_a_task_opens_one_fresh_pi_on_it_as_literal_text(self):
+        verdict = self._check(task="audit this")
+        self.assertTrue(verdict["ok"])
+        self.assertEqual(verdict["spec"]["argv"][-3:],
+                         ["pi", "--", "audit this"])
+
+    def test_an_option_like_task_stays_text(self):
+        # pi parses its words as options, so `--` is what keeps a task that
+        # starts like one from being read as one.
+        verdict = self._check(task="--help")
+        self.assertEqual(verdict["spec"]["argv"][-3:],
+                         ["pi", "--", "--help"])
+
+    def test_a_task_naming_a_file_stays_text(self):
+        # pi reads a leading `@` as a file even after `--`.
+        verdict = self._check(task="@notes.txt is the report")
+        self.assertEqual(verdict["spec"]["argv"][-2:],
+                         ["--", " @notes.txt is the report"])
+
+    def test_a_launch_takes_an_argv_or_a_task_never_both(self):
+        verdict = self._check(argv=["/bin/true"], task="audit this")
+        self.assertFalse(verdict["ok"])
+        self.assertEqual(verdict["reason"], "invalid-session")
+
+    def test_a_launch_needs_an_argv_or_a_task(self):
+        self.assertEqual(self._check()["reason"], "invalid-session")
+
+    def test_a_blank_task_is_refused(self):
+        self.assertEqual(self._check(task="  ")["reason"],
+                         "invalid-session")
 
 
 if __name__ == "__main__":

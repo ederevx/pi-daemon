@@ -314,6 +314,20 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(result["status"], "spawned")
         self.assertEqual(result["agent"]["agentId"], "kid")
 
+    def test_a_spawn_takes_an_argv_or_a_task_never_both(self):
+        directory = tempfile.mkdtemp(dir=SCRATCH)
+        completed = self.fixture.run(
+            "spawn", "--task", "audit this", directory, "--",
+            sys.executable, "-c", "pass")
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertIn("never both", completed.stderr)
+
+    def test_a_spawn_needs_a_command_or_a_task(self):
+        directory = tempfile.mkdtemp(dir=SCRATCH)
+        completed = self.fixture.run("spawn", directory)
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertIn("--task TEXT", completed.stderr)
+
     def test_a_service_without_a_launcher_answers_method_not_found(self):
         bare = BareComms().start()
         try:
@@ -440,6 +454,93 @@ class DroppingServer(threading.Thread):
         except OSError:
             pass
         self.join(5.0)
+
+
+class RecordingServer(threading.Thread):
+    """Answers the greeting and one request, and keeps what it read."""
+
+    RESULT = {"status": "spawned", "created": True, "spawnId": "s" * 32,
+              "agent": {"nodeId": "n", "agentId": "kid"},
+              "parent": {"nodeId": "n", "agentId": "alice"},
+              "session": {"name": "kid"}}
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind(("127.0.0.1", 0))
+        self.socket.listen(1)
+        self.socket.settimeout(0.2)
+        self.port = self.socket.getsockname()[1]
+        self.requests = []
+        self.running = True
+        self.start()
+
+    def run(self):
+        codec = RpcCodec()
+        while self.running:
+            try:
+                connection, _ = self.socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            try:
+                stream = connection.makefile("rb")
+                hello = codec.decode(stream.readline())
+                connection.sendall(codec.encode(codec.result(
+                    hello["id"], {"service": "agent-comms", "version": 1,
+                                  "maxFrameBytes": 65536,
+                                  "agent": {"nodeId": "n",
+                                            "agentId": "alice"},
+                                  "headSequence": 0})))
+                request = codec.decode(stream.readline())
+                self.requests.append(request["params"])
+                connection.sendall(codec.encode(
+                    codec.result(request["id"], self.RESULT)))
+            except (OSError, ValueError, KeyError):
+                pass
+            finally:
+                connection.close()
+
+    def stop(self):
+        self.running = False
+        try:
+            self.socket.close()
+        except OSError:
+            pass
+        self.join(5.0)
+
+
+class TaskTransportTests(unittest.TestCase):
+    """`--task` reaches the service as one string, whatever it says."""
+
+    def test_a_task_travels_whole_and_without_an_argv(self):
+        server = RecordingServer()
+        try:
+            base = tempfile.mkdtemp(dir=SCRATCH)
+            path = os.path.join(base, "comms.json")
+            EndpointFile(path).publish({"host": "127.0.0.1",
+                                        "port": server.port,
+                                        "token": "tok"})
+            environment = dict(os.environ)
+            environment["PI_COMMS_AGENT_ID"] = "alice"
+            environment["PI_COMMS_ENDPOINT"] = path
+            # Option-like, file-like and multi-line text is still one task.
+            text = "--help\n@notes.txt and -p stay text"
+            completed = subprocess.run(
+                [sys.executable, CLI, "spawn", "--request-id", "r1",
+                 f"--task={text}", base],
+                capture_output=True, text=True, timeout=60,
+                env=environment)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(len(server.requests), 1)
+            request = server.requests[0]
+            self.assertEqual(request["task"], text)
+            self.assertNotIn("argv", request)
+            self.assertEqual(request["requestId"], "r1")
+        finally:
+            server.stop()
 
 
 if __name__ == "__main__":

@@ -284,8 +284,8 @@ class CommsService:
 
     @staticmethod
     def _digest(spec):
-        fields = ("agentId", "name", "dir", "argv", "cols", "rows", "env",
-                  "envOnce")
+        fields = ("agentId", "name", "dir", "argv", "task", "cols",
+                  "rows", "env", "envOnce")
         encoded = json.dumps({field: spec.get(field) for field in fields},
                              sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
