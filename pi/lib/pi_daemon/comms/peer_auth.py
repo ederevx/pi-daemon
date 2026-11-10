@@ -52,24 +52,15 @@ class PeerAuthenticator:
             # Only the daemon's own credentials directory: a path an agent
             # could point anywhere would make the token or a key sendable.
             raise ValueError("the credential is not in its directory")
-        # Who may read this file is the platform's question: POSIX answers
-        # with owner and mode bits, Windows with the access control list.
-        problem, checked = pi_platform.private_file_problem(path)
+        # Who may read this file is the platform's question, and it answers
+        # with the descriptor it cleared: POSIX opens it refusing a symlink
+        # and reads owner and mode bits, Windows opens it refusing a
+        # reparse point and reads that handle's owner and access list. The
+        # read below uses the same file, so there is no path left to swap.
+        problem, descriptor, info = pi_platform.open_private_file(path)
         if problem is not None:
             raise ValueError(problem)
         try:
-            descriptor = os.open(path,
-                                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        except OSError as failure:
-            raise ValueError(f"the credential is unreadable: {failure}") \
-                from None
-        try:
-            info = os.fstat(descriptor)
-            if (info.st_dev, info.st_ino) != \
-                    (checked.st_dev, checked.st_ino):
-                # The path was swapped between the check and the open: the
-                # descriptor no longer names the file that was cleared.
-                raise ValueError("the credential changed while it was read")
             if info.st_size <= 0 or info.st_size > self._max_bytes:
                 raise ValueError("the credential file is out of bounds")
             with os.fdopen(descriptor, "r", encoding="utf-8") as handle:

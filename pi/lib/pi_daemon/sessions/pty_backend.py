@@ -3,6 +3,8 @@
 import os
 import subprocess
 
+import pi_platform
+
 from .pty_child import PtyChild, set_winsize
 from .pty_exec import PtyExec
 
@@ -14,7 +16,7 @@ class PosixPtyBackend:
         self._config = config
 
     def spawn(self, argv, cwd, env, cols, rows):
-        if os.name == "nt":
+        if pi_platform.platform_name() == "windows":
             raise OSError("PTY hosting is not available on this platform")
         master, slave = os.openpty()
         set_winsize(slave, cols, rows)

@@ -283,6 +283,7 @@ class WindowsPtyChild:
         self._reaped = False
         self._exit_code = 0
         self._closed = False
+        self.tree_kill_failed = False
         self._input_buffer = bytearray()
         self._input_lock = threading.Lock()
         self._input_ready = threading.Event()
@@ -504,9 +505,16 @@ class WindowsPtyChild:
 
     def _stop_input_pump(self):
         self._input_ready.set()
-        if self._input_thread is not None:
-            self._input_thread.join(timeout=1.0)
-            self._input_thread = None
+        thread = self._input_thread
+        if thread is None:
+            return
+        thread.join(timeout=1.0)
+        if thread.is_alive():
+            # Keeping the reference is what makes a pump still parked in a
+            # write visible; dropping it would report a thread that is
+            # still running as stopped.
+            return
+        self._input_thread = None
 
     def resize(self, cols, rows):
         if self._hpc is None:
@@ -603,21 +611,23 @@ class WindowsPtyChild:
         terminated root severs the only evidence of its descendants, and
         Windows termination never reaches children of its own accord.
         TerminateProcess on the root follows only as the fallback for a
-        root taskkill could not open.
+        root taskkill could not open, and a /T that failed is remembered:
+        the root's exit does not stand in for a tree that was ended.
         """
         if self._process is None:
             return
         if self.wait_nohang()[0]:
             return
-        self._taskkill_tree(grace)
+        if not self._taskkill_tree(grace):
+            self.tree_kill_failed = True
         if not self.wait_nohang()[0]:
             self._terminate_process()
         self._wait_reaped(grace)
 
     def terminate(self, grace=None):
-        """End the child's tree; False when the root outlived the bound."""
+        """End the child's tree; False when the tree may have survived."""
         self.kill_tree(0.5 if grace is None else grace)
-        return self.wait_nohang()[0]
+        return self.wait_nohang()[0] and not self.tree_kill_failed
 
     def _terminate_process(self):
         self._api.lib.TerminateProcess(self._process, 1)
@@ -626,10 +636,12 @@ class WindowsPtyChild:
         # Same tree kill the platform seam owns for the daemon; the
         # lazy pi_platform import is safe here (it loads this module
         # only behind a runtime platform check, never at import time).
+        # taskkill keeps its own command bound: `grace` bounds the reap
+        # that follows, and a command cut short would name half a tree.
         if not _IS_WINDOWS:
-            return
+            return False
         import pi_platform
-        pi_platform.ProcessControl().taskkill_tree(self.pid, max(0.0, grace))
+        return pi_platform.ProcessControl().taskkill_tree(self.pid)
 
     def _wait_reaped(self, grace):
         deadline = time.time() + max(0.0, grace)
@@ -639,14 +651,30 @@ class WindowsPtyChild:
             time.sleep(_KILL_TICK)
 
     def close(self):
+        """Stop this child's I/O; the process handle stays with its waiter.
+
+        A handle closed under a pending WaitForSingleObject is undefined,
+        so the process handles are released by `close_process` once the
+        waiter has returned. The pseudoconsole goes first here: its input
+        is a pipe, and a pump thread parked in a write into a full one only
+        returns when the console closes the read end.
+        """
         if self._closed:
             return
         self._closed = True
-        self._stop_input_pump()
+        self._input_ready.set()
         self._close_pseudoconsole()
+        self._stop_input_pump()
         self._close_reader()
         self._close_output_pipe()
         self._close_master_fd()
+
+    def close_process(self):
+        """Release the process handles once nothing waits on them."""
+        if not self._closed:
+            self.close()
+        if self._process is not None and not self._reaped:
+            self.wait_nohang()
         self._close_process_handles()
 
     def _close_pseudoconsole(self):

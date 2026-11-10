@@ -49,8 +49,12 @@ class SessionRelay:
 
     def start(self):
         # A socket pair, not a pipe: the relay selects on Windows too, and
-        # Windows select only accepts sockets.
+        # Windows select only accepts sockets. Both ends are non-blocking
+        # because the wake is written from request threads too: a blocking
+        # send would hold them behind a loop that has not drained yet.
         self._wake_read, self._wake_write = socket.socketpair()
+        self._wake_read.setblocking(False)
+        self._wake_write.setblocking(False)
         self._thread = threading.Thread(target=self._loop, name="session-relay",
                                         daemon=True)
         self._thread.start()
@@ -133,6 +137,9 @@ class SessionRelay:
             return
         try:
             self._wake_write.send(b"x")
+        except (BlockingIOError, InterruptedError):
+            # The pairing byte is already queued: one wake covers both.
+            pass
         except OSError:
             pass
 

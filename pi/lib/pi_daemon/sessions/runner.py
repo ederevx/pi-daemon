@@ -196,13 +196,19 @@ class SessionRunner:
                 continue
             verdict = ProcessIdentity.current(pid).classify(identity)
             if verdict == ProcessIdentity.SAME:
-                reclaim.append(pid)
+                # The identity travels with the reclaim: what this seals
+                # must be the process the record names, not whatever the
+                # PID answers with later.
+                reclaim.append((record.id, pid, identity))
             elif verdict == ProcessIdentity.UNKNOWN:
                 # The PID cannot be proven gone: leave the run open rather
                 # than invent a death the evidence does not support.
                 skip.append(record.id)
-        for pid in reclaim:
-            _end_group(pid, self._config.cancel_grace)
+        for run_id, pid, expected in reclaim:
+            if not _end_group(pid, expected, self._config.cancel_grace):
+                # A process that outlived the bound, or a PID a stranger now
+                # holds, is not a run this instance may seal.
+                skip.append(run_id)
         return self._store.recover(instance, skip=skip)
 
     # -- internals ---------------------------------------------------------
@@ -223,7 +229,7 @@ class SessionRunner:
                 self._relay.close(key)
             except Exception:
                 pass
-            child.close()
+            _dispose(child)
             with self._lock:
                 self._children.pop(key, None)
                 self._threads.pop(key, None)
@@ -246,7 +252,7 @@ class SessionRunner:
         except Exception:
             pass
         self._relay.close(key)
-        child.close()
+        _dispose(child)
         self._store.discard(key)
 
     def _environment(self, name, record, env_once):
@@ -280,16 +286,42 @@ class SessionRunner:
         return environment
 
 
-def _end_group(pid, grace):
-    """End a tree this instance did not father, only while it is identical."""
-    identity = ProcessIdentity.current(pid)
+def _dispose(child):
+    """Release a child's I/O, then the process handle its waiter owned."""
+    try:
+        child.close()
+    finally:
+        release = getattr(child, "close_process", None)
+        if release is not None:
+            release()
+
+
+def _end_group(pid, expected, grace):
+    """End a tree this instance did not father, only while it is the recorded one.
+
+    `expected` is the identity the record carried: a process that vanished
+    between the record's check and this call must not be replaced by
+    whatever the PID names now, so an identity that is neither the same nor
+    proven gone ends the attempt without a signal. Returns True when the
+    recorded process is proven gone, False when it outlived the bound or its
+    PID now names a stranger.
+    """
     control = pi_platform.ProcessControl()
     for number in (signal.SIGTERM,
                    getattr(signal, "SIGKILL", signal.SIGTERM)):
+        verdict = ProcessIdentity.current(pid).classify(expected)
+        if verdict == ProcessIdentity.GONE:
+            return True
+        if verdict != ProcessIdentity.SAME:
+            return False
         control.signal_tree(pid, number)
         deadline = time.monotonic() + grace
         while time.monotonic() < deadline:
-            if ProcessIdentity.current(pid).classify(identity) != \
-                    ProcessIdentity.SAME:
-                return
+            verdict = ProcessIdentity.current(pid).classify(expected)
+            if verdict == ProcessIdentity.GONE:
+                return True
+            if verdict != ProcessIdentity.SAME:
+                return False
             time.sleep(0.02)
+    return ProcessIdentity.current(pid).classify(expected) == \
+        ProcessIdentity.GONE

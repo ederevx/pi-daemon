@@ -21,7 +21,7 @@ class ProcessIdentity:
         pid = int(pid or 0)
         if pid <= 0:
             return cls(0)
-        return cls(pid, _boot_id(),
+        return cls(pid, pi_platform.boot_identity(),
                    pi_platform.ProcessControl().process_start_token(pid))
 
     @classmethod
@@ -49,13 +49,3 @@ class ProcessIdentity:
         if not pi_platform.ProcessControl().pid_alive(self.pid):
             return self.GONE
         return self.UNKNOWN
-
-
-def _boot_id():
-    """The kernel's boot identity, the one host fact a record can trust."""
-    try:
-        with open("/proc/sys/kernel/random/boot_id", "r",
-                  encoding="utf-8") as handle:
-            return handle.read().strip() or None
-    except OSError:
-        return None

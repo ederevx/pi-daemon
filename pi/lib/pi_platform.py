@@ -45,49 +45,178 @@ _ERROR_ACCESS_DENIED = 5
 _PRIVATE_SIDS = ("S-1-5-18", "S-1-5-32-544", "S-1-3-4")
 
 
-def private_file_problem(path):
-    """Why this file is not a private credential, and its stat.
+def open_private_file(path):
+    """Open a private file once, and say why it is not one.
 
     A credential is one regular file only its owner may read. POSIX says
     that with the inode's owner and mode bits; Windows keeps no such bits,
-    so its access control list is read instead - every entry that grants
-    access must name this user, SYSTEM, or Administrators - and a reparse
-    point is refused, because such a path opens something other than the
-    file the check just looked at.
+    so its access control list is read instead - the file must be owned by
+    this user, and every entry that grants access must name this user,
+    SYSTEM, or Administrators - and a reparse point is refused, because
+    such a path opens something other than the file the check looked at.
 
-    Returns (None, info) for a private file and (reason, info) otherwise;
-    info is the stat the caller compares against the descriptor it opens.
+    The check and the handle belong to one object: the descriptor returned
+    is the file that was cleared, so a reader never opens the path a second
+    time and has no inode to compare. Returns (problem, descriptor, info)
+    with exactly one of problem and descriptor set.
     """
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return ("an absolute path is required", None, None)
+    if os.name == "nt":
+        return _windows_open_private(path)
+    return _posix_open_private(path)
+
+
+def private_file_problem(path):
+    """Why this file is not a private credential, and its stat."""
+    problem, descriptor, info = open_private_file(path)
+    if descriptor is not None:
+        os.close(descriptor)
+    return (problem, info)
+
+
+def _posix_open_private(path):
     import stat
 
-    if not isinstance(path, str) or not os.path.isabs(path):
-        return ("an absolute path is required", None)
     try:
-        info = os.lstat(path)
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as failure:
-        return ("the file is unreadable: %s" % failure, None)
+        return ("the file is unreadable: %s" % failure, None, None)
+    try:
+        info = os.fstat(descriptor)
+    except OSError as failure:
+        os.close(descriptor)
+        return ("the file is unreadable: %s" % failure, None, None)
+    problem = None
     if not stat.S_ISREG(info.st_mode):
-        return ("a regular file is required", info)
-    if os.name != "nt":
-        if info.st_uid != os.geteuid():
-            return ("a file of mine is required", info)
-        if info.st_mode & 0o077:
-            return ("the file is readable by others", info)
-        return (None, info)
-    try:
-        return (_windows_file_problem(path, info), info)
-    except OSError as failure:
-        return ("the access control list is unreadable: %s" % failure, info)
+        problem = "a regular file is required"
+    elif info.st_uid != os.geteuid():
+        problem = "a file of mine is required"
+    elif info.st_mode & 0o077:
+        problem = "the file is readable by others"
+    if problem is not None:
+        os.close(descriptor)
+        return (problem, None, info)
+    return (None, descriptor, info)
 
 
-def _windows_file_problem(path, info):
+def _windows_open_private(path):
+    """One CreateFileW, then the DACL of that handle, then read it."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    OPEN_EXISTING = 3
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
     FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-    if getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT:
-        return "a reparse point is not a credential"
-    mine = _windows_current_sid()
-    for sid in _windows_grants(path):
-        if sid != mine and sid not in _PRIVATE_SIDS:
-            return "the file is readable by others"
+    FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+    INVALID_HANDLE = wintypes.HANDLE(-1).value
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    _declare_file_apis(kernel32, advapi32, ctypes, wintypes)
+    handle = kernel32.CreateFileW(
+        path, GENERIC_READ, FILE_SHARE_READ, None, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, None)
+    if not handle or handle == INVALID_HANDLE:
+        return ("the file is unreadable: %s"
+                % ctypes.WinError(ctypes.get_last_error()), None, None)
+    handed_over = False
+    try:
+        details = _BY_HANDLE_FILE_INFORMATION(ctypes, wintypes)
+        if not kernel32.GetFileInformationByHandle(handle,
+                                                   ctypes.byref(details)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        attributes = details.dwFileAttributes
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+            return ("a reparse point is not a credential", None, None)
+        if attributes & FILE_ATTRIBUTE_DIRECTORY:
+            return ("a regular file is required", None, None)
+        problem = _windows_security_problem(handle, kernel32, advapi32,
+                                            ctypes, wintypes)
+        if problem is not None:
+            return (problem, None, None)
+        descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDONLY)
+        handed_over = True
+    except OSError as failure:
+        return ("the file is unreadable: %s" % failure, None, None)
+    finally:
+        if not handed_over:
+            kernel32.CloseHandle(handle)
+    return (None, descriptor, os.fstat(descriptor))
+
+
+def _BY_HANDLE_FILE_INFORMATION(ctypes, wintypes):
+    class Details(ctypes.Structure):
+        _fields_ = [("dwFileAttributes", wintypes.DWORD),
+                    ("ftCreationTime", wintypes.FILETIME),
+                    ("ftLastAccessTime", wintypes.FILETIME),
+                    ("ftLastWriteTime", wintypes.FILETIME),
+                    ("dwVolumeSerialNumber", wintypes.DWORD),
+                    ("nFileSizeHigh", wintypes.DWORD),
+                    ("nFileSizeLow", wintypes.DWORD),
+                    ("nNumberOfLinks", wintypes.DWORD),
+                    ("nFileIndexHigh", wintypes.DWORD),
+                    ("nFileIndexLow", wintypes.DWORD)]
+    return Details()
+
+
+def _declare_acl_apis(advapi32, ctypes, wintypes):
+    advapi32.GetAclInformation.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_int]
+    advapi32.GetAclInformation.restype = wintypes.BOOL
+    advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD,
+                                ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.GetAce.restype = wintypes.BOOL
+
+
+def _declare_file_apis(kernel32, advapi32, ctypes, wintypes):
+    """Name every prototype this module calls, handles included."""
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = [wintypes.HANDLE,
+                                                    ctypes.c_void_p]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    advapi32.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.GetSecurityInfo.restype = wintypes.DWORD
+    _declare_acl_apis(advapi32, ctypes, wintypes)
+
+
+def _windows_security_problem(handle, kernel32, advapi32, ctypes, wintypes):
+    """The owner and every granting entry of the open file's DACL."""
+    SE_FILE_OBJECT = 1
+    OWNER = 0x00000001
+    DACL = 0x00000004
+    owner = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    result = advapi32.GetSecurityInfo(
+        handle, SE_FILE_OBJECT, OWNER | DACL, ctypes.byref(owner), None,
+        ctypes.byref(dacl), None, ctypes.byref(descriptor))
+    # GetSecurityInfo answers with the error code itself, not a BOOL.
+    if result:
+        raise ctypes.WinError(result)
+    try:
+        mine = _windows_current_sid()
+        if not owner.value or _sid_text(owner) != mine:
+            return "a file of mine is required"
+        for sid in _windows_acl_grants(dacl, advapi32, ctypes, wintypes):
+            if sid != mine and sid not in _PRIVATE_SIDS:
+                return "the file is readable by others"
+    finally:
+        kernel32.LocalFree(descriptor)
     return None
 
 
@@ -109,6 +238,12 @@ def _windows_current_sid():
                                      TOKEN_QUERY, ctypes.byref(token)):
         raise ctypes.WinError(ctypes.get_last_error())
     try:
+        advapi32.GetTokenInformation.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD)]
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
         needed = wintypes.DWORD(0)
         advapi32.GetTokenInformation(token, TOKEN_USER, None, 0,
                                      ctypes.byref(needed))
@@ -134,6 +269,8 @@ def _sid_text(pointer):
     advapi32.ConvertSidToStringSidW.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
     advapi32.ConvertSidToStringSidW.restype = ctypes.c_int
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
     text = ctypes.c_wchar_p()
     if not advapi32.ConvertSidToStringSidW(pointer, ctypes.byref(text)):
         raise ctypes.WinError(ctypes.get_last_error())
@@ -143,22 +280,27 @@ def _sid_text(pointer):
         kernel32.LocalFree(text)
 
 
-def _windows_grants(path):
-    """The SIDs the file's access-allowed entries grant access to.
+def _windows_acl_grants(acl, advapi32, ctypes, wintypes):
+    """The SIDs the open file's access-allowed entries grant access to.
 
-    A missing DACL means everyone, and an object-specific allow entry
-    grants rights this mask read cannot enumerate, so both answer as the
-    wildcard that no check accepts.
+    A missing DACL means everyone. An entry that grants access through an
+    object type, a condition, or a type this read cannot decode answers as
+    the wildcard that no check accepts, because treating an unknown grant
+    as absent would approve a file it did not clear.
     """
-    import ctypes
-    from ctypes import wintypes
-
-    OWNER = 0x00000001
-    DACL = 0x00000004
-    ACCESS_ALLOWED_ACE_TYPE = 0
-    ACCESS_ALLOWED_OBJECT_ACE_TYPE = 5
     ACL_SIZE_INFORMATION = 2
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    ACCESS_ALLOWED_ACE_TYPE = 0
+    ACCESS_ALLOWED_COMPOUND_ACE_TYPE = 4
+    ACCESS_ALLOWED_OBJECT_ACE_TYPE = 5
+    ACCESS_ALLOWED_CALLBACK_ACE_TYPE = 9
+    ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE = 11
+    # Deny, audit, alarm, label, resource and scoped-policy entries grant
+    # nothing this read has to weigh.
+    NON_GRANTING = {1, 2, 3, 6, 7, 8, 10, 12, 13, 14, 15, 16, 17, 18, 19}
+    UNREADABLE_GRANTS = {ACCESS_ALLOWED_COMPOUND_ACE_TYPE,
+                         ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+                         ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+                         ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE}
 
     class AclSize(ctypes.Structure):
         _fields_ = [("AceCount", wintypes.DWORD),
@@ -170,38 +312,7 @@ def _windows_grants(path):
                     ("AceFlags", ctypes.c_ubyte),
                     ("AceSize", wintypes.WORD)]
 
-    advapi32.GetFileSecurityW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD)]
-    advapi32.GetFileSecurityW.restype = wintypes.BOOL
-    advapi32.GetSecurityDescriptorDacl.argtypes = [
-        ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
-        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)]
-    advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
-    advapi32.GetAclInformation.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_int]
-    advapi32.GetAclInformation.restype = wintypes.BOOL
-    advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD,
-                                ctypes.POINTER(ctypes.c_void_p)]
-    advapi32.GetAce.restype = wintypes.BOOL
-
-    needed = wintypes.DWORD(0)
-    advapi32.GetFileSecurityW(path, OWNER | DACL, None, 0,
-                              ctypes.byref(needed))
-    if not needed.value:
-        raise ctypes.WinError(ctypes.get_last_error())
-    buffer = ctypes.create_string_buffer(needed.value)
-    if not advapi32.GetFileSecurityW(path, OWNER | DACL, buffer, needed.value,
-                                     ctypes.byref(needed)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    present = wintypes.BOOL(0)
-    defaulted = wintypes.BOOL(0)
-    acl = ctypes.c_void_p()
-    if not advapi32.GetSecurityDescriptorDacl(
-            buffer, ctypes.byref(present), ctypes.byref(acl),
-            ctypes.byref(defaulted)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    if not present.value or not acl.value:
+    if not acl or not acl.value:
         return ("*",)
     size = AclSize()
     if not advapi32.GetAclInformation(acl, ctypes.byref(size),
@@ -214,14 +325,38 @@ def _windows_grants(path):
         if not advapi32.GetAce(acl, index, ctypes.byref(entry)):
             raise ctypes.WinError(ctypes.get_last_error())
         header = ctypes.cast(entry, ctypes.POINTER(AceHeader)).contents
-        if header.AceType == ACCESS_ALLOWED_OBJECT_ACE_TYPE:
+        if header.AceType in UNREADABLE_GRANTS:
             grants.append("*")
             continue
         if header.AceType != ACCESS_ALLOWED_ACE_TYPE:
+            if header.AceType not in NON_GRANTING:
+                grants.append("*")
             continue
         # ACCESS_ALLOWED_ACE: the mask word, then the SID.
         grants.append(_sid_text(ctypes.c_void_p(entry.value + 8)))
     return grants
+
+
+def platform_name():
+    """This host's name in the seam's one vocabulary: windows or posix."""
+    return "windows" if sys.platform.startswith("win") else "posix"
+
+
+def boot_identity():
+    """The kernel's boot identity, or None where the host has none.
+
+    POSIX names the boot so a record from another boot is a different
+    host; Windows has no such name, and there the process creation time
+    already carries the identity that matters.
+    """
+    if platform_name() == "windows":
+        return None
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "r",
+                  encoding="utf-8") as handle:
+            return handle.read().strip() or None
+    except OSError:
+        return None
 
 
 def send_json(sock, obj):
@@ -641,14 +776,23 @@ class ProcessControl:
         return str(current) == str(token)
 
     def terminate_tree(self, pid, grace, process=None):
-        """End a process and its descendants, waiting at most grace.
+        """End a process and its descendants, then wait at most grace.
 
         `process` is the subprocess child this pid belongs to, when there
         is one: its own poll/wait is the only reaper that may observe it,
         because a waitpid here would steal the exit status the owner
         still needs. A tree that survives the bound, or a termination
-        command that could not run, raises OSError: a caller records a
-        failed ending rather than claiming one that did not happen.
+        command that could not run while its root lived, raises OSError: a
+        caller records a failed ending rather than claiming one that did
+        not happen.
+
+        On Windows two budgets apply: the tree kill runs to its own
+        command bound (taskkill's five seconds) and only then does grace
+        bound the wait for the root to disappear. The nominal budget is
+        that bound plus grace; process creation and the timeout cleanup
+        can add overhead on top. A failed kill whose root did end is
+        reported as ended: nothing here proves a reparented descendant
+        died, so the strong guarantee needs a job object.
         """
         if self.platform.startswith("win"):
             self._windows_terminate(pid, grace, process)
@@ -902,31 +1046,41 @@ class ProcessControl:
         if not handle:
             return
         try:
-            if kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)                     not in (0x00000000, 0x00000080):
-                _raise_last_error("WaitForSingleObject")
+            waited = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+            if waited not in (0x00000000, 0x00000080):
+                raise ctypes.WinError(ctypes.get_last_error())
         finally:
             kernel32.CloseHandle(handle)
 
     def _windows_terminate(self, pid, grace, process=None):
-        """taskkill the tree while its root still exists, then reap it.
+        """taskkill the tree on its own bound, then reap the root.
 
         /T walks the ancestry it finds, so it must run before the root is
         signalled: killing the root first severs the only evidence of its
         descendants. Windows cannot prove ownership of a descendant that
         was reparented after an intermediate ancestor exited; that
         stronger guarantee would need a job object, and /T does not carry
-        it. The grace bounds the wait for the process to disappear;
-        taskkill keeps the execution bound its own call declares, because
-        a command killed mid-run ends nothing.
+        it. The tree kill keeps its own command bound - a taskkill cut
+        short names half a tree - and grace bounds what follows: the wait
+        for the root to disappear.
         """
+        grace = max(0.0, grace)
+        if process is not None and process.poll() is not None:
+            # Already reaped by its owner: there is no root left to walk
+            # the ancestry from, and no exit status left to steal.
+            return
         killed = self.taskkill_tree(pid)
         if process is not None:
             try:
-                process.wait(max(0.0, grace))
+                process.wait(grace)
             except subprocess.TimeoutExpired:
-                raise OSError("process %d survived termination" % pid)
-            return
+                raise OSError("process %d survived termination" % pid) \
+                    from None
         if not killed and self.pid_alive(pid):
+            # The root outlived /T, or /T could not run: the descendants it
+            # would have named are still unaccounted for. A failed /T whose
+            # root did end is reported as ended, which is all this can show:
+            # nothing here proves a reparented descendant died.
             raise OSError("could not terminate process %d" % pid)
 
     def taskkill_tree(self, pid, timeout=5):
