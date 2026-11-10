@@ -27,6 +27,12 @@ interface ExeResult {
   killed: boolean;
 }
 
+/** The argument list the dispatch meant: the Windows launch shape puts the
+ *  pi-rc script path first, so a recorded call is read past it. */
+function logicalArgs(args: string[]): string[] {
+  return /(^|[\\/])pi-rc$/.test(args[0] ?? "") ? args.slice(1) : args;
+}
+
 function ok(stdout: string): ExeResult {
   return { code: 0, stdout, stderr: "", killed: false };
 }
@@ -131,16 +137,18 @@ class FakePi {
   }
 
   async exec(file: string, args: string[]): Promise<ExeResult> {
-    // The Windows launch shape runs pi-rc through the Python
-    // interpreter (the script path leads the args); normalize to the
-    // POSIX shape - the script is the file, the args follow - so the
-    // dispatch and recorded calls match on every platform.
-    const python = /python/i.test(file);
-    const cmd = (python ? args[1] : args[0]) ?? "";
-    const rest = python ? args.slice(2) : args.slice(1);
+    // The Windows launch shape leads with the interpreter and carries the
+    // script path as its first argument. Normalize on that known script
+    // path - never on the interpreter's name - so the dispatch and the
+    // recorded calls match the same way on every platform.
+    const logical = /(^|[\\/])pi-rc$/.test(args[0] ?? "")
+      ? args.slice(1)
+      : args;
+    const cmd = logical[0] ?? "";
+    const rest = logical.slice(1);
     // Record the normalized pi-rc call (subcommand first, then its
     // arguments) so assertions can name the verb and its flags alike.
-    this.execCalls.push({ file: python ? args[0] : file, args: [cmd, ...rest] });
+    this.execCalls.push({ file: args[0] ?? file, args: [cmd, ...rest] });
     if (this.daemonDown) return { code: 4, stdout: "", stderr: "down", killed: false };
     if (cmd === "ticket-submit") {
       return ok(`ticket ${this.submitIds.shift() ?? "t-1"}\n`);
@@ -860,11 +868,25 @@ test("offload: a huge log stays within the per-tick read and snapshot bounds", a
   pi.track("t-1", ["running"]);
   pi.logs.set("t-1", Buffer.from(("0123456789".repeat(10) + "\n").repeat(52000)));
   const updates: string[] = [];
-  const result = await runToolIO<{ content: Array<{ text: string }> }>(
-    tools, { action: "result", id: "t-1", wait: 1 },
-    { onUpdate: (u) => updates.push((u as { content: Array<{ text: string }> }).content[0].text) },
+  // The wait ends when a partial has actually arrived, not on a wall
+  // clock: delivery after expiry is deliberately suppressed, so a
+  // deadline is what the bounded-wait test below measures.
+  const controller = new AbortController();
+  const result = await runToolIO<{
+    content: Array<{ text: string }>;
+    details?: { statusUnavailable?: boolean };
+  }>(
+    tools, { action: "result", id: "t-1", wait: 30 },
+    {
+      signal: controller.signal,
+      onUpdate: (u) => {
+        updates.push((u as { content: Array<{ text: string }> }).content[0].text);
+        controller.abort();
+      },
+    },
   );
-  assertMatches(result.content[0].text, /still running/);
+  assertEq(result.details?.statusUnavailable, undefined,
+    "the wait did not expire");
   // One tick pulls at most its chunk budget. Count the reads that run
   // together between two status round trips, not the total for the wait:
   // a second tick can start just before the deadline, and that boundary
@@ -896,7 +918,10 @@ test("offload: a deadline cancels a pending status request without a replacement
   (pi as { exec: unknown }).exec = (
     file: string, args: string[], options?: { signal?: AbortSignal },
   ): Promise<ExeResult> => {
-    if (args[0] === "ticket-list" && options?.signal) {
+    // The same normalization the dispatch uses: the Windows launch shape
+    // puts the script path first, and this override runs before it.
+    const logical = logicalArgs(args);
+    if (logical[0] === "ticket-list" && options?.signal) {
       pi.execCalls.push({ file, args });
       return new Promise<ExeResult>((resolve) => {
         options.signal!.addEventListener("abort", () => resolve(ok("")),
@@ -912,10 +937,12 @@ test("offload: a deadline cancels a pending status request without a replacement
   }>(tools, { action: "result", id: "t-1", wait: 0.2 }, {});
   assertEq(result.details.statusUnavailable, true,
     "the deadline reports status unavailable");
-  const lists = pi.execCalls.filter((c) => c.args[0] === "ticket-list");
+  const lists = pi.execCalls.filter(
+    (c) => logicalArgs(c.args)[0] === "ticket-list");
   assertEq(lists.length, 1, "exactly one ticket-list request");
   assertEq(
-    pi.execCalls.filter((c) => c.args[0].startsWith("ticket-")).length, 1,
+    pi.execCalls.filter(
+      (c) => (logicalArgs(c.args)[0] ?? "").startsWith("ticket-")).length, 1,
     "no replacement ticket requests");
 });
 

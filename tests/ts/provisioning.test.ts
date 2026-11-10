@@ -21,7 +21,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -86,19 +86,31 @@ class ScratchPackage {
   }
 
   path(): string {
-    return `${join(this.root, "fakebin")}:${process.env.PATH ?? ""}`;
+    // Native separator: bash converts PATH at its own invocation boundary,
+    // so a POSIX-style list here would leave the fake tools unresolvable.
+    return [join(this.root, "fakebin"), process.env.PATH ?? ""].join(
+      delimiter);
   }
 
   env(): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: this.home };
     env.PATH = this.path();
-    delete env.PI_CODING_AGENT_DIR;
+    if (process.platform === "win32") {
+      env.USERPROFILE = this.home;
+      for (const name of ["APPDATA", "LOCALAPPDATA", "TEMP", "TMP"]) {
+        env[name] = join(this.root, "profile");
+      }
+    }
+    // The agent home this install writes to, named rather than inferred.
+    env.PI_CODING_AGENT_DIR = join(this.home, ".pi", "agent");
     // Every root the installer probes comes from this scratch tree: the
-    // live daemon's endpoints and unit must never decide a test's outcome.
+    // live daemon's endpoints, service entries and unit must never decide
+    // a test's outcome.
     env.XDG_RUNTIME_DIR = join(this.root, "xdg-runtime");
     env.XDG_STATE_HOME = join(this.root, "xdg-state");
     env.PI_DAEMON_STATE_DIR = join(this.root, "new-state");
     env.PI_DAEMON_RUNTIME_DIR = join(this.root, "new-runtime");
+    env.PI_SERVICES_DIR = join(this.root, "services");
     return env;
   }
 
@@ -263,8 +275,11 @@ test("extension: a headless session start provisions without a UI", async () => 
   const start = sessionStartHandler();
   await withEnv(scratch.env(), async () => {
     await start({ ui: undefined });
+    // A package install writes a whole generation; on Windows that is
+    // tens of seconds, so the wait is bounded by completion, not by the
+    // harness's three-second default for cheap predicates.
     await waitFor(() => scratch.stamp().isCurrent(),
-      "the session start provisions a stale clone");
+      "the session start provisions a stale clone", 120_000);
   });
   assert(existsSync(join(scratch.home, ".local", "bin", "pi-daemon")),
     "the installed daemon came from the session start");
@@ -285,6 +300,6 @@ test("extension: a failing notice never escapes the session start", async () => 
       },
     });
     await waitFor(() => scratch.stamp().isCurrent(),
-      "provisioning finished despite the throwing notice");
+      "provisioning finished despite the throwing notice", 120_000);
   });
 });

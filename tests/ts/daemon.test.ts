@@ -125,7 +125,11 @@ test("daemon: win32 layout mirrors RuntimeLayout", async () => {
     assertEq(endpointPath("win32"),
       join(temp, "pi-daemon", "pi-pty-host.sock"));
   });
-  await withEnv({ LOCALAPPDATA: undefined, TEMP: undefined }, () => {
+  await withEnv({
+    XDG_STATE_HOME: undefined,
+    LOCALAPPDATA: undefined,
+    TEMP: undefined,
+  }, () => {
     assertEq(stateHome("win32"), homedir());
   });
 });
