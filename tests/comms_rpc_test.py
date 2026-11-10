@@ -18,6 +18,17 @@ from collections import deque
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
+import isolation
+
+# Every root this module probes belongs to its own scratch tree, never
+# the host's live daemon.
+ISOLATION = isolation.ScratchEnvironment()
+ISOLATION.apply()
+
+def tearDownModule():
+    ISOLATION.cleanup()
+
+
 from pi_daemon.comms.mailbox_store import MailboxStore
 from pi_daemon.comms.peer_auth import PeerAuthenticator
 from pi_daemon.comms.peer_config_store import PeerConfigStore
@@ -845,10 +856,6 @@ class SpawnTests(SocketCase):
         self.assertEqual(answer["error"]["code"], METHOD_NOT_FOUND)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class PeerWireTests(SocketCase):
     """The peer wire: its own credential, its own methods, its own mail."""
 
@@ -1028,7 +1035,7 @@ class PeerWireTests(SocketCase):
                              ("localPort", 65536),
                              ("outboundCredentialFile", "relative"),
                              ("outboundCredentialFile", "/" + "c" * 5000),
-                             ("outboundCredentialFile", "/run/cred"),
+                             ("outboundCredentialFile", os.path.abspath(os.path.join(os.sep, "run", "cred"))),
                              ("inboundCredentialSha256", "short")):
             answer = operator.call("comms.peer.add", self.spec(**{field: value}))
             self.assertEqual(answer["error"]["code"], INVALID_PARAMS, field)
@@ -1078,3 +1085,7 @@ class PeerWireTests(SocketCase):
         answer = peer.call("comms.peer.ping", {})
         self.assertEqual(answer["error"]["code"], UNAUTHORIZED)
         self.assertIn("peer-stale", answer["error"]["message"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

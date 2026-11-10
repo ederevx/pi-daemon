@@ -105,7 +105,7 @@ class PeerOperations:
             raise RpcError(INVALID_PARAMS, "localPort must be a tcp port")
         credential = params.get("outboundCredentialFile")
         if not isinstance(credential, str) or \
-                not credential.startswith("/") or len(credential) > 4096:
+                not os.path.isabs(credential) or len(credential) > 4096:
             raise RpcError(INVALID_PARAMS,
                            "outboundCredentialFile must be an absolute path")
         if self._directory is not None and \

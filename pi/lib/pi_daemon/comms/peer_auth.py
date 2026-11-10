@@ -8,7 +8,8 @@ into peer state, an answer, or a log line.
 import hashlib
 import hmac
 import os
-import stat
+
+import pi_platform
 
 CREDENTIAL_BYTES = 4096
 
@@ -51,6 +52,11 @@ class PeerAuthenticator:
             # Only the daemon's own credentials directory: a path an agent
             # could point anywhere would make the token or a key sendable.
             raise ValueError("the credential is not in its directory")
+        # Who may read this file is the platform's question: POSIX answers
+        # with owner and mode bits, Windows with the access control list.
+        problem, checked = pi_platform.private_file_problem(path)
+        if problem is not None:
+            raise ValueError(problem)
         try:
             descriptor = os.open(path,
                                  os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -59,13 +65,13 @@ class PeerAuthenticator:
                 from None
         try:
             info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or \
-                    info.st_uid != os.geteuid():
-                raise ValueError("a regular file of my own is required")
+            if (info.st_dev, info.st_ino) != \
+                    (checked.st_dev, checked.st_ino):
+                # The path was swapped between the check and the open: the
+                # descriptor no longer names the file that was cleared.
+                raise ValueError("the credential changed while it was read")
             if info.st_size <= 0 or info.st_size > self._max_bytes:
                 raise ValueError("the credential file is out of bounds")
-            if info.st_mode & 0o077:
-                raise ValueError("the credential file is readable by others")
             with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
                 descriptor = None
                 return handle.read().strip()

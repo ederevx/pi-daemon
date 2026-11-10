@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -17,6 +18,17 @@ from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
+
+import isolation
+
+# Every root this module probes belongs to its own scratch tree, never
+# the host's live daemon.
+ISOLATION = isolation.ScratchEnvironment()
+ISOLATION.apply()
+
+def tearDownModule():
+    ISOLATION.cleanup()
+
 
 from pi_daemon.comms.error import CommsError
 from pi_daemon.comms.peer_auth import PeerAuthenticator
@@ -582,7 +594,10 @@ class NodeIdentityTests(unittest.TestCase):
         first = self._identity().id()
         self.assertRegex(first, r"^[0-9a-f]{32}$")
         self.assertEqual(self._identity().id(), first)
-        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+        # Windows keeps only a file's read-only bit and reports the mode back
+        # as 0o666 or 0o444, so a private mode is a POSIX property.
+        if os.name == "posix":
+            self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
 
     def test_a_broken_identity_refuses_to_load(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -820,6 +835,8 @@ class SpawnLedgerTests(StoreCase):
         self.assertIsNone(self._ledger().find(self._parent(), "r1", "d1"))
 
     def test_the_record_file_is_private(self):
+        if os.name != "posix":
+            self.skipTest("file modes are not enforced here")
         self.ledger.open(self._parent(), "r1", "d1", self._agent("kid"), "kid")
         mode = os.stat(self.layout.comms_spawns_path()).st_mode & 0o777
         self.assertEqual(mode, 0o600)
@@ -1177,10 +1194,6 @@ class SpawnServiceTests(unittest.TestCase):
         self.assertEqual(launched["env_once"]["TERM"], "xterm")
         self.assertEqual(launched["env_once"]["PI_COMMS_PORT"], "1234")
         self.assertEqual(launched["env"]["PI_COMMS_AGENT_ID"], "kid")
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 # -- peers -----------------------------------------------------------------
@@ -1657,18 +1670,42 @@ class PeerCredentialTests(PeerCase):
     def test_a_symlinked_credential_is_refused(self):
         directory, path = self.write("cred")
         link = os.path.join(directory, "link")
-        os.symlink(path, link)
+        try:
+            os.symlink(path, link)
+        except (OSError, NotImplementedError) as failure:
+            # Creating a symlink needs a privilege Windows does not grant by
+            # default; where the platform cannot make one, it cannot be
+            # pointed at either, and the reparse-point refusal stands untested.
+            self.skipTest("this host cannot create symlinks: %s" % failure)
         auth = PeerAuthenticator(self.config, self.peers(),
                                  directory=directory)
         with self.assertRaises(ValueError):
             auth.outbound_credential({"outboundCredentialFile": link})
 
     def test_a_credential_readable_by_others_is_refused(self):
-        directory, path = self.write("cred", mode=0o644)
+        directory, path = self.write("cred")
+        self.open_to_others(path)
         auth = PeerAuthenticator(self.config, self.peers(),
                                  directory=directory)
         with self.assertRaises(ValueError):
             auth.outbound_credential({"outboundCredentialFile": path})
+
+    def open_to_others(self, path):
+        """Make the file readable by someone other than its owner.
+
+        POSIX says that with a mode bit; Windows keeps no bits, so the
+        access control list gains an entry for Everyone, which is the same
+        promise in the record that platform actually consults.
+        """
+        if os.name != "nt":
+            os.chmod(path, 0o644)
+            return
+        result = subprocess.run(
+            ["icacls", path, "/grant", "*S-1-1-0:(R)"],
+            capture_output=True, text=True)
+        if result.returncode != 0:
+            self.skipTest("icacls could not widen the file: %s"
+                          % result.stderr.strip())
 
 
 class PeerConfigStoreTests(PeerCase):
@@ -1676,7 +1713,7 @@ class PeerConfigStoreTests(PeerCase):
     def spec(self, **overrides):
         value = {"nodeId": NODE_B, "sshTarget": "peer.example",
                  "remotePort": 5000, "localPort": 0,
-                 "outboundCredentialFile": "/run/cred",
+                 "outboundCredentialFile": os.path.abspath(os.path.join(os.sep, "run", "cred")),
                  "inboundCredentialSha256": "c" * 64}
         value.update(overrides)
         return value
@@ -1990,7 +2027,7 @@ class PeerOperationsTests(PeerCase):
     def spec(self, **overrides):
         value = {"nodeId": NODE_B, "sshTarget": "peer.example",
                  "remotePort": 5000, "localPort": 0,
-                 "outboundCredentialFile": "/run/cred",
+                 "outboundCredentialFile": os.path.abspath(os.path.join(os.sep, "run", "cred")),
                  "inboundCredentialSha256": hashlib.sha256(
                      b"shared").hexdigest()}
         value.update(overrides)
@@ -2122,7 +2159,7 @@ class PeerOperationsTests(PeerCase):
                                     clock=lambda: self.now,
                                     directory=directory)
         with self.assertRaises(RpcError) as caught:
-            operations.add(None, self.spec(outboundCredentialFile="/run/cred"))
+            operations.add(None, self.spec(outboundCredentialFile=os.path.abspath(os.path.join(os.sep, "run", "cred"))))
         self.assertEqual(caught.exception.code, -32602)
         accepted = operations.add(None, self.spec(
             outboundCredentialFile=os.path.join(directory, "cred")))
@@ -2210,3 +2247,7 @@ class TunnelArgvTests(PeerCase):
         self.assertLess(time.time() - started, 1.5)
         self.assertEqual(len(caught), 1)
         self.assertTrue(caught[0].reason.startswith("tunnel-stopped"))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
