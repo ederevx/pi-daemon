@@ -8,7 +8,7 @@
  * degrades to a tool error instead of breaking the turn.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -94,7 +94,32 @@ export class CommsCli {
 	 *  CLI refuses every command, so a session that cannot name itself can
 	 *  neither send nor read mail. */
 	identity(): string {
-		return this.env.PI_COMMS_AGENT_ID || this.env.PI_HOSTED_SESSION || "";
+		return this.env.PI_COMMS_AGENT_ID
+			|| this.env.PI_HOSTED_SESSION
+			|| this.registered();
+	}
+
+	/** The daemon's own name for this session, read from its registry when the
+	 *  launch environment names nothing. A session started by `pi-rc` carries
+	 *  its session file but not the mailbox name the spawn ledger writes, so
+	 *  without this the tools cannot name the agent they act as and the CLI
+	 *  refuses every command. */
+	private registered(): string {
+		const state = this.env.PI_DAEMON_STATE_DIR;
+		const mine = this.env.PI_SESSION_FILE;
+		if (!state || !mine) return "";
+		try {
+			const registry = JSON.parse(readFileSync(
+				join(state, "sessions", "sessions.json"), "utf8")) as {
+					files?: Record<string, string>;
+				};
+			for (const [name, file] of Object.entries(registry.files ?? {})) {
+				if (file === mine) return name;
+			}
+		} catch {
+			// No registry (or no readable one): there is nothing to name with.
+		}
+		return "";
 	}
 
 	/** One command's argv with the identity in front of it, if there is one. */

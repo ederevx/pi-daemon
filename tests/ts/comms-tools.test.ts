@@ -8,7 +8,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExecOptions, ExecResult } from "@earendil-works/pi-coding-agent";
 
@@ -237,6 +237,44 @@ test("comms_send: a hosted session names itself when no launch identity was set"
 		const argv = recorded(env.STUB_LOG)[0];
 		assertEq(argv.slice(0, 4).join(" "), "--format json --agent pi-hosted",
 			"the hosted name is the identity");
+	});
+});
+
+test("comms_send: the daemon registry names a session that carries no launch id", async () => {
+	const state = join(scratchDir(), "state");
+	const session = join(scratchDir(), "session.jsonl");
+	mkdirSync(join(state, "sessions"), { recursive: true });
+	writeFileSync(join(state, "sessions", "sessions.json"), JSON.stringify({
+		files: { other: join(scratchDir(), "other.jsonl"), "pi-registered": session },
+	}));
+	const env = invocation({ status: "accepted" });
+	env.PI_COMMS_AGENT_ID = "";
+	env.PI_HOSTED_SESSION = "";
+	env.PI_DAEMON_STATE_DIR = state;
+	env.PI_SESSION_FILE = session;
+	await withEnv(env, async () => {
+		const result = await call("comms_send", { to: "bob", payload: "hi" });
+		assert(!result.isError, "not an error");
+		const argv = recorded(env.STUB_LOG)[0];
+		assertEq(argv.slice(0, 4).join(" "), "--format json --agent pi-registered",
+			"the registry name is the identity");
+	});
+});
+
+test("comms_send: no launch id and no registry entry leaves the CLI to refuse", async () => {
+	const env = invocation(undefined, 1,
+		"pi-comms: an agent id is required: --agent or PI_COMMS_AGENT_ID");
+	env.PI_COMMS_AGENT_ID = "";
+	env.PI_HOSTED_SESSION = "";
+	env.PI_DAEMON_STATE_DIR = "";
+	env.PI_SESSION_FILE = "";
+	await withEnv(env, async () => {
+		const result = await call("comms_send", { to: "bob", payload: "hi" });
+		assertEq(result.isError, true, "is an error");
+		const argv = recorded(env.STUB_LOG)[0];
+		assertEq(argv.slice(0, 4).join(" "), "--format json send bob",
+			"the command is sent with no identity");
+		assert(!argv.includes("--agent"), "no --agent is invented");
 	});
 });
 
