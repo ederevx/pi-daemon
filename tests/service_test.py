@@ -7,6 +7,7 @@ import errno
 import io
 import json
 import os
+import shlex
 import shutil
 import socket
 import signal
@@ -19,6 +20,13 @@ from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
+
+import isolation
+
+# Every root this module probes belongs to its own scratch tree, never
+# the host's live daemon.
+ISOLATION = isolation.ScratchEnvironment()
+ISOLATION.apply()
 
 from pi_daemon.application import DaemonApplication
 from pi_daemon.atomic_state_file import AtomicStateFile
@@ -47,6 +55,7 @@ SCRATCH = tempfile.mkdtemp(prefix="pi-service-")
 
 
 def tearDownModule():
+    ISOLATION.cleanup()
     shutil.rmtree(SCRATCH, ignore_errors=True)
 
 
@@ -556,8 +565,11 @@ class RunnerTests(unittest.TestCase):
     def test_a_multibyte_output_is_paged_without_decoding(self):
         service, _, _ = tasks_service()
         script = "import sys;sys.stdout.buffer.write(bytes([99,97,102,195,169]))"
-        ticket, _ = service.submit("pi-1", SCRATCH,
-                                f'{sys.executable} -c "{script}"')
+        # A ticket command is a Bash command string on every platform, so
+        # the interpreter and its argument are quoted for Bash: a Windows
+        # path loses its backslashes to any other quoting.
+        command = shlex.join([sys.executable, "-c", script])
+        ticket, _ = service.submit("pi-1", SCRATCH, command)
         service.wait(ticket["id"], 10)
         whole = service.output(ticket["id"])
         self.assertEqual(whole["data"], b"caf\xc3\xa9")

@@ -1,5 +1,6 @@
 """Every path the service derives, resolved once, with no cleanup."""
 
+import ntpath
 import os
 
 
@@ -22,7 +23,11 @@ class RuntimeLayout:
         return self._runtime_root
 
     def domain_root(self, name):
-        if not name or os.sep in name or name in (".", ".."):
+        # A component is checked by its meaning, not by the host's
+        # separator: Windows accepts both, so either one is traversal.
+        if (not name or name in (".", "..")
+                or "/" in name or "\\" in name
+                or ntpath.splitdrive(name)[0]):
             raise ValueError(f"unsafe domain name: {name!r}")
         root = os.path.join(self._state_root, name)
         os.makedirs(root, exist_ok=True)
