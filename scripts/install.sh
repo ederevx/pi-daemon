@@ -36,6 +36,60 @@ esac
 
 die() { echo "install: $*" >&2; exit 1; }
 
+# Text this script reads back line by line - a path, a digest, a name - comes
+# from a native interpreter on Windows that ends its lines with \r\n, and a
+# trailing \r makes a path that exists look missing to `-f` and to `-d`. The
+# line-oriented answers are stripped once, here, so every reader below sees
+# what the writer meant.
+py() { python3 "$@" | tr -d '\r'; }
+
+# Two spellings of one file - a native `C:\\...` from a tool and the shell's
+# own `C:/...` or `/c/...` - name it the same only once the filesystem has
+# resolved them, so every comparison of a path from outside this script with
+# one it built goes through this.
+same_path() {
+  python3 - "$1" "$2" <<'PY'
+import os
+import sys
+
+
+def native(path):
+    if os.name != "nt":
+        # /c/... is a real directory on POSIX: only Windows spells a drive
+        # that way, so nothing is rewritten elsewhere.
+        return path
+    path = path.replace("\\", "/")
+    if len(path) > 2 and path[0] == "/" and path[2] == "/" \
+            and path[1].isalpha():
+        return path[1].upper() + ":" + path[2:]
+    return path
+
+
+def key(path):
+    return os.path.normcase(os.path.realpath(native(path)))
+
+
+sys.exit(0 if key(sys.argv[1]) == key(sys.argv[2]) else 1)
+PY
+}
+
+# sed reads a backslash in its replacement as an escape and `&` as the text it
+# matched, so a Windows path spliced into a launcher or the unit would lose
+# them. Every substituted value is quoted first.
+sed_value() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+
+# One spelling per tree: a native Windows caller passes `C:\Users\...` while
+# every tool below resolves the same directory through the shell's own
+# `/c/...` form, and rm, grep and sha256sum are handed shell paths.
+shell_path() {
+  local path="$1"
+  if [[ "$path" == [A-Za-z]:[\\/]* ]]; then
+    path="/$(printf '%s' "${path:0:1}" | tr 'A-Z' 'a-z')${path:2}"
+    path="${path//\\//}"
+  fi
+  printf '%s' "$path"
+}
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pi_home="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
 local_bin="$HOME/.local/bin"
@@ -194,10 +248,71 @@ try:
         document = json.load(handle)
 except (OSError, ValueError):
     document = {}
+
+
+def native(path):
+    """A path in the form this interpreter opens: a manifest written by the
+    shell spells a drive as /c/..., which is not a path here."""
+    if os.name != "nt":
+        # /c/... is a real directory on POSIX: only Windows spells a drive
+        # that way, so nothing is rewritten elsewhere.
+        return path
+    path = path.replace("\\", "/")
+    if len(path) > 2 and path[0] == "/" and path[2] == "/" \
+            and path[1].isalpha():
+        return path[1].upper() + ":" + path[2:]
+    return path
+
+
+def same_path(path):
+    """One spelling per directory: a manifest records a Windows path with
+    forward slashes while the listing carries the shell's own form, and a
+    plain string comparison would read them as two different trees."""
+    return os.path.normcase(os.path.realpath(native(path)))
+
+
 retained = [path for path in document.get("retained") or []]
-keep = {document.get("active_root") or ""}
-keep.update(retained if serving == "1" else retained[:1])
-keep.discard("")
+keep = {same_path(document["active_root"])} \
+    if document.get("active_root") else set()
+keep.update(same_path(path)
+            for path in (retained if serving == "1" else retained[:1]))
+keep.discard(same_path(""))
+
+
+def alive(pid):
+    """Whether this pid still names a running process.
+
+    os.kill(pid, 0) is no probe on Windows: it opens the process and
+    terminates it, so a sweep of a leftover tree would end whatever now
+    carries the number. The handle-based wait asks the same question and
+    ends nothing.
+    """
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        SYNCHRONIZE = 0x00100000
+        WAIT_TIMEOUT = 0x00000102
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                         wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE,
+                                                 wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 def in_flight(name):
@@ -208,17 +323,13 @@ def in_flight(name):
         pid = name[len(prefix):]
         if not pid.isdigit():
             return False
-        try:
-            os.kill(int(pid), 0)
-        except OSError:
-            return False
-        return True
+        return alive(int(pid))
     return False
 
 
 for name in sorted(os.listdir(releases)):
     path = os.path.join(releases, name)
-    if not os.path.isdir(path) or path in keep or in_flight(name):
+    if not os.path.isdir(path) or same_path(path) in keep or in_flight(name):
         continue
     shutil.rmtree(path, ignore_errors=True)
 PY
@@ -237,7 +348,9 @@ service_active() {
   [[ -f "$unit" ]] || return 1
   loaded="$(systemctl --user show -p FragmentPath --value pi-daemon.service \
     2>/dev/null)" || return 1
-  [[ "$loaded" == "$unit" ]] || return 1
+  # The unit systemd names may be spelled by the user manager rather than by
+  # this shell; the same file under another spelling is this install's unit.
+  same_path "$loaded" "$unit" || return 1
   systemctl --user is-active --quiet pi-daemon.service >/dev/null 2>&1
 }
 
@@ -331,7 +444,7 @@ refuse_while_serving() {
 
 # One field of a migration plan, or nothing when the plan is unreadable.
 plan_field() {
-  python3 - "$1" "$2" <<'PY'
+  py - "$1" "$2" <<'PY'
 import json
 import sys
 
@@ -375,7 +488,7 @@ PY
 }
 
 content_id() {
-  python3 - "$1" <<'PY'
+  py - "$1" <<'PY'
 import hashlib
 import os
 import sys
@@ -396,24 +509,29 @@ PY
 
 render_launcher() {
   local target="$1" dest="$2"
-  sed "s|@TARGET@|$target|" "$repo_root/pi/bin/pi-launcher.in" \
+  sed "s|@TARGET@|$(sed_value "$target")|" "$repo_root/pi/bin/pi-launcher.in" \
     > "$dest.tmp.$$"
   chmod 755 "$dest.tmp.$$"
   mv -f "$dest.tmp.$$" "$dest"
 }
 
 write_manifest() {
-  local out="$1" retained="$2" sources_file="$3"
+  local out="$1" retained_file="$2" sources_file="$3"
   shift 3
-  python3 - "$out" "$repo_root" "$active_root" "$retained" "$sources_file" \
+  python3 - "$out" "$repo_root" "$active_root" "$retained_file" "$sources_file" \
     "$manifest" "$@" <<'PY'
 import hashlib
 import json
 import os
 import sys
 
-out, repo, active, retained, sources_file, previous = sys.argv[1:7]
+out, repo, active, retained_file, sources_file, previous = sys.argv[1:7]
 owned = sys.argv[7:]
+
+# NUL-delimited, so a Windows path keeps its backslashes instead of
+# arriving as an escape the JSON reader would reject.
+with open(retained_file, encoding="utf-8") as handle:
+    retained = [path for path in handle.read().split("\0") if path]
 
 
 def digest(path):
@@ -436,7 +554,7 @@ try:
         known = json.load(handle).get("trees") or {}
 except (OSError, ValueError):
     known = {}
-for root in json.loads(retained):
+for root in retained:
     if root in known:
         trees[root] = known[root]
 sources = {}
@@ -454,7 +572,7 @@ document = {
     "hashes": {path: digest(path) for path in owned
                if os.path.isfile(path)},
     "trees": trees,
-    "retained": json.loads(retained),
+    "retained": retained,
     "sources": sources,
 }
 with open(out, "w", encoding="utf-8") as handle:
@@ -490,11 +608,49 @@ sweep_releases
 # conflicts. A copy goes when a previous manifest owned it, or when it is
 # byte-identical to this clone's extension (a copy whose manifest is gone).
 # Unrelated files are never touched.
+# Whether the manifest being replaced recorded this file. The paths it holds
+# were written by whichever shell ran that install, and this one may spell the
+# same tree differently (`C:\...` for a native caller, `/c/...` for a shell
+# one), so the comparison is made on the directories themselves.
+manifest_owns() {
+  [[ -f "$manifest" ]] || return 1
+  python3 - "$manifest" "$1" <<'PY'
+import json
+import os
+import sys
+
+
+def native(path):
+    if os.name != "nt":
+        # /c/... is a real directory on POSIX: only Windows spells a drive
+        # that way, so nothing is rewritten elsewhere.
+        return path
+    path = path.replace("\\", "/")
+    if len(path) > 2 and path[0] == "/" and path[2] == "/" \
+            and path[1].isalpha():
+        return path[1].upper() + ":" + path[2:]
+    return path
+
+
+manifest, wanted = sys.argv[1:3]
+try:
+    with open(manifest, encoding="utf-8") as handle:
+        document = json.load(handle)
+except (OSError, ValueError):
+    sys.exit(1)
+target = os.path.normcase(os.path.realpath(native(wanted)))
+for path in document.get("owned") or []:
+    if os.path.normcase(os.path.realpath(native(path))) == target:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
 for ext in daemon offload; do
   src="$repo_root/pi/extensions/$ext.ts"
-  dst="$pi_home/extensions/$ext.ts"
+  dst="$(shell_path "$pi_home")/extensions/$ext.ts"
   [[ -f "$dst" ]] || continue
-  if { [[ -f "$manifest" ]] && grep -qF "\"$dst\"" "$manifest"; } \
+  if manifest_owns "$dst" \
       || [[ "$(sha256sum "$dst" | cut -d' ' -f1)" == \
             "$(sha256sum "$src" | cut -d' ' -f1)" ]]; then
     rm -f "$dst"
@@ -597,23 +753,20 @@ public=("$local_bin/pi-daemon" "$local_bin/pi-rc" "$local_bin/pi-rc.cmd"
 # interrupted run is recovered from this journal rather than guessed at.
 backups="$backups_root/$(date +%s)-$$"
 mkdir -p "$backups"
+# Records, not JSON: the paths carry backslashes on Windows, and a
+# hand-written JSON string would arrive as invalid escapes. Python
+# builds the escaped document from these NUL-delimited pairs.
 {
-  printf '[\n'
-  first=1
   index=0
   for path in "${public[@]}"; do
-    backup=null
+    backup=""
     if [[ -e "$path" ]]; then
       backup="$backups/$index-$(basename "$path")"
       cp -p "$path" "$backup"
-      backup="\"$backup\""
     fi
-    [[ $first -eq 1 ]] || printf ',\n'
-    first=0
+    printf '%s\0%s\0' "$path" "$backup"
     index=$((index + 1))
-    printf '  {"path": "%s", "backup": %s}' "$path" "$backup"
   done
-  printf '\n]\n'
 } > "$state_dir/transaction-backups.$$"
 python3 - "$transaction" "$candidate" "$created" \
   "$state_dir/transaction-backups.$$" <<'PY'
@@ -622,7 +775,11 @@ import sys
 
 out, active, created, backups = sys.argv[1:5]
 with open(backups, encoding="utf-8") as handle:
-    entries = json.load(handle)
+    fields = handle.read().split("\0")
+entries = [
+    {"path": fields[index], "backup": fields[index + 1] or None}
+    for index in range(0, len(fields) - 1, 2)
+]
 with open(out, "w", encoding="utf-8") as handle:
     json.dump({"version": 1, "active_root": active,
                "created": created == "1", "backups": entries},
@@ -655,16 +812,19 @@ install_if_changed "$repo_root/pi/bin/pi-rc.cmd" "$local_bin/pi-rc.cmd"
 install_if_changed "$repo_root/pi/bin/pi-daemon-migrate.cmd" \
   "$local_bin/pi-daemon-migrate.cmd"
 
-sed "s|@REAL_PI@|$real_pi|" "$repo_root/pi/bin/pi-wrapper" \
+sed "s|@REAL_PI@|$(sed_value "$real_pi")|" "$repo_root/pi/bin/pi-wrapper" \
   > "$local_bin/pi.tmp.$$"
 chmod 755 "$local_bin/pi.tmp.$$"
 mv -f "$local_bin/pi.tmp.$$" "$local_bin/pi"
 install_if_changed "$repo_root/pi/bin/pi-wrapper.cmd" "$local_bin/pi.cmd"
 
-sed "s|@REAL_PI@|$real_pi|;s|@PI_BIN_DIR@|$(dirname "$real_pi")|;\
-s|@STATE_DIR@|$new_state|;s|@RUNTIME_DIR@|$new_runtime|;\
-s|@LAUNCHER@|$local_bin/pi-daemon|;s|@LAUNCHER_RC@|$local_bin/pi-rc|;\
-s|@ENDPOINT@|$new_runtime/control.json|" \
+sed "s|@REAL_PI@|$(sed_value "$real_pi")|;\
+s|@PI_BIN_DIR@|$(sed_value "$(dirname "$real_pi")")|;\
+s|@STATE_DIR@|$(sed_value "$new_state")|;\
+s|@RUNTIME_DIR@|$(sed_value "$new_runtime")|;\
+s|@LAUNCHER@|$(sed_value "$local_bin/pi-daemon")|;\
+s|@LAUNCHER_RC@|$(sed_value "$local_bin/pi-rc")|;\
+s|@ENDPOINT@|$(sed_value "$new_runtime/control.json")|" \
   "$repo_root/pi/systemd/pi-daemon.service" > "$systemd_dir/pi-daemon.service.tmp.$$"
 mv -f "$systemd_dir/pi-daemon.service.tmp.$$" "$systemd_dir/pi-daemon.service"
 
@@ -672,33 +832,39 @@ mv -f "$systemd_dir/pi-daemon.service.tmp.$$" "$systemd_dir/pi-daemon.service"
 # because a running process may still be executing them.
 previous_active=""
 if [[ -f "$manifest" ]]; then
-  previous_active="$(python3 -c 'import json,sys
+  previous_active="$(py -c 'import json,sys
 try:
     print(json.load(open(sys.argv[1], encoding="utf-8")).get("active_root") or "")
 except Exception:
     print("")' "$manifest")"
 fi
-retained="["
-separator=""
-if [[ -n "$previous_active" && "$previous_active" != "$candidate" \
-      && -d "$previous_active" ]]; then
-  retained+="$separator\"$previous_active\""
-  separator=", "
+retained_file="$state_dir/retained.$$"
+: > "$retained_file"
+# One spelling per tree: a path read back from the manifest and a path this
+# run built can name the same directory in two forms, and string equality
+# would read them as two.
+same_tree() {
+  local left right
+  left="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+  right="$(cd "$2" 2>/dev/null && pwd -P)" || return 1
+  [[ -n "$left" && "$left" == "$right" ]]
+}
+if [[ -n "$previous_active" && -d "$previous_active" ]] \
+      && ! same_tree "$previous_active" "$candidate"; then
+  printf '%s\0' "$previous_active" >> "$retained_file"
 fi
 if [[ -f "$manifest" ]]; then
   while IFS= read -r kept; do
-    [[ -n "$kept" ]] || continue
-    [[ "$kept" == "$candidate" || "$kept" == "$previous_active" ]] && continue
-    [[ -d "$kept" ]] || continue
-    retained+="$separator\"$kept\""
-    separator=", "
-  done < <(python3 -c 'import json,sys
+    [[ -n "$kept" && -d "$kept" ]] || continue
+    same_tree "$kept" "$candidate" && continue
+    same_tree "$kept" "$previous_active" && continue
+    printf '%s\0' "$kept" >> "$retained_file"
+  done < <(py -c 'import json,sys
 try:
     print("\n".join(json.load(open(sys.argv[1], encoding="utf-8")).get("retained") or []))
 except Exception:
     pass' "$manifest")
 fi
-retained+="]"
 
 # The flat seam modules of a v2 install are no longer owned: the generation
 # carries them and the public entry is a dispatcher. The list is read from
@@ -718,7 +884,7 @@ try:
         document = json.load(handle)
 except (OSError, ValueError):
     document = {}
-with open(out, "w", encoding="utf-8") as handle:
+with open(out, "w", encoding="utf-8", newline="\n") as handle:
     for path in document.get("owned") or []:
         if os.path.basename(path) in flat:
             handle.write(path + "\n")
@@ -727,9 +893,9 @@ fi
 
 active_root="$candidate"
 all_sources > "$state_dir/sources.$$"
-write_manifest "$manifest.tmp.$$" "$retained" "$state_dir/sources.$$" "${public[@]}"
+write_manifest "$manifest.tmp.$$" "$retained_file" "$state_dir/sources.$$" "${public[@]}"
 mv "$manifest.tmp.$$" "$manifest"
-rm -f "$state_dir/sources.$$"
+rm -f "$state_dir/sources.$$" "$retained_file"
 while IFS= read -r retired; do
   [[ -n "$retired" ]] || continue
   [[ -e "$retired" ]] && rm -f "$retired"

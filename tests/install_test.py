@@ -28,6 +28,17 @@ SCRATCH = os.path.expanduser("~/tmp")
 
 sys.path.insert(0, str(ROOT / "pi" / "lib"))
 
+import isolation
+
+# Every root this module probes belongs to its own scratch tree, never
+# the host's live daemon.
+ISOLATION = isolation.ScratchEnvironment()
+ISOLATION.apply()
+
+def tearDownModule():
+    ISOLATION.cleanup()
+
+
 from pi_daemon.lifecycle.instance_coordinator import InstanceCoordinator
 
 
@@ -57,6 +68,8 @@ class ScratchHome:
         self.runtime_dir.mkdir()
         self.state_home = self.root / "xdg-state"
         self.state_home.mkdir()
+        self.services_dir = self.root / "services"
+        self.services_dir.mkdir()
         self.env_extra = {}
 
     def _write_exe(self, name, extra=""):
@@ -79,8 +92,20 @@ class ScratchHome:
     def env(self):
         env = dict(os.environ)
         env["HOME"] = str(self.root)
-        env["PATH"] = f"{self.fakebin}:{env.get('PATH', '')}"
-        env.pop("PI_CODING_AGENT_DIR", None)
+        # Native path syntax: bash converts PATH at its own invocation
+        # boundary, so a Bash-style separator here would leave the fake
+        # tools unresolvable and a real service manager in their place.
+        env["PATH"] = os.pathsep.join(
+            [str(self.fakebin), env.get("PATH", "")])
+        if os.name == "nt":
+            # Native Windows runs resolve the profile and the temporary
+            # directories too, so every one of them belongs to the scratch
+            # tree rather than to the account running the tests.
+            for name in ("USERPROFILE", "APPDATA", "LOCALAPPDATA",
+                         "TEMP", "TMP"):
+                env[name] = str(self.root)
+        env["PI_CODING_AGENT_DIR"] = str(self.root / ".pi" / "agent")
+        env["PI_SERVICES_DIR"] = str(self.services_dir)
         # The release's own commands are what must keep bytecode out of a
         # published generation; an inherited setting would decide it instead.
         env.pop("PYTHONDONTWRITEBYTECODE", None)
@@ -345,7 +370,9 @@ class InstallScriptTests(unittest.TestCase):
                   encoding="utf-8") as handle:
             handle.write("\n# a new build\n")
         self.assertEqual(self.scratch.package(clone).returncode, 0)
-        self.assertEqual(self.scratch.manifest()["retained"], [str(first)])
+        self.assertEqual([winform(path) for path in
+                          self.scratch.manifest()["retained"]],
+                         [winform(first)])
         foreign = first / "notes.txt"
         foreign.write_text("not ours\n")
         result = subprocess.run(
@@ -565,7 +592,8 @@ class InstallScriptTests(unittest.TestCase):
                   encoding="utf-8") as handle:
             pristine = handle.read()
         self.assertEqual(self.scratch.package(clone).returncode, 0)
-        self.assertEqual(self.scratch.manifest()["active_root"], str(active),
+        self.assertEqual(winform(self.scratch.manifest()["active_root"]),
+                         winform(active),
                          "the published content keeps its name")
         self.assertEqual((active / "lib" / "pi_services.py").read_text(),
                          pristine, "the mutated tree is rebuilt")
@@ -583,14 +611,17 @@ class InstallScriptTests(unittest.TestCase):
             handle.write("\n# a new build\n")
         self.assertEqual(self.scratch.package(clone).returncode, 0)
         second = pathlib.Path(self.scratch.manifest()["active_root"])
-        self.assertNotEqual(first, second)
-        self.assertEqual(self.scratch.manifest()["retained"], [str(first)])
+        self.assertNotEqual(winform(first), winform(second))
+        self.assertEqual([winform(path) for path in
+                          self.scratch.manifest()["retained"]],
+                         [winform(first)])
         with open(first / "lib" / "pi_services.py", "a",
                   encoding="utf-8") as handle:
             handle.write("\n# not ours\n")
         source.write_bytes(original)
         self.assertEqual(self.scratch.package(clone).returncode, 0)
-        self.assertEqual(self.scratch.manifest()["active_root"], str(first),
+        self.assertEqual(winform(self.scratch.manifest()["active_root"]),
+                         winform(first),
                          "a revert selects the retained content again")
         self.assertTrue(second.is_dir(), "the newer generation is kept")
         self.assertEqual((first / "lib" / "pi_services.py").read_bytes(),

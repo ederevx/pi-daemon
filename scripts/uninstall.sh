@@ -10,8 +10,25 @@
 # survives.
 set -euo pipefail
 
-pi_home="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+# One spelling per tree: a native Windows caller passes `C:\Users\...` while
+# rm and the manifest lookup below resolve the same directory through the
+# shell's own `/c/...` form.
+shell_path() {
+  local path="$1"
+  if [[ "$path" == [A-Za-z]:[\\/]* ]]; then
+    path="/$(printf '%s' "${path:0:1}" | tr 'A-Z' 'a-z')${path:2}"
+    path="${path//\\//}"
+  fi
+  printf '%s' "$path"
+}
+
+pi_home="$(shell_path "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}")"
 manifest="$pi_home/.pi-daemon/manifest.json"
+
+# A native Windows interpreter ends its lines with \r\n; a path that keeps the
+# \r exists nowhere, and the removal loop above would pass over every file
+# the manifest records. python's output is read through tr, above, for that
+# reason.
 
 if [[ ! -f "$manifest" ]]; then
   echo "uninstall: no manifest at $manifest — nothing installed by this repo" >&2
@@ -21,7 +38,7 @@ fi
 systemctl --user disable --now pi-daemon.service 2>/dev/null || true
 systemctl --user daemon-reload 2>/dev/null || true
 
-mapfile -t recorded < <(python3 - "$manifest" <<'EOF'
+mapfile -t recorded < <(python3 - "$manifest" <<'EOF' | tr -d '\r'
 import json
 import sys
 
