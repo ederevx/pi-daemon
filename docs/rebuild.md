@@ -687,7 +687,9 @@ other's lock, registry or descriptor:
 
 | | legacy | new |
 |---|---|---|
-| state | `$XDG_STATE_HOME/pi-pty-host/` | `PI_DAEMON_STATE_DIR` |
+| state | `$XDG_STATE_HOME/pi-pty-host/` (the old daemon's
+|        | `pi_platform` state home, so `%LOCALAPPDATA%\pi-pty-host` on
+|        | Windows) | `PI_DAEMON_STATE_DIR` |
 | | `tickets.json`, `tickets/` | `tasks/tickets.json`, `tasks/logs/` |
 | | `sessions.json` | `sessions/sessions.json` |
 | | `session-files.json` (a transcript-file index) | none: dropped |
@@ -701,7 +703,10 @@ other's lock, registry or descriptor:
 `pi-daemon-migrate` is the installed verb, never `pi-rc` (a client that
 must speak to both servers and must never write server state) and never a
 one-shot script (which would duplicate the stores' layout). It reads the
-legacy root read-only and writes the new one:
+legacy root read-only and writes the new one, resolving that root through
+`pi_platform` so a Windows host reads the `%LOCALAPPDATA%\pi-pty-host`
+the old daemon actually wrote, not a POSIX default no Windows daemon
+ever wrote:
 
     pi-daemon-migrate --dry-run        # print the plan as JSON, write nothing
     pi-daemon-migrate                  # translate, then record a marker

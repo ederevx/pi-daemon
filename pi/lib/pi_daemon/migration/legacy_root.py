@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 
+import pi_platform
+
 from .error import UNREADABLE, MigrationError
 
 
@@ -16,9 +18,11 @@ class LegacyRoot:
 
     @classmethod
     def from_environment(cls, environ):
-        state_home = environ.get("XDG_STATE_HOME") \
-            or os.path.expanduser("~/.local/state")
-        return cls(os.path.join(state_home, "pi-pty-host"))
+        # The root the old daemon wrote, resolved as that daemon resolved
+        # it: pi_platform owns the per-platform state home, so a Windows
+        # host's %LOCALAPPDATA%\pi-pty-host is read instead of the POSIX
+        # default that daemon never wrote.
+        return cls(pi_platform.RuntimeLayout(environ).registry_dir())
 
     def root(self):
         return self._root

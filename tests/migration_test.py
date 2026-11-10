@@ -411,6 +411,32 @@ class RefusalTests(unittest.TestCase):
         self.assertIn("PI_DAEMON_STATE_DIR", completed.stderr)
 
 
+class LegacyRootResolutionTests(unittest.TestCase):
+    """The legacy root is the one the old daemon actually wrote.
+
+    The old daemon resolved its state home through pi_platform, so on a
+    Windows host that root is %LOCALAPPDATA%\\pi-pty-host, not the POSIX
+    default no Windows daemon ever wrote.
+    """
+
+    def test_the_legacy_root_is_the_old_daemons_registry_dir(self):
+        environ = {}
+        if sys.platform.startswith("win"):
+            local = tempfile.mkdtemp(dir=SCRATCH)
+            environ["LOCALAPPDATA"] = local
+            expected = os.path.join(local, "pi-pty-host")
+        else:
+            expected = os.path.expanduser("~/.local/state/pi-pty-host")
+        self.assertEqual(LegacyRoot.from_environment(environ).root(),
+                         os.path.abspath(expected))
+
+    def test_an_explicit_state_home_wins_on_every_platform(self):
+        home = tempfile.mkdtemp(dir=SCRATCH)
+        root = LegacyRoot.from_environment({"XDG_STATE_HOME": home})
+        self.assertEqual(root.root(),
+                         os.path.abspath(os.path.join(home, "pi-pty-host")))
+
+
 class LongPathTests(unittest.TestCase):
     """A legacy root whose own path is past the classic Windows limit.
 
