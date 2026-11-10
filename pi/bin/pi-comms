@@ -122,8 +122,13 @@ def _registered():
     try:
         with open(os.path.join(state, "sessions", "sessions.json"),
                   encoding="utf-8") as handle:
-            files = (json.load(handle) or {}).get("files") or {}
+            registry = json.load(handle)
     except (OSError, ValueError):
+        return ""
+    if not isinstance(registry, dict):
+        return ""
+    files = registry.get("files")
+    if not isinstance(files, dict):
         return ""
     for name, path in files.items():
         if path == mine:

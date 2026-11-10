@@ -246,14 +246,31 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(output(completed)["agent"]["agentId"], "pi-hosted")
 
+    def test_a_registry_that_is_not_an_object_is_refused(self):
+        # A malformed registry must not crash: the refusal stays a usage error.
+        state = os.path.join(self.fixture.runtime, "state")
+        os.makedirs(os.path.join(state, "sessions"), exist_ok=True)
+        session = os.path.join(self.fixture.runtime, "session.jsonl")
+        with open(os.path.join(state, "sessions", "sessions.json"), "w",
+                  encoding="utf-8") as opened:
+            json.dump(["not", "a", "registry"], opened)
+        environment = self.fixture.environment(
+            agent=None, PI_DAEMON_STATE_DIR=state, PI_SESSION_FILE=session)
+        completed = self.fixture.run("node", agent=None, environment=environment)
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertIn("agent id", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+
     def test_a_session_the_registry_names_uses_that_name(self):
         state = os.path.join(self.fixture.runtime, "state")
         os.makedirs(os.path.join(state, "sessions"), exist_ok=True)
         session = os.path.join(self.fixture.runtime, "session.jsonl")
         with open(os.path.join(state, "sessions", "sessions.json"), "w",
                   encoding="utf-8") as opened:
-            json.dump({"files": {"pi-registered": session,
-                                 "other": session + ".other"}}, opened)
+            # The non-matching entry comes first, so a lookup that returns
+            # the first name blindly cannot pass this.
+            json.dump({"files": {"other": session + ".other",
+                                 "pi-registered": session}}, opened)
         environment = self.fixture.environment(
             agent=None, PI_DAEMON_STATE_DIR=state, PI_SESSION_FILE=session)
         completed = self.fixture.run("node", agent=None, environment=environment)
