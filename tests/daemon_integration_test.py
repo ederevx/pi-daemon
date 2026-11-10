@@ -27,6 +27,9 @@ SERVICES = os.path.join(SCRATCH, "services")
 os.makedirs(RUNTIME, exist_ok=True)
 os.makedirs(STATE, exist_ok=True)
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import isolation  # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DAEMON_PATH = os.path.join(REPO, "pi", "daemon", "pi-daemon")
 PI_RC = os.path.join(REPO, "pi", "bin", "pi-rc")
@@ -41,7 +44,12 @@ LIVE_DESCRIPTOR = os.path.join(
 TEST_DESCRIPTOR = os.path.join(
     SERVICES, "session-host", "pi-daemon.json")
 
-ENV = dict(os.environ)
+# The suite's own environment, not the host's: every root the product
+# resolves is redirected into this tree, and every name of a live endpoint,
+# a hosted session or a comms identity is removed rather than inherited.
+# Run on its own, this script isolates exactly like tests/run.py.
+ISOLATED = isolation.ScratchEnvironment()
+ENV = ISOLATED.environment()
 AGENT = os.path.join(SCRATCH, "agent")
 os.makedirs(AGENT, exist_ok=True)
 ENV.update({"XDG_RUNTIME_DIR": RUNTIME, "XDG_STATE_HOME": STATE,
@@ -371,35 +379,41 @@ def _main():
     # pi's own signal path: the handler disposes the runtime and exits 0, so
     # the status looks like a clean exit. The recorded busy state is the only
     # thing that can tell this from a settled run, and the daemon must read
-    # it as a mid-run exit, not as a settle.
-    resp = wire({"cmd": "start", "name": "pi-itest-term", "dir": SCRATCH,
-                 "argv": ["sh", "-c", "trap 'exit 0' TERM; read line"],
-                 "cols": 80, "rows": 24})
-    if not resp.get("ok"):
-        fail("handled-term start", str(resp))
-    r = pi_rc("state", "itest-term", "busy")
-    if r.returncode != 0:
-        fail("handled-term state", r.stderr)
-    pid = next((s["pid"] for s in wire({"cmd": "list"}).get("sessions", [])
-                if s["name"] == "pi-itest-term"), None)
-    if not pid:
-        fail("handled-term pid", "session not listed")
-    os.kill(pid, signal.SIGTERM)
-    deadline = time.time() + 5
-    while time.time() < deadline:
-        if not any(s["name"] == "pi-itest-term"
-                   for s in wire({"cmd": "list"}).get("sessions", [])):
-            break
-        time.sleep(0.1)
-    # Windows has no catchable SIGTERM: os.kill terminates the child, so the
-    # same scenario is a plain death there and never a clean exit.
-    expected = "exited-mid-run" if os.name == "posix" else "died-mid-run"
-    r = pi_rc("run-state", "itest-term")
-    if not r.stdout.startswith(expected):
-        fail("run-state after a handled SIGTERM",
-             f"expected {expected}, out={r.stdout!r} err={r.stderr!r}")
+    # it as a mid-run exit, not as a settle. A catchable SIGTERM is POSIX-only:
+    # on this host os.kill ends the child outright, which the case above
+    # already covers, so this one says what it could not run instead of
+    # passing a Windows death off as handled-signal coverage.
+    if os.name != "posix":
+        print("  unsupported run-state reads a handled SIGTERM as a mid-run "
+              "exit (a catchable SIGTERM is POSIX-only)")
+        resp = None
     else:
-        ok("run-state: a handled SIGTERM mid-run is not a settle")
+        resp = wire({"cmd": "start", "name": "pi-itest-term", "dir": SCRATCH,
+                     "argv": ["sh", "-c", "trap 'exit 0' TERM; read line"],
+                     "cols": 80, "rows": 24})
+    if resp is not None:
+        if not resp.get("ok"):
+            fail("handled-term start", str(resp))
+        r = pi_rc("state", "itest-term", "busy")
+        if r.returncode != 0:
+            fail("handled-term state", r.stderr)
+        pid = next((s["pid"] for s in wire({"cmd": "list"}).get("sessions", [])
+                    if s["name"] == "pi-itest-term"), None)
+        if not pid:
+            fail("handled-term pid", "session not listed")
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not any(s["name"] == "pi-itest-term"
+                       for s in wire({"cmd": "list"}).get("sessions", [])):
+                break
+            time.sleep(0.1)
+        r = pi_rc("run-state", "itest-term")
+        if not r.stdout.startswith("exited-mid-run"):
+            fail("run-state after a handled SIGTERM",
+                 f"out={r.stdout!r} err={r.stderr!r}")
+        else:
+            ok("run-state reads a handled SIGTERM as a mid-run exit")
 
     r = pi_rc("start", "a", "b", "c")  # start takes at most name+dir
     if r.returncode == 0:

@@ -58,6 +58,17 @@ class TestRegistry {
     if (this.skipped.length > 0) {
       console.error(`Unsupported on this host: ${this.skipped.join("; ")}`);
     }
+    // One machine-readable line so the gate counts these cases instead of
+    // reporting the whole TypeScript step as a single opaque check.
+    console.log(
+      "pi-ts-summary " +
+        JSON.stringify({
+          ran: this.cases.length,
+          passed: this.passed,
+          failed: this.failures,
+          skipped: this.skipped,
+        }),
+    );
   }
 
   get failed(): number {

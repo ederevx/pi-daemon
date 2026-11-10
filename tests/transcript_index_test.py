@@ -48,7 +48,8 @@ def symlink_or_skip(testcase, src, dst):
         os.symlink(src, dst)
     except OSError as exc:
         if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
-            testcase.skipTest("symlinks unavailable: %s" % exc)
+            testcase.skipTest("blocked: this host cannot create symlinks: %s"
+                              % exc)
             return False
         raise
     return True

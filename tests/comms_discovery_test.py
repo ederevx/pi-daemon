@@ -115,11 +115,14 @@ class DescribePublishedFilesTests(unittest.TestCase):
         self.assertTrue(data["nodeId"])
         control = EndpointFile(self.app.endpoint_path()).read()
         self.assertEqual(data["token"], control["token"])
-        mode = os.stat(self.fixture.layout.comms_endpoint_path()).st_mode
+
+    def test_the_token_file_is_private_where_modes_are_kept(self):
         # Windows keeps only a file's read-only bit and reports the mode back
         # as 0o666, so a token file's private mode is a POSIX property.
-        if os.name == "posix":
-            self.assertEqual(mode & 0o077, 0, "the token file is private")
+        if os.name != "posix":
+            self.skipTest("POSIX file modes are not enforced here")
+        mode = os.stat(self.fixture.layout.comms_endpoint_path()).st_mode
+        self.assertEqual(mode & 0o077, 0, "the token file is private")
 
     def test_the_descriptor_names_the_endpoint_file_and_the_activation(self):
         path = self.fixture.descriptor().path()

@@ -3,7 +3,9 @@
 real daemon+client integration test. Zero dependencies (stdlib only).
 
 Every step runs in one suite-owned environment, so no test can read,
-write or signal the host's own daemon roots.
+write or signal the host's own daemon roots. The gate also snapshots the
+host's installed descriptors before and after the run, read-only, and
+compares them in full.
 
 The runner reports what it measured, not what it hoped: the exact
 invocation, each step's outcome, how many tests ran, and every case this
@@ -19,11 +21,15 @@ Usage:
     python3 tests/run.py
 """
 
+import json
+import hashlib
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -43,6 +49,21 @@ SKIPPED = re.compile(
     r"^(?P<name>\S+) \((?P<where>[^)]*)\) \.\.\. skipped (?P<reason>.*)$")
 PROBLEM = re.compile(
     r"^(?P<kind>FAIL|ERROR): (?P<name>\S+) \((?P<where>[^)]*)\)")
+# A harness of its own prints one of these instead of unittest's shape.
+SUMMARY = re.compile(r"^pi-ts-summary (?P<body>\{.*\})$")
+
+
+def _keep_logs(name, index, output):
+    """Copy one failed step's output where the next reader can open it."""
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "step"
+    # A directory per failure: a rerun, or two gates at once, must not
+    # overwrite the evidence the other one kept.
+    directory = tempfile.mkdtemp(prefix="pi-daemon-gate-logs-",
+                                 dir=isolation.host_scratch())
+    path = os.path.join(directory, "step-%d-%s.log" % (index, slug))
+    with open(path, "w", encoding="utf-8", errors="replace") as handle:
+        handle.write(output)
+    return path
 
 
 class Step:
@@ -62,10 +83,11 @@ class Step:
         self.failed = []
         self.unsupported = []
         self.blocked = []
+        self.kept = None
 
     def execute(self, environment, scratch, index):
         print(f"== {self.name} ==")
-        print("command: " + " ".join(self.command))
+        print("command: " + shlex.join(self.command))
         log = os.path.join(scratch.root, "step-%d.log" % index)
         with open(log, "wb") as handle:
             self.returncode = subprocess.run(
@@ -76,33 +98,68 @@ class Step:
         sys.stdout.write(output)
         if self.suite:
             self._read(output)
+            if self.ran == 0:
+                # A suite that reports no count is a step whose coverage
+                # nobody measured, whatever its exit code said.
+                self.failed.append("no test count reported")
         print()
         ok = self.returncode == 0 and not self.failed
         print(f"{self.name}: ok" if ok
               else f"{self.name}: FAILED ({self.returncode})")
+        if not ok:
+            # The scratch tree goes away with the run, so a failure's own
+            # output is copied out: a report that names a failure and cannot
+            # show it leaves the next reader to guess.
+            self.kept = _keep_logs(self.name, index, output)
+            print("output kept: " + self.kept)
         return ok
 
     def _read(self, output):
         for line in output.splitlines():
+            found = SUMMARY.match(line)
+            if found:
+                try:
+                    summary = json.loads(found.group("body"))
+                except ValueError:
+                    self.failed.append("unreadable summary line")
+                    continue
+                self.ran = int(summary.get("ran") or 0)
+                for name in summary.get("failed") or []:
+                    self.failed.append(str(name))
+                for entry in summary.get("skipped") or []:
+                    self._skip(str(entry), "")
+                continue
             found = RAN.match(line)
             if found:
                 self.ran = int(found.group("count"))
                 continue
             found = SKIPPED.match(line)
             if found:
-                identifier = "%s (%s)" % (found.group("name"),
-                                          found.group("where"))
-                reason = found.group("reason").strip("'\"")
-                if reason.startswith(BLOCKED):
-                    self.blocked.append(
-                        (identifier, reason[len(BLOCKED):].lstrip(" :")))
-                else:
-                    self.unsupported.append((identifier, reason))
+                # The case is named by its id and its module; the reason is
+                # what says whether the host could not show the property.
+                self._skip("%s (%s)" % (found.group("name"),
+                                        found.group("where")),
+                           found.group("reason"))
                 continue
             found = PROBLEM.match(line)
             if found:
                 self.failed.append("%s (%s)" % (found.group("name"),
                                                 found.group("where")))
+
+    def _skip(self, entry, detail):
+        """Sort one skipped case into unsupported or blocked."""
+        if detail:
+            name, rest = entry, detail
+        elif ": " in entry:
+            name, rest = entry.split(": ", 1)
+        else:
+            name, rest = entry, ""
+        reason = rest.strip().strip("'\"").strip()
+        if reason.startswith(BLOCKED):
+            self.blocked.append(
+                (name, reason[len(BLOCKED):].lstrip(" :")))
+        else:
+            self.unsupported.append((name, reason))
 
     @property
     def passed(self):
@@ -118,8 +175,8 @@ class Sentinel:
     The environment names the suite's own services directory, so a test
     that dials a service dials a scratch fixture. This descriptor lives in
     a sibling directory nothing points at, behind a listener that counts
-    its connections: whatever the count is at the end is proof about
-    where the suite looked.
+    its connections: whatever the count is at the end is evidence about
+    the names the suite inherited from outside its own tree.
     """
 
     TOKEN = "sentinel-not-a-real-token"
@@ -157,11 +214,12 @@ class Sentinel:
 
 
 def host_daemons(process):
-    """The host's installed descriptors and the identity of each one.
+    """The host's installed descriptors, in full, and the identity of each.
 
     Read-only: discovery lists and reads files, and the start token is a
-    query on a live handle, never a signal. None means the host's own
-    services root could not be read at all.
+    query on a live handle, never a signal. The digest of each endpoint
+    file stands in for its content, so a comparison never prints a token.
+    None means the host's own services root could not be read at all.
     """
     try:
         entries = pi_services.ServiceDirectory().find()
@@ -171,9 +229,29 @@ def host_daemons(process):
     for entry in entries:
         pid = entry.get("pid")
         token = (process.process_start_token(pid)
-                 if isinstance(pid, int) else None)
-        snapshot.append((entry.get("endpoint_file"), pid, token))
+                 if isinstance(pid, int) and not isinstance(pid, bool)
+                 else None)
+        snapshot.append({
+            "descriptor": json.dumps(entry, sort_keys=True, default=str),
+            "endpoint": _file_digest(entry.get("endpoint_file")),
+            "pid": pid,
+            "token": token,
+        })
     return snapshot
+
+
+def _file_digest(path):
+    """One file's size, mtime and content hash, or None when absent."""
+    if not isinstance(path, str):
+        return None
+    try:
+        info = os.stat(path)
+        with open(path, "rb") as handle:
+            content = handle.read()
+    except OSError:
+        return None
+    return {"size": info.st_size, "mtime": info.st_mtime_ns,
+            "sha256": hashlib.sha256(content).hexdigest()}
 
 
 def preservation(before, after):
@@ -184,12 +262,17 @@ def preservation(before, after):
         return ("not verified",
                 "no installed daemon was running when the suite started, "
                 "so continuity cannot be established")
-    if before == after:
-        return ("verified",
-                "%d installed descriptor(s) kept their pid and start token"
-                % len(before))
-    return ("VIOLATED",
-            "installed descriptors changed: %r -> %r" % (before, after))
+    if before != after:
+        return ("VIOLATED",
+                "installed descriptors changed: %r -> %r"
+                % (before, after))
+    if any(entry["pid"] is None or entry["token"] is None for entry in before):
+        return ("not verified",
+                "a live descriptor carried no pid or process start token, "
+                "so continuity cannot be proven")
+    return ("verified",
+            "%d installed descriptor(s) kept their pid, start token, "
+            "fields and endpoint bytes" % len(before))
 
 
 def steps():
@@ -221,7 +304,12 @@ def steps():
              [python, "tests/pi_rc_activation_test.py", "-v"], suite=True),
         Step("extension tests (TS)",
              ["node", "--experimental-strip-types",
-              "--experimental-transform-types", "tests/ts/run.ts"]),
+              "--experimental-transform-types", "tests/ts/run.ts"],
+             suite=True),
+        Step("suite isolation test", [python, "tests/isolation_test.py", "-v"],
+             suite=True),
+        Step("gate report tests", [python, "tests/gate_report_test.py", "-v"],
+             suite=True),
         Step("conversation index tests",
              [python, "tests/transcript_index_test.py", "-v"], suite=True),
         Step("transcript wire test",
@@ -245,11 +333,12 @@ def report(ran_steps, invocation, before, after, sentinel):
     blocked = [(step, case) for step in ran_steps for case in step.blocked]
     tests = sum(step.ran for step in ran_steps if step.suite)
     checks = [step for step in ran_steps if not step.suite]
-    failures = (sum(len(step.failed) for step in ran_steps)
-                + len([step for step in checks if step.returncode != 0]))
+    silent = [step for step in ran_steps
+              if step.returncode != 0 and not step.failed]
+    failures = sum(len(step.failed) for step in ran_steps) + len(silent)
     passed = sum(step.passed for step in ran_steps)
     print("== validation report ==")
-    print("command: " + " ".join(invocation))
+    print("command: " + invocation)
     print("passed: %d" % passed)
     print("failed: %d%s" % (failures, " - " if failures else ""))
     for step in failed_steps:
@@ -271,12 +360,12 @@ def report(ran_steps, invocation, before, after, sentinel):
     state, detail = preservation(before, after)
     print("host preservation: %s - %s" % (state, detail))
     if sentinel.connections:
-        print("sentinel protection: VIOLATED - %d connection(s) reached a "
-              "service outside the suite's roots: %r"
+        print("sentinel protection: VIOLATED - %d connection(s) reached the "
+              "sentinel service in a directory no suite root names: %r"
               % (len(sentinel.connections), sentinel.connections))
     else:
-        print("sentinel protection: verified - no test reached the service "
-              "outside its own roots")
+        print("sentinel protection: verified - nothing connected to the "
+              "sentinel service in a directory no suite root names")
     if unsupported:
         print()
         print("This host does not implement every property the suite "
@@ -290,17 +379,23 @@ def main():
     scratch = isolation.ScratchEnvironment()
     environment = scratch.environment()
     process = pi_platform.ProcessControl()
-    invocation = [sys.executable] + sys.argv
+    invocation = shlex.join([sys.executable] + sys.argv)
     before = host_daemons(process)
     # Not a root this gate names anywhere: a service here answers only a
-    # test that left its own tree.
+    # test that dialed a name inherited from outside the suite tree. Zero
+    # connections is evidence about that name, not about every service the
+    # host runs.
     sentinel = Sentinel(os.path.join(scratch.root, "not-a-suite-root"))
     try:
         ran_steps = []
-        for index, step in enumerate(steps()):
-            ran_steps.append(step)
-            step.execute(environment, scratch, index)
-        after = host_daemons(process)
+        try:
+            for index, step in enumerate(steps()):
+                ran_steps.append(step)
+                step.execute(environment, scratch, index)
+        finally:
+            # Capture the host's state whatever the steps did: a step that
+            # raised must not also cost the preservation comparison.
+            after = host_daemons(process)
         failed_steps, blocked = report(ran_steps, invocation, before, after,
                                        sentinel)
         if failed_steps or sentinel.connections or \

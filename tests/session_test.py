@@ -1577,7 +1577,7 @@ class SignalTests(unittest.TestCase):
                                            "gen-1"))
         directory = self.reload.directory("pi-a")
         if os.name != "posix" or os.geteuid() == 0:
-            self.skipTest("permissions are not enforced here")
+            self.skipTest("POSIX permissions are not enforced here")
         os.chmod(directory, 0o000)
         try:
             self.assertFalse(self.reload.consumed("pi-a", "round-1"))

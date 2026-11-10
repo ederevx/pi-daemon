@@ -594,10 +594,14 @@ class NodeIdentityTests(unittest.TestCase):
         first = self._identity().id()
         self.assertRegex(first, r"^[0-9a-f]{32}$")
         self.assertEqual(self._identity().id(), first)
-        # Windows keeps only a file's read-only bit and reports the mode back
-        # as 0o666 or 0o444, so a private mode is a POSIX property.
-        if os.name == "posix":
-            self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_the_identity_file_is_private_where_modes_are_kept(self):
+        # Windows keeps only a file's read-only bit and reports the mode
+        # back as 0o666 or 0o444, so a private mode is a POSIX property.
+        if os.name != "posix":
+            self.skipTest("POSIX file modes are not enforced here")
+        self._identity()
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
 
     def test_a_broken_identity_refuses_to_load(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -836,7 +840,7 @@ class SpawnLedgerTests(StoreCase):
 
     def test_the_record_file_is_private(self):
         if os.name != "posix":
-            self.skipTest("file modes are not enforced here")
+            self.skipTest("POSIX file modes are not enforced here")
         self.ledger.open(self._parent(), "r1", "d1", self._agent("kid"), "kid")
         mode = os.stat(self.layout.comms_spawns_path()).st_mode & 0o777
         self.assertEqual(mode, 0o600)
@@ -1676,7 +1680,8 @@ class PeerCredentialTests(PeerCase):
             # Creating a symlink needs a privilege Windows does not grant by
             # default; where the platform cannot make one, it cannot be
             # pointed at either, and the reparse-point refusal stands untested.
-            self.skipTest("this host cannot create symlinks: %s" % failure)
+            self.skipTest("blocked: this host cannot create symlinks: %s"
+                          % failure)
         auth = PeerAuthenticator(self.config, self.peers(),
                                  directory=directory)
         with self.assertRaises(ValueError):
@@ -1704,7 +1709,7 @@ class PeerCredentialTests(PeerCase):
             ["icacls", path, "/grant", "*S-1-1-0:(R)"],
             capture_output=True, text=True)
         if result.returncode != 0:
-            self.skipTest("icacls could not widen the file: %s"
+            self.skipTest("blocked: icacls could not widen the file: %s"
                           % result.stderr.strip())
 
 

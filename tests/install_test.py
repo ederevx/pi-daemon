@@ -439,7 +439,8 @@ class InstallScriptTests(unittest.TestCase):
             self.scratch.path(".pi/agent/.pi-daemon/manifest.json").exists())
         self.assertFalse(self.scratch.path(".local/bin/pi-daemon").exists())
 
-    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "no unix sockets here")
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"),
+                         "blocked: this host has no unix sockets")
     def test_install_refuses_beside_a_serving_socket(self):
         # The legacy daemon publishes a unix socket, which no `-f` test sees:
         # the endpoint probe has to reach it as a socket.
@@ -683,7 +684,8 @@ class InstallScriptTests(unittest.TestCase):
         self.assertTrue(newest.is_dir(), "the newest retained one stays")
         self.assertTrue(pathlib.Path(active).is_dir())
 
-    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "no unix sockets here")
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"),
+                         "blocked: this host has no unix sockets")
     def test_a_sweep_keeps_every_generation_while_a_daemon_serves(self):
         # A serving daemon may be running any retained generation, so none is
         # removed while one answers.

@@ -213,8 +213,14 @@ class AtomicFileTests(unittest.TestCase):
         state = AtomicStateFile(path)
         state.write_dict({"a": 1})
         self.assertEqual(state.read_dict(), {"a": 1})
-        if os.name != "nt":
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_a_state_file_is_private_where_modes_are_kept(self):
+        if os.name != "posix":
+            self.skipTest("POSIX file modes are not enforced here")
+        directory = tempfile.mkdtemp(dir=SCRATCH)
+        path = os.path.join(directory, "state.json")
+        AtomicStateFile(path).write_dict({"a": 1})
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
 
     def test_replacement_failure_is_raised_and_temp_removed(self):
         directory = tempfile.mkdtemp(dir=SCRATCH)
@@ -718,9 +724,12 @@ class EndpointTests(unittest.TestCase):
     def test_the_descriptor_names_its_instance_and_is_restricted(self):
         self.assertEqual(self.coordinates["instance"], self.app._instance)
         self.assertEqual(self.coordinates["srv"], "pi-daemon")
-        if os.name != "nt":
-            mode = os.stat(self.app.endpoint_path()).st_mode & 0o777
-            self.assertEqual(mode, 0o600)
+
+    def test_the_descriptor_file_is_private_where_modes_are_kept(self):
+        if os.name != "posix":
+            self.skipTest("POSIX file modes are not enforced here")
+        mode = os.stat(self.app.endpoint_path()).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
 
     def conversation(self):
         """One indexed conversation inside the store the app was told to

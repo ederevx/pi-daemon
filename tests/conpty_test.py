@@ -9,9 +9,11 @@ the file stays loadable from a Linux checkout.
 
 import os
 import select
+import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
@@ -151,6 +153,97 @@ class Win32InputModeFilterTest(unittest.TestCase):
         return _Win32InputModeFilter()
 
 
+class WindowsTerminateBudgetTests(unittest.TestCase):
+    """Two budgets: taskkill's own, then grace for the reap.
+
+    The cases drive the seam with mocks, except the already reaped child,
+    which is a real exited process; no case signals a live one.
+    """
+
+    def setUp(self):
+        import pi_platform
+        self.control = pi_platform.ProcessControl()
+
+    def test_an_already_reaped_child_is_not_killed_again(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait(30)
+        with mock.patch.object(self.control, "taskkill_tree") as killed:
+            self.control._windows_terminate(child.pid, 0.2, child)
+        # There is no root left to walk an ancestry from.
+        killed.assert_not_called()
+
+    def test_the_tree_kill_keeps_its_own_bound_and_grace_bounds_the_reap(self):
+        waited = []
+
+        class Child:
+            def poll(self):
+                return None
+
+            def wait(self, timeout):
+                waited.append(timeout)
+
+        with mock.patch.object(self.control, "taskkill_tree",
+                               return_value=True) as killed, \
+                mock.patch.object(self.control, "pid_alive",
+                                  return_value=False):
+            self.control._windows_terminate(4242, 0.75, Child())
+        self.assertEqual(killed.call_args, mock.call(4242),
+                         "taskkill keeps its own command bound")
+        self.assertEqual(waited, [0.75], "grace bounds the reap")
+
+    def test_a_taskkill_timeout_is_not_a_kill(self):
+        with mock.patch("subprocess.run",
+                        side_effect=subprocess.TimeoutExpired("taskkill", 5)):
+            self.assertFalse(self.control.taskkill_tree(4242),
+                             "a command cut short ended no tree")
+
+    def test_a_root_that_outlives_its_grace_is_an_error(self):
+        class Child:
+            def poll(self):
+                return None
+
+            def wait(self, timeout):
+                raise subprocess.TimeoutExpired("child", timeout)
+
+        with mock.patch.object(self.control, "taskkill_tree",
+                               return_value=True):
+            with self.assertRaises(OSError) as raised:
+                self.control._windows_terminate(4242, 0.01, Child())
+        self.assertEqual(str(raised.exception),
+                         "process 4242 survived termination")
+
+    def test_a_failed_tree_kill_whose_root_ended_is_reported_as_ended(self):
+        class Child:
+            def poll(self):
+                return None
+
+            def wait(self, timeout):
+                pass
+
+        with mock.patch.object(self.control, "taskkill_tree",
+                               return_value=False), \
+                mock.patch.object(self.control, "pid_alive",
+                                  return_value=False):
+            self.control._windows_terminate(4242, 0.2, Child())
+
+    def test_a_failed_tree_kill_with_a_live_root_is_an_error(self):
+        class Child:
+            def poll(self):
+                return None
+
+            def wait(self, timeout):
+                pass
+
+        with mock.patch.object(self.control, "taskkill_tree",
+                               return_value=False), \
+                mock.patch.object(self.control, "pid_alive",
+                                  return_value=True):
+            with self.assertRaises(OSError) as raised:
+                self.control._windows_terminate(4242, 0.2, Child())
+        self.assertEqual(str(raised.exception),
+                         "could not terminate process 4242")
+
+
 def main():
     if sys.platform != "win32":
         print("conpty: skipped (non-Windows)")
@@ -159,6 +252,7 @@ def main():
     suite = unittest.TestSuite([
         loader.loadTestsFromTestCase(WindowsConPtyTest),
         loader.loadTestsFromTestCase(Win32InputModeFilterTest),
+        loader.loadTestsFromTestCase(WindowsTerminateBudgetTests),
     ])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1

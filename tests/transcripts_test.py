@@ -274,7 +274,7 @@ class LiveSetTest(unittest.TestCase):
         try:
             os.symlink(outside, link)
         except (OSError, NotImplementedError):
-            self.skipTest("symlinks are unavailable here")
+            self.skipTest("blocked: this host cannot create symlinks")
         service = service_for(self.root)
         self.assertFalse(service.owns(link))
         reply = TranscriptOperations(service).handlers()["transcript-open"](
