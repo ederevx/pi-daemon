@@ -12,6 +12,7 @@ import {
 	chmodSync,
 	existsSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	statSync,
 	writeFileSync,
@@ -19,6 +20,7 @@ import {
 import { join } from "node:path";
 import {
 	scratchDir,
+	skip,
 	test,
 	assert,
 	assertEq,
@@ -66,6 +68,11 @@ const ALL_ENV = {
 
 function theme(): { fg: (color: string, text: string) => string } {
 	return { fg: (_color, text) => text };
+}
+
+/** A directory's entries in a stable order, for a no-stray-files check. */
+function sortedEntries(dir: string): string[] {
+	return readdirSync(dir).sort();
 }
 
 /** Minimal pi surface for the command-registration and e2e tests. */
@@ -188,7 +195,7 @@ test("settings: a failing custom UI reports why above the listing", async () => 
 	assertMatches(notices[0].message, /pi-daemon-settings:/);
 });
 
-test("settings: store writes atomically and preserves keys and mode", async () => {
+test("settings: store writes atomically and preserves keys", async () => {
 	const dir = join(scratchDir(), "store-agent");
 	mkdirSync(dir, { recursive: true });
 	const file = join(dir, "settings.json");
@@ -208,7 +215,51 @@ test("settings: store writes atomically and preserves keys and mode", async () =
 	assertEq(written.packages.join(","), "git:x", "packages preserved");
 	assertEq(written.piDaemon.offload.enabled, true, "nested key written");
 	assertEq(written.piDaemon.gcIdleHours, 42, "new key written");
+	assertEq(sortedEntries(dir).join(","), "settings.json",
+		"the sibling temporary is consumed, not left behind");
+});
+
+test("settings: store preserves the POSIX file mode", async () => {
+	if (process.platform === "win32") {
+		skip("POSIX owner/group/other mode bits");
+	}
+	const dir = join(scratchDir(), "mode-agent");
+	mkdirSync(dir, { recursive: true });
+	const file = join(dir, "settings.json");
+	writeFileSync(file, JSON.stringify({ theme: "dark" }) + "\n");
+	chmodSync(file, 0o600);
+	await withEnv({ PI_CODING_AGENT_DIR: dir }, () => {
+		new SettingsStore().set("gcIdleHours", 1);
+	});
 	assertEq(statSync(file).mode & 0o777, 0o600, "file mode preserved");
+});
+
+test("settings: an unreplaceable original is reported, never deleted", async () => {
+	if (process.platform !== "win32") {
+		skip("a POSIX directory owner replaces a read-only file");
+	}
+	const dir = join(scratchDir(), "readonly-agent");
+	mkdirSync(dir, { recursive: true });
+	const file = join(dir, "settings.json");
+	writeFileSync(file, JSON.stringify({ theme: "dark" }) + "\n");
+	chmodSync(file, 0o444);
+	try {
+		await withEnv({ PI_CODING_AGENT_DIR: dir }, () => {
+			let threw = false;
+			try {
+				new SettingsStore().set("gcIdleHours", 3);
+			} catch {
+				threw = true;
+			}
+			assert(threw, "the failed replacement is reported");
+			assertEq(JSON.parse(readFileSync(file, "utf8")).theme, "dark",
+				"the original survives the failure");
+			assertEq(sortedEntries(dir).join(","), "settings.json",
+				"the temporary is discarded");
+		});
+	} finally {
+		chmodSync(file, 0o600);
+	}
 });
 
 test("settings: a corrupt file is reported, never overwritten", async () => {
@@ -296,6 +347,20 @@ test("settings: reset removes only the piDaemon namespace", async () => {
 	const written = JSON.parse(readFileSync(file, "utf8"));
 	assertEq(written.piDaemon, undefined, "piDaemon namespace deleted");
 	assertEq(written.theme, "dark", "other top-level key preserved");
+});
+
+test("settings: reset preserves the POSIX file mode", async () => {
+	if (process.platform === "win32") {
+		skip("POSIX owner/group/other mode bits");
+	}
+	const dir = join(scratchDir(), "reset-mode-agent");
+	mkdirSync(dir, { recursive: true });
+	const file = join(dir, "settings.json");
+	writeFileSync(file, JSON.stringify({ piDaemon: {} }) + "\n");
+	chmodSync(file, 0o640);
+	await withEnv({ PI_CODING_AGENT_DIR: dir }, () => {
+		new SettingsStore().reset();
+	});
 	assertEq(statSync(file).mode & 0o777, 0o640, "file mode preserved");
 });
 

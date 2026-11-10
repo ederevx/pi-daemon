@@ -18,6 +18,7 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -100,23 +101,34 @@ export class SettingsStore {
 		return child;
 	}
 
-	/** Atomic write: a temp file in the target directory carrying the
-	 *  original's mode, renamed over the original (Windows unlink
-	 *  fallback), so a reader never sees a partial file. */
+	/** Atomic write: a uniquely named sibling temporary renamed over the
+	 *  original, so a reader never sees a partial file. A replacement that
+	 *  cannot land is reported and the temporary discarded: the original
+	 *  is never deleted to make room for a write that may still fail. */
 	private save(settings: Record<string, unknown>): void {
 		const file = this.path();
 		const dir = dirname(file);
 		mkdirSync(dir, { recursive: true });
-		const tmp = join(dir, `settings.json.tmp-${process.pid}`);
+		const tmp = join(dir,
+			`settings.json.tmp-${process.pid}-${randomUUID()}`);
 		const mode = existsSync(file) ? statSync(file).mode : undefined;
-		writeFileSync(tmp, JSON.stringify(settings, null, 2) + "\n");
-		if (mode !== undefined) chmodSync(tmp, mode);
 		try {
+			writeFileSync(tmp, JSON.stringify(settings, null, 2) + "\n",
+				{ flag: "wx" });
+			if (mode !== undefined) chmodSync(tmp, mode);
 			renameSync(tmp, file);
+		} catch (error) {
+			this.discard(tmp);
+			throw error;
+		}
+	}
+
+	/** Remove a temporary that never became the target. */
+	private discard(tmp: string): void {
+		try {
+			unlinkSync(tmp);
 		} catch {
-			// Windows cannot rename over an existing file.
-			if (existsSync(file)) unlinkSync(file);
-			renameSync(tmp, file);
+			// Nothing to remove: the write never created it.
 		}
 	}
 }
