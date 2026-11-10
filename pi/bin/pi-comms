@@ -115,13 +115,9 @@ def _identity(options):
 
 def _registered():
     """The daemon's name for this session, from its session registry."""
-    state = (os.environ.get("PI_DAEMON_STATE_DIR")
-             or os.path.join(os.environ.get("XDG_STATE_HOME")
-                             or os.path.join(os.path.expanduser("~"),
-                                             ".local", "state"),
-                             "pi-daemon"))
+    state = os.environ.get("PI_DAEMON_STATE_DIR")
     mine = os.environ.get("PI_SESSION_FILE")
-    if not mine:
+    if not state or not mine:
         return ""
     try:
         with open(os.path.join(state, "sessions", "sessions.json"),
