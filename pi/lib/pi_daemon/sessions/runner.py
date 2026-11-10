@@ -5,6 +5,8 @@ import signal
 import threading
 import time
 
+import pi_platform
+
 from ..wire import SPAWN_FAILED
 from .error import SessionError
 from .identity import ProcessIdentity
@@ -61,11 +63,11 @@ class SessionRunner:
             identity = ProcessIdentity.current(child.pid)
             child.identity = identity
             self._store.mark_started(record.id, child.pid, identity)
-            master = child.disown_master()
             # The queue runs in order, so a registration that timed out is
             # still ahead of the close that `_abandon` queues behind it;
-            # the relay is the only owner that closes the master.
-            self._relay.register(record.id, record.generation, master)
+            # the relay is the only owner that closes the child's I/O, and
+            # this runner stays the only owner of its process lifetime.
+            self._relay.register(record.id, record.generation, child)
             child.release()
         except (OSError, LookupError, TimeoutError) as exc:
             self._abandon(record.id, child)
@@ -279,17 +281,12 @@ class SessionRunner:
 
 
 def _end_group(pid, grace):
-    """End a group this instance did not father, only while it is identical."""
+    """End a tree this instance did not father, only while it is identical."""
     identity = ProcessIdentity.current(pid)
-    for number in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            group = os.getpgid(pid)
-            if group == os.getpgrp():
-                os.kill(pid, number)
-            else:
-                os.killpg(group, number)
-        except OSError:
-            return
+    control = pi_platform.ProcessControl()
+    for number in (signal.SIGTERM,
+                   getattr(signal, "SIGKILL", signal.SIGTERM)):
+        control.signal_tree(pid, number)
         deadline = time.monotonic() + grace
         while time.monotonic() < deadline:
             if ProcessIdentity.current(pid).classify(identity) != \

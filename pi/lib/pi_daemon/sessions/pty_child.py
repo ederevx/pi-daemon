@@ -3,14 +3,32 @@
 import errno
 import os
 import select
-import signal
 import time
+
+import pi_platform
 
 from .identity import ProcessIdentity
 
 
+def set_winsize(descriptor, cols, rows):
+    """Apply one window size to a PTY descriptor.
+
+    The child owns the live size and the backend applies the same call to
+    the slave at spawn, so one owner decides what a size change means.
+    """
+    import fcntl
+    import struct
+    import termios
+
+    try:
+        fcntl.ioctl(descriptor, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", int(rows), int(cols), 0, 0))
+    except OSError:
+        pass
+
+
 class PtyChild:
-    """The runner owns process lifetime here; nothing else signals a child."""
+    """The runner owns process lifetime here; the relay owns the I/O."""
 
     def __init__(self, process, master, gate, error, config):
         self.process = process
@@ -18,12 +36,15 @@ class PtyChild:
         self._gate = gate
         self._error = error
         self._config = config
+        self._control = pi_platform.ProcessControl()
         self._released = False
         self.identity = None
 
     @property
     def pid(self):
         return self.process.pid
+
+    # -- the runner's side -------------------------------------------------
 
     def release(self):
         """Let the helper exec, then confirm the target really started."""
@@ -73,46 +94,52 @@ class PtyChild:
         return self.process.wait(timeout)
 
     def terminate(self, grace=None):
-        """Signal the child's process tree, escalating only after a grace."""
-        grace = self._config.cancel_grace if grace is None else grace
-        self._signal(signal.SIGTERM)
-        try:
-            self.process.wait(grace)
-            return
-        except (OSError, Exception):
-            pass
-        self._signal(signal.SIGKILL)
+        """End the child's process tree; False when it survived the bound.
 
-    def _signal(self, number):
-        """A group is signalled only while it is still this child's."""
+        The identity is checked first, so a group is signalled only while
+        it is still this child's: a pid the host recycled is never hit.
+        """
+        grace = self._config.cancel_grace if grace is None else grace
         if self.process.returncode is not None:
-            return
+            return True
         if self.identity is not None and ProcessIdentity.current(self.pid) \
                 .classify(self.identity) != ProcessIdentity.SAME:
-            return
+            return False
         try:
-            if os.name == "nt":
-                if number == signal.SIGKILL:
-                    self.process.kill()
-                else:
-                    self.process.terminate()
-                return
-            group = os.getpgid(self.process.pid)
-            if group == os.getpgrp():
-                # The helper before its gate opens still shares our group.
-                self.process.send_signal(number)
-            else:
-                os.killpg(group, number)
-        except (OSError, ValueError):
-            try:
-                self.process.send_signal(number)
-            except (OSError, ValueError):
-                pass
+            self._control.terminate_tree(self.pid, grace,
+                                         process=self.process)
+        except OSError:
+            return False
+        return True
 
-    def disown_master(self):
-        """Hand the PTY to the relay; this child never closes it again."""
-        master, self.master = self.master, -1
-        return master
+    # -- the relay's side --------------------------------------------------
+
+    def output_handle(self):
+        return self.master
+
+    def output_valid(self):
+        """Whether the master descriptor is still open."""
+        try:
+            os.fstat(self.master)
+        except OSError:
+            return False
+        return True
+
+    def read_output(self, limit):
+        try:
+            return os.read(self.master, limit)
+        except OSError:
+            # EIO is the normal PTY read failure after the child exits.
+            return b""
+
+    def write_input(self, data):
+        try:
+            return os.write(self.master, data)
+        except OSError:
+            return 0
+
+    def set_winsize(self, cols, rows):
+        set_winsize(self.master, cols, rows)
 
     def close(self):
         self._close(self.master)

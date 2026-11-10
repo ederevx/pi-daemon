@@ -10,11 +10,12 @@ over the resulting socket is what makes the link up, not the tunnel.
 
 import os
 import secrets
-import signal
 import socket
 import subprocess
 import threading
 import time
+
+import pi_platform
 
 from .peer_tunnel_error import TunnelError
 
@@ -35,6 +36,9 @@ class PeerTunnel:
         self._readers = []
         self._local_port = 0
         self._stopping = threading.Event()
+        # One platform seam owns how the child is grouped and how its tree
+        # ends; this domain only decides when.
+        self._control = pi_platform.ProcessControl()
 
     def start(self, peer, cancel=None):
         """Launch the forward and wait for its readiness marker."""
@@ -53,7 +57,7 @@ class PeerTunnel:
                 process = self._spawn(
                     argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, shell=False,
-                    start_new_session=True)
+                    **self._control.group_kwargs())
             except (OSError, ValueError) as failure:
                 raise TunnelError(f"spawn-failed: {failure}") from None
             self._process = process
@@ -133,28 +137,14 @@ class PeerTunnel:
         self._readers = []
 
     def _terminate(self, process):
-        if process.poll() is None:
-            self._signal_group(process, signal.SIGTERM)
-            try:
-                process.wait(self._config.stop_grace)
-            except subprocess.TimeoutExpired:
-                self._signal_group(process, signal.SIGKILL)
-                try:
-                    process.wait(self._config.stop_grace)
-                except subprocess.TimeoutExpired:
-                    return False
+        """End the tunnel's tree and reap it; False when it survived."""
         try:
-            process.wait(0)
-        except subprocess.TimeoutExpired:
+            self._control.terminate_tree(process.pid,
+                                         self._config.stop_grace,
+                                         process=process)
+        except OSError:
             return False
         return True
-
-    @staticmethod
-    def _signal_group(process, number):
-        try:
-            os.killpg(os.getpgid(process.pid), number)
-        except OSError:
-            pass
 
     def _free_port(self):
         """Reserve an ephemeral port, then release it for the child to bind."""

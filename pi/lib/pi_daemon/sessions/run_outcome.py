@@ -18,6 +18,17 @@ SETTLED = "settled"
 CAUSES = ("daemon", "reload", "signal", "exit", "unknown", "abort", "lost")
 
 
+# The names a signalled exit is reported under. Windows knows only a handful
+# of signal numbers, and a run's ending must read the same on every platform,
+# so the POSIX names are spelled out here.
+POSIX_SIGNALS = {
+    1: "SIGHUP", 2: "SIGINT", 3: "SIGQUIT", 4: "SIGILL", 5: "SIGTRAP",
+    6: "SIGABRT", 7: "SIGBUS", 8: "SIGFPE", 9: "SIGKILL", 10: "SIGUSR1",
+    11: "SIGSEGV", 12: "SIGUSR2", 13: "SIGPIPE", 14: "SIGALRM",
+    15: "SIGTERM",
+}
+
+
 class RunOutcome:
     """A seal is a pure projection of the record and how the process ended."""
 
@@ -68,5 +79,5 @@ def _abnormal(returncode):
         try:
             return True, signal.Signals(-returncode).name
         except ValueError:
-            return True, None
+            return True, POSIX_SIGNALS.get(-returncode)
     return returncode != 0, None

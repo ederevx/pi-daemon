@@ -1,7 +1,6 @@
 """Ticket execution: one child, one output worker, one completion boundary."""
 
 import os
-import signal
 import subprocess
 import threading
 import time
@@ -131,19 +130,12 @@ class TicketRunner:
         args = self._process.shell_command(
             snapshot["command"], (env or {}).get("PI_SHELL")
             or self._config.shell or None)
-        if os.name == "nt":
-            flags = subprocess.CREATE_NEW_PROCESS_GROUP
-            session = False
-        else:
-            flags = 0
-            session = True
         environment = dict(os.environ)
         environment.update(env or {})
         return subprocess.Popen(
             args, cwd=cwd, env=environment, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            start_new_session=session, creationflags=flags,
-        )
+            **self._process.group_kwargs())
 
     def _drain(self, ticket_id, pipe):
         try:
@@ -166,8 +158,7 @@ class TicketRunner:
         try:
             exit_code = child.wait(timeout=timeout if timeout > 0 else None)
         except subprocess.TimeoutExpired:
-            self._terminate(child)
-            outcome, error = FAILED, "timed out"
+            outcome, error = FAILED, self._timeout_error(child)
         except OSError as exc:
             outcome, error = FAILED, str(exc)
         drain = self._drains.get(ticket_id)
@@ -199,24 +190,14 @@ class TicketRunner:
             event.set()
 
     def _terminate(self, child):
-        self._signal(child, signal.SIGTERM)
-        try:
-            child.wait(self._config.cancel_grace)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        except OSError:
-            return
-        self._signal(child, signal.SIGKILL)
+        """End the ticket's tree; the record names any ending that failed."""
+        self._process.terminate_tree(child.pid, self._config.cancel_grace,
+                                     process=child)
 
-    def _signal(self, child, number):
+    def _timeout_error(self, child):
+        """The record's error for a run that outstayed its timeout."""
         try:
-            if os.name == "nt":
-                child.kill() if number == signal.SIGKILL else child.terminate()
-                return
-            os.killpg(os.getpgid(child.pid), number)
-        except OSError:
-            try:
-                child.kill()
-            except OSError:
-                pass
+            self._terminate(child)
+        except OSError as exc:
+            return "timed out; %s" % (exc,)
+        return "timed out"

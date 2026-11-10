@@ -16,6 +16,13 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
+import isolation
+
+# Every root this module probes belongs to its own scratch tree, never
+# the host's live daemon.
+ISOLATION = isolation.ScratchEnvironment()
+ISOLATION.apply()
+
 SCRATCH = tempfile.mkdtemp(
     prefix="pi-tasks-", dir=os.path.expanduser("~/tmp"))
 os.environ["PI_DAEMON_STATE_DIR"] = os.path.join(SCRATCH, "state")
@@ -34,6 +41,7 @@ from pi_daemon.wire import SPAWN_FAILED, TICKET_RUNNING, TOO_BUSY
 
 
 def tearDownModule():
+    ISOLATION.cleanup()
     shutil.rmtree(SCRATCH, ignore_errors=True)
 
 

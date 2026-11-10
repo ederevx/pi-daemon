@@ -1,6 +1,6 @@
-"""Process identity: a PID is only evidence with its boot and start tick."""
+"""Process identity: a PID is only evidence with its boot and start token."""
 
-import os
+import pi_platform
 
 
 class ProcessIdentity:
@@ -21,7 +21,8 @@ class ProcessIdentity:
         pid = int(pid or 0)
         if pid <= 0:
             return cls(0)
-        return cls(pid, _boot_id(), _start_tick(pid))
+        return cls(pid, _boot_id(),
+                   pi_platform.ProcessControl().process_start_token(pid))
 
     @classmethod
     def from_dict(cls, data):
@@ -43,23 +44,11 @@ class ProcessIdentity:
             return self.GONE
         if self.start is not None and expected.start is not None:
             return self.SAME if self.start == expected.start else self.GONE
-        if not _alive(self.pid):
+        # Without a token to compare, a portable liveness probe is all
+        # that is left, and it never reports a pid it cannot prove gone.
+        if not pi_platform.ProcessControl().pid_alive(self.pid):
             return self.GONE
         return self.UNKNOWN
-
-
-def _alive(pid):
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
 
 
 def _boot_id():
@@ -70,17 +59,3 @@ def _boot_id():
             return handle.read().strip() or None
     except OSError:
         return None
-
-
-def _start_tick(pid):
-    """Field 22 of /proc/<pid>/stat, parsed after the final ')'."""
-    try:
-        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
-            text = handle.read()
-    except OSError:
-        return None
-    closing = text.rfind(")")
-    if closing < 0:
-        return None
-    fields = text[closing + 2:].split()
-    return fields[19] if len(fields) > 19 else None

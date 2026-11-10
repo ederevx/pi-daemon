@@ -23,14 +23,205 @@ import json
 import os
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
 
-# A repaint nudge waits this long between toggling the PTY size and
-# restoring it, so the child processes the intermediate size change
-# before the real one.
-_REPAINT_TICK = 0.05
+# Win32 facts a process probe needs: the access right that lets a handle
+# be queried without the right to end the process, the exit code a
+# running process reports, and the error a denied OpenProcess raises.
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+_ERROR_ACCESS_DENIED = 5
+
+
+# -- private files ---------------------------------------------------------
+
+# The two well-known identities every Windows file already carries and no
+# owner can remove: the operating system itself and the local administrators.
+# OWNER RIGHTS (S-1-3-4) belongs here too: an entry carrying it applies to
+# the owner and to nobody else, which is what the file already promises.
+_PRIVATE_SIDS = ("S-1-5-18", "S-1-5-32-544", "S-1-3-4")
+
+
+def private_file_problem(path):
+    """Why this file is not a private credential, and its stat.
+
+    A credential is one regular file only its owner may read. POSIX says
+    that with the inode's owner and mode bits; Windows keeps no such bits,
+    so its access control list is read instead - every entry that grants
+    access must name this user, SYSTEM, or Administrators - and a reparse
+    point is refused, because such a path opens something other than the
+    file the check just looked at.
+
+    Returns (None, info) for a private file and (reason, info) otherwise;
+    info is the stat the caller compares against the descriptor it opens.
+    """
+    import stat
+
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return ("an absolute path is required", None)
+    try:
+        info = os.lstat(path)
+    except OSError as failure:
+        return ("the file is unreadable: %s" % failure, None)
+    if not stat.S_ISREG(info.st_mode):
+        return ("a regular file is required", info)
+    if os.name != "nt":
+        if info.st_uid != os.geteuid():
+            return ("a file of mine is required", info)
+        if info.st_mode & 0o077:
+            return ("the file is readable by others", info)
+        return (None, info)
+    try:
+        return (_windows_file_problem(path, info), info)
+    except OSError as failure:
+        return ("the access control list is unreadable: %s" % failure, info)
+
+
+def _windows_file_problem(path, info):
+    FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+    if getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT:
+        return "a reparse point is not a credential"
+    mine = _windows_current_sid()
+    for sid in _windows_grants(path):
+        if sid != mine and sid not in _PRIVATE_SIDS:
+            return "the file is readable by others"
+    return None
+
+
+def _windows_current_sid():
+    """The SID text of the user this process runs as."""
+    import ctypes
+    from ctypes import wintypes
+
+    TOKEN_QUERY = 0x0008
+    TOKEN_USER = 1
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                          ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(),
+                                     TOKEN_QUERY, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        needed = wintypes.DWORD(0)
+        advapi32.GetTokenInformation(token, TOKEN_USER, None, 0,
+                                     ctypes.byref(needed))
+        buffer = ctypes.create_string_buffer(max(1, needed.value))
+        if not advapi32.GetTokenInformation(token, TOKEN_USER, buffer,
+                                            needed.value,
+                                            ctypes.byref(needed)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        # TOKEN_USER begins with SID_AND_ATTRIBUTES, whose first field is the
+        # SID pointer: the same offset on both word sizes.
+        sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+        return _sid_text(sid)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _sid_text(pointer):
+    """A SID's string form, allocated and released by the two APIs."""
+    import ctypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+    advapi32.ConvertSidToStringSidW.restype = ctypes.c_int
+    text = ctypes.c_wchar_p()
+    if not advapi32.ConvertSidToStringSidW(pointer, ctypes.byref(text)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return text.value
+    finally:
+        kernel32.LocalFree(text)
+
+
+def _windows_grants(path):
+    """The SIDs the file's access-allowed entries grant access to.
+
+    A missing DACL means everyone, and an object-specific allow entry
+    grants rights this mask read cannot enumerate, so both answer as the
+    wildcard that no check accepts.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    OWNER = 0x00000001
+    DACL = 0x00000004
+    ACCESS_ALLOWED_ACE_TYPE = 0
+    ACCESS_ALLOWED_OBJECT_ACE_TYPE = 5
+    ACL_SIZE_INFORMATION = 2
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+    class AclSize(ctypes.Structure):
+        _fields_ = [("AceCount", wintypes.DWORD),
+                    ("AclBytesInUse", wintypes.DWORD),
+                    ("AclBytesFree", wintypes.DWORD)]
+
+    class AceHeader(ctypes.Structure):
+        _fields_ = [("AceType", ctypes.c_ubyte),
+                    ("AceFlags", ctypes.c_ubyte),
+                    ("AceSize", wintypes.WORD)]
+
+    advapi32.GetFileSecurityW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    advapi32.GetFileSecurityW.restype = wintypes.BOOL
+    advapi32.GetSecurityDescriptorDacl.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)]
+    advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+    advapi32.GetAclInformation.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_int]
+    advapi32.GetAclInformation.restype = wintypes.BOOL
+    advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD,
+                                ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.GetAce.restype = wintypes.BOOL
+
+    needed = wintypes.DWORD(0)
+    advapi32.GetFileSecurityW(path, OWNER | DACL, None, 0,
+                              ctypes.byref(needed))
+    if not needed.value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    buffer = ctypes.create_string_buffer(needed.value)
+    if not advapi32.GetFileSecurityW(path, OWNER | DACL, buffer, needed.value,
+                                     ctypes.byref(needed)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    present = wintypes.BOOL(0)
+    defaulted = wintypes.BOOL(0)
+    acl = ctypes.c_void_p()
+    if not advapi32.GetSecurityDescriptorDacl(
+            buffer, ctypes.byref(present), ctypes.byref(acl),
+            ctypes.byref(defaulted)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not present.value or not acl.value:
+        return ("*",)
+    size = AclSize()
+    if not advapi32.GetAclInformation(acl, ctypes.byref(size),
+                                      ctypes.sizeof(size),
+                                      ACL_SIZE_INFORMATION):
+        raise ctypes.WinError(ctypes.get_last_error())
+    grants = []
+    for index in range(size.AceCount):
+        entry = ctypes.c_void_p()
+        if not advapi32.GetAce(acl, index, ctypes.byref(entry)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        header = ctypes.cast(entry, ctypes.POINTER(AceHeader)).contents
+        if header.AceType == ACCESS_ALLOWED_OBJECT_ACE_TYPE:
+            grants.append("*")
+            continue
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE:
+            continue
+        # ACCESS_ALLOWED_ACE: the mask word, then the SID.
+        grants.append(_sid_text(ctypes.c_void_p(entry.value + 8)))
+    return grants
 
 
 def send_json(sock, obj):
@@ -344,43 +535,68 @@ class ProcessControl:
         except OSError:
             return True
 
+    def _win_process(self, pid):
+        """kernel32 with declared prototypes, and an open query handle.
+
+        ctypes truncates a handle to a C int unless restype says
+        otherwise, and a truncated handle names no process; every call
+        this class makes declares both sides. The handle is None with the
+        pending Win32 error beside it when the pid names no process this
+        account may query.
+        """
+        import ctypes
+        import ctypes.wintypes as wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                         wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        if int(pid or 0) <= 0:
+            return kernel32, None, None
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION,
+                                      False, int(pid))
+        return kernel32, handle, None if handle else ctypes.get_last_error()
+
     def _win_pid_alive(self, pid):
         """Windows liveness through a process handle.
 
         os.kill(pid, 0) is unusable here: on Windows it calls
         TerminateProcess rather than probing (Python issue 14480). A
-        failed OpenProcess means the pid names no live process; a
-        successful one is decided by GetExitCodeProcess, where
-        STILL_ACTIVE means alive and any other code means reaped. pids
-        at or below zero are never valid Windows process ids.
+        successful handle is decided by GetExitCodeProcess, where
+        STILL_ACTIVE means alive and any other code means reaped. A
+        denied handle names a process that exists and is not ours to
+        query, so only a pid that names nothing proves it is gone.
         """
         import ctypes
-        if pid <= 0:
-            return False
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        handle = kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        import ctypes.wintypes as wintypes
+        kernel32, handle, error = self._win_process(pid)
         if not handle:
-            return False
+            return error == _ERROR_ACCESS_DENIED
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
         try:
-            code = ctypes.c_ulong()
-            if not kernel32.GetExitCodeProcess(handle,
-                                               ctypes.byref(code)):
-                return False
-            return code.value == STILL_ACTIVE
+            code = wintypes.DWORD(0)
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == _STILL_ACTIVE
         finally:
             kernel32.CloseHandle(handle)
 
     def process_start_token(self, pid):
-        """A token identifying this exact process incarnation: the
-        starttime field (ticks since boot) of /proc/<pid>/stat. A bare
-        signal probe cannot tell a recycled pid from the original one;
-        comparing recorded tokens can. Returns None where the start
-        time is unavailable (Windows has no /proc)."""
+        """A token identifying this exact process incarnation.
+
+        POSIX reads the starttime field (ticks since boot) of
+        /proc/<pid>/stat. Windows reads the creation time GetProcessTimes
+        reports and serializes it as decimal 100 ns ticks, so no
+        precision is lost between the recorded and the compared value. A
+        bare signal probe cannot tell a recycled pid from the original
+        one; comparing recorded tokens can. Returns None where the start
+        time is unavailable.
+        """
         if self.platform.startswith("win"):
-            return None
+            return self._win_start_token(pid)
         try:
             with open("/proc/%d/stat" % pid) as fh:
                 # Drop "pid (comm) "; the remaining fields start at 3,
@@ -388,6 +604,31 @@ class ProcessControl:
                 return fh.read().rsplit(")", 1)[1].split()[19]
         except (OSError, IndexError):
             return None
+
+    def _win_start_token(self, pid):
+        """pid's creation time as decimal ticks, else None."""
+        import ctypes
+        import ctypes.wintypes as wintypes
+        kernel32, handle, _error = self._win_process(pid)
+        if not handle:
+            return None
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME)]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        created, exited, kernel, user = (wintypes.FILETIME()
+                                         for _name in range(4))
+        try:
+            if not kernel32.GetProcessTimes(
+                    handle, ctypes.byref(created), ctypes.byref(exited),
+                    ctypes.byref(kernel), ctypes.byref(user)):
+                return None
+            return str((created.dwHighDateTime << 32)
+                       | created.dwLowDateTime)
+        finally:
+            kernel32.CloseHandle(handle)
 
     def pid_matches_token(self, pid, token):
         """True while pid is still the process incarnation the token was
@@ -399,11 +640,45 @@ class ProcessControl:
             return True
         return str(current) == str(token)
 
-    def terminate_tree(self, pid, grace):
+    def terminate_tree(self, pid, grace, process=None):
+        """End a process and its descendants, waiting at most grace.
+
+        `process` is the subprocess child this pid belongs to, when there
+        is one: its own poll/wait is the only reaper that may observe it,
+        because a waitpid here would steal the exit status the owner
+        still needs. A tree that survives the bound, or a termination
+        command that could not run, raises OSError: a caller records a
+        failed ending rather than claiming one that did not happen.
+        """
         if self.platform.startswith("win"):
-            self._windows_terminate(pid)
+            self._windows_terminate(pid, grace, process)
         else:
-            self._posix_terminate(pid, grace)
+            self._posix_terminate(pid, grace, process)
+
+    def signal_tree(self, pid, number):
+        """One signal to one process tree: the single group owner.
+
+        Windows has no signal a group understands, and Popen.kill() and
+        terminate() end one process only, so the tree kill is the whole
+        meaning the platform carries.
+        """
+        if self.platform.startswith("win"):
+            self.taskkill_tree(pid)
+            return
+        try:
+            group = os.getpgid(pid)
+            # A child that has not reached its own session yet still shares
+            # ours: signalling that group would take the daemon down with
+            # the child it meant to end, so only a foreign group is signalled.
+            if group == os.getpgrp():
+                os.kill(pid, number)
+            else:
+                os.killpg(group, number)
+        except OSError:
+            try:
+                os.kill(pid, number)
+            except OSError:
+                pass
 
     def signal_winch(self, pid):
         if self.platform.startswith("win"):
@@ -414,22 +689,12 @@ class ProcessControl:
             pass
 
     def signal_term(self, pid):
-        if self.platform.startswith("win"):
-            self._windows_terminate(pid)
-            return
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except OSError:
-            pass
+        self.signal_tree(pid, signal.SIGTERM)
 
     def signal_kill(self, pid):
-        if self.platform.startswith("win"):
-            self._windows_terminate(pid)
-            return
-        try:
-            os.killpg(pid, signal.SIGKILL)
-        except OSError:
-            pass
+        # Windows has no SIGKILL attribute at all; its tree kill ignores
+        # which of the two the caller asked for.
+        self.signal_tree(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
     def resume_command(self):
         """argv that resumes the latest pi conversation, else starts one.
@@ -540,23 +805,28 @@ class ProcessControl:
                     getattr(subprocess, "CREATE_NO_WINDOW", 0)}
         return {"start_new_session": True}
 
-    def _posix_terminate(self, pid, grace):
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except OSError:
-            pass
-        deadline = time.time() + grace
+    def _posix_terminate(self, pid, grace, process=None):
+        self.signal_term(pid)
+        if self._wait_gone(pid, grace, process):
+            return
+        self.signal_kill(pid)
+        if not self._wait_gone(pid, grace, process):
+            raise OSError("process %d survived termination" % pid)
+
+    def _wait_gone(self, pid, grace, process=None):
+        """Wait out the grace bound; True as soon as the pid is gone."""
+        deadline = time.time() + max(0.0, grace)
         while time.time() < deadline:
-            try:
-                if os.waitpid(pid, os.WNOHANG)[0] == pid:
-                    return
-            except ChildProcessError:
-                return
+            if not self._alive(pid, process):
+                return True
             time.sleep(0.1)
-        try:
-            os.killpg(pid, signal.SIGKILL)
-        except OSError:
-            pass
+        return not self._alive(pid, process)
+
+    def _alive(self, pid, process=None):
+        """Liveness of a pid, or of the child that pid belongs to."""
+        if process is not None:
+            return process.poll() is None
+        return self.pid_alive(pid)
 
     def windowless_python(self, interpreter=None):
         """Map an interpreter to its GUI-subsystem twin on Windows.
@@ -614,39 +884,80 @@ class ProcessControl:
 
     def _windows_wait_exit(self, pid):
         import ctypes
+        from ctypes import wintypes
         SYNCHRONIZE = 0x00100000
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # ctypes defaults a foreign return value to C int, which truncates a
+        # 64-bit handle on the way in and out: every call here names its
+        # types so the handle survives the round trip.
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                         wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE,
+                                                 wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
         handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
         if not handle:
             return
         try:
-            kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+            if kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)                     not in (0x00000000, 0x00000080):
+                _raise_last_error("WaitForSingleObject")
         finally:
             kernel32.CloseHandle(handle)
 
-    def _windows_terminate(self, pid):
-        self.taskkill_tree(pid)
+    def _windows_terminate(self, pid, grace, process=None):
+        """taskkill the tree while its root still exists, then reap it.
+
+        /T walks the ancestry it finds, so it must run before the root is
+        signalled: killing the root first severs the only evidence of its
+        descendants. Windows cannot prove ownership of a descendant that
+        was reparented after an intermediate ancestor exited; that
+        stronger guarantee would need a job object, and /T does not carry
+        it. The grace bounds the wait for the process to disappear;
+        taskkill keeps the execution bound its own call declares, because
+        a command killed mid-run ends nothing.
+        """
+        killed = self.taskkill_tree(pid)
+        if process is not None:
+            try:
+                process.wait(max(0.0, grace))
+            except subprocess.TimeoutExpired:
+                raise OSError("process %d survived termination" % pid)
+            return
+        if not killed and self.pid_alive(pid):
+            raise OSError("could not terminate process %d" % pid)
 
     def taskkill_tree(self, pid, timeout=5):
         """Windows tree kill: one taskkill /T /F owner for the daemon's
-        signal paths and the ConPTY backend's child teardown."""
-        import subprocess
+        signal paths and the ConPTY backend's child teardown. True when
+        taskkill ran and reported that it ended the tree."""
         try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           stdin=subprocess.DEVNULL,
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL,
-                           creationflags=getattr(subprocess,
-                                                  "CREATE_NO_WINDOW", 0),
-                           timeout=timeout)
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=timeout)
         except (OSError, subprocess.SubprocessError):
-            pass
+            return False
+        return result.returncode == 0
 
 
 class PtyChild:
-    """One child on a pseudo-terminal, owned by a PtyBackend."""
+    """One child on a pseudo-terminal: the only owner of its own I/O.
+
+    The relay reads, writes and resizes through these operations; the
+    runner keeps the process itself, so `release` is what lets a recorded
+    child start and `wait` is the one reaper of its exit status.
+    """
+
+    pid = 0
 
     def output_handle(self):
+        """A descriptor the relay's read loop can select on."""
         raise NotImplementedError
 
     def read_output(self, limit):
@@ -658,199 +969,24 @@ class PtyChild:
     def set_winsize(self, cols, rows):
         raise NotImplementedError
 
-    def get_winsize(self):
-        return (0, 0)
-
-    def signal_winch(self):
-        """Ask the child to repaint.
-
-        A TUI redraws only when its winsize really changes, so an
-        implementation must force one even when the requested size
-        equals the current size: POSIX toggles the PTY size around
-        SIGWINCH, Windows toggles the pseudoconsole size.
-        """
-
-    def exit_abnormal(self, status):
-        """Whether a reaped status is an abnormal death.
-
-        The child owns its exit-status encoding: a POSIX waitpid status
-        versus a raw Windows exit code. A nonzero code is abnormal on
-        both; PosixPtyChild refines this with the wait-status macros so
-        signal deaths stay distinct from clean quits.
-        """
-        return bool(status)
-
-    def exit_outcome(self, status):
-        """(signalled, exit_code) for a reaped status, None where unknown.
-
-        The run-outcome record needs the signal bit separately from the
-        code: a signal death and a clean exit 0 both carry a small
-        status, and only the decoded form tells them apart.
-        """
-        return (False, status)
-
-    def wait_nohang(self):
+    def release(self):
+        """Let a child spawned gated or suspended start running."""
         raise NotImplementedError
 
-    def kill_tree(self, grace):
+    def poll(self):
+        """Its exit code once it is reaped, else None."""
+        raise NotImplementedError
+
+    def wait(self, timeout=None):
+        """Reap it and return its subprocess-style exit code."""
+        raise NotImplementedError
+
+    def terminate(self, grace=None):
+        """End its process tree; False when it survived the bound."""
         raise NotImplementedError
 
     def close(self):
-        pass
-
-
-class PosixPtyChild(PtyChild):
-    """POSIX openpty master: direct fd I/O plus waitpid reap."""
-
-    def __init__(self, pid, master_fd, control=None):
-        self.pid = pid
-        self.master_fd = master_fd
-        self.control = control if control is not None else ProcessControl()
-
-    def output_handle(self):
-        return self.master_fd
-
-    def read_output(self, limit):
-        try:
-            return os.read(self.master_fd, limit)
-        except OSError:
-            # EIO is the normal PTY read failure after child exit.
-            return b""
-
-    def write_input(self, data):
-        try:
-            return os.write(self.master_fd, data)
-        except OSError:
-            return 0
-
-    def set_winsize(self, cols, rows):
-        import fcntl
-        import struct
-        import termios
-        try:
-            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ,
-                        struct.pack("HHHH", rows, cols, 0, 0))
-        except OSError:
-            pass
-
-    def get_winsize(self):
-        import fcntl
-        import struct
-        import termios
-        try:
-            pack = fcntl.ioctl(self.master_fd, termios.TIOCGWINSZ,
-                               struct.pack("HHHH", 0, 0, 0, 0))
-            rows, cols = struct.unpack("HHHH", pack)[:2]
-        except OSError:
-            rows, cols = 0, 0
-        return (rows, cols)
-
-    def signal_winch(self):
-        # A bare SIGWINCH is not enough: Node emits the tty resize event
-        # that drives pi's repaint only when the winsize really changes,
-        # so a resize or attach at the current size would stay silent.
-        # Toggle one row, pause, then restore the real size, so the child
-        # always sees a change and redraws its whole frame. The Windows
-        # child does the same through the pseudoconsole, so the daemon
-        # carries no OS branch for the repaint.
-        rows, cols = self.get_winsize()
-        if rows <= 0 or cols <= 0:
-            # The winsize is unknown (ioctl failed): nothing to toggle.
-            self.control.signal_winch(self.pid)
-            return
-        if rows > 1:
-            self.set_winsize(cols, rows - 1)
-        else:
-            self.set_winsize(max(cols - 1, 1), rows)
-        self.control.signal_winch(self.pid)
-        time.sleep(_REPAINT_TICK)
-        self.set_winsize(cols, rows)
-        self.control.signal_winch(self.pid)
-
-    def exit_abnormal(self, status):
-        if status and os.WIFSIGNALED(status):
-            return True
-        if status and os.WIFEXITED(status):
-            return os.WEXITSTATUS(status) != 0
-        return False
-
-    def exit_outcome(self, status):
-        if status and os.WIFSIGNALED(status):
-            return (True, None)
-        if status and os.WIFEXITED(status):
-            return (False, os.WEXITSTATUS(status))
-        return (False, None)
-
-    def wait_nohang(self):
-        try:
-            reaped = os.waitpid(self.pid, os.WNOHANG)
-        except ChildProcessError:
-            return (True, 0)
-        if reaped[0] == self.pid:
-            return (True, reaped[1])
-        return (False, 0)
-
-    def kill_tree(self, grace):
-        self.control.terminate_tree(self.pid, grace)
-
-    def close(self):
-        try:
-            os.close(self.master_fd)
-        except OSError:
-            pass
-
-
-class PosixPtyBackend:
-    """openpty + fork + setsid/TIOCSCTTY behind the PtyBackend interface."""
-
-    name = "posix"
-
-    def __init__(self, control=None):
-        self.control = control if control is not None else ProcessControl()
-
-    def spawn(self, argv, cwd, env, cols, rows):
-        import fcntl
-        import termios
-        master, slave = os.openpty()
-        try:
-            fcntl.ioctl(slave, termios.TIOCSWINSZ,
-                        _winsize_pack(cols, rows))
-        except OSError:
-            pass
-        pid = os.fork()
-        if pid == 0:
-            self._exec_child(argv, cwd, env, slave, cols, rows)
-        os.close(slave)
-        return PosixPtyChild(pid, master, self.control)
-
-    def _exec_child(self, argv, cwd, env, slave, cols, rows):
-        import fcntl
-        import resource
-        import termios
-        try:
-            os.setsid()
-            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
-            os.dup2(slave, 0)
-            os.dup2(slave, 1)
-            os.dup2(slave, 2)
-            os.chdir(cwd)
-            maxfd = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-            if maxfd == resource.RLIM_INFINITY or maxfd > 65536:
-                maxfd = 65536
-            os.closerange(3, maxfd)
-            os.execvpe(argv[0], argv, env)
-        except Exception as exc:
-            try:
-                sys.stderr.write("pi-daemon: exec failed: %s\n" % (exc,))
-            except Exception:
-                pass
-            os._exit(127)
-
-
-def _winsize_pack(cols, rows):
-    import struct
-    return struct.pack("HHHH", rows, cols, 0, 0)
-
+        """Close this child's own I/O; it never signals the process."""
 
 class TerminalMode:
     """Raw terminal + resize seam for the pi-rc attach bridge.
@@ -1037,13 +1173,16 @@ class PosixTerminal(TerminalMode):
             pass
 
 
-def select_pty_backend(platform=None):
-    """The PTY backend for this platform: POSIX, or lazy ConPTY."""
+def select_pty_backend(config=None, platform=None):
+    """The one PTY backend for this platform: the gated POSIX helper, or
+    the lazy ConPTY one. Both are selected here, so no domain names a
+    platform-specific implementation of its own."""
     platform = sys.platform if platform is None else platform
     if platform.startswith("win"):
         from pi_conpty import WindowsPtyBackend
         return WindowsPtyBackend()
-    return PosixPtyBackend()
+    from pi_daemon.sessions.pty_backend import PosixPtyBackend
+    return PosixPtyBackend(config)
 
 
 def select_terminal_mode(platform=None):
