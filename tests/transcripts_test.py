@@ -18,6 +18,13 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
+import isolation
+
+# Every root this module probes belongs to its own scratch tree, never
+# the host's live daemon.
+ISOLATION = isolation.ScratchEnvironment()
+ISOLATION.apply()
+
 from pi_daemon.config import ServiceConfig
 from pi_daemon.sessions.store import SessionStore
 from pi_daemon.transcripts.operations import TranscriptOperations
@@ -41,6 +48,7 @@ SCRATCH = tempfile.mkdtemp(prefix="pi-transcripts-")
 
 
 def tearDownModule():
+    ISOLATION.cleanup()
     shutil.rmtree(SCRATCH, ignore_errors=True)
 
 

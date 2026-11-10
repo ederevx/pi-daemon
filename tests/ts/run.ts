@@ -9,24 +9,28 @@
  * install (see repo .gitignore). Scratch lives under ~/tmp.
  */
 
-import { registry, cleanupScratch } from "./harness.ts";
+import { registry, cleanupScratch, isolateHost } from "./harness.ts";
 
-import "./daemon.test.ts";
-import "./completion.test.ts";
-import "./offload.test.ts";
-import "./offload-policy.test.ts";
-import "./pre-daemon.test.ts";
-import "./remote-guard.test.ts";
-import "./settings.test.ts";
-import "./provisioning.test.ts";
-import "./discovery.test.ts";
-import "./comms-tools.test.ts";
-import "./settings-reconciler.test.ts";
-import "./transcript.test.ts";
-import "./sessions.test.ts";
+// Before any test module loads a product module: every root, endpoint and
+// session identity belongs to this run's scratch tree, never the host's.
+isolateHost();
+
+await import("./daemon.test.ts");
+await import("./completion.test.ts");
+await import("./offload.test.ts");
+await import("./offload-policy.test.ts");
+await import("./pre-daemon.test.ts");
+await import("./remote-guard.test.ts");
+await import("./settings.test.ts");
+await import("./provisioning.test.ts");
+await import("./discovery.test.ts");
+await import("./comms-tools.test.ts");
+await import("./settings-reconciler.test.ts");
+await import("./transcript.test.ts");
+await import("./sessions.test.ts");
 // Isolated from the process-wide state each test needs: this file drives
 // its own SharedState instances, and its last test stops publishing.
-import "./session-state.test.ts";
+await import("./session-state.test.ts");
 
 await registry.runAll();
 cleanupScratch();

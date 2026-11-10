@@ -5,7 +5,7 @@
  *   node --experimental-strip-types --experimental-transform-types tests/ts/run.ts
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -16,10 +16,14 @@ interface TestCase {
   fn: TestFn;
 }
 
+/** Thrown by `skip`, so a host without the property still reports it. */
+class Skipped extends Error {}
+
 class TestRegistry {
   private readonly cases: TestCase[] = [];
   private passed = 0;
   private readonly failures: string[] = [];
+  private readonly skipped: string[] = [];
 
   register(name: string, fn: TestFn): void {
     this.cases.push({ name, fn });
@@ -32,6 +36,11 @@ class TestRegistry {
         this.passed++;
         console.log(`  ok   ${testCase.name}`);
       } catch (error) {
+        if (error instanceof Skipped) {
+          this.skipped.push(`${testCase.name}: ${error.message}`);
+          console.log(`  skip ${testCase.name} (${error.message})`);
+          continue;
+        }
         this.failures.push(testCase.name);
         console.error(`  FAIL ${testCase.name}`);
         console.error(
@@ -39,14 +48,24 @@ class TestRegistry {
         );
       }
     }
-    console.log(`\n${this.passed}/${this.cases.length} passed`);
+    console.log(
+      `\n${this.passed}/${this.cases.length} passed` +
+        (this.skipped.length > 0 ? `, ${this.skipped.length} skipped` : ""),
+    );
     if (this.failures.length > 0) {
       console.error(`Failed: ${this.failures.join(", ")}`);
+    }
+    if (this.skipped.length > 0) {
+      console.error(`Unsupported on this host: ${this.skipped.join("; ")}`);
     }
   }
 
   get failed(): number {
     return this.failures.length;
+  }
+
+  get unsupported(): number {
+    return this.skipped.length;
   }
 }
 
@@ -54,6 +73,11 @@ export const registry = new TestRegistry();
 
 export function test(name: string, fn: TestFn): void {
   registry.register(name, fn);
+}
+
+/** Report this test as not applicable on this host, with the reason. */
+export function skip(reason: string): never {
+  throw new Skipped(reason);
 }
 
 export function assert(condition: unknown, message: string): asserts condition {
@@ -102,6 +126,45 @@ export function cleanupScratch(): void {
     rmSync(scratchRoot, { recursive: true, force: true });
     scratchRoot = undefined;
   }
+}
+
+/** The roots, service identities and session identities the suite owns.
+ *  An inherited value names the live host instead. */
+const OWNED_ROOTS: Record<string, string[]> = {
+  home: ["HOME", "USERPROFILE"],
+  appdata: ["APPDATA"],
+  localappdata: ["LOCALAPPDATA"],
+  temp: ["TEMP", "TMP", "TMPDIR"],
+  runtime: ["XDG_RUNTIME_DIR"],
+  state: ["XDG_STATE_HOME"],
+  config: ["XDG_CONFIG_HOME"],
+  data: ["XDG_DATA_HOME"],
+  agent: ["PI_CODING_AGENT_DIR"],
+  "daemon-state": ["PI_DAEMON_STATE_DIR"],
+  "daemon-runtime": ["PI_DAEMON_RUNTIME_DIR"],
+  services: ["PI_SERVICES_DIR"],
+};
+
+const CLEARED_VARIABLES = [
+  "PI_DAEMON_ENDPOINT",
+  "PI_HOSTED",
+  "PI_HOSTED_SESSION",
+  "PI_DAEMON_RUN_ID",
+  "PI_DAEMON_RUN_GENERATION",
+  "PI_COMMS_AGENT_ID",
+];
+
+/** Point this process at a scratch tree before any product module resolves
+ *  a host root, so no test dials, writes or signals the live daemon. */
+export function isolateHost(): void {
+  const root = scratchDir();
+  for (const [directory, names] of Object.entries(OWNED_ROOTS)) {
+    const target = join(root, directory);
+    mkdirSync(target, { recursive: true });
+    for (const name of names) process.env[name] = target;
+  }
+  mkdirSync(join(root, "home", "tmp"), { recursive: true });
+  for (const name of CLEARED_VARIABLES) delete process.env[name];
 }
 
 /** Save/restore env around a test body (async-aware). */

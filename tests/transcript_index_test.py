@@ -17,6 +17,18 @@ import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
+
+import isolation
+
+# Every root this module probes belongs to its own scratch tree, never
+# the host's live daemon.
+ISOLATION = isolation.ScratchEnvironment()
+ISOLATION.apply()
+
+def tearDownModule():
+    ISOLATION.cleanup()
+
+
 import pi_transcript  # noqa: E402
 
 

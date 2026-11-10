@@ -15,6 +15,13 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
+import isolation
+
+# Every root this module probes belongs to its own scratch tree, never
+# the host's live daemon.
+ISOLATION = isolation.ScratchEnvironment()
+ISOLATION.apply()
+
 from pi_daemon.application import DaemonApplication
 from pi_daemon.config import ServiceConfig
 from pi_daemon.runtime_layout import RuntimeLayout
@@ -35,6 +42,7 @@ FAST_STOP = {"cancel_grace": 0.05, "settle_grace": 0.05}
 
 
 def tearDownModule():
+    ISOLATION.cleanup()
     shutil.rmtree(SCRATCH, ignore_errors=True)
 
 

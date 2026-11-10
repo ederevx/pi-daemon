@@ -13,6 +13,13 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
+import isolation
+
+# Every root this module probes belongs to its own scratch tree, never
+# the host's live daemon.
+ISOLATION = isolation.ScratchEnvironment()
+ISOLATION.apply()
+
 from pi_daemon.config import ServiceConfig
 from pi_daemon.lifecycle.instance_coordinator import InstanceCoordinator
 from pi_daemon.migration.error import MigrationError
@@ -27,6 +34,7 @@ SCRATCH = tempfile.mkdtemp(prefix="pi-migration-")
 
 
 def tearDownModule():
+    ISOLATION.cleanup()
     shutil.rmtree(SCRATCH, ignore_errors=True)
 
 
@@ -401,6 +409,37 @@ class RefusalTests(unittest.TestCase):
                                    text=True)
         self.assertEqual(completed.returncode, 2)
         self.assertIn("PI_DAEMON_STATE_DIR", completed.stderr)
+
+
+class LongPathTests(unittest.TestCase):
+    """A legacy root whose own path is past the classic Windows limit.
+
+    The translated layout is used where it is given, so a root the host
+    serves only with long paths enabled still translates. Where the host
+    policy refuses the path, the prerequisite is blocked: the property is
+    untested here, not unsupported, and the path is never shortened to
+    make the case fit.
+    """
+
+    def test_a_legacy_root_past_the_legacy_path_limit_translates(self):
+        deep = SCRATCH
+        while len(os.path.join(deep, "xdg", "pi-pty-host")) <= 300:
+            deep = os.path.join(deep, "deepening-%02d" % (len(deep) % 100,))
+        try:
+            os.makedirs(deep)
+        except OSError as failure:
+            self.skipTest("blocked: this host refuses a path past the "
+                          "legacy limit: %s" % failure)
+        fixture = LegacyFixture(deep)
+        self.assertGreater(len(fixture.legacy), 260)
+        code, plan, stderr = fixture.run()
+        self.assertEqual((code, plan["action"], stderr), (0, "translate", ""))
+        layout = fixture.layout()
+        store = TicketStore(layout.tickets_path(), layout.logs_dir(),
+                            fixture.config())
+        store.load()
+        self.assertEqual([ticket["id"] for ticket in store.snapshot()],
+                         ["t-aa-12", "t-aa-13", "t-aa-14"])
 
 
 if __name__ == "__main__":

@@ -14,6 +14,13 @@ from unittest import mock
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
+import isolation
+
+# Every root this module probes belongs to its own scratch tree, never
+# the host's live daemon.
+ISOLATION = isolation.ScratchEnvironment()
+ISOLATION.apply()
+
 from pi_daemon.application import DaemonApplication
 from pi_daemon.config import ServiceConfig
 from pi_daemon.runtime_layout import RuntimeLayout
@@ -31,6 +38,7 @@ FAST_STOP = {"cancel_grace": 0.05, "settle_grace": 0.05}
 
 
 def tearDownModule():
+    ISOLATION.cleanup()
     shutil.rmtree(SCRATCH, ignore_errors=True)
 
 
@@ -108,7 +116,10 @@ class DescribePublishedFilesTests(unittest.TestCase):
         control = EndpointFile(self.app.endpoint_path()).read()
         self.assertEqual(data["token"], control["token"])
         mode = os.stat(self.fixture.layout.comms_endpoint_path()).st_mode
-        self.assertEqual(mode & 0o077, 0, "the token file is private")
+        # Windows keeps only a file's read-only bit and reports the mode back
+        # as 0o666, so a token file's private mode is a POSIX property.
+        if os.name == "posix":
+            self.assertEqual(mode & 0o077, 0, "the token file is private")
 
     def test_the_descriptor_names_the_endpoint_file_and_the_activation(self):
         path = self.fixture.descriptor().path()

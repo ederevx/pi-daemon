@@ -22,8 +22,19 @@ import tempfile
 import time
 import unittest
 
+import isolation
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DAEMON_PATH = os.path.join(REPO, "pi", "daemon", "pi-daemon")
+
+# Every root this module probes belongs to its own scratch tree, never
+# the host's live daemon.
+ISOLATION = isolation.ScratchEnvironment()
+ISOLATION.apply()
+
+
+def tearDownModule():
+    ISOLATION.cleanup()
 
 HEADER = ('{"type":"session","version":3,"id":"wire-sess",'
           '"timestamp":"2026-01-01T00:00:00.000Z","cwd":"/home/wire"}\n')

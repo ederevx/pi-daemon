@@ -311,15 +311,25 @@ def _main():
         fail("session stop", r.stderr)
     else:
         ok("session stop")
-    time.sleep(0.5)
-    r = pi_rc("list")
-    if "itest" in r.stdout:
-        fail("session gone after stop", r.stdout)
+    # The daemon seals the record once it has reaped the ended child, and a
+    # Windows tree kill spends its grace first: the seal is polled for rather
+    # than assumed inside one fixed pause.
+    deadline = time.time() + 5
+    listing = pi_rc("list").stdout
+    while time.time() < deadline and "itest" in listing:
+        time.sleep(0.1)
+        listing = pi_rc("list").stdout
+    if "itest" in listing:
+        fail("session gone after stop", listing)
     else:
         ok("session ended")
     # The record survives the session: a consented stop is sealed by the
     # daemon, and a name it no longer hosts still answers.
+    deadline = time.time() + 5
     r = pi_rc("run-state", "itest")
+    while time.time() < deadline and not r.stdout.startswith("stopped"):
+        time.sleep(0.1)
+        r = pi_rc("run-state", "itest")
     if not r.stdout.startswith("stopped"):
         fail("run-state after stop", f"out={r.stdout!r} err={r.stderr!r}")
     else:
@@ -381,10 +391,13 @@ def _main():
                    for s in wire({"cmd": "list"}).get("sessions", [])):
             break
         time.sleep(0.1)
+    # Windows has no catchable SIGTERM: os.kill terminates the child, so the
+    # same scenario is a plain death there and never a clean exit.
+    expected = "exited-mid-run" if os.name == "posix" else "died-mid-run"
     r = pi_rc("run-state", "itest-term")
-    if not r.stdout.startswith("exited-mid-run"):
+    if not r.stdout.startswith(expected):
         fail("run-state after a handled SIGTERM",
-             f"out={r.stdout!r} err={r.stderr!r}")
+             f"expected {expected}, out={r.stdout!r} err={r.stderr!r}")
     else:
         ok("run-state: a handled SIGTERM mid-run is not a settle")
 
