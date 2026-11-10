@@ -2,6 +2,7 @@
 
 import os
 import select
+import socket
 import threading
 import time
 import uuid
@@ -13,16 +14,30 @@ from .relay_session import RelaySession
 CLEAR_SEQ = b"\x1b[H\x1b[2J\x1b[m"
 
 
+def stepped_size(cols, rows):
+    """A size one step away from the real one.
+
+    A terminal reports a resize to its child only when the size really
+    changes, so a repaint steps away and the caller restores the real
+    size after a pause.
+    """
+    cols, rows = int(cols), int(rows)
+    if rows > 1:
+        return cols, rows - 1
+    if cols > 1:
+        return cols - 1, rows
+    return cols, rows + 1
+
+
 class SessionRelay:
     """All PTY traffic crosses one thread; every request is a ticket."""
 
-    def __init__(self, config, backend=None):
+    def __init__(self, config):
         self._config = config
-        self._backend = backend
         self._lock = threading.Lock()
         self._commands = []
-        self._wake_read = -1
-        self._wake_write = -1
+        self._wake_read = None
+        self._wake_write = None
         self._sessions = {}
         # A nudged size still owes its restore: keyed by session, so a
         # session that ends drops the debt with it.
@@ -33,9 +48,9 @@ class SessionRelay:
     # -- public surface (called from request and watcher threads) ----------
 
     def start(self):
-        self._wake_read, self._wake_write = os.pipe()
-        os.set_blocking(self._wake_read, False)
-        os.set_blocking(self._wake_write, False)
+        # A socket pair, not a pipe: the relay selects on Windows too, and
+        # Windows select only accepts sockets.
+        self._wake_read, self._wake_write = socket.socketpair()
         self._thread = threading.Thread(target=self._loop, name="session-relay",
                                         daemon=True)
         self._thread.start()
@@ -47,8 +62,8 @@ class SessionRelay:
             self._thread.join(timeout=self._config.cancel_grace + 1.0)
         self._close_wake()
 
-    def register(self, key, generation, master):
-        self._call(lambda: self._register(key, generation, master))
+    def register(self, key, generation, child):
+        self._call(lambda: self._register(key, generation, child))
 
     def attach(self, key, generation, connection, initial=b""):
         viewer_id = uuid.uuid4().hex
@@ -114,10 +129,10 @@ class SessionRelay:
         return result
 
     def _wake(self):
-        if self._wake_write < 0:
+        if self._wake_write is None:
             return
         try:
-            os.write(self._wake_write, b"x")
+            self._wake_write.send(b"x")
         except OSError:
             pass
 
@@ -136,8 +151,8 @@ class SessionRelay:
 
     # -- commands (run on the relay thread) --------------------------------
 
-    def _register(self, key, generation, master):
-        self._sessions[key] = RelaySession(key, generation, master,
+    def _register(self, key, generation, child):
+        self._sessions[key] = RelaySession(key, generation, child,
                                           self._config.relay_buffer_bytes)
         return True
 
@@ -165,11 +180,11 @@ class SessionRelay:
 
     def _resize(self, key, cols, rows):
         session = self._sessions.get(key)
-        if session is not None and self._backend is not None:
+        if session is not None:
             # A resize settles the size the client wants: a nudge still
             # owing its restore would put back the size it stepped from.
             self._repaints.pop(key, None)
-            self._backend.resize(session.master, cols, rows)
+            session.child.set_winsize(cols, rows)
         return True
 
     def _begin_finish(self, key, reason):
@@ -226,16 +241,16 @@ class SessionRelay:
             target.viewers[viewer_id] = connection
             target.pending[viewer_id] = bytearray(CLEAR_SEQ)
             moved += 1
-        if moved and self._backend is not None:
+        if moved:
             # pi redraws only on a real size change, so the carried
             # viewer would otherwise stare at the cleared screen until
             # the target happens to print. The size is stepped here and
             # restored from the loop, which owns the pause: this thread
             # serves every conversation and must not sleep.
-            if self._backend.nudge(target.master, cols, rows) is not None:
-                self._repaints[target_key] = (
-                    target.generation, cols, rows,
-                    time.monotonic() + self._config.repaint_tick)
+            target.child.set_winsize(*stepped_size(cols, rows))
+            self._repaints[target_key] = (
+                target.generation, cols, rows,
+                time.monotonic() + self._config.repaint_tick)
         return {"moved": moved}
 
     def _restore_repaints(self):
@@ -251,7 +266,7 @@ class SessionRelay:
             if session is None or session.generation != generation:
                 # The run that was nudged has already gone.
                 continue
-            self._backend.resize(session.master, cols, rows)
+            session.child.set_winsize(cols, rows)
 
     def _timeout(self):
         """The nearest repaint restore bounds the wait, so it is never
@@ -270,7 +285,7 @@ class SessionRelay:
             return False
         for viewer_id in list(session.viewers):
             session.drop_viewer(viewer_id)
-        _close_master(session.master)
+        session.child.close()
         session.done.set()
         return True
 
@@ -289,10 +304,11 @@ class SessionRelay:
         writable = []
         watched = list(self._sessions.values())
         for session in watched:
-            if not session.eof:
-                readable.append(session.master)
-            if session.inbox:
-                writable.append(session.master)
+            handle = session.child.output_handle()
+            if not session.eof and handle is not None and handle >= 0:
+                readable.append(handle)
+            if session.inbox and handle is not None and handle >= 0:
+                writable.append(handle)
             for viewer_id, connection in session.viewers.items():
                 readable.append(connection)
                 if session.pending.get(viewer_id):
@@ -317,26 +333,23 @@ class SessionRelay:
                 self._complete(session.key)
 
     def _readable(self, source):
-        if source == self._wake_read:
+        if source is self._wake_read:
             try:
-                os.read(self._wake_read, 4096)
+                self._wake_read.recv(4096)
             except OSError:
                 pass
             return
         for session in list(self._sessions.values()):
-            if source == session.master:
-                self._from_master(session)
+            if source == session.child.output_handle():
+                self._from_child(session)
                 return
             for viewer_id, connection in session.viewers.items():
                 if source == connection:
                     self._from_viewer(session, viewer_id, connection)
                     return
 
-    def _from_master(self, session):
-        try:
-            data = os.read(session.master, self._config.master_chunk_bytes)
-        except OSError:
-            data = b""
+    def _from_child(self, session):
+        data = session.child.read_output(self._config.master_chunk_bytes)
         if not data:
             session.eof = True
             if not session.closing:
@@ -365,7 +378,7 @@ class SessionRelay:
 
     def _writable(self, source):
         for session in list(self._sessions.values()):
-            if source == session.master:
+            if source == session.child.output_handle():
                 self._flush_input(session)
                 return
             for viewer_id, connection in session.viewers.items():
@@ -376,10 +389,8 @@ class SessionRelay:
     def _flush_input(self, session):
         if not session.inbox:
             return
-        try:
-            written = os.write(session.master, session.inbox)
-        except OSError:
-            session.inbox.clear()
+        written = session.child.write_input(session.inbox)
+        if not written:
             return
         del session.inbox[:written]
 
@@ -402,7 +413,7 @@ class SessionRelay:
     def _prune(self):
         """Drop the conversations and viewers whose descriptor is gone."""
         for session in list(self._sessions.values()):
-            if not _open_fd(session.master):
+            if not _output_valid(session.child):
                 self._complete(session.key)
                 continue
             for viewer_id, connection in list(session.viewers.items()):
@@ -410,13 +421,13 @@ class SessionRelay:
                     session.drop_viewer(viewer_id)
 
     def _close_wake(self):
-        for descriptor in (self._wake_read, self._wake_write):
-            if descriptor >= 0:
+        for wake in (self._wake_read, self._wake_write):
+            if wake is not None:
                 try:
-                    os.close(descriptor)
+                    wake.close()
                 except OSError:
                     pass
-        self._wake_read = self._wake_write = -1
+        self._wake_read = self._wake_write = None
 
 
 def _close(connection):
@@ -426,18 +437,21 @@ def _close(connection):
         pass
 
 
-def _open_fd(descriptor):
-    if descriptor is None or descriptor < 0:
+def _output_valid(child):
+    """Whether the child's output endpoint is still open.
+
+    The child answers for its own endpoint: what a handle means differs by
+    backend - a CRT descriptor on POSIX, a Winsock value under ConPTY - and
+    an fstat on the latter reports a healthy socket as a dead descriptor.
+    """
+    valid = getattr(child, "output_valid", None)
+    if valid is not None:
+        return bool(valid())
+    handle = child.output_handle()
+    if handle is None or handle < 0:
         return False
     try:
-        os.fstat(descriptor)
+        os.fstat(handle)
     except OSError:
         return False
     return True
-
-
-def _close_master(master):
-    try:
-        os.close(master)
-    except OSError:
-        pass

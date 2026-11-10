@@ -1,15 +1,15 @@
-"""One relayed conversation: its master PTY and its attached viewers."""
+"""One relayed conversation: its child's PTY and its attached viewers."""
 
 import threading
 
 
 class RelaySession:
-    """Buffers belong to viewers; the master belongs to the conversation."""
+    """Buffers belong to viewers; the child owns the terminal."""
 
-    def __init__(self, key, generation, master, limit):
+    def __init__(self, key, generation, child, limit):
         self.key = key
         self.generation = generation
-        self.master = master
+        self.child = child
         self.limit = int(limit)
         self.viewers = {}
         self.pending = {}

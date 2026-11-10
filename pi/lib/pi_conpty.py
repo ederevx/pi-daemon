@@ -12,7 +12,9 @@
 #   * output_fd  - one end of a socketpair, select-able on Windows, fed by
 #                  a reader thread that pumps the ConPTY output pipe;
 #   * master_fd  - a CRT fd over the ConPTY input HANDLE for os.write;
-#   * pid + wait_nohang/kill_tree - non-blocking process reaping.
+#   * release/wait - a child is spawned suspended, so the host can record
+#                  its identity before its first instruction, and is
+#                  reaped through the one call the contract names.
 #
 # Spawn follows node-pty src/win/conpty.cc: CreatePseudoConsole, then a
 # STARTUPINFOEXW carrying PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE and
@@ -33,11 +35,13 @@ _IS_WINDOWS = sys.platform == "win32"
 # -- Win32 constants -------------------------------------------------------
 
 _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+_CREATE_SUSPENDED = 0x00000004
 _CREATE_UNICODE_ENVIRONMENT = 0x00000400
 _STARTF_USESTDHANDLES = 0x00000100
 _PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
 
 _WAIT_OBJECT_0 = 0x00000000
+_INFINITE = 0xFFFFFFFF
 
 _GENERIC_READ = 0x80000000
 _GENERIC_WRITE = 0x40000000
@@ -64,6 +68,10 @@ DEFAULT_ROWS = 24
 _READ_CHUNK = 65536
 _PUMP_TICK = 0.1
 _KILL_TICK = 0.05
+# A pseudoconsole input handle is a pipe that blocks when it fills, and
+# the relay writes for every conversation from one thread, so input is
+# queued here and dropped oldest-first past this bound instead.
+_INPUT_LIMIT = 65536
 # ConPTY repaint nudge: a resize event only reaches the child when the
 # pseudoconsole size really changes, so signal_winch toggles one cell and
 # waits this long before restoring the real size.
@@ -211,6 +219,8 @@ class _Kernel32:
         lib.GetExitCodeProcess.restype = wintypes.BOOL
         lib.TerminateProcess.argtypes = [wintypes.HANDLE, ctypes.c_uint]
         lib.TerminateProcess.restype = wintypes.BOOL
+        lib.ResumeThread.argtypes = [wintypes.HANDLE]
+        lib.ResumeThread.restype = wintypes.DWORD
         lib.CloseHandle.argtypes = [wintypes.HANDLE]
         lib.CloseHandle.restype = wintypes.BOOL
 
@@ -266,12 +276,17 @@ class WindowsPtyChild:
         self._output_read = None
         self._output_write = None
         self._process = None
+        self._thread = None
         self._out_sock = None
         self._reader_sock = None
         self._reader_thread = None
         self._reaped = False
         self._exit_code = 0
         self._closed = False
+        self._input_buffer = bytearray()
+        self._input_lock = threading.Lock()
+        self._input_ready = threading.Event()
+        self._input_thread = None
         # The ConPTY has no queryable size, so the child remembers the
         # size it was spawned with and last resized to.
         self._cols = DEFAULT_COLS
@@ -362,17 +377,20 @@ class WindowsPtyChild:
         env_block = _environment_block(env)
         cwd_block = ctypes.c_wchar_p(cwd) if cwd else None
         info = _PROCESS_INFORMATION()
+        # Suspended, so the host records the child's identity before it
+        # executes its first instruction; release resumes the thread.
         created = lib.CreateProcessW(
             None, command, None, None, False,
-            _EXTENDED_STARTUPINFO_PRESENT | _CREATE_UNICODE_ENVIRONMENT,
+            _EXTENDED_STARTUPINFO_PRESENT | _CREATE_UNICODE_ENVIRONMENT
+            | _CREATE_SUSPENDED,
             env_block, cwd_block, ctypes.byref(si_ex), ctypes.byref(info))
         lib.DeleteProcThreadAttributeList(si_ex.lpAttributeList)
         del attr_buf
         if not created:
             _raise_last_error("CreateProcessW")
         self._process = info.hProcess
+        self._thread = info.hThread
         self.pid = int(info.dwProcessId)
-        lib.CloseHandle(info.hThread)
 
     def _open_master_fd(self):
         import msvcrt
@@ -383,6 +401,7 @@ class WindowsPtyChild:
         else:
             self.master_fd = fd
             self._input_write = None
+        self._start_input_pump()
 
     def _start_reader(self):
         self._out_sock, self._reader_sock = socket.socketpair()
@@ -419,6 +438,20 @@ class WindowsPtyChild:
     def output_handle(self):
         return self.output_fd
 
+    def output_valid(self):
+        """Whether the output socket is still open.
+
+        output_handle() is a Winsock value, not a CRT descriptor, so the
+        socket object itself answers here instead of an fstat on the number.
+        """
+        sock = self._out_sock
+        if sock is None or self.output_fd < 0:
+            return False
+        try:
+            return sock.fileno() >= 0
+        except OSError:
+            return False
+
     def read_output(self, limit):
         if self._out_sock is None:
             return b""
@@ -428,12 +461,52 @@ class WindowsPtyChild:
             return b""
 
     def write_input(self, data):
+        """Queue input for the child; never block the relay thread.
+
+        The pseudoconsole input handle is a pipe, so a full one would
+        hold the single relay thread for every conversation. The pump
+        thread owns the real write, and past the bound the oldest queued
+        bytes go first, which is what a viewer that outran the child
+        already lost.
+        """
         if self.master_fd < 0:
             return 0
-        try:
-            return os.write(self.master_fd, data)
-        except OSError:
-            return 0
+        with self._input_lock:
+            self._input_buffer += data
+            if len(self._input_buffer) > _INPUT_LIMIT:
+                del self._input_buffer[:len(self._input_buffer)
+                                       - _INPUT_LIMIT]
+        self._input_ready.set()
+        return len(data)
+
+    def _start_input_pump(self):
+        self._input_ready.clear()
+        self._input_thread = threading.Thread(target=self._input_loop,
+                                              daemon=True)
+        self._input_thread.start()
+
+    def _input_loop(self):
+        while not self._closed:
+            if not self._input_ready.wait(_PUMP_TICK):
+                continue
+            self._input_ready.clear()
+            with self._input_lock:
+                data = bytes(self._input_buffer)
+                self._input_buffer.clear()
+            if not data:
+                continue
+            written = 0
+            try:
+                while written < len(data):
+                    written += os.write(self.master_fd, data[written:])
+            except OSError:
+                return
+
+    def _stop_input_pump(self):
+        self._input_ready.set()
+        if self._input_thread is not None:
+            self._input_thread.join(timeout=1.0)
+            self._input_thread = None
 
     def resize(self, cols, rows):
         if self._hpc is None:
@@ -473,6 +546,40 @@ class WindowsPtyChild:
         # the child died abnormally (a clean quit is 0).
         return bool(status)
 
+    def release(self):
+        """Resume the suspended child; the host has recorded its identity."""
+        if self._thread is None:
+            return
+        try:
+            if self._api.lib.ResumeThread(self._thread) == 0xFFFFFFFF:
+                _raise_last_error("ResumeThread")
+        finally:
+            self._api.lib.CloseHandle(self._thread)
+            self._thread = None
+
+    def poll(self):
+        reaped, code = self.wait_nohang()
+        return code if reaped else None
+
+    def wait(self, timeout=None):
+        """Reap the child and return its exit code, waiting up to timeout."""
+        if self._reaped:
+            return self._exit_code
+        if self._process is None:
+            return None
+        milliseconds = _INFINITE if timeout is None \
+            else max(0, int(timeout * 1000))
+        if self._api.lib.WaitForSingleObject(
+                self._process, milliseconds) != _WAIT_OBJECT_0:
+            raise TimeoutError("the child did not exit in time")
+        code = wintypes.DWORD(0)
+        if not self._api.lib.GetExitCodeProcess(
+                self._process, ctypes.byref(code)):
+            _raise_last_error("GetExitCodeProcess")
+        self._reaped = True
+        self._exit_code = int(code.value)
+        return self._exit_code
+
     def wait_nohang(self):
         if self._reaped:
             return (True, self._exit_code)
@@ -490,16 +597,27 @@ class WindowsPtyChild:
         return (True, self._exit_code)
 
     def kill_tree(self, grace):
+        """End the root's tree while the root still names its children.
+
+        /T walks the ancestry it finds when it runs, so it goes first: a
+        terminated root severs the only evidence of its descendants, and
+        Windows termination never reaches children of its own accord.
+        TerminateProcess on the root follows only as the fallback for a
+        root taskkill could not open.
+        """
         if self._process is None:
             return
         if self.wait_nohang()[0]:
             return
-        self._terminate_process()
         self._taskkill_tree(grace)
+        if not self.wait_nohang()[0]:
+            self._terminate_process()
         self._wait_reaped(grace)
 
-    def terminate(self, grace=0.5):
-        self.kill_tree(grace)
+    def terminate(self, grace=None):
+        """End the child's tree; False when the root outlived the bound."""
+        self.kill_tree(0.5 if grace is None else grace)
+        return self.wait_nohang()[0]
 
     def _terminate_process(self):
         self._api.lib.TerminateProcess(self._process, 1)
@@ -524,6 +642,7 @@ class WindowsPtyChild:
         if self._closed:
             return
         self._closed = True
+        self._stop_input_pump()
         self._close_pseudoconsole()
         self._close_reader()
         self._close_output_pipe()
@@ -584,9 +703,13 @@ class WindowsPtyChild:
         self._input_read = None
 
     def _close_process_handles(self):
-        if self._process is not None and self._api is not None:
-            self._api.lib.CloseHandle(self._process)
-        self._process = None
+        # The primary thread handle belongs to the same spawn: leaving it
+        # behind leaks one handle per child abandoned before release().
+        for name in ("_thread", "_process"):
+            handle = getattr(self, name, None)
+            if handle is not None and self._api is not None:
+                self._api.lib.CloseHandle(handle)
+            setattr(self, name, None)
 
 
 class WindowsPtyBackend:

@@ -18,7 +18,15 @@ from unittest import mock
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
+import isolation
+
+# Every root this module probes belongs to its own scratch tree, never
+# the host's live daemon.
+ISOLATION = isolation.ScratchEnvironment()
+ISOLATION.apply()
+
 from pi_daemon.config import ServiceConfig
+from pi_daemon.application import DaemonApplication
 from pi_daemon.sessions.carry import SessionCarry
 from pi_daemon.sessions.error import SessionError
 from pi_daemon.sessions.handover import SessionHandover
@@ -26,9 +34,10 @@ from pi_daemon.sessions.identity import ProcessIdentity
 from pi_daemon.sessions.model import SessionRecord
 from pi_daemon.sessions.operations import SessionOperations
 from pi_daemon.sessions.pi_command import PiCommand
-from pi_daemon.sessions.pty_backend import PosixPtyBackend, service_root
+from pi_daemon.sessions.pty_backend import PosixPtyBackend
+from pi_daemon.sessions.pty_child import set_winsize
 from pi_daemon.sessions.reload import SessionReload
-from pi_daemon.sessions.relay import SessionRelay
+from pi_daemon.sessions.relay import SessionRelay, stepped_size
 from pi_daemon.sessions.runner import SessionRunner
 from pi_daemon.sessions.run_outcome import RunOutcome
 from pi_daemon.sessions.service import SessionService
@@ -39,6 +48,7 @@ SCRATCH = tempfile.mkdtemp(prefix="pi-sessions-")
 
 
 def tearDownModule():
+    ISOLATION.cleanup()
     shutil.rmtree(SCRATCH, ignore_errors=True)
 
 
@@ -437,18 +447,21 @@ class GatedChild:
     def terminate(self, grace=None):
         self.terminated = True
 
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        return 0
+
     def close(self):
         self.closed = True
-
-    def disown_master(self):
-        return -1
 
 
 class StubRelay:
     def __init__(self):
         self.closed = []
 
-    def register(self, key, generation, master):
+    def register(self, key, generation, child):
         return True
 
     def close(self, key):
@@ -806,12 +819,13 @@ class OperationsTests(unittest.TestCase):
         self.assertEqual(reply["bytes"], 2)
 
 
+@unittest.skipUnless(os.name == "posix", "POSIX PTY backend coverage")
 class RelayTests(unittest.TestCase):
     def setUp(self):
         self.child = None
         self.relay = None
         self.config = ServiceConfig(settle_grace=1.0)
-        self.backend = PosixPtyBackend(self.config, service_root())
+        self.backend = PosixPtyBackend(self.config)
 
     def tearDown(self):
         if self.relay is not None:
@@ -824,9 +838,9 @@ class RelayTests(unittest.TestCase):
         self.child = self.backend.spawn(["sh", "-c", script], REPO,
                                         dict(os.environ), 80, 24)
         self.child.release()
-        self.relay = SessionRelay(self.config, self.backend)
+        self.relay = SessionRelay(self.config)
         self.relay.start()
-        self.relay.register("k", "g", self.child.disown_master())
+        self.relay.register("k", "g", self.child)
 
     def attach(self):
         viewer, peer = socket.socketpair()
@@ -936,7 +950,7 @@ class RelayTests(unittest.TestCase):
         self.relay.resize(other, 120, 50)
         # The restore the carry still owed must not undo the new size.
         time.sleep(self.config.repaint_tick * 4)
-        master = self.relay._sessions[other].master
+        master = self.relay._sessions[other].child.master
         packed = fcntl.ioctl(master, termios.TIOCGWINSZ, b"\0" * 8)
         rows, cols = struct.unpack("HH", packed[:4])
         self.assertEqual((cols, rows), (120, 50))
@@ -959,15 +973,15 @@ class RelayTests(unittest.TestCase):
                                     dict(os.environ), 80, 24)
         second.release()
         self.addCleanup(lambda: (second.terminate(grace=0.2), second.close()))
-        self.relay.register("k2", "g2", second.disown_master())
+        self.relay.register("k2", "g2", second)
         return "k2"
 
 
+@unittest.skipUnless(os.name == "posix", "POSIX PTY winsize coverage")
 class NudgeTests(unittest.TestCase):
     """A repaint nudge always steps to a size the child has never had."""
 
     def setUp(self):
-        self.backend = PosixPtyBackend(ServiceConfig(), service_root())
         self.master, self.slave = os.openpty()
         self.addCleanup(os.close, self.master)
         self.addCleanup(os.close, self.slave)
@@ -983,12 +997,68 @@ class NudgeTests(unittest.TestCase):
 
     def test_every_terminal_steps_away_and_returns(self):
         for cols, rows in ((80, 24), (80, 1), (1, 1)):
-            self.backend.resize(self.master, cols, rows)
-            temporary = self.backend.nudge(self.master, cols, rows)
+            set_winsize(self.master, cols, rows)
+            temporary = stepped_size(cols, rows)
             self.assertNotEqual(temporary, (cols, rows))
+            set_winsize(self.master, *temporary)
             self.assertEqual(self.size(), temporary)
-            self.backend.resize(self.master, cols, rows)
+            set_winsize(self.master, cols, rows)
             self.assertEqual(self.size(), (cols, rows))
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows ConPTY hosting")
+class WindowsSessionTests(unittest.TestCase):
+    """A hosted session on this host's real PTY backend.
+
+    The backend is the one Application composes, so this is the Windows
+    equivalent of the POSIX relay coverage above: a real pseudoconsole, a
+    recorded child, the relay's own read loop and a viewer that receives
+    what the child printed.
+    """
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="pi-win-session-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.app = DaemonApplication.from_environment({
+            "PI_DAEMON_STATE_DIR": os.path.join(self.base, "state"),
+            "PI_DAEMON_RUNTIME_DIR": os.path.join(self.base, "runtime"),
+            "PI_CODING_AGENT_DIR": os.path.join(self.base, "agent"),
+        })
+        self.app.start()
+        self.addCleanup(self.app.stop)
+
+    def read_until(self, connection, marker, timeout=20.0):
+        buffer = b""
+        deadline = time.monotonic() + timeout
+        connection.settimeout(0.5)
+        while marker not in buffer and time.monotonic() < deadline:
+            try:
+                chunk = connection.recv(65536)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            buffer += chunk
+        return buffer
+
+    def test_a_hosted_session_prints_and_ends(self):
+        sessions = self.app._sessions
+        sessions.start("pi-a", self.base, ["cmd.exe", "/c", "echo HOSTED"],
+                       80, 24)
+        plan = sessions.attach_plan("pi-a", 80, 24)
+        viewer, peer = socket.socketpair()
+        self.addCleanup(viewer.close)
+        self.addCleanup(peer.close)
+        self.assertTrue(sessions.attach_now(plan, viewer))
+        self.assertIn(b"HOSTED", self.read_until(peer, b"HOSTED"))
+        sessions.stop("pi-a")
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if not any(view["name"] == "pi-a"
+                       for view in sessions.sessions()):
+                break
+            time.sleep(0.05)
+        self.assertEqual([view["name"] for view in sessions.sessions()], [])
 
 
 class CarryRelay:
@@ -1312,7 +1382,18 @@ class ResumeTests(unittest.TestCase):
 
 class HandoverTests(unittest.TestCase):
     def setUp(self):
-        self.dir = tempfile.mkdtemp(prefix="work:", dir=SCRATCH)
+        # The target name comes from the directory's own name, and a colon in
+        # it is what the sanitiser replaces. A Windows filesystem cannot hold
+        # a colon, so the directory is made with a portable prefix there and
+        # the sanitiser is covered by the cases that spell the name itself.
+        self.dir = tempfile.mkdtemp(prefix="work", dir=SCRATCH)
+        named = os.path.join(SCRATCH, "work:" + os.path.basename(self.dir)[4:])
+        try:
+            os.rename(self.dir, named)
+        except OSError:
+            pass
+        else:
+            self.dir = named
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.file = os.path.join(self.dir, "conversation.jsonl")
         with open(self.file, "w", encoding="utf-8") as handle:

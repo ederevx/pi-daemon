@@ -25,7 +25,6 @@ from .sessions.handover import SessionHandover
 from .sessions.launcher import SessionLauncher
 from .sessions.operations import SessionOperations
 from .sessions.pi_command import PiCommand
-from .sessions.pty_backend import PosixPtyBackend, service_root
 from .sessions.reload import SessionReload
 from .sessions.relay import SessionRelay
 from .sessions.runner import SessionRunner
@@ -152,8 +151,8 @@ class DaemonApplication:
         store = SessionStore(self._layout.sessions_path(),
                              self._layout.run_state_dir(), self._config)
         store.load()
-        backend = PosixPtyBackend(self._config, service_root())
-        relay = SessionRelay(self._config, backend)
+        backend = pi_platform.select_pty_backend(self._config)
+        relay = SessionRelay(self._config)
         relay.start()
         self._session_store, self._relay = store, relay
         owner = ProcessIdentity.current(os.getpid()).to_dict()

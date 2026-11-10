@@ -16,6 +16,16 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
 
+import isolation
+
+# Every root this module probes belongs to its own scratch tree, never
+# the host's live daemon.
+ISOLATION = isolation.ScratchEnvironment()
+ISOLATION.apply()
+
+def tearDownModule():
+    ISOLATION.cleanup()
+
 
 class WindowsConPtyTest(unittest.TestCase):
     """Smoke exercises for WindowsPtyBackend and WindowsPtyChild."""
@@ -34,7 +44,7 @@ class WindowsConPtyTest(unittest.TestCase):
     def _drain(self, child, want, deadline):
         collected = b""
         while time.time() < deadline:
-            ready, _w, _e = select.select([child.output_fd], [], [], 0.2)
+            ready, _w, _e = select.select([child.output_handle()], [], [], 0.2)
             if not ready:
                 continue
             chunk = child.read_output(65536)
@@ -48,8 +58,23 @@ class WindowsConPtyTest(unittest.TestCase):
     def test_child_output_arrives(self):
         child = self._spawn_echo()
         try:
-            collected = self._drain(child, b"hello", time.time() + 10)
+            child.release()
+            collected = self._drain(child, b"hello", time.time() + 20)
             self.assertIn(b"hello", collected)
+        finally:
+            child.terminate(2)
+            child.close()
+
+    def test_a_child_runs_nothing_before_it_is_released(self):
+        child = self._spawn_echo()
+        try:
+            # Suspended at creation: the host records the identity first.
+            self.assertIsNone(child.poll())
+            self.assertEqual(self._drain(child, b"hello", time.time() + 1),
+                             b"")
+            child.release()
+            self.assertIn(b"hello", self._drain(child, b"hello",
+                                                time.time() + 20))
         finally:
             child.terminate(2)
             child.close()
@@ -57,15 +82,11 @@ class WindowsConPtyTest(unittest.TestCase):
     def test_resize_then_reap(self):
         child = self._spawn_echo()
         try:
-            self.assertTrue(child.resize(100, 30))
-            self._drain(child, b"hello", time.time() + 10)
-            reaped, code = child.wait_nohang()
-            deadline = time.time() + 5
-            while not reaped and time.time() < deadline:
-                time.sleep(0.05)
-                reaped, code = child.wait_nohang()
-            self.assertTrue(reaped)
-            self.assertEqual(code, 0)
+            child.release()
+            child.set_winsize(100, 30)
+            self._drain(child, b"hello", time.time() + 20)
+            self.assertEqual(child.wait(20), 0)
+            self.assertEqual(child.poll(), 0)
         finally:
             child.terminate(2)
             child.close()
