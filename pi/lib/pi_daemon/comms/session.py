@@ -47,7 +47,11 @@ class CommsSession:
             "agent": dict(self._agent),
             "mailbox": dict(self._mailbox),
             "headSequence": self._store.head_sequence(self.agent_id()),
-            "limits": {"maxWaitMs": int(self._config.comms_wait_max * 1000)},
+            "limits": {"maxWaitMs": int(self._config.comms_wait_max * 1000),
+                       # A forwarded call may spend one peer round trip here
+                       # before the destination's own hold begins.
+                       "forwardMs": int(
+                           self._config.comms_peer_request_timeout * 1000)},
         }
 
     def methods(self, sender=None):

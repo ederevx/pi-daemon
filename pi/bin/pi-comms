@@ -7,7 +7,11 @@
 # `rpc.hello`, and prints the service's answer unchanged:
 #
 #   pi-comms [--agent ID] [--endpoint FILE] [--timeout SEC]
-#            [--format json|text] <command> [args]
+#            [--at NODE_ID] [--format json|text] <command> [args]
+#
+# `--at` runs the command where a configured peer is, as this agent, and
+# prints the answer that peer's daemon gave. `send --node` still names the
+# recipient's node: the two are different questions.
 #
 #   node                                  the greeting: node, agent,
 #                                         methods, head sequence
@@ -67,6 +71,8 @@ import pi_services
 
 SERVICE = "agent-comms"
 PROTOCOL = "pi-rpc/1"
+DESCRIBE = "comms.describe"
+REMOTE = "comms.remote"
 
 EXIT_OK = 0
 EXIT_USAGE = 1
@@ -159,6 +165,8 @@ class Command:
         self.agent = _identity(options)
         self.client = None
         self.greeting = None
+        self.mailbox = None
+        self.describe = None
 
     def connect(self):
         endpoint = _endpoint(self.options)
@@ -172,20 +180,76 @@ class Command:
         return self
 
     def call(self, method, params, mutating=False):
-        """A wait's socket deadline outlives the hold the service allows."""
-        deadline = self.options.timeout
-        if method == "comms.wait":
-            held = params.get("timeoutMs")
-            if not isinstance(held, (int, float)) or isinstance(held, bool):
-                held = 60_000
-            deadline += float(held) / 1000.0
+        """A wait's socket deadline outlives the hold the service allows.
+
+        `--at` asks this daemon to run the same request where that peer is,
+        so the deadline follows the limit that node advertises.
+        """
+        deadline = self.options.timeout + self._setup() + self._hold(
+            method, params)
+        if self.options.at:
+            method, params = REMOTE, {"nodeId": self.options.at,
+                                      "method": method, "params": params}
         return self.client.call(method, params, deadline=deadline,
                                 mutating=mutating)
 
+    def _hold(self, method, params):
+        """How long past the socket bound a held wait may still answer.
+
+        A node that names no limit - one older than the limit it would
+        advertise - is still answered for the hold the caller asked for, and
+        an agent that wants a longer hold names one: `unknown` is never read
+        as `zero`, and an absent request keeps the socket bound alone.
+        """
+        if method != "comms.wait":
+            return 0.0
+        limit = self._wait_limit_ms()
+        asked = params.get("timeoutMs")
+        if isinstance(asked, bool) or not isinstance(asked, (int, float)):
+            # A node that names no limit still answers the hold it was asked
+            # for: the request is its own bound, and the hold is on top.
+            return max(limit, 0.0) / 1000.0
+        asked = max(float(asked), 0.0)
+        return (min(asked, max(limit, 0.0)) if limit > 0 else asked) / 1000.0
+
+    def _setup(self):
+        """The peer round trip a forwarded call spends before it is served."""
+        if not self.options.at:
+            return 0.0
+        limits = self.greeting.get("limits") or {}
+        spent = limits.get("forwardMs")
+        if isinstance(spent, bool) or not isinstance(spent, (int, float)):
+            return 0.0
+        return max(float(spent), 0.0) / 1000.0
+
+    def _wait_limit_ms(self):
+        """The longest wait that mailbox's own node holds, as it says."""
+        limits = (self._describe() if self.options.at
+                  else self.greeting).get("limits") or {}
+        limit = limits.get("maxWaitMs")
+        return float(limit) if isinstance(limit, (int, float)) and \
+            not isinstance(limit, bool) else 0.0
+
+    def _describe(self):
+        """What the peer answers for this agent: its mailbox and limits."""
+        if self.describe is None:
+            self.describe = self.call(DESCRIBE, {})
+        return self.describe
+
     def cursor(self, after):
-        return {"agent": {"nodeId": self.greeting["agent"]["nodeId"],
-                          "agentId": self.greeting["agent"]["agentId"]},
+        """A cursor counts one mailbox's sequence, so it names that mailbox."""
+        owner = self._owner()
+        return {"agent": {"nodeId": owner["nodeId"],
+                          "agentId": owner["agentId"]},
                 "sequence": after}
+
+    def _owner(self):
+        """The mailbox read here, or the one that peer keeps for this agent."""
+        if not self.options.at:
+            return self.greeting["agent"]
+        if self.mailbox is None:
+            self.mailbox = self._describe()["mailbox"]
+        return self.mailbox
 
     def close(self):
         if self.client is not None:
@@ -380,9 +444,16 @@ def _run_peer(command, options):
     return command.call("comms.peer.add", params, mutating=True)
 
 
+def _run_node(command, options):
+    """This node's greeting, or the peer's description of what it offers."""
+    if options.at:
+        return command._describe()
+    return command.greeting
+
+
 def _dispatch(command, options):
     handlers = {
-        "node": lambda: command.greeting,
+        "node": lambda: _run_node(command, options),
         "send": lambda: _run_send(command, options),
         "broadcast": lambda: _run_broadcast(command, options),
         "receipt": lambda: _run_receipt(command, options),
@@ -449,6 +520,9 @@ def _parser():
     parser.add_argument("--timeout", type=float, default=5.0,
                         metavar="SEC", help="the socket bound per request")
     parser.add_argument("--format", choices=("json", "text"), default="json")
+    parser.add_argument("--at", metavar="NODE_ID",
+                        help="run the command where that peer is (default: "
+                             "this node)")
     commands = parser.add_subparsers(dest="command", metavar="<command>")
     commands.add_parser("node", help="print the greeting")
 
@@ -456,11 +530,11 @@ def _parser():
         sub = commands.add_parser(name, help=help_text)
         if with_target:
             sub.add_argument("to", metavar="TO", help="the recipient agent id")
+            sub.add_argument("--node", metavar="NODE_ID",
+                             help="the recipient's node (default: this node)")
         sub.add_argument("payload", nargs="?", metavar="PAYLOAD",
                          help="JSON payload text, or - for stdin")
         sub.add_argument("--text", help="a plain string payload")
-        sub.add_argument("--node", metavar="NODE_ID",
-                         help="the recipient's node (default: this node)")
         sub.add_argument("--kind", default="message", metavar="KIND")
         sub.add_argument("--ttl", type=float, metavar="SEC")
         sub.add_argument("--request-id", metavar="ID",
@@ -529,7 +603,8 @@ def main(argv):
         print(USAGE, file=sys.stderr)
         return EXIT_USAGE
     try:
-        if options.command == "peer" and options.peer_command == "add":
+        if options.command == "peer" and options.peer_command == "add" and \
+                not options.at:
             options.credential = os.path.abspath(options.credential)
         return _execute(options)
     except Declined as exc:
@@ -549,8 +624,9 @@ def main(argv):
               file=sys.stderr)
         if exc.code == UNAUTHORIZED:
             return EXIT_UNAUTHORIZED
-        if exc.code == UNAVAILABLE and getattr(options, "command", None) in (
-                "send", "broadcast", "ack", "spawn"):
+        if exc.code in (UNAVAILABLE, TIMEOUT) and \
+                getattr(options, "command", None) in (
+                    "send", "broadcast", "ack", "spawn"):
             print("pi-comms: the request may have been acted on",
                   file=sys.stderr)
             return EXIT_AMBIGUOUS

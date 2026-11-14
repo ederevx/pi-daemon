@@ -473,6 +473,7 @@ class RecordingServer(threading.Thread):
         self.socket.settimeout(0.2)
         self.port = self.socket.getsockname()[1]
         self.requests = []
+        self.calls = []
         self.running = True
         self.start()
 
@@ -494,10 +495,16 @@ class RecordingServer(threading.Thread):
                                   "agent": {"nodeId": "n",
                                             "agentId": "alice"},
                                   "headSequence": 0})))
-                request = codec.decode(stream.readline())
-                self.requests.append(request["params"])
-                connection.sendall(codec.encode(
-                    codec.result(request["id"], self.RESULT)))
+                while True:
+                    line = stream.readline()
+                    if not line:
+                        break
+                    request = codec.decode(line)
+                    self.requests.append(request["params"])
+                    self.calls.append({"method": request.get("method"),
+                                       "params": request["params"]})
+                    connection.sendall(codec.encode(
+                        codec.result(request["id"], self.RESULT)))
             except (OSError, ValueError, KeyError):
                 pass
             finally:
@@ -510,6 +517,62 @@ class RecordingServer(threading.Thread):
         except OSError:
             pass
         self.join(5.0)
+
+
+class RouteTests(unittest.TestCase):
+    """`--at` sends the whole command there, as one route."""
+
+    NODE = "b" * 32
+
+    def test_every_command_travels_as_one_route(self):
+        cases = (("node", (), "comms.describe"),
+                 ("send", ("bob", "--text=hi"), "comms.send"),
+                 ("replay", ("--all",), "comms.replay"),
+                 ("wait", ("--timeout-ms=1",), "comms.wait"),
+                 ("ack", ("m1",), "comms.ack"),
+                 ("spawn", ("--task=t", SCRATCH), "comms.spawn"),
+                 ("peer", ("list",), "comms.peer.list"))
+        for verb, extra, method in cases:
+            server = RecordingServer()
+            try:
+                completed = self.there(server, verb, *extra)
+                self.assertEqual(completed.returncode, 0,
+                                 (verb, completed.stderr))
+                self.assertEqual({call["method"] for call in server.calls},
+                                 {"comms.remote"}, verb)
+                routed = server.calls[-1]["params"]
+                self.assertEqual(routed["nodeId"], self.NODE, verb)
+                self.assertEqual(routed["method"], method, verb)
+            finally:
+                server.stop()
+
+    def test_a_send_names_its_recipient_and_its_route_apart(self):
+        server = RecordingServer()
+        try:
+            completed = self.there(server, "send", "bob", "--node=other",
+                                   "--text=hi")
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            routed = server.calls[0]["params"]
+            self.assertEqual(routed["method"], "comms.send")
+            self.assertEqual(routed["nodeId"], self.NODE)
+            self.assertEqual(routed["params"]["to"],
+                             {"agentId": "bob", "nodeId": "other"})
+            self.assertEqual(routed["params"]["payload"], "hi")
+        finally:
+            server.stop()
+
+    def there(self, server, *arguments):
+        """One CLI run at that node, over one recorded endpoint."""
+        base = tempfile.mkdtemp(dir=SCRATCH)
+        path = os.path.join(base, "comms.json")
+        EndpointFile(path).publish({"host": "127.0.0.1", "port": server.port,
+                                    "token": "tok"})
+        environment = dict(os.environ)
+        environment["PI_COMMS_AGENT_ID"] = "alice"
+        environment["PI_COMMS_ENDPOINT"] = path
+        return subprocess.run(
+            [sys.executable, CLI, f"--at={self.NODE}", *arguments],
+            capture_output=True, text=True, timeout=60, env=environment)
 
 
 class TaskTransportTests(unittest.TestCase):

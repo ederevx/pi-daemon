@@ -20,6 +20,7 @@ import {
 	CommsArgv,
 	CommsExit,
 	type CommsAckParams,
+	type CommsPeersParams,
 	type CommsReplayParams,
 	type CommsSendParams,
 	type CommsSpawnParams,
@@ -68,6 +69,9 @@ export class CommsTools {
 				node: Type.Optional(Type.String({
 					description: "The recipient's node (default: this node).",
 				})),
+				at: Type.Optional(Type.String({
+					description: "Run the send where that peer is, as this agent.",
+				})),
 				requestId: Type.Optional(Type.String({
 					description: "Reuse this id to retry one send safely.",
 				})),
@@ -98,6 +102,9 @@ export class CommsTools {
 					minimum: 0,
 					description: "How long the service may hold the request.",
 				})),
+				node: Type.Optional(Type.String({
+					description: "Wait on the mailbox kept for this agent there.",
+				})),
 			}),
 			annotations: { readOnlyHint: true, openWorldHint: false },
 			execute: async (_toolCallId, params: CommsWaitParams, signal, _update, ctx) =>
@@ -120,6 +127,9 @@ export class CommsTools {
 				all: Type.Optional(Type.Boolean({
 					description: "Follow every page from the cursor.",
 				})),
+				node: Type.Optional(Type.String({
+					description: "Read the mailbox kept for this agent there.",
+				})),
 			}),
 			annotations: { readOnlyHint: true, openWorldHint: false },
 			execute: async (_toolCallId, params: CommsReplayParams, signal, _update, ctx) =>
@@ -136,6 +146,9 @@ export class CommsTools {
 					minItems: 1,
 					description: "The message ids to acknowledge.",
 				}),
+				node: Type.Optional(Type.String({
+					description: "Acknowledge mail in the mailbox kept for this agent there.",
+				})),
 			}),
 			annotations: { readOnlyHint: false, openWorldHint: false },
 			execute: async (_toolCallId, params: CommsAckParams, signal) =>
@@ -171,6 +184,10 @@ export class CommsTools {
 				task: Type.Optional(Type.String({
 					description: "One task for a fresh pi conversation.",
 				})),
+				node: Type.Optional(Type.String({
+					description: "Launch where that peer is; dir is then that " +
+						"node's own path, taken verbatim.",
+				})),
 			}),
 			annotations: { readOnlyHint: false, openWorldHint: false },
 			execute: async (
@@ -183,9 +200,14 @@ export class CommsTools {
 			label: "peers",
 			description:
 				"List the agent-comms peers this node is configured to reach.",
-			parameters: Type.Object({}),
+			parameters: Type.Object({
+				node: Type.Optional(Type.String({
+					description: "List the peers that node is configured to reach.",
+				})),
+			}),
 			annotations: { readOnlyHint: true, openWorldHint: false },
-			execute: async (_toolCallId, _params, signal) => this.peers(signal),
+			execute: async (_toolCallId, params, signal) =>
+				this.peers(params as CommsPeersParams, signal),
 		});
 	}
 
@@ -246,7 +268,9 @@ export class CommsTools {
 			return CommsTools.refusal(
 				"comms_spawn takes exactly one of argv or task.");
 		}
-		const dir = resolve(ctx?.cwd ?? process.cwd(), params.dir);
+		const dir = params.node
+			? params.dir
+			: resolve(ctx?.cwd ?? process.cwd(), params.dir);
 		const requestId = params.requestId || randomUUID();
 		const outcome = await this.cli.run(
 			CommsTools.SPAWN,
@@ -264,9 +288,12 @@ export class CommsTools {
 		};
 	}
 
-	private async peers(signal?: AbortSignal): Promise<CommsToolResult> {
+	private async peers(
+		params: CommsPeersParams,
+		signal?: AbortSignal,
+	): Promise<CommsToolResult> {
 		const outcome = await this.cli.run(
-			CommsTools.PEERS, CommsArgv.peers(), { signal });
+			CommsTools.PEERS, CommsArgv.peers(params.node), { signal });
 		return this.result(outcome, {});
 	}
 

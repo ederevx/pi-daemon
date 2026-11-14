@@ -529,6 +529,24 @@ The peer credential is therefore authority over the surface of a local
 agent, launches included, as the destination daemon's user: configure
 a peer only for a host whose agent you trust that far.
 
+`--at NODE` (the CLI's global option, `node` on the tools) runs one
+command where that peer is, over a fresh agent-bound connection the
+daemon opens for that one call. The answer is the remote node's own; a
+remote `comms.spawn` launches there with the directory taken verbatim,
+a remote `peer add` names a credential file that node reads, and a
+remote `comms.wait` holds on the mailbox kept there for the caller, not
+on this node's. `send --node` still names the recipient's node. A
+method the destination does not offer is refused there and is never
+redirected to local execution, so a peer that predates a method answers
+unsupported instead of quietly acting here. Routing itself is offered
+to this node's own agents only: a peer cannot relay onward through it.
+A call that never reaches the destination - a tunnel that is down, a
+hello the destination refuses - answers `peer-unreachable`, and never
+leaves as a transport failure no agent can read. The greeting's
+`limits.forwardMs` names the extra round trip that open may spend
+before the destination's own hold begins, so a client's socket deadline
+can outlive both.
+
 Inbound delivery is one envelope, committed before it is published,
 and answers `accepted` with the mailbox sequence it took. A delivery ID
 is deduplicated per source node: a replay returns the outcome recorded

@@ -12,7 +12,10 @@
 export interface CommsSendParams {
 	to: string;
 	payload: unknown;
+	/** The recipient's node. */
 	node?: string;
+	/** Run the send where that peer is, as this agent. */
+	at?: string;
 	kind?: string;
 	requestId?: string;
 }
@@ -22,6 +25,8 @@ export interface CommsWaitParams {
 	after?: number;
 	limit?: number;
 	timeoutMs?: number;
+	/** Wait on the mailbox kept for this agent there, not here. */
+	node?: string;
 }
 
 /** `comms_replay`: read the mailbox from a cursor, or every page. */
@@ -29,11 +34,15 @@ export interface CommsReplayParams {
 	after?: number;
 	limit?: number;
 	all?: boolean;
+	/** Read the mailbox kept for this agent there, not here. */
+	node?: string;
 }
 
 /** `comms_ack`: acknowledge delivered mail. */
 export interface CommsAckParams {
 	messageIds: string[];
+	/** Acknowledge mail in the mailbox kept for this agent there. */
+	node?: string;
 }
 
 /** `comms_spawn`: launch another agent through the daemon's launcher, on
@@ -44,6 +53,14 @@ export interface CommsSpawnParams {
 	dir: string;
 	argv?: string[];
 	task?: string;
+	/** Launch where that peer is; `dir` is then that node's own path. */
+	node?: string;
+}
+
+/** `peers`: the peers this node is configured to reach. */
+export interface CommsPeersParams {
+	/** List the peers that node is configured to reach. */
+	node?: string;
 }
 
 /** The CLI's exit codes; they are the failure vocabulary of the profile. */
@@ -75,10 +92,16 @@ export class CommsExit {
 
 /** The argv for each command, without the global `--format json` prefix. */
 export class CommsArgv {
+	/** `--at` is a global option, so it precedes the command name: the whole
+	 *  command runs where that peer is and prints that peer's answer. */
+	private static at(node?: string): string[] {
+		return node ? [`--at=${node}`] : [];
+	}
+
 	/** A string payload travels through `--text` so it stays a string; any
 	 *  other JSON value is the positional the CLI decodes as JSON. */
 	static send(params: CommsSendParams & { requestId: string }): string[] {
-		const argv = ["send", params.to];
+		const argv = [...CommsArgv.at(params.at), "send", params.to];
 		if (params.node) argv.push(`--node=${params.node}`);
 		if (params.kind) argv.push(`--kind=${params.kind}`);
 		argv.push(`--request-id=${params.requestId}`);
@@ -91,7 +114,7 @@ export class CommsArgv {
 	}
 
 	static wait(params: CommsWaitParams): string[] {
-		const argv = ["wait"];
+		const argv = [...CommsArgv.at(params.node), "wait"];
 		if (params.after !== undefined) argv.push(`--after=${params.after}`);
 		if (params.limit !== undefined) argv.push(`--limit=${params.limit}`);
 		if (params.timeoutMs !== undefined) {
@@ -101,7 +124,7 @@ export class CommsArgv {
 	}
 
 	static replay(params: CommsReplayParams): string[] {
-		const argv = ["replay"];
+		const argv = [...CommsArgv.at(params.node), "replay"];
 		if (params.after !== undefined) argv.push(`--after=${params.after}`);
 		if (params.limit !== undefined) argv.push(`--limit=${params.limit}`);
 		if (params.all) argv.push("--all");
@@ -109,11 +132,11 @@ export class CommsArgv {
 	}
 
 	static ack(params: CommsAckParams): string[] {
-		return ["ack", ...params.messageIds];
+		return [...CommsArgv.at(params.node), "ack", ...params.messageIds];
 	}
 
 	static spawn(params: CommsSpawnParams): string[] {
-		const argv = ["spawn"];
+		const argv = [...CommsArgv.at(params.node), "spawn"];
 		if (params.agentId) argv.push(`--agent-id=${params.agentId}`);
 		if (params.requestId) argv.push(`--request-id=${params.requestId}`);
 		if (params.task !== undefined) argv.push(`--task=${params.task}`);
@@ -124,7 +147,7 @@ export class CommsArgv {
 		return argv;
 	}
 
-	static peers(): string[] {
-		return ["peer", "list"];
+	static peers(node?: string): string[] {
+		return [...CommsArgv.at(node), "peer", "list"];
 	}
 }

@@ -566,3 +566,48 @@ test("argv: send omits absent options and keeps a string payload plain", () => {
 	assertEq(CommsArgv.send({ to: "bob", payload: "hi", requestId: "r" }).join(" "),
 		"send bob --request-id=r --text=hi", "minimal send argv");
 });
+
+test("argv: --at precedes the command, so the whole one runs there", () => {
+	assertEq(CommsArgv.wait({ node: "peer" }).join(" "), "--at=peer wait",
+		"a wait runs where that peer is");
+	assertEq(CommsArgv.replay({ node: "peer", all: true }).join(" "),
+		"--at=peer replay --all", "a replay runs there");
+	assertEq(CommsArgv.ack({ node: "peer", messageIds: ["m1"] }).join(" "),
+		"--at=peer ack m1", "an ack runs there");
+	assertEq(CommsArgv.spawn({ node: "peer", dir: "/srv", task: "t" }).join(" "),
+		"--at=peer spawn --task=t /srv", "a launch runs there");
+});
+
+test("argv: send keeps its recipient node separate from where it runs", () => {
+	assertEq(CommsArgv.send({
+		to: "bob", node: "other", at: "peer", payload: "hi", requestId: "r",
+	}).join(" "),
+		"--at=peer send bob --node=other --request-id=r --text=hi",
+		"the recipient's node and the node it runs at are different questions");
+});
+
+test("comms_spawn: a remote launch takes the directory verbatim", async () => {
+	const env = invocation({ status: "spawned", requestId: "r4" });
+	await withEnv(env, async () => {
+		const result = await call("comms_spawn", {
+			requestId: "r4", dir: "/srv/work", task: "do it", node: "peer",
+		});
+		assert(!result.isError, "not an error");
+		const argv = recorded(env.STUB_LOG)[0];
+		assertEq(argv.slice(0, 6).join(" "),
+			"--format json --agent pi-test --at=peer spawn", "prefix");
+		assertEq(argv[6], "--request-id=r4", "request id");
+		assertEq(argv[8], "/srv/work",
+			"the destination's own path, not one resolved here");
+	});
+});
+
+test("peers: a node lists the peers that node reaches", async () => {
+	const env = invocation({ status: "ok", peers: [] });
+	await withEnv(env, async () => {
+		const result = await call("peers", { node: "peer" });
+		assert(!result.isError, "not an error");
+		assertEq(recorded(env.STUB_LOG)[0].join(" "),
+			"--format json --agent pi-test --at=peer peer list", "argv");
+	});
+});
