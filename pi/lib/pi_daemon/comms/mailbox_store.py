@@ -30,6 +30,7 @@ UNDELIVERABLE = "undeliverable"
 UNKNOWN = "unknown"
 NO_SUCH_PEER = "no-such-peer"
 PEER_REMOVED = "peer-removed"
+IDENTITY_CLAIMED = "identity-claimed"
 RETENTION_EXPIRED = "retention-expired"
 UNCONFIRMED = "delivery-unconfirmed"
 MAILBOX_FULL = "mailbox-full"
@@ -281,15 +282,22 @@ class MailboxStore:
 
     # -- mailboxes ---------------------------------------------------------
 
-    def reserve(self, agent_id, provisional=False):
+    def reserve(self, agent_id, provisional=False, permitted=None):
         """A mailbox exists as soon as its identity is presented.
 
         A provisional mailbox belongs to one launch, named by the value:
         only that launch may release it, and the first presentation of the
         identity, or the first message addressed to it, adopts it.
+
+        `permitted` is asked inside this lock, before the mailbox is created
+        or adopted. An ownership rule has to be decided here: a look taken
+        before the call can pass just as another holder creates that very
+        id, and the reservation would then adopt its mailbox.
         """
         with self._lock:
             self._expire_if_due_locked()
+            if permitted is not None and not permitted(agent_id):
+                raise CommsError(IDENTITY_CLAIMED)
             state = self._recipients.get(agent_id)
             if state is None:
                 if len(self._recipients) >= self._recipient_cap:
@@ -331,6 +339,25 @@ class MailboxStore:
     def exists(self, agent_id):
         with self._lock:
             return agent_id in self._recipients
+
+    def allocate(self, agent_id):
+        """Create this mailbox only if the identity is free, and say so.
+
+        Adoption is what `reserve` does; a mailbox kept for a remote agent
+        must be one this call created, so an id an agent already holds here
+        is reported instead of being handed over.
+        """
+        with self._lock:
+            self._expire_if_due_locked()
+            if agent_id in self._recipients:
+                return False
+            if len(self._recipients) >= self._recipient_cap:
+                raise CommsError(BUSY)
+            candidate = dict(self._recipients)
+            candidate[agent_id] = {"next_sequence": 0, "messages": [],
+                                   "acknowledged": [], "provisional": False}
+            self._commit_locked(candidate, self._receipts)
+            return True
 
     def head_sequence(self, agent_id):
         with self._lock:

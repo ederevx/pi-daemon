@@ -41,7 +41,10 @@ from pi_daemon.comms.peer_operations import PeerOperations
 from pi_daemon.comms.peer_tunnel import PeerTunnel
 from pi_daemon.comms.peer_tunnel_error import TunnelError
 from pi_daemon.atomic_state_file import AtomicStateFile
-from pi_daemon.comms.mailbox_store import ALL_TARGET, MailboxStore
+from pi_daemon.comms.mailbox_store import (ALL_TARGET, BUSY, IDENTITY_CLAIMED,
+                                           MailboxStore)
+from pi_daemon.comms.peer_mailboxes import (STORE_CORRUPT, STORE_FAILED,
+                                            PeerMailboxes)
 from pi_daemon.comms.service import CommsService
 from pi_daemon.comms.node_identity import NodeIdentity
 from pi_daemon.comms.spawn_ledger import SpawnLedger
@@ -577,6 +580,183 @@ class RecoveryTests(StoreCase):
             json.dump({"version": 99}, handle)
         with self.assertRaises(CommsError):
             self._store()
+
+
+class PeerMailboxesTests(StoreCase):
+    """The mailboxes this node keeps for agents that live elsewhere."""
+
+    def _peer(self, node_id="peer", agent_id="alpha"):
+        return {"nodeId": node_id, "agentId": agent_id}
+
+    def _mailboxes(self):
+        return PeerMailboxes(self.layout.comms_peer_mailboxes_path(),
+                             self.config).load()
+
+    def _record(self, text):
+        os.makedirs(os.path.dirname(
+            self.layout.comms_peer_mailboxes_path()), exist_ok=True)
+        with open(self.layout.comms_peer_mailboxes_path(), "w",
+                  encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_a_peer_mailbox_is_created_once_and_kept(self):
+        mailboxes = self._mailboxes()
+        first = mailboxes.bind(self._peer(), self.store)
+        self.assertEqual(first["nodeId"], "local")
+        self.assertEqual(mailboxes.bind(self._peer(), self.store), first)
+        self.assertTrue(self.store.exists(first["agentId"]))
+        self.assertEqual(self._mailboxes().mailbox(self._peer()),
+                         first["agentId"])
+
+    def test_one_origin_agent_keeps_one_mailbox_here(self):
+        mailboxes = self._mailboxes()
+        bound = {mailboxes.bind(origin, self.store)["agentId"]
+                 for origin in (self._peer(agent_id="alpha"),
+                                self._peer(agent_id="beta"),
+                                self._peer(node_id="other"))}
+        self.assertEqual(len(bound), 3)
+        self.assertTrue(all(self.store.exists(item) for item in bound))
+
+    def test_an_allocation_never_adopts_an_existing_mailbox(self):
+        self.store.reserve("a")
+        self.assertFalse(self.store.allocate("a"))
+        self.assertTrue(self.store.allocate("b"))
+        self.assertTrue(self.store.exists("a"))
+
+    def test_a_mailbox_another_origin_holds_is_not_handed_over(self):
+        held = self._mailboxes().bind(self._peer(), self.store)["agentId"]
+        # A node that lost its record meets the very id it derived before.
+        self._record(json.dumps({"version": 1, "origins": {}}))
+        second = self._mailboxes().bind(self._peer(), self.store)["agentId"]
+        self.assertNotEqual(second, held)
+        self.assertTrue(self.store.exists(held))
+        self.assertTrue(self.store.exists(second))
+
+    def test_a_full_node_names_its_capacity_and_writes_no_record(self):
+        self.store = self._store(comms_recipient_cap=1)
+        self.store.reserve("a")
+        mailboxes = self._mailboxes()
+        with self.assertRaises(CommsError) as caught:
+            mailboxes.bind(self._peer(), self.store)
+        self.assertEqual(caught.exception.code, BUSY)
+        self.assertIsNone(mailboxes.mailbox(self._peer()))
+        self.assertFalse(os.path.exists(
+            self.layout.comms_peer_mailboxes_path()))
+
+    def test_a_derived_id_fits_the_id_limit(self):
+        self.store = self._store(comms_agent_id_limit=12)
+        proxy = self._mailboxes().bind(self._peer(), self.store)["agentId"]
+        self.assertTrue(proxy.startswith("peer-"))
+        self.assertLessEqual(len(proxy), 12)
+
+    def test_a_corrupt_record_is_refused(self):
+        self._record("{not json")
+        with self.assertRaises(CommsError) as caught:
+            self._mailboxes()
+        self.assertEqual(caught.exception.code, STORE_CORRUPT)
+
+    def test_two_origins_for_one_mailbox_are_refused(self):
+        self._record(json.dumps({"version": 1, "origins": {
+            json.dumps(["peer", "alpha"]): "peer-00000000",
+            json.dumps(["peer", "beta"]): "peer-00000000"}}))
+        with self.assertRaises(CommsError) as caught:
+            self._mailboxes()
+        self.assertEqual(caught.exception.code, STORE_CORRUPT)
+
+    def test_a_record_naming_a_local_id_is_refused(self):
+        self._record(json.dumps({"version": 1, "origins": {
+            json.dumps(["peer", "alpha"]): "alpha"}}))
+        with self.assertRaises(CommsError) as caught:
+            self._mailboxes()
+        self.assertEqual(caught.exception.code, STORE_CORRUPT)
+
+    def test_a_record_over_the_id_limit_is_refused(self):
+        self.store = self._store(comms_agent_id_limit=12)
+        self._record(json.dumps({"version": 1, "origins": {
+            json.dumps(["peer", "alpha"]): "peer-0123456789abcdef"}}))
+        with self.assertRaises(CommsError) as caught:
+            self._mailboxes()
+        self.assertEqual(caught.exception.code, STORE_CORRUPT)
+
+    def test_a_failed_write_is_reported_and_binds_nothing(self):
+        mailboxes = self._mailboxes()
+        with mock.patch.object(AtomicStateFile, "write_dict",
+                               side_effect=OSError("full")):
+            with self.assertRaises(CommsError) as caught:
+                mailboxes.bind(self._peer(), self.store)
+        self.assertEqual(caught.exception.code, STORE_FAILED)
+        self.assertIsNone(mailboxes.mailbox(self._peer()))
+
+    def test_two_binds_of_one_origin_share_the_one_mailbox(self):
+        mailboxes = self._mailboxes()
+        bound = []
+        lock = threading.Lock()
+
+        def bind():
+            item = mailboxes.bind(self._peer(), self.store)["agentId"]
+            with lock:
+                bound.append(item)
+
+        threads = [threading.Thread(target=bind) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5.0)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(len(bound), 6)
+        self.assertEqual(len(set(bound)), 1)
+        self.assertEqual(mailboxes.mailbox(self._peer()), bound[0])
+
+    def test_a_local_reservation_refuses_an_id_a_peer_holds(self):
+        mailboxes = self._mailboxes()
+        proxy = mailboxes.bind(self._peer(), self.store)["agentId"]
+        # The reservation is asked for the id the peer's bind created, with
+        # the rule decided inside it: a look taken before that bind would
+        # have called the id free, and the reservation would have adopted the
+        # peer's mailbox for a local agent.
+        with self.assertRaises(CommsError) as caught:
+            self.store.reserve(proxy, permitted=mailboxes.permit)
+        self.assertEqual(caught.exception.code, IDENTITY_CLAIMED)
+        self.assertTrue(mailboxes.owns(proxy))
+        self.assertTrue(self.store.exists(proxy))
+
+    def test_a_claim_whose_mailbox_could_not_be_created_is_withdrawn(self):
+        self.store = self._store(comms_recipient_cap=1)
+        self.store.reserve("a")
+        mailboxes = self._mailboxes()
+        with self.assertRaises(CommsError) as caught:
+            mailboxes.bind(self._peer(), self.store)
+        self.assertEqual(caught.exception.code, BUSY)
+        # The claim is written before the mailbox exists, so a failure that
+        # leaves it behind would refuse a local agent an id it never held.
+        self.assertEqual(mailboxes._origins, {})
+        self.assertFalse(os.path.exists(
+            self.layout.comms_peer_mailboxes_path()))
+
+    def test_a_node_that_kept_none_writes_no_file(self):
+        self._mailboxes().save()
+        self.assertFalse(os.path.exists(
+            self.layout.comms_peer_mailboxes_path()))
+
+    def test_binds_at_once_give_each_origin_its_own_mailbox(self):
+        mailboxes = self._mailboxes()
+        bound = []
+        lock = threading.Lock()
+
+        def bind(agent_id):
+            item = mailboxes.bind(self._peer(agent_id=agent_id),
+                                  self.store)["agentId"]
+            with lock:
+                bound.append(item)
+
+        threads = [threading.Thread(target=bind, args=("a%d" % index,))
+                   for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5.0)
+        self.assertEqual(len(set(bound)), 8)
+        self.assertTrue(all(self.store.exists(item) for item in bound))
 
 
 class NodeIdentityTests(unittest.TestCase):

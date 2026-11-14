@@ -61,6 +61,9 @@ class RuntimeLayout:
     def comms_spawns_path(self):
         return os.path.join(self.domain_root("comms"), "spawns.json")
 
+    def comms_peer_mailboxes_path(self):
+        return os.path.join(self.domain_root("comms"), "peer-mailboxes.json")
+
     def comms_peers_path(self):
         return os.path.join(self.domain_root("comms"), "peers.json")
 
