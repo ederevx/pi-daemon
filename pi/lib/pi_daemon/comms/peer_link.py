@@ -33,7 +33,7 @@ class PeerLink:
         self._request_id = 0
         self._frame_limit = None
 
-    def open(self, address, peer, credential, timeout=None):
+    def open(self, address, peer, credential, timeout=None, agent=None):
         """Connect, authenticate as this node, and require the peer's node."""
         with self._lock:
             self._close_locked()
@@ -47,10 +47,11 @@ class PeerLink:
             stream = JsonLineStream(connection,
                                     self._config.frame_bytes,
                                     self._config.read_chunk_bytes)
+            identity = {"nodeId": self._node_id, "credential": credential}
+            if agent is not None:
+                identity["agentId"] = agent["agentId"]
             hello = {"jsonrpc": "2.0", "id": "hello", "method": HELLO,
-                     "params": {"version": VERSION,
-                                "peer": {"nodeId": self._node_id,
-                                         "credential": credential}}}
+                     "params": {"version": VERSION, "peer": identity}}
             try:
                 stream.write(self._codec.encode(hello))
                 greeting = self._result(

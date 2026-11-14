@@ -31,7 +31,10 @@ def tearDownModule():
 
 
 from pi_daemon.comms.error import CommsError
+from pi_daemon.comms.operations import (METHOD_UNAVAILABLE, PEER_LOST_ANSWER,
+                                        PEER_UNREACHABLE, UNKNOWN_PEER)
 from pi_daemon.comms.peer_auth import PeerAuthenticator
+from pi_daemon.comms.peer_channel import PeerChannel
 from pi_daemon.comms.peer_config_store import PeerConfigStore
 from pi_daemon.comms.peer_delivery import PeerDelivery
 from pi_daemon.comms.peer_link import PeerLink
@@ -757,6 +760,175 @@ class PeerMailboxesTests(StoreCase):
             thread.join(5.0)
         self.assertEqual(len(set(bound)), 8)
         self.assertTrue(all(self.store.exists(item) for item in bound))
+
+
+class StubChannel:
+    """One opened peer connection, reduced to the one call it carries."""
+
+    def __init__(self, failure=None, answer=None):
+        self.failure = failure
+        self.answer = answer
+        self.closed = 0
+
+    def request(self, _method, _params, _timeout=None):
+        if self.failure is not None:
+            raise self.failure
+        return self.answer
+
+    def close(self):
+        self.closed += 1
+
+
+class StubPeers:
+    """A peer manager reduced to the two things a forward asks of it."""
+
+    def __init__(self, failure=None, channel=None):
+        self.failure = failure
+        self.channel = channel
+
+    def on_peer_gone(self, _listener):
+        return self
+
+    def open_channel(self, _node_id, _agent_id):
+        if self.failure is not None:
+            raise self.failure
+        return self.channel
+
+
+class ForwardTests(StoreCase):
+    """A forward answers in codes, whether the open or the call failed."""
+
+    PEER = "b" * 32
+
+    def service(self, peers):
+        return CommsService(self.store, self.config, "token",
+                            "local").use_peers(peers)
+
+    def test_a_good_forward_answers_and_closes_its_channel(self):
+        channel = StubChannel(answer={"agent": "a"})
+        service = self.service(StubPeers(channel=channel))
+        self.assertEqual(service.forward(self.PEER, "a", "comms.describe", {}),
+                         {"agent": "a"})
+        self.assertEqual(channel.closed, 1)
+
+    def test_an_open_that_fails_reads_as_a_peer_that_could_not_answer(self):
+        # A refused hello never produces a channel: the failure has to be
+        # projected here, or it leaves as an exception no agent can read.
+        service = self.service(StubPeers(
+            failure=PeerLinkError("unauthorized")))
+        with self.assertRaises(CommsError) as caught:
+            service.forward(self.PEER, "a", "comms.describe", {})
+        self.assertEqual(caught.exception.code, PEER_UNREACHABLE)
+
+    def test_an_unserved_method_keeps_its_own_reason(self):
+        channel = StubChannel(failure=PeerLinkError("method-unavailable"))
+        service = self.service(StubPeers(channel=channel))
+        with self.assertRaises(CommsError) as caught:
+            service.forward(self.PEER, "a", "comms.spawn", {})
+        self.assertEqual(caught.exception.code, METHOD_UNAVAILABLE)
+        self.assertEqual(channel.closed, 1)
+
+    def test_a_lost_answer_is_reported_as_a_lost_answer(self):
+        channel = StubChannel(failure=PeerLinkError("request-timeout"))
+        service = self.service(StubPeers(channel=channel))
+        with self.assertRaises(CommsError) as caught:
+            service.forward(self.PEER, "a", "comms.spawn", {})
+        self.assertEqual(caught.exception.code, PEER_LOST_ANSWER)
+
+    def test_a_node_this_one_does_not_know_is_unknown_not_unreachable(self):
+        service = self.service(StubPeers())
+        with self.assertRaises(CommsError) as caught:
+            service.forward(self.PEER, "a", "comms.describe", {})
+        self.assertEqual(caught.exception.code, UNKNOWN_PEER)
+
+
+class StubPeerLink:
+    """A link a channel opens: it records the call and answers as told."""
+
+    NODE = "b" * 32
+
+    def __init__(self, greeting=None, failure=None, on_open=None):
+        self.greeting = {"nodeId": self.NODE, "methods": ["comms.wait"],
+                         "limits": {"maxWaitMs": 2000}}
+        self.greeting.update(greeting or {})
+        self.failure = failure
+        self.on_open = on_open
+        self.opened = None
+        self.interrupted = 0
+        self.closed = 0
+
+    def open(self, address, peer, credential, timeout=None, agent=None):
+        self.opened = {"address": address, "peer": dict(peer),
+                       "credential": credential, "timeout": timeout,
+                       "agent": agent}
+        if self.on_open is not None:
+            self.on_open()
+        if self.failure is not None:
+            raise self.failure
+        return self.greeting
+
+    def request(self, method, params, timeout=None):
+        self.requests = getattr(self, "requests", [])
+        self.requests.append((method, params, timeout))
+        return {"status": "ok"}
+
+    def interrupt(self):
+        self.interrupted += 1
+
+    def close(self):
+        self.closed += 1
+
+
+class PeerChannelTests(unittest.TestCase):
+    """One call's connection: what it presents, and when it ends."""
+
+    def channel(self, link, limits=None):
+        self.config = ServiceConfig.load(overrides={
+            "comms_peer_request_timeout": 7.0,
+            "comms_wait_max": 30.0})
+        if limits is not None:
+            link.greeting["limits"] = limits
+        return PeerChannel(self.config, {"nodeId": StubPeerLink.NODE},
+                           link, StubCredentials(), "alpha",
+                           ("127.0.0.1", 4242))
+
+    def test_a_channel_presents_this_agent_and_the_call_timeout(self):
+        link = StubPeerLink()
+        self.channel(link).open()
+        self.assertEqual(link.opened["agent"], {"agentId": "alpha"})
+        self.assertEqual(link.opened["credential"], "shared")
+        self.assertEqual(link.opened["timeout"], 7.0)
+
+    def test_a_held_wait_outlives_the_hold_that_node_allows(self):
+        link = StubPeerLink()
+        channel = self.channel(link, limits={"maxWaitMs": 2000}).open()
+        channel.request("comms.wait", {"timeoutMs": 60000}, 7.0)
+        self.assertEqual(link.requests[-1][2], 9.0)
+
+    def test_a_wait_asking_less_than_the_limit_is_bounded_by_its_own_ask(self):
+        link = StubPeerLink()
+        channel = self.channel(link, limits={"maxWaitMs": 2000}).open()
+        channel.request("comms.wait", {"timeoutMs": 500}, 7.0)
+        self.assertEqual(link.requests[-1][2], 7.5)
+
+    def test_a_method_the_greeting_lists_is_never_sent(self):
+        link = StubPeerLink()
+        channel = self.channel(link).open()
+        with self.assertRaises(PeerLinkError) as caught:
+            channel.request("comms.spawn", {}, 7.0)
+        self.assertEqual(caught.exception.reason, "method-unavailable")
+        self.assertEqual(getattr(link, "requests", []), [])
+
+    def test_a_channel_closed_while_opening_leaves_no_connection(self):
+        holder = {}
+        link = StubPeerLink(on_open=lambda: holder["channel"].close())
+        holder["channel"] = self.channel(link)
+        with self.assertRaises(PeerLinkError) as caught:
+            holder["channel"].open()
+        # The hello may already be on the wire when a shutdown closes this
+        # channel: the connection it produced is closed, never left open.
+        self.assertEqual(caught.exception.reason, "channel-closed")
+        self.assertGreaterEqual(link.closed, 1)
 
 
 class NodeIdentityTests(unittest.TestCase):

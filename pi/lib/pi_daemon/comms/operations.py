@@ -1,6 +1,7 @@
 """The comms wire: published methods, validated params, result shapes."""
 
-from ..transport.rpc_codec import (CAPACITY, INVALID_PARAMS, UNAVAILABLE)
+from ..transport.rpc_codec import (CAPACITY, INVALID_PARAMS, METHOD_NOT_FOUND,
+                                   TIMEOUT, UNAVAILABLE)
 from ..transport.rpc_error import RpcError
 from .error import CommsError
 from .mailbox_store import (ALL_TARGET, BAD_REQUEST, BUSY, PAYLOAD_TOO_LARGE,
@@ -11,6 +12,11 @@ from .wait_registry import CLOSING, WAIT_PENDING
 
 LOCAL_SCOPE = "local"
 NO_LOCAL_RECIPIENT = "no-local-recipient"
+UNKNOWN_PEER = "unknown-peer"
+PEER_UNREACHABLE = "peer-unreachable"
+PEER_LOST_ANSWER = "peer-lost-answer"
+METHOD_UNAVAILABLE = "method-unavailable"
+REMOTE = "comms.remote"
 # What every bound connection answers itself, whatever it was offered.
 SESSION_METHODS = frozenset({"rpc.hello", "rpc.cancel", "rpc.subscribe",
                              "rpc.unsubscribe", "comms.wait"})
@@ -24,6 +30,10 @@ CODES = {
     STORE_FAILED: UNAVAILABLE,
     CLOSING: UNAVAILABLE,
     WAIT_PENDING: INVALID_PARAMS,
+    UNKNOWN_PEER: INVALID_PARAMS,
+    PEER_UNREACHABLE: UNAVAILABLE,
+    PEER_LOST_ANSWER: TIMEOUT,
+    METHOD_UNAVAILABLE: METHOD_NOT_FOUND,
     # Session launch verdicts, carried as data by the sessions domain.
     "invalid-session": INVALID_PARAMS,
     "no-dir": INVALID_PARAMS,
@@ -41,7 +51,7 @@ class CommsOperations:
         self._config = config
 
     def handlers(self, sender=None):
-        """What this node offers the caller."""
+        """What this node offers the caller; routing is for its own agents."""
         handlers = {
             "comms.send": self.send,
             "comms.broadcast": self.broadcast,
@@ -52,6 +62,8 @@ class CommsOperations:
         }
         if self._service.spawns_enabled():
             handlers["comms.spawn"] = self.spawn
+        if self._service.peers_enabled() and self._local(sender):
+            handlers[REMOTE] = self.remote
         handlers.update(self._service.peer_handlers())
         return handlers
 
@@ -84,6 +96,28 @@ class CommsOperations:
     def describe(self, sender, _params):
         """What this node offers the caller, and the mailbox it reads here."""
         return self._service.describe(sender)
+
+    def remote(self, sender, params):
+        """One call answered where the named peer is, as the calling agent."""
+        if not self._local(sender):
+            raise RpcError(INVALID_PARAMS, "a peer cannot forward further")
+        node_id = self._identifier(params, "nodeId")
+        method = self._identifier(params, "method")
+        if not method.startswith("comms.") or method == REMOTE:
+            raise RpcError(INVALID_PARAMS, "only an agent-comms method")
+        inner = params.get("params")
+        if inner is None:
+            inner = {}
+        if not isinstance(inner, dict):
+            raise RpcError(INVALID_PARAMS, "params must be an object")
+        return self._project(self._service.forward, node_id,
+                             sender["agentId"], method, inner,
+                             self._config.comms_peer_request_timeout)
+
+    def _local(self, sender):
+        """Whether the caller is one of this node's own agents."""
+        return sender is None or \
+            sender.get("nodeId") == self._service.node_id()
 
     def broadcast(self, sender, params):
         request_id = self._identifier(params, "requestId")

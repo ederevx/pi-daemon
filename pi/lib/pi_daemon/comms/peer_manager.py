@@ -10,6 +10,7 @@ import threading
 
 from .error import CommsError
 from .mailbox_store import PEER_REMOVED
+from .operations import PEER_UNREACHABLE
 from .peer_auth import PeerAuthenticator
 from .peer_config_store import ACTIVE, PeerConfigStore
 from .peer_delivery import PeerDelivery
@@ -105,6 +106,20 @@ class PeerManager:
 
     def generation(self, node_id):
         return self._peers.active_generation(node_id)
+
+    def open_channel(self, node_id, agent_id):
+        """One agent-bound connection over that peer's live tunnel."""
+        with self._lock:
+            if self._closing:
+                raise CommsError(CLOSING)
+            if self._peers.get(node_id) is None:
+                return None
+            worker = self._workers.get(node_id)
+            link = self._link_factory()
+        channel = worker.channel(agent_id, link) if worker is not None else None
+        if channel is None:
+            raise CommsError(PEER_UNREACHABLE)
+        return channel
 
     def wake(self, node_id):
         with self._lock:

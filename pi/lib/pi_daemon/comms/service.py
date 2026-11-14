@@ -13,8 +13,11 @@ from .error import CommsError
 from .mailbox_store import (BAD_REQUEST, IDENTITY_CLAIMED, QUEUED,
                             STORE_FAILED)
 from .message_relay import MessageRelay
-from .operations import CommsOperations, SPAWN_FAILED
+from .operations import (CommsOperations, METHOD_UNAVAILABLE,
+                         PEER_LOST_ANSWER, PEER_UNREACHABLE, SPAWN_FAILED,
+                         UNKNOWN_PEER)
 from .peer_operations import PeerOperations
+from .peer_link_error import PeerLinkError
 from .peer_session import PeerSession
 from .session import CommsSession
 from .spawn_ledger import (ENV_AGENT_ID, ENV_HOST, ENV_NODE_ID,
@@ -23,6 +26,9 @@ from .spawn_ledger import (ENV_AGENT_ID, ENV_HOST, ENV_NODE_ID,
 from .wait_registry import CLOSING, WaitRegistry
 
 SERVICE = "agent-comms"
+# Link failures that follow a frame the peer did read: the answer is lost.
+LOST_ANSWERS = frozenset({"request-timeout", "link-broken",
+                          "mismatched-reply", "bad-error-code"})
 VERSION = 1
 
 
@@ -280,6 +286,9 @@ class CommsService:
 
     # -- launching another agent -------------------------------------------
 
+    def peers_enabled(self):
+        return self._peers is not None
+
     def describe(self, sender):
         """What this node offers the caller, and the mailbox it reads here."""
         mailbox = {"nodeId": self._node_id, "agentId": sender["agentId"]}
@@ -296,6 +305,34 @@ class CommsService:
                 "methods": self._operations.methods(sender),
                 "limits": {"maxWaitMs": int(self._config.comms_wait_max
                                             * 1000)}}
+
+    def forward(self, node_id, agent_id, method, params, timeout=None):
+        """One call over a connection opened as the calling agent."""
+        if self._peers is None:
+            raise CommsError(BAD_REQUEST)
+        channel = None
+        try:
+            channel = self._peers.open_channel(node_id, agent_id)
+            if channel is None:
+                raise CommsError(UNKNOWN_PEER)
+            return channel.request(method, params, timeout)
+        except PeerLinkError as failure:
+            # Opening fails with the same reasons a request does: a refused
+            # hello and an interrupted call must read alike to the agent.
+            raise CommsError(self._forward_failure(failure)) from None
+        finally:
+            if channel is not None:
+                channel.close()
+
+    @staticmethod
+    def _forward_failure(failure):
+        """An unserved method stays apart from a peer that could not answer."""
+        reason = failure.reason.split(":", 1)[0]
+        if reason == "method-unavailable":
+            return METHOD_UNAVAILABLE
+        if reason in LOST_ANSWERS:
+            return PEER_LOST_ANSWER
+        return PEER_UNREACHABLE
 
     def spawns_enabled(self):
         return self._spawns is not None and self._launcher is not None

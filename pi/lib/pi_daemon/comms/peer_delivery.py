@@ -11,6 +11,7 @@ from ..transport.rpc_error import RpcError
 from .error import CommsError
 from .mailbox_store import (ACCEPTED, BAD_REQUEST, PAYLOAD_TOO_LARGE,
                             QUEUED, UNDELIVERABLE)
+from .peer_channel import PeerChannel
 from .peer_link_error import PeerLinkError
 
 DELIVER = "comms.peer.deliver"
@@ -40,6 +41,7 @@ class PeerDelivery:
         self._thread = None
         self._state = DOWN
         self._last_error = None
+        self._channels = []
         self._backoff = config.comms_peer_reconnect_initial
 
     def start(self):
@@ -56,20 +58,60 @@ class PeerDelivery:
         with self._lock:
             return {"state": self._state, "lastError": self._last_error}
 
+    def channel(self, agent_id, link):
+        """One agent-bound connection over this peer's live tunnel."""
+        address = self.address()
+        if address is None:
+            return None
+        channel = PeerChannel(self._config, self._peer, link,
+                              self._credentials, agent_id, address, self)
+        with self._lock:
+            # A worker that is already stopping closes what it holds; a
+            # channel registered behind its sweep would never be interrupted.
+            if self._stop.is_set():
+                return None
+            self._channels.append(channel)
+        return channel.open()
+
+    def address(self):
+        """The tunnel address this worker holds open, or None while down."""
+        with self._lock:
+            if self._state != UP:
+                return None
+        return self._tunnel.address()
+
+    def forget(self, channel):
+        """A call that is over stops being one this worker interrupts."""
+        with self._lock:
+            if channel in self._channels:
+                self._channels.remove(channel)
+
     def signal(self):
-        """Unblock the worker and its links; it never waits for a lock."""
-        self._stop.set()
+        """Unblock the worker, its link and every call it carries."""
+        with self._lock:
+            # Closing admission under the same lock the check takes: a channel
+            # admitted behind this sweep would never be interrupted.
+            self._stop.set()
+            channels = list(self._channels)
         self._wake.set()
         self._link.interrupt()
+        for channel in channels:
+            channel.interrupt()
         self._tunnel.close()
 
     def stop(self):
-        """Signal, then reap the link, the worker and its tunnel."""
+        """Signal, then reap the link, the calls, the worker and its tunnel."""
         self.signal()
         self._link.close()
         if self._thread is not None:
             self._thread.join(self._config.stop_grace)
+        for channel in self._channel_list():
+            channel.close()
         self._mark(DOWN, "stopped")
+
+    def _channel_list(self):
+        with self._lock:
+            return list(self._channels)
 
     # -- the worker --------------------------------------------------------
 

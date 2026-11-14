@@ -180,10 +180,29 @@ class FakeTunnel:
         return True
 
 
+class AddressTunnel:
+    """A tunnel already up where a real listener answers: no ssh in tests."""
+
+    def __init__(self, address):
+        self._address = address
+        self.closed = 0
+
+    def start(self, _peer, cancel=None):
+        return self._address
+
+    def address(self):
+        return self._address
+
+    def close(self):
+        self.closed += 1
+        return True
+
+
 class Harness:
     """One daemon-side comms stack on a scratch root."""
 
-    def __init__(self, spawns=False, peers=None, node=None, **overrides):
+    def __init__(self, spawns=False, peers=None, node=None, tunnel=None,
+                 credential_dir=None, **overrides):
         self.base = tempfile.mkdtemp(prefix="pi-comms-rpc-")
         self.node = node or NODE
         layout = RuntimeLayout(os.path.join(self.base, "state"),
@@ -203,15 +222,24 @@ class Harness:
                                     ledger, launcher)
         self.peer_store = None
         self.credentials = layout.comms_peer_credentials_path()
-        if peers is not None:
+        os.makedirs(self.credentials, exist_ok=True)
+        if peers is not None or credential_dir is not None:
             self.peer_store = PeerConfigStore(layout.comms_peers_path(),
                                              self.config)
+            if credential_dir is None:
+                authenticator = PeerAuthenticator(
+                    self.config, self.peer_store,
+                    reader=lambda _path: peers)
+            else:
+                # Real reads: the test wrote and chmodded the credential.
+                authenticator = PeerAuthenticator(
+                    self.config, self.peer_store,
+                    directory=self.credentials if credential_dir is True
+                    else credential_dir)
             self.service.use_peers(PeerManager(
-                self.config, self.store, self.peer_store,
-                PeerAuthenticator(self.config, self.peer_store,
-                                  reader=lambda _path: peers),
+                self.config, self.store, self.peer_store, authenticator,
                 self.service.deliver_peer, self.node,
-                tunnel_factory=FakeTunnel),
+                tunnel_factory=tunnel or FakeTunnel),
                 credentials=self.credentials,
                 mailboxes=PeerMailboxes(
                     layout.comms_peer_mailboxes_path(), self.config))
@@ -1193,9 +1221,11 @@ class PeerWireTests(SocketCase):
         self.configure()
         local = self.harness.client("op").greeting["result"]["methods"]
         peer = self.agent_peer().greeting["result"]["methods"]
+        # Routing stays with this node's own agents: a peer that forwarded
+        # would relay as a proxy through a third connection.
         self.assertEqual(sorted(set(peer)),
-                         sorted(set(local) | {"comms.peer.deliver",
-                                              "comms.peer.ping"}))
+                         sorted((set(local) - {"comms.remote"}) |
+                                {"comms.peer.deliver", "comms.peer.ping"}))
 
     def test_two_origin_agents_keep_separate_mailboxes_and_ids(self):
         self.configure()
@@ -1351,8 +1381,248 @@ class PeerWireTests(SocketCase):
         answer = self.agent_peer().call("comms.nonsense", {})
         self.assertEqual(answer["error"]["code"], METHOD_NOT_FOUND)
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    def test_a_local_agent_may_route_and_a_peer_may_not(self):
+        self.configure()
+        local = self.harness.client("op").greeting["result"]["methods"]
+        self.assertIn("comms.remote", local)
+        peer = self.peer_client()
+        self.assertNotIn("comms.remote", peer.greeting["result"]["methods"])
+        # Not offered, and not answered when asked anyway: no relaying.
+        answer = peer.call("comms.remote",
+                           {"nodeId": self.NODE_B, "method": "comms.replay",
+                            "params": {}})
+        self.assertEqual(answer["error"]["code"], METHOD_NOT_FOUND)
+
+    def test_a_route_to_a_node_this_one_does_not_know_is_unknown(self):
+        self.configure()
+        answer = self.harness.client("op").call(
+            "comms.remote", {"nodeId": "c" * 32, "method": "comms.replay",
+                             "params": {}})
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+        self.assertEqual(answer["error"]["message"], "unknown-peer")
+
+    def test_a_route_to_a_peer_with_no_live_tunnel_is_unreachable(self):
+        self.configure()
+        answer = self.harness.client("op").call(
+            "comms.remote", {"nodeId": self.NODE_B,
+                             "method": "comms.describe", "params": {}})
+        self.assertEqual(answer["error"]["code"], UNAVAILABLE)
+        self.assertEqual(answer["error"]["message"], "peer-unreachable")
+
+    def test_a_route_carries_only_an_agent_comms_method(self):
+        self.configure()
+        answer = self.harness.client("op").call(
+            "comms.remote", {"nodeId": self.NODE_B, "method": "rpc.hello",
+                             "params": {}})
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+
+    def test_a_mailbox_kept_for_a_peer_is_never_a_launch_target(self):
+        self.configure()
+        proxy = self.agent_peer().greeting["result"]["mailbox"]["agentId"]
+        answer = self.harness.client("op").call(
+            "comms.spawn", {"requestId": "s1", "dir": self.harness.base,
+                            "argv": ["/bin/true"], "agentId": proxy})
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+
+
+class ForwardTests(unittest.TestCase):
+    """One node's agent calling the surface a configured peer serves there.
+
+    Two real daemons: the origin's tunnel is a stub that already points at
+    the destination's listener, so every hop below is the production path -
+    the peer link, the agent-bound channel, and the mailbox the destination
+    keeps for an agent that lives here.
+    """
+
+    ORIGIN = "a" * 32
+    DEST = "d" * 32
+    KEY = "origin-to-destination"
+    BACK = "destination-to-origin"
+
+    def setUp(self):
+        values = {"comms_peer_reconnect_initial": 3600.0,
+                  "comms_peer_reconnect_max": 3600.0}
+        self.destination = Harness(spawns=True, node=self.DEST,
+                                   credential_dir=True, **values)
+        self.addCleanup(self.destination.close)
+        self.origin = Harness(spawns=True, node=self.ORIGIN,
+                              credential_dir=True,
+                              tunnel=lambda: AddressTunnel(
+                                  self.destination.address()), **values)
+        self.addCleanup(self.origin.close)
+        self.origin_key = self.credential(self.origin, self.KEY)
+        self.dest_key = self.credential(self.destination, self.BACK)
+        self.destination.client("op").result("comms.peer.add", {
+            "nodeId": self.ORIGIN, "sshTarget": "origin.example",
+            "remotePort": 5000, "localPort": 0,
+            "outboundCredentialFile": self.dest_key,
+            "inboundCredentialSha256": self.digest(self.KEY)})
+        self.origin.client("op").result("comms.peer.add", {
+            "nodeId": self.DEST, "sshTarget": "destination.example",
+            "remotePort": 5000, "localPort": 0,
+            "outboundCredentialFile": self.origin_key,
+            "inboundCredentialSha256": self.digest(self.BACK)})
+        self.op = self.origin.client("op")
+
+    @staticmethod
+    def digest(text):
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def credential(harness, text):
+        path = os.path.join(harness.credentials, "peer.key")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(path, 0o600)
+        return path
+
+    def call(self, method, params=None, client=None):
+        """The forwarded answer, once the link this node opened is up."""
+        deadline = time.time() + 15
+        while True:
+            answer = (client or self.op).call(
+                "comms.remote", {"nodeId": self.DEST, "method": method,
+                                 "params": params or {}})
+            if answer.get("error", {}).get("message") != "peer-unreachable" \
+                    or time.time() >= deadline:
+                return answer
+            time.sleep(0.05)
+
+    def result(self, method, params=None):
+        answer = self.call(method, params)
+        if "error" in answer:
+            raise AssertionError(f"{method} failed: {answer['error']}")
+        return answer["result"]
+
+    def test_a_forwarded_describe_answers_the_mailbox_kept_here(self):
+        described = self.result("comms.describe")
+        self.assertEqual(described["nodeId"], self.DEST)
+        self.assertEqual(described["agent"], {"nodeId": self.ORIGIN,
+                                              "agentId": "op"})
+        self.assertEqual(described["mailbox"]["nodeId"], self.DEST)
+        self.assertTrue(described["mailbox"]["agentId"].startswith("peer-"))
+        # That mailbox belongs to the peer's agent, never to a local hello.
+        refused = self.destination.client(described["mailbox"]["agentId"])
+        self.assertEqual(refused.greeting["error"]["code"], INVALID_PARAMS)
+
+    def test_a_forwarded_spawn_launches_once_at_the_destination(self):
+        params = {"requestId": "s1", "dir": self.destination.base,
+                  "task": "write the report"}
+        first = self.result("comms.spawn", params)
+        self.assertEqual(first["status"], "spawned")
+        self.assertEqual(first["agent"]["nodeId"], self.DEST)
+        self.assertEqual(first["parent"], {"nodeId": self.ORIGIN,
+                                            "agentId": "op"})
+        again = self.result("comms.spawn", params)
+        self.assertEqual(again["spawnId"], first["spawnId"])
+        self.assertEqual(len(self.destination.sessions.starts), 1)
+        self.result("comms.spawn", dict(params, requestId="s2"))
+        self.assertEqual(len(self.destination.sessions.starts), 2)
+
+    def test_a_forwarded_wait_holds_for_mail_the_destination_took_in(self):
+        proxy = self.result("comms.describe")["mailbox"]
+        held = {}
+
+        def hold():
+            held["answer"] = self.call(
+                "comms.wait", {"cursor": {"agent": proxy, "sequence": 0},
+                               "timeoutMs": 5000},
+                client=self.origin.client("op"))
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        try:
+            time.sleep(0.2)
+            sent = self.destination.client("op").result(
+                "comms.send", {"requestId": "m1",
+                               "to": {"nodeId": self.DEST,
+                                      "agentId": proxy["agentId"]},
+                               "kind": "text", "payload": {"text": "hi"}})
+            self.assertEqual(sent["status"], "accepted")
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+            answer = held["answer"]
+            self.assertNotIn("error", answer)
+            self.assertEqual(answer["result"]["status"], "ok")
+            self.assertEqual([message["payload"]["text"] for message in
+                              answer["result"]["messages"]], ["hi"])
+            # The cursor that wait answered with reads on: the same mail is
+            # not handed out a second time.
+            replayed = self.result("comms.replay",
+                                   {"cursor": answer["result"]["cursor"]})
+            self.assertEqual(replayed["messages"], [])
+        finally:
+            thread.join(1)
+
+    def test_a_peer_that_stops_serving_this_one_reads_as_unreachable(self):
+        self.destination.client("op").result("comms.peer.remove",
+                                             {"nodeId": self.ORIGIN})
+        state = self.await_state("down")
+        self.assertEqual(state, "down")
+        answer = self.call("comms.describe")
+        self.assertEqual(answer["error"]["code"], UNAVAILABLE)
+        self.assertEqual(answer["error"]["message"], "peer-unreachable")
+        # The node that was refused still serves its own agents.
+        self.assertEqual(self.op.result("comms.describe")["agent"],
+                         {"nodeId": self.ORIGIN, "agentId": "op"})
+
+    def await_state(self, wanted):
+        deadline = time.time() + 15
+        state = None
+        while time.time() < deadline:
+            peers = self.op.result("comms.peer.list")["peers"]
+            state = peers[0]["state"] if peers else None
+            if state == wanted:
+                return state
+            time.sleep(0.05)
+        return state
+
+
+class LauncherTaskTests(unittest.TestCase):
+    """A launch runs an argv, or opens one fresh `pi` on a task."""
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="pi-launcher-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.config = ServiceConfig.load()
+        self.sessions = StubSessions()
+        self.launcher = SessionLauncher(self.sessions, self.config,
+                                        PiCommand())
+
+    def _check(self, **spec):
+        return self.launcher.check(dict({"name": "kid", "dir": self.base},
+                                        **spec))
+
+    def test_a_task_opens_one_fresh_pi_on_it_as_literal_text(self):
+        verdict = self._check(task="audit this")
+        self.assertTrue(verdict["ok"])
+        self.assertEqual(verdict["spec"]["argv"][-3:],
+                         ["pi", "--", "audit this"])
+
+    def test_an_option_like_task_stays_text(self):
+        # pi parses its words as options, so `--` is what keeps a task that
+        # starts like one from being read as one.
+        verdict = self._check(task="--help")
+        self.assertEqual(verdict["spec"]["argv"][-3:],
+                         ["pi", "--", "--help"])
+
+    def test_a_task_naming_a_file_stays_text(self):
+        # pi reads a leading `@` as a file even after `--`.
+        verdict = self._check(task="@notes.txt is the report")
+        self.assertEqual(verdict["spec"]["argv"][-2:],
+                         ["--", " @notes.txt is the report"])
+
+    def test_a_launch_takes_an_argv_or_a_task_never_both(self):
+        verdict = self._check(argv=["/bin/true"], task="audit this")
+        self.assertFalse(verdict["ok"])
+        self.assertEqual(verdict["reason"], "invalid-session")
+
+    def test_a_launch_needs_an_argv_or_a_task(self):
+        self.assertEqual(self._check()["reason"], "invalid-session")
+
+    def test_a_blank_task_is_refused(self):
+        self.assertEqual(self._check(task="  ")["reason"],
+                         "invalid-session")
 
 
 if __name__ == "__main__":
