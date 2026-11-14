@@ -54,6 +54,10 @@ class PeerOperations:
         return {"comms.peer.deliver": self.deliver,
                 "comms.peer.ping": self.ping}
 
+    def generation(self, node_id):
+        """The generation currently authorised for a peer, or `None`."""
+        return self._manager.generation(node_id)
+
     def add(self, _sender, params):
         return self._call(self._manager.configure, self._spec(params))
 

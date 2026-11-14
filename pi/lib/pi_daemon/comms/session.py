@@ -8,26 +8,33 @@ from .error import CommsError
 from .message_relay import MESSAGE_TOPIC as TOPIC_MESSAGE
 from .operations import CODES
 
+# A mailbox answers for the mail it holds; everything else answers as the
+# agent that asked, so a remote caller keeps its own address.
+MAILBOX_METHODS = frozenset({"comms.replay", "comms.ack"})
+
 
 class CommsSession:
     """A connection is bound to one identity for its whole life."""
 
-    def __init__(self, config, store, relay, waits, writer, operations, agent):
+    def __init__(self, config, store, relay, waits, writer, operations, agent,
+                 mailbox=None):
         self._config = config
         self._store = store
         self._relay = relay
         self._waits = waits
         self._writer = writer
         self._operations = operations
-        self._handlers = operations.handlers()
+        self._handlers = operations.handlers(agent)
         self._agent = agent
+        self._mailbox = mailbox or agent
         self._codec = RpcCodec()
         self._subscribed = set()
         self._topics_lock = threading.Lock()
         relay.attach(self)
 
     def agent_id(self):
-        return self._agent["agentId"]
+        """The mailbox this connection reads, and is waited on through."""
+        return self._mailbox["agentId"]
 
     def greeting(self):
         return {
@@ -38,13 +45,14 @@ class CommsSession:
             "topics": [TOPIC_MESSAGE],
             "maxFrameBytes": self._config.frame_bytes,
             "agent": dict(self._agent),
+            "mailbox": dict(self._mailbox),
             "headSequence": self._store.head_sequence(self.agent_id()),
+            "limits": {"maxWaitMs": int(self._config.comms_wait_max * 1000)},
         }
 
-    def methods(self):
-        return sorted(set(self._handlers) | {"rpc.hello", "rpc.cancel",
-                                             "rpc.subscribe", "rpc.unsubscribe",
-                                             "comms.wait"})
+    def methods(self, sender=None):
+        """What this connection answers, as the caller it was admitted for."""
+        return self._operations.methods(sender or self._agent)
 
     def handle(self, request):
         method = request.get("method")
@@ -58,7 +66,8 @@ class CommsSession:
         handler = self._handlers.get(method)
         if handler is None:
             raise LookupError(method)
-        return handler(self._agent, self._params(request))
+        identity = self._mailbox if method in MAILBOX_METHODS else self._agent
+        return handler(identity, self._params(request))
 
     def deliver(self, envelope):
         """Offer one envelope; unsent mail is replayed from the mailbox."""
@@ -67,7 +76,7 @@ class CommsSession:
         try:
             self._writer.send(self._codec.notification(TOPIC_MESSAGE, envelope))
         except OSError:
-            self._end()
+            self._end(False)
         except RpcError:
             # The envelope cannot fit a frame; the stored mail is replayed.
             return
@@ -90,7 +99,7 @@ class CommsSession:
     def complete(self, request_id, result):
         """Answer a wait the registry finished. Nobody else sends it."""
         try:
-            reply = self._operations.wait_result(self._agent, result)
+            reply = self._operations.wait_result(self._mailbox, result)
         except RpcError as exc:
             self._send(self._codec.failure(request_id, exc.code, exc.message))
             return
@@ -99,19 +108,25 @@ class CommsSession:
         except RpcError as exc:
             self._send(self._codec.failure(request_id, exc.code, exc.message))
         except OSError:
-            self._end()
+            self._end(False)
 
     def refuse(self, request_id, code, message):
         self._send(self._codec.failure(request_id, code, message))
 
-    def close(self):
-        self._waits.drop(self)
-        self._relay.detach(self)
+    def close(self, wait=True):
+        """A session is its connection: closing one ends both.
+
+        A local connection's loop closes it on the way out, and removal ends
+        a peer's while it is still held: the wait it was holding, the topics
+        it took and the socket itself go together. `wait=False` is for a
+        caller that already knows the peer is gone and will not be drained.
+        """
+        self._end(wait)
 
     def _wait(self, request):
         """Register a wait. The registry answers it from another thread."""
-        wait = self._operations.wait_request(self._agent,
-                                             self._params(request))
+        wait = self._operations.wait_request(self._mailbox,
+                                            self._params(request))
         try:
             self._waits.begin(self, request.get("id"), self.agent_id(),
                               wait["cursor"], wait["limit"], wait["timeout"])
@@ -126,12 +141,21 @@ class CommsSession:
         except RpcError:
             pass
         except OSError:
-            self._end()
+            self._end(False)
 
-    def _end(self):
+    def detach(self):
+        """Release what this connection took, without touching its socket.
+
+        A greeting that is refused is answered on the socket it arrived on,
+        and that answer is the connection loop's to write: the domain state
+        goes here, the socket there.
+        """
         self._waits.drop(self)
         self._relay.detach(self)
-        self._writer.close(wait=False)
+
+    def _end(self, wait=True):
+        self.detach()
+        self._writer.close(wait=wait)
 
     def _wants(self):
         with self._topics_lock:

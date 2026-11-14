@@ -10,15 +10,16 @@ from ..transport.rpc_codec import (CAPACITY, INVALID_PARAMS, UNAUTHORIZED,
                                    UNAVAILABLE)
 from ..transport.rpc_error import RpcError
 from .error import CommsError
-from .mailbox_store import BAD_REQUEST, QUEUED, STORE_FAILED
+from .mailbox_store import (BAD_REQUEST, IDENTITY_CLAIMED, QUEUED,
+                            STORE_FAILED)
 from .message_relay import MessageRelay
 from .operations import CommsOperations, SPAWN_FAILED
 from .peer_operations import PeerOperations
 from .peer_session import PeerSession
 from .session import CommsSession
 from .spawn_ledger import (ENV_AGENT_ID, ENV_HOST, ENV_NODE_ID,
-                           ENV_PARENT_AGENT_ID, ENV_PORT, ENV_SPAWN_ID,
-                           SPAWNED)
+                           ENV_PARENT_AGENT_ID, ENV_PARENT_NODE_ID, ENV_PORT,
+                           ENV_SPAWN_ID, SPAWNED)
 from .wait_registry import CLOSING, WaitRegistry
 
 SERVICE = "agent-comms"
@@ -37,7 +38,10 @@ class CommsService:
         self._spawns = spawns
         self._launcher = launcher
         self._peers = None
+        self._mailboxes = None
         self._peer_operations = None
+        self._peer_sessions = []
+        self._peer_lock = threading.Lock()
         self._relay = MessageRelay()
         self._waits = WaitRegistry(store, config)
         self._operations = CommsOperations(self, config)
@@ -53,16 +57,21 @@ class CommsService:
         self._store.load()
         if self._spawns is not None:
             self._spawns.load()
+        if self._mailboxes is not None:
+            self._mailboxes.load()
         self._waits.start()
         if self._peers is not None:
             self._peers.start()
         return self
 
-    def use_peers(self, manager, operations=None, credentials=None):
+    def use_peers(self, manager, operations=None, credentials=None,
+                  mailboxes=None):
         """Attach the peer manager and the wire it serves, before start()."""
         self._peers = manager
+        self._mailboxes = mailboxes
         self._peer_operations = operations or PeerOperations(
             manager, self._config, self._node_id, directory=credentials)
+        manager.on_peer_gone(self.close_peer_sessions)
         return self
 
     def peer_handlers(self):
@@ -85,6 +94,8 @@ class CommsService:
         self._store.save()
         if self._spawns is not None:
             self._spawns.save()
+        if self._mailboxes is not None:
+            self._mailboxes.save()
 
     def node_id(self):
         return self._node_id
@@ -100,7 +111,7 @@ class CommsService:
         """Authenticate a hello, reserve its mailbox and bind the socket."""
         params = self._params(params)
         if params.get("peer") is not None:
-            return self._bind_peer(params)
+            return self._bind_peer(params, writer)
         supplied = str(params.get("token") or "")
         if not hmac.compare_digest(supplied, self._token):
             raise RpcError(UNAUTHORIZED, "bad token")
@@ -108,14 +119,17 @@ class CommsService:
             raise RpcError(INVALID_PARAMS, "unsupported version")
         agent = self._agent(params.get("agent"))
         try:
-            self._store.reserve(agent["agentId"])
+            self._store.reserve(agent["agentId"], permitted=self._permit())
         except CommsError as exc:
+            if exc.code == IDENTITY_CLAIMED:
+                raise RpcError(INVALID_PARAMS,
+                               "that id belongs to a peer") from None
             raise RpcError(CAPACITY if exc.code == "busy" else UNAVAILABLE,
                            str(exc.code)) from None
         return CommsSession(self._config, self._store, self._relay,
                             self._waits, writer, self._operations, agent)
 
-    def _bind_peer(self, params):
+    def _bind_peer(self, params, writer):
         """A peer presents its own credential, never the daemon token."""
         if self._peers is None or self._peer_operations is None:
             raise RpcError(UNAUTHORIZED, "peers are not served here")
@@ -134,8 +148,78 @@ class CommsService:
         generation = self._peers.generation(node_id)
         if generation is None:
             raise RpcError(UNAUTHORIZED, "the peer is not configured")
-        return PeerSession(self._config, self._peer_operations,
-                           {"nodeId": node_id, "generation": generation})
+        identity = {"nodeId": node_id, "generation": generation}
+        bound = None
+        agent_id = peer.get("agentId")
+        if agent_id is not None:
+            bound = self._bind_peer_agent(node_id, agent_id, writer)
+        session = PeerSession(self._config, self._peer_operations, identity,
+                              bound, writer, on_close=self._forget_peer_session)
+        # A removal or a shutdown may have swept the connections while this
+        # one was binding: registering behind the sweep would leave a
+        # connection nothing can close. The sweep runs under this lock. A
+        # connection refused here is answered on its socket like any other
+        # greeting error, and the loop closes it.
+        with self._peer_lock:
+            admitted = not self._closing and \
+                self._peers.admitting() and \
+                self._peers.generation(node_id) == generation
+            if admitted:
+                self._peer_sessions.append(session)
+        if not admitted:
+            # The socket still owes this greeting its refusal, which the loop
+            # writes; what the session took from the relay is released here,
+            # or the refused connection would stay attached forever.
+            if bound is not None:
+                bound.detach()
+            raise RpcError(UNAUTHORIZED, "peer-stale")
+        return session
+
+    def _forget_peer_session(self, session):
+        """A connection that is over stops being one removal can close."""
+        with self._peer_lock:
+            if session in self._peer_sessions:
+                self._peer_sessions.remove(session)
+
+    def _permit(self):
+        """The ownership rule a local reservation applies, if peers exist."""
+        if self._mailboxes is None:
+            return None
+        return self._mailboxes.permit
+
+    def close_peer_sessions(self, node_id=None):
+        """A peer that is gone keeps no connection here, open or bound.
+
+        The generation check refuses a removed peer's calls, but a held wait
+        would otherwise answer later and an unread mailbox would stay
+        readable by a node this daemon no longer trusts. The connection is
+        cut rather than drained: nothing a removed peer holds is owed an
+        answer.
+        """
+        with self._peer_lock:
+            closing = [session for session in self._peer_sessions
+                       if node_id is None or session.node_id() == node_id]
+        for session in closing:
+            session.close(wait=False)
+        return len(closing)
+
+    def _bind_peer_agent(self, node_id, agent_id, writer):
+        """A peer's agent is served the surface a local agent is served."""
+        if self._mailboxes is None:
+            raise RpcError(UNAUTHORIZED, "peers are not served here")
+        if not isinstance(agent_id, str) or not agent_id or \
+                len(agent_id) > self._config.comms_agent_id_limit:
+            raise RpcError(INVALID_PARAMS, "agentId must be a short name")
+        try:
+            mailbox = self._mailboxes.bind(
+                {"nodeId": node_id, "agentId": agent_id}, self._store)
+        except CommsError as exc:
+            raise RpcError(CAPACITY if exc.code == "busy" else UNAVAILABLE,
+                           str(exc.code)) from None
+        return CommsSession(self._config, self._store, self._relay,
+                            self._waits, writer, self._operations,
+                            {"nodeId": node_id, "agentId": agent_id},
+                            mailbox)
 
     def _agent(self, value):
         if not isinstance(value, dict):
@@ -145,6 +229,8 @@ class CommsService:
             raise RpcError(INVALID_PARAMS, "an agent id is required")
         if len(agent_id) > self._config.comms_agent_id_limit:
             raise RpcError(INVALID_PARAMS, "an agent id must be short")
+        if self._mailboxes is not None and self._mailboxes.owns(agent_id):
+            raise RpcError(INVALID_PARAMS, "that id belongs to a peer")
         if str(value.get("nodeId") or self._node_id) != self._node_id:
             raise RpcError(INVALID_PARAMS, "this node is the one served")
         # A sender is stamped with this node, whatever the caller claimed.
@@ -194,6 +280,23 @@ class CommsService:
 
     # -- launching another agent -------------------------------------------
 
+    def describe(self, sender):
+        """What this node offers the caller, and the mailbox it reads here."""
+        mailbox = {"nodeId": self._node_id, "agentId": sender["agentId"]}
+        if self._mailboxes is not None:
+            bound = self._mailboxes.mailbox(sender)
+            if bound is not None:
+                mailbox["agentId"] = bound
+        return {"nodeId": self._node_id,
+                "agent": {"nodeId": sender["nodeId"],
+                          "agentId": sender["agentId"]},
+                "mailbox": mailbox,
+                "headSequence": self._store.head_sequence(
+                    mailbox["agentId"]),
+                "methods": self._operations.methods(sender),
+                "limits": {"maxWaitMs": int(self._config.comms_wait_max
+                                            * 1000)}}
+
     def spawns_enabled(self):
         return self._spawns is not None and self._launcher is not None
 
@@ -213,6 +316,9 @@ class CommsService:
             agent_id = spec.get("agentId") or uuid.uuid4().hex
             if agent_id == sender["agentId"]:
                 raise CommsError(BAD_REQUEST)
+            if self._mailboxes is not None and \
+                    self._mailboxes.owns(agent_id):
+                raise CommsError(BAD_REQUEST)
             agent = {"nodeId": self._node_id, "agentId": agent_id}
             name = spec.get("name") or agent_id
             check = dict(spec, name=name)
@@ -224,11 +330,14 @@ class CommsService:
                                        launch["name"])
             spawn_id = record["spawnId"]
             try:
-                self._store.reserve(agent_id, provisional=spawn_id)
+                self._store.reserve(agent_id, provisional=spawn_id,
+                                    permitted=self._permit())
             except (CommsError, OSError) as failure:
                 if not self._forget(sender, request_id, agent_id, spawn_id):
                     raise CommsError(STORE_FAILED) from None
                 if isinstance(failure, CommsError):
+                    if failure.code == IDENTITY_CLAIMED:
+                        raise CommsError(BAD_REQUEST) from None
                     raise
                 raise CommsError(STORE_FAILED) from None
             launch["env"] = dict(launch["env"] or {},
@@ -276,6 +385,7 @@ class CommsService:
         return {ENV_AGENT_ID: agent["agentId"],
                 ENV_NODE_ID: agent["nodeId"],
                 ENV_PARENT_AGENT_ID: sender["agentId"],
+                ENV_PARENT_NODE_ID: sender["nodeId"],
                 ENV_SPAWN_ID: spawn_id}
 
     def _endpoint_env(self):

@@ -499,12 +499,35 @@ symlink, so a path an agent names can never reach the token file or a
 key outside that directory.
 
 A peer connection presents `{version, peer: {nodeId, credential}}` at
-`rpc.hello`, never the daemon token and never an agent identity: the
-verifier configured for that node decides admission, and the greeting
-binds the connection to the peer's own node with the peer methods
-(`comms.peer.deliver`, `comms.peer.ping`), no agent method and no
-topics. An agent connection is offered the peer administration and
-never the peer wire.
+`rpc.hello`, never the daemon token: the verifier configured for that
+node decides admission. A connection that presents no agent is the
+delivery wire and nothing else - `comms.peer.deliver` and
+`comms.peer.ping`, no agent method and no topics. A connection that
+adds `peer.agentId` is served the surface a local agent is served,
+plus those two transport methods: it acts as that agent of its own
+node, and it reads a mailbox this node keeps for it, named in the
+greeting as `mailbox`. That id is derived from the origin, one mailbox
+per origin agent, and no local identity may claim it. A local agent
+session is offered the peer administration and never the peer wire.
+Removing a peer takes back what it still held here: the generation stops
+admitting calls, the connections that peer opened, the waits they
+registered and the mailboxes they read are ended with them - a held wait
+is not answered later and a closed connection is not left silent.
+
+The origin-to-mailbox record (`peer-mailboxes.json`, in the comms
+state directory, with the same protected mode as the mailbox store) is
+durable ownership: it is written by the first successful agent-bound
+peer hello, which is also when the mailbox is created, and a hello that
+presents no agent writes nothing. The claim is published before its
+mailbox is created, so no local agent can adopt the id in between, and
+a claim whose mailbox could not be created is withdrawn. Keep this
+record with the mailbox state it names - a restore that keeps the
+mailboxes and drops the record loses which of them belong to a peer,
+and an older release does not enforce those guards.
+
+The peer credential is therefore authority over the surface of a local
+agent, launches included, as the destination daemon's user: configure
+a peer only for a host whose agent you trust that far.
 
 Inbound delivery is one envelope, committed before it is published,
 and answers `accepted` with the mailbox sequence it took. A delivery ID
@@ -536,11 +559,18 @@ with reason `peer-removed`, and mail already attempted is `unknown`,
 because this node cannot promise the remote mailbox did not take it.
 The answer reports both counts, and adding the peer again mints a new
 generation, so mail queued for the removed one can never be delivered
-as mail for the new one. A connection still bound to the removed
-generation is refused at `comms.peer.ping` and at `comms.peer.deliver`
-with `peer-stale`, which sends its worker back to a fresh `rpc.hello`
-instead of wedging it: a steady stream of sends cannot keep a dead
-generation's link alive.
+as mail for the new one.
+
+Removal also ends the connections that peer opened here rather than
+draining them: a held wait is dropped, the agent session it was bound to
+is closed and the socket is cut, because nothing a removed peer holds is
+owed an answer. A connection that outlived its sweep, or one whose
+greeting lost the race against the removal, is refused with `peer-stale`
+at the greeting or at its next call, which sends its worker back to a
+fresh `rpc.hello` instead of wedging it: a steady stream of sends cannot
+keep a dead generation's link alive. A connection refused that way is
+never registered, so no later sweep can miss it, and its refusal is
+answered on the socket like any other greeting error.
 
 The message envelope is bounded by the frame, not only by the payload
 limit, so a notification always fits the connection that carries it. A

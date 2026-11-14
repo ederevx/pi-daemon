@@ -14,6 +14,7 @@ from .comms.node_identity import NodeIdentity
 from .comms.peer_auth import PeerAuthenticator
 from .comms.peer_config_store import PeerConfigStore
 from .comms.peer_manager import PeerManager
+from .comms.peer_mailboxes import PeerMailboxes
 from .comms.service import CommsService
 from .comms.spawn_ledger import SpawnLedger
 from .config import ServiceConfig
@@ -80,6 +81,7 @@ class DaemonApplication:
         self._comms_listener = None
         self._comms_spawns = None
         self._comms_peers = None
+        self._comms_mailboxes = None
         self._node_identity = None
         self._comms_file = None
         self._comms_descriptor = None
@@ -204,7 +206,11 @@ class DaemonApplication:
             self._config, store, peers,
             PeerAuthenticator(self._config, peers, directory=credentials),
             service.deliver_peer, identity.id())
-        service.use_peers(manager, credentials=credentials)
+        mailboxes = PeerMailboxes(self._layout.comms_peer_mailboxes_path(),
+                                  self._config)
+        self._comms_mailboxes = mailboxes
+        service.use_peers(manager, credentials=credentials,
+                          mailboxes=mailboxes)
         self._comms = service
         service.start()
         listener = RpcListener(self._config, RpcCodec(), service,
@@ -345,6 +351,7 @@ class DaemonApplication:
         self._comms_store = None
         self._comms_listener = None
         self._comms_peers = None
+        self._comms_mailboxes = None
         self._node_identity = None
 
     def _unwind(self):

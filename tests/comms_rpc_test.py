@@ -14,6 +14,7 @@ import time
 import unittest
 
 from collections import deque
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
@@ -30,9 +31,11 @@ def tearDownModule():
 
 
 from pi_daemon.comms.mailbox_store import MailboxStore
+from pi_daemon.comms.error import CommsError
 from pi_daemon.comms.peer_auth import PeerAuthenticator
 from pi_daemon.comms.peer_config_store import PeerConfigStore
 from pi_daemon.comms.peer_manager import PeerManager
+from pi_daemon.comms.peer_mailboxes import PeerMailboxes
 from pi_daemon.comms.service import CommsService
 from pi_daemon.comms.spawn_ledger import SpawnLedger
 from pi_daemon.config import ServiceConfig
@@ -110,6 +113,14 @@ class Client:
         except OSError:
             pass
 
+    def eof(self, timeout=5.0):
+        """Whether the server closed this connection on its own."""
+        self._socket.settimeout(timeout)
+        try:
+            return self._socket.recv(1) == b""
+        except socket.timeout:
+            return False
+
     def _exchange(self, method, params):
         self._next += 1
         request_id = f"c{self._next}"
@@ -172,21 +183,23 @@ class FakeTunnel:
 class Harness:
     """One daemon-side comms stack on a scratch root."""
 
-    def __init__(self, spawns=False, peers=None, **overrides):
+    def __init__(self, spawns=False, peers=None, node=None, **overrides):
         self.base = tempfile.mkdtemp(prefix="pi-comms-rpc-")
+        self.node = node or NODE
         layout = RuntimeLayout(os.path.join(self.base, "state"),
                               os.path.join(self.base, "run"))
         self.config = ServiceConfig.load(overrides=overrides)
         self.store = MailboxStore(layout.comms_mailbox_path(), self.config,
-                                  NODE)
+                                  self.node)
         self.sessions = StubSessions() if spawns else None
         ledger = None
         launcher = None
         if spawns:
-            ledger = SpawnLedger(layout.comms_spawns_path(), self.config, NODE)
+            ledger = SpawnLedger(layout.comms_spawns_path(), self.config,
+                                 self.node)
             launcher = SessionLauncher(self.sessions, self.config,
                                        PiCommand())
-        self.service = CommsService(self.store, self.config, TOKEN, NODE,
+        self.service = CommsService(self.store, self.config, TOKEN, self.node,
                                     ledger, launcher)
         self.peer_store = None
         self.credentials = layout.comms_peer_credentials_path()
@@ -197,8 +210,11 @@ class Harness:
                 self.config, self.store, self.peer_store,
                 PeerAuthenticator(self.config, self.peer_store,
                                   reader=lambda _path: peers),
-                self.service.deliver_peer, NODE,
-                tunnel_factory=FakeTunnel), credentials=self.credentials)
+                self.service.deliver_peer, self.node,
+                tunnel_factory=FakeTunnel),
+                credentials=self.credentials,
+                mailboxes=PeerMailboxes(
+                    layout.comms_peer_mailboxes_path(), self.config))
         self.service.start()
         self.listener = RpcListener(self.config, RpcCodec(), self.service)
         self.listener.start()
@@ -900,7 +916,8 @@ class PeerWireTests(SocketCase):
     CREDENTIAL = "shared"
 
     def make_harness(self, **overrides):
-        values = {"comms_peer_reconnect_initial": 3600.0,
+        values = {"spawns": True,
+                  "comms_peer_reconnect_initial": 3600.0,
                   "comms_peer_reconnect_max": 3600.0}
         values.update(overrides)
         return Harness(peers=self.CREDENTIAL, **values)
@@ -922,12 +939,18 @@ class PeerWireTests(SocketCase):
     def remote(self, agent_id="b"):
         return {"nodeId": self.NODE_B, "agentId": agent_id}
 
-    def peer_client(self, node_id=None, credential=CREDENTIAL, **options):
-        client = Client(self.harness.address(),
-                        peer={"nodeId": node_id or self.NODE_B,
-                              "credential": credential}, **options)
+    def peer_client(self, node_id=None, credential=CREDENTIAL,
+                    agent_id=None, **options):
+        identity = {"nodeId": node_id or self.NODE_B, "credential": credential}
+        if agent_id is not None:
+            identity["agentId"] = agent_id
+        client = Client(self.harness.address(), peer=identity, **options)
         self.harness.clients.append(client)
         return client
+
+    def agent_peer(self, agent_id="alpha", **options):
+        """A connection that presents an agent of its own, not just a node."""
+        return self.peer_client(agent_id=agent_id, **options)
 
     def delivery(self, delivery_id="d1", to="b"):
         now = time.time()
@@ -1032,19 +1055,53 @@ class PeerWireTests(SocketCase):
             "comms.peer.deliver", {"delivery": self.delivery()})
         self.assertEqual(answer["error"]["code"], METHOD_NOT_FOUND)
 
-    def test_a_removed_peer_cannot_deliver_under_its_old_generation(self):
+    def test_a_removed_peer_loses_the_connection_it_had(self):
         self.configure()
         self.reserve("b")
         peer = self.peer_client()
         removed = self.harness.client("op").result("comms.peer.remove",
                                                    {"nodeId": self.NODE_B})
         self.assertEqual(removed["status"], "removed")
-        answer = peer.call("comms.peer.deliver", {"delivery": self.delivery()})
-        # Gone generation means greet again, not a bad request the worker
-        # would retry forever against a link that can never succeed.
-        self.assertEqual(answer["error"]["code"], UNAUTHORIZED)
+        # Removal ends the connection instead of answering on it: nothing a
+        # removed peer holds here is owed a reply.
+        self.assertTrue(peer.eof())
         self.assertEqual(self.harness.client("b").result(
             "comms.replay", {})["messages"], [])
+
+    def test_removal_ends_what_a_peer_still_held_here(self):
+        self.configure()
+        peer = self.agent_peer()
+        mailbox = peer.greeting["result"]["mailbox"]
+        peer.result("rpc.subscribe", {"topics": ["message"]})
+        held = {}
+
+        def wait():
+            try:
+                held["answer"] = peer.call("comms.wait", {"timeoutMs": 5000})
+            except (OSError, ValueError, ConnectionError) as failure:
+                held["answer"] = failure
+
+        thread = threading.Thread(target=wait)
+        thread.start()
+        try:
+            time.sleep(0.2)
+            started = time.monotonic()
+            self.harness.client("op").result("comms.peer.remove",
+                                            {"nodeId": self.NODE_B})
+            # Joined well inside the wait's own hold: the connection ends
+            # rather than leaving the caller to its socket deadline.
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertLess(time.monotonic() - started, 3.0)
+            self.assertNotIsInstance(held.get("answer"), dict)
+            # The mailbox it read here is nobody's to read now: mail still
+            # arrives for it, and no connection is left to push it.
+            self.harness.client("local").result(
+                "comms.send", {"requestId": "r2",
+                               "to": {"agentId": mailbox["agentId"]},
+                               "kind": "text", "payload": {"n": 2}})
+        finally:
+            thread.join(1)
 
     def test_the_operator_configures_lists_and_removes_a_peer(self):
         operator = self.harness.client("op")
@@ -1099,76 +1156,203 @@ class PeerWireTests(SocketCase):
         self.assertEqual(answer, {"status": "undeliverable",
                                   "reason": "no-such-peer"})
 
-    def test_a_delivery_on_a_stale_connection_also_says_greet_again(self):
+    def test_a_connection_a_sweep_missed_says_greet_again(self):
+        self.configure()
+        peer = self.peer_client()
+        service = self.harness.service
+        # A removal whose sweep did not reach this socket: the generation is
+        # what refuses it, and the answer is the greet-again a worker's
+        # steady retries can act on, not a bad request it would repeat.
+        service._peers._listeners = []
+        self.harness.client("op").result("comms.peer.remove",
+                                         {"nodeId": self.NODE_B})
+        self.configure()
+        delivered = peer.call("comms.peer.deliver",
+                              {"delivery": self.delivery()})
+        self.assertEqual(delivered["error"]["code"], UNAUTHORIZED)
+        self.assertIn("peer-stale", delivered["error"]["message"])
+        pinged = peer.call("comms.peer.ping", {})
+        self.assertIn("peer-stale", pinged["error"]["message"])
+
+    # -- an agent-bound connection: the same surface, further away --
+
+    def test_an_agent_bound_peer_is_served_the_agent_surface(self):
+        self.configure()
+        peer = self.agent_peer()
+        greeting = peer.greeting["result"]
+        self.assertIn("comms.send", greeting["methods"])
+        self.assertIn("comms.replay", greeting["methods"])
+        self.assertIn("comms.wait", greeting["methods"])
+        self.assertIn("comms.peer.deliver", greeting["methods"])
+        self.assertEqual(greeting["agent"], {"nodeId": self.NODE_B,
+                                             "agentId": "alpha"})
+        self.assertEqual(greeting["mailbox"]["nodeId"], NODE)
+        self.assertNotEqual(greeting["mailbox"]["agentId"], "alpha")
+
+    def test_an_agent_bound_peer_is_offered_exactly_a_local_agent_surface(self):
+        self.configure()
+        local = self.harness.client("op").greeting["result"]["methods"]
+        peer = self.agent_peer().greeting["result"]["methods"]
+        self.assertEqual(sorted(set(peer)),
+                         sorted(set(local) | {"comms.peer.deliver",
+                                              "comms.peer.ping"}))
+
+    def test_two_origin_agents_keep_separate_mailboxes_and_ids(self):
+        self.configure()
+        alpha = self.agent_peer("alpha").greeting["result"]["mailbox"]
+        beta = self.agent_peer("beta").greeting["result"]["mailbox"]
+        self.assertNotEqual(alpha["agentId"], beta["agentId"])
+        self.assertEqual(alpha["agentId"],
+                         self.agent_peer("alpha").greeting["result"]
+                         ["mailbox"]["agentId"])
+        claimed = Client(self.harness.address(), agent_id=alpha["agentId"])
+        self.harness.clients.append(claimed)
+        self.assertEqual(claimed.greeting["error"]["code"], INVALID_PARAMS)
+
+    def test_a_local_hello_is_refused_when_its_own_look_was_stale(self):
+        self.configure()
+        proxy = self.agent_peer().greeting["result"]["mailbox"]["agentId"]
+        service = self.harness.service
+        real = service._mailboxes
+
+        class Stale:
+            """The look a hello takes a moment before the peer's claim."""
+
+            def owns(self, agent_id):
+                return False
+
+            def permit(self, agent_id):
+                return real.permit(agent_id)
+
+        with mock.patch.object(service, "_mailboxes", Stale()):
+            claimed = Client(self.harness.address(), agent_id=proxy)
+            self.harness.clients.append(claimed)
+        # The look said free; the reservation is the one that decides, and it
+        # answers for the peer that created that very id meanwhile.
+        self.assertEqual(claimed.greeting["error"]["code"], INVALID_PARAMS)
+        self.assertEqual(claimed.greeting["error"]["message"],
+                         "that id belongs to a peer")
+        self.assertTrue(real.owns(proxy))
+
+    def test_a_spawn_cannot_take_an_id_a_peer_owns(self):
+        self.configure()
+        proxy = self.agent_peer().greeting["result"]["mailbox"]["agentId"]
+        answer = self.harness.client("a").call(
+            "comms.spawn", {"requestId": "r1", "dir": self.harness.base,
+                            "argv": ["/bin/true"], "agentId": proxy})
+        # The launch never starts: the reservation, not the look before it,
+        # is what refuses an id a peer's mailbox is keeping here.
+        self.assertEqual(answer["error"]["code"], INVALID_PARAMS)
+        self.assertEqual(self.harness.sessions.starts, [])
+
+    def test_a_connection_that_binds_behind_a_removal_is_refused(self):
+        self.configure()
+        service = self.harness.service
+        relay = service._relay
+        real = service._bind_peer_agent
+        removed = []
+        attached = list(relay._sessions)
+
+        def bind_then_remove(node_id, agent_id, writer):
+            mailbox = real(node_id, agent_id, writer)
+            # The removal completes between the bind and the registration.
+            removed.append(service._peers.remove(self.NODE_B))
+            return mailbox
+
+        with mock.patch.object(service, "_bind_peer_agent",
+                               side_effect=bind_then_remove):
+            peer = self.agent_peer()
+        self.assertEqual(peer.greeting["error"]["code"], UNAUTHORIZED)
+        self.assertEqual(peer.greeting["error"]["message"], "peer-stale")
+        self.assertEqual([item["status"] for item in removed], ["removed"])
+        self.assertEqual(service._peer_sessions, [])
+        # The refusal is answered on the socket, so the session the greeting
+        # had already built must have let go of the relay it attached to.
+        self.assertEqual(list(relay._sessions), attached)
+
+    def test_a_removal_ends_an_idle_peer_connection(self):
         self.configure()
         peer = self.peer_client()
         self.harness.client("op").result("comms.peer.remove",
                                         {"nodeId": self.NODE_B})
-        self.configure()
-        answer = peer.call("comms.peer.deliver",
-                           {"delivery": self.delivery()})
-        # The same answer ping gives, so a worker's steady sends cannot keep
-        # a removed generation's link wedged.
-        self.assertEqual(answer["error"]["code"], UNAUTHORIZED)
-        self.assertIn("peer-stale", answer["error"]["message"])
+        # No request is sent: the socket is what a removal takes back, so an
+        # idle delivery-only connection must see the end of it.
+        self.assertTrue(peer.eof())
 
-    def test_a_connection_whose_generation_is_gone_must_greet_again(self):
+    def test_a_removal_announces_the_peer_even_when_settlement_fails(self):
         self.configure()
         peer = self.peer_client()
-        self.assertEqual(peer.result("comms.peer.ping", {})["nodeId"], NODE)
-        self.harness.client("op").result("comms.peer.remove",
-                                         {"nodeId": self.NODE_B})
+        service = self.harness.service
+        announced = []
+        service._peers.on_peer_gone(announced.append)
+        with mock.patch.object(self.harness.store, "cancel_peer",
+                               side_effect=CommsError("store-failed")):
+            with self.assertRaises(CommsError):
+                service._peers.remove(self.NODE_B)
+        # The generation is gone whatever the settlement did, so the
+        # connections and sessions of that peer cannot survive the failure.
+        self.assertEqual(announced, [self.NODE_B])
+        self.assertTrue(peer.eof())
+        self.assertEqual(service._peer_sessions, [])
+
+    def test_a_peer_reads_the_mailbox_this_node_keeps_for_it(self):
         self.configure()
-        answer = peer.call("comms.peer.ping", {})
-        self.assertEqual(answer["error"]["code"], UNAUTHORIZED)
-        self.assertIn("peer-stale", answer["error"]["message"])
+        peer = self.agent_peer()
+        mailbox = peer.greeting["result"]["mailbox"]
+        self.harness.client("local").result(
+            "comms.send", {"requestId": "r1", "to": mailbox,
+                           "kind": "text", "payload": {"n": 1}})
+        waited = peer.result("comms.wait", {"timeoutMs": 2000})
+        self.assertEqual([message["payload"]
+                          for message in waited["messages"]], [{"n": 1}])
+        self.assertEqual(waited["messages"][0]["from"],
+                         {"nodeId": NODE, "agentId": "local"})
 
+    def test_describe_names_the_mailbox_the_caller_reads_here(self):
+        self.configure()
+        peer = self.agent_peer()
+        described = peer.result("comms.describe", {})
+        self.assertEqual(described["mailbox"],
+                         peer.greeting["result"]["mailbox"])
+        self.assertEqual(described["nodeId"], NODE)
+        self.assertEqual(described["headSequence"], 0)
 
-class LauncherTaskTests(unittest.TestCase):
-    """A launch runs an argv, or opens one fresh `pi` on a task."""
+    def test_a_repeated_send_request_over_a_peer_answers_once(self):
+        self.configure()
+        self.reserve("target")
+        peer = self.agent_peer()
+        params = {"requestId": "r1", "to": {"agentId": "target"},
+                  "kind": "text", "payload": {"n": 1}}
+        first = peer.result("comms.send", params)
+        self.assertEqual(peer.result("comms.send", params), first)
+        self.assertEqual(first["status"], "accepted")
+        replayed = self.harness.client("target").result("comms.replay", {})
+        self.assertEqual(len(replayed["messages"]), 1)
+        self.assertEqual(replayed["messages"][0]["from"],
+                         {"nodeId": self.NODE_B, "agentId": "alpha"})
 
-    def setUp(self):
-        self.base = tempfile.mkdtemp(prefix="pi-launcher-")
-        self.addCleanup(shutil.rmtree, self.base, True)
-        self.config = ServiceConfig.load()
-        self.sessions = StubSessions()
-        self.launcher = SessionLauncher(self.sessions, self.config,
-                                        PiCommand())
+    def test_a_peer_launches_an_agent_where_that_node_is(self):
+        self.configure()
+        peer = self.agent_peer()
+        request = {"requestId": "s1", "dir": self.harness.base,
+                   "argv": ["/bin/true"], "agentId": "kid"}
+        answer = peer.result("comms.spawn", request)
+        self.assertEqual(answer["status"], "spawned")
+        self.assertEqual(answer["agent"], {"nodeId": NODE, "agentId": "kid"})
+        self.assertEqual(answer["parent"], {"nodeId": self.NODE_B,
+                                             "agentId": "alpha"})
+        # The same request answers the launch that already happened.
+        self.assertEqual(peer.result("comms.spawn", request)["spawnId"],
+                         answer["spawnId"])
+        self.assertEqual(len(self.harness.sessions.starts), 1)
 
-    def _check(self, **spec):
-        return self.launcher.check(dict({"name": "kid", "dir": self.base},
-                                        **spec))
+    def test_a_peer_connection_still_refuses_a_method_nobody_serves(self):
+        self.configure()
+        answer = self.agent_peer().call("comms.nonsense", {})
+        self.assertEqual(answer["error"]["code"], METHOD_NOT_FOUND)
 
-    def test_a_task_opens_one_fresh_pi_on_it_as_literal_text(self):
-        verdict = self._check(task="audit this")
-        self.assertTrue(verdict["ok"])
-        self.assertEqual(verdict["spec"]["argv"][-3:],
-                         ["pi", "--", "audit this"])
-
-    def test_an_option_like_task_stays_text(self):
-        # pi parses its words as options, so `--` is what keeps a task that
-        # starts like one from being read as one.
-        verdict = self._check(task="--help")
-        self.assertEqual(verdict["spec"]["argv"][-3:],
-                         ["pi", "--", "--help"])
-
-    def test_a_task_naming_a_file_stays_text(self):
-        # pi reads a leading `@` as a file even after `--`.
-        verdict = self._check(task="@notes.txt is the report")
-        self.assertEqual(verdict["spec"]["argv"][-2:],
-                         ["--", " @notes.txt is the report"])
-
-    def test_a_launch_takes_an_argv_or_a_task_never_both(self):
-        verdict = self._check(argv=["/bin/true"], task="audit this")
-        self.assertFalse(verdict["ok"])
-        self.assertEqual(verdict["reason"], "invalid-session")
-
-    def test_a_launch_needs_an_argv_or_a_task(self):
-        self.assertEqual(self._check()["reason"], "invalid-session")
-
-    def test_a_blank_task_is_refused(self):
-        self.assertEqual(self._check(task="  ")["reason"],
-                         "invalid-session")
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 
 
 if __name__ == "__main__":

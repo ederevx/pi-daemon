@@ -39,7 +39,14 @@ class PeerManager:
             lambda: PeerLink(config, node_id, clock=clock))
         self._lock = threading.Lock()
         self._workers = {}
+        self._listeners = []
         self._closing = False
+
+    def on_peer_gone(self, listener):
+        """What removal and shutdown announce: the node that left, or None."""
+        with self._lock:
+            self._listeners.append(listener)
+        return self
 
     def start(self):
         self._peers.load()
@@ -68,6 +75,7 @@ class PeerManager:
             worker.stop()
         with self._lock:
             self._workers = {}
+        self._gone(None)
 
     def stop(self):
         self.begin_shutdown()
@@ -103,6 +111,11 @@ class PeerManager:
             worker = self._workers.get(node_id)
         if worker is not None:
             worker.wake()
+
+    def admitting(self):
+        """Whether a new peer connection may still be registered."""
+        with self._lock:
+            return not self._closing
 
     # -- administration ----------------------------------------------------
 
@@ -142,6 +155,10 @@ class PeerManager:
         finally:
             if worker is not None:
                 worker.stop()
+            # A removed peer's connections are closed after its generation is
+            # gone, whatever the settlement did: a failure here must not
+            # leave the connections the peer opened open.
+            self._gone(node_id)
         return {"status": "removed", "nodeId": node_id,
                 "undeliverableCount": counts["undeliverable"],
                 "unknownCount": counts["unknown"]}
@@ -150,6 +167,12 @@ class PeerManager:
         return {"peers": [self._view(record) for record in self._peers.list()]}
 
     # -- internals ---------------------------------------------------------
+
+    def _gone(self, node_id):
+        with self._lock:
+            listeners = list(self._listeners)
+        for listener in listeners:
+            listener(node_id)
 
     def _spawn(self, record):
         worker = PeerDelivery(

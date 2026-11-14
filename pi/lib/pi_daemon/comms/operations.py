@@ -11,6 +11,9 @@ from .wait_registry import CLOSING, WAIT_PENDING
 
 LOCAL_SCOPE = "local"
 NO_LOCAL_RECIPIENT = "no-local-recipient"
+# What every bound connection answers itself, whatever it was offered.
+SESSION_METHODS = frozenset({"rpc.hello", "rpc.cancel", "rpc.subscribe",
+                             "rpc.unsubscribe", "comms.wait"})
 CODES = {
     BUSY: CAPACITY,
     REQUEST_CONFLICT: INVALID_PARAMS,
@@ -37,18 +40,24 @@ class CommsOperations:
         self._service = service
         self._config = config
 
-    def handlers(self):
+    def handlers(self, sender=None):
+        """What this node offers the caller."""
         handlers = {
             "comms.send": self.send,
             "comms.broadcast": self.broadcast,
             "comms.replay": self.replay,
             "comms.ack": self.ack,
             "comms.receipt": self.receipt,
+            "comms.describe": self.describe,
         }
         if self._service.spawns_enabled():
             handlers["comms.spawn"] = self.spawn
         handlers.update(self._service.peer_handlers())
         return handlers
+
+    def methods(self, sender=None):
+        """Every method a connection as this sender answers, in one place."""
+        return sorted(set(self.handlers(sender)) | SESSION_METHODS)
 
     def send(self, sender, params):
         request_id = self._identifier(params, "requestId")
@@ -71,6 +80,10 @@ class CommsOperations:
     def receipt(self, sender, params):
         request_id = self._identifier(params, "requestId")
         return self._project(self._service.receipt, sender, request_id)
+
+    def describe(self, sender, _params):
+        """What this node offers the caller, and the mailbox it reads here."""
+        return self._service.describe(sender)
 
     def broadcast(self, sender, params):
         request_id = self._identifier(params, "requestId")
@@ -194,7 +207,8 @@ class CommsOperations:
                 sequence < 0:
             raise RpcError(INVALID_PARAMS, "cursor.sequence must be a number")
         if not isinstance(owner, dict) or \
-                owner.get("agentId") != agent["agentId"]:
+                owner.get("agentId") != agent["agentId"] or \
+                owner.get("nodeId", agent["nodeId"]) != agent["nodeId"]:
             raise RpcError(INVALID_PARAMS, "a cursor belongs to one mailbox")
         return sequence
 

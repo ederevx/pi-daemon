@@ -872,9 +872,11 @@ class StubStore:
     def exists(self, agent_id):
         return agent_id in self.mailboxes
 
-    def reserve(self, agent_id, provisional=False):
+    def reserve(self, agent_id, provisional=False, permitted=None):
         if self.fail_reserve:
             raise OSError("disk")
+        if permitted is not None and not permitted(agent_id):
+            raise CommsError(IDENTITY_CLAIMED)
         if agent_id not in self.mailboxes:
             self.mailboxes[agent_id] = 0
             if provisional:
@@ -2258,6 +2260,13 @@ class PeerOperationsTests(PeerCase):
         with self.assertRaises(CommsError) as caught:
             self.manager.deliver(NODE_B, "stale", delivery)
         self.assertEqual(caught.exception.code, "peer-stale")
+
+    def test_removal_announces_the_node_that_left(self):
+        gone = []
+        self.manager.on_peer_gone(gone.append)
+        self.operations.add(None, self.spec())
+        self.operations.remove(None, {"nodeId": NODE_B})
+        self.assertEqual(gone, [NODE_B])
 
     def offline(self):
         """A manager whose tunnel never comes up, so mail stays queued."""
