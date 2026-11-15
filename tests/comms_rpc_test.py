@@ -1442,8 +1442,6 @@ class ForwardTests(unittest.TestCase):
     def setUp(self):
         values = {"comms_peer_reconnect_initial": 3600.0,
                   "comms_peer_reconnect_max": 3600.0,
-                  # A removal is read as down by probing, and the wait for it is
-                  # 15 s, so the probe interval the test runs with is shorter.
                   "comms_peer_probe_interval": 0.2}
         self.destination = Harness(spawns=True, node=self.DEST,
                                    credential_dir=True, **values)
