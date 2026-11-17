@@ -7,18 +7,21 @@ child. On any non-Windows platform it prints a skip line and exits 0 so
 the file stays loadable from a Linux checkout.
 """
 
+import ctypes
 import os
 import select
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
-
 import isolation
+
+import pi_conpty
 
 # Every root this module probes belongs to its own scratch tree, never
 # the host's live daemon.
@@ -244,6 +247,303 @@ class WindowsTerminateBudgetTests(unittest.TestCase):
                          "could not terminate process 4242")
 
 
+class WindowsConsoleOutputPumpTest(unittest.TestCase):
+    """The attach client's CONOUT$ writer seams behind a socket front.
+
+    The relay selects the front; the writer thread owns the blocking
+    console writes, drains a queued burst through stop-time EOF, and a
+    failed console write surfaces at the relay as a None return.
+    """
+
+    def setUp(self):
+        from pi_conpty import WindowsConsole
+        self.console = WindowsConsole(drain_timeout=0.05)
+
+    def _stub_writer(self, writes):
+        api = mock.Mock()
+
+        def write_file(_handle, buf, count, written_ref, _overlap):
+            chunk = ctypes.cast(
+                buf, ctypes.POINTER(ctypes.c_char * count)).contents.raw
+            writes.append(chunk)
+            written_ref._obj.value = count
+            return 1
+
+        api.lib.WriteFile.side_effect = write_file
+        self.console._api = api
+        self.console._out_handle = 4242
+
+    def _wait_for(self, writes, want, deadline=2.0):
+        end = time.monotonic() + deadline
+        while time.monotonic() < end and b"".join(writes) != want:
+            time.sleep(0.02)
+
+    def test_output_reaches_the_console_through_the_socket_front(self):
+        writes = []
+        self._stub_writer(writes)
+        self.console._start_output_pump()
+        try:
+            self.assertIsNotNone(self.console.writable_fd())
+            self.assertEqual(self.console.write_output(b"hello"), 5)
+            self._wait_for(writes, b"hello")
+            self.assertEqual(b"".join(writes), b"hello")
+        finally:
+            self.console._stop_output_pump()
+            self.console._out_handle = None
+        self.assertIsNone(self.console.writable_fd())
+
+    def test_a_pending_burst_drains_when_the_bridge_stops(self):
+        writes = []
+        self._stub_writer(writes)
+        self.console._start_output_pump()
+        payload = b"x" * (256 * 1024)
+        try:
+            data = payload
+            accepted = b""
+            deadline = time.monotonic() + 4.0
+            while data and time.monotonic() < deadline:
+                sent = self.console.write_output(data)
+                self.assertIsNotNone(sent)
+                if sent:
+                    accepted += data[:sent]
+                    data = data[sent:]
+                time.sleep(0.005)
+            self.assertEqual(accepted, payload)
+            self.console._stop_output_pump()
+            self.assertEqual(b"".join(writes), payload)
+        finally:
+            self.console._stop_output_pump()
+            self.console._out_handle = None
+
+    def test_a_short_console_write_still_writes_the_whole_chunk(self):
+        writes = []
+        api = mock.Mock()
+
+        def write_file(_handle, buf, count, written_ref, _overlap):
+            written = max(1, count // 2)
+            chunk = ctypes.cast(
+                buf, ctypes.POINTER(ctypes.c_char * count)).contents.raw
+            writes.append(chunk[:written])
+            written_ref._obj.value = written
+            return 1
+
+        api.lib.WriteFile.side_effect = write_file
+        self.console._api = api
+        self.console._out_handle = 4242
+        self.console._start_output_pump()
+        try:
+            self.console.write_output(b"short write test")
+            self._wait_for(writes, b"short write test")
+            self.assertEqual(b"".join(writes), b"short write test")
+        finally:
+            self.console._stop_output_pump()
+            self.console._out_handle = None
+
+    def _chunked_write(self, steps, want):
+        writes = []
+        self._stub_writer(writes)
+        self.console._start_output_pump()
+        try:
+            for data, midline in steps:
+                self.console.write_output(data)
+                self._wait_for(writes, midline)
+            self.assertEqual(b"".join(writes), want)
+        finally:
+            self.console._stop_output_pump()
+            self.console._out_handle = None
+
+    def test_a_split_utf8_sequence_is_held_until_it_completes(self):
+        self._chunked_write(
+            [(b"OK\xe4\xbd", b"OK"),
+             (b"\xa0\xe5\xa5\xbd", b"OK\xe4\xbd\xa0\xe5\xa5\xbd")],
+            b"OK\xe4\xbd\xa0\xe5\xa5\xbd")
+
+    def test_a_split_win32_request_is_held_until_it_completes(self):
+        # Each step's console line-up is awaited, so the request really
+        # crosses the writer's recv boundary instead of racing into one
+        # receive.
+        self._chunked_write([(b"A\x1b[?9", b"A"), (b"001hB", b"AB")],
+                            b"AB")
+
+    def test_a_parked_writer_is_cancelled_and_reports_success(self):
+        write_entered = threading.Event()
+        cancelled = threading.Event()
+        api = mock.Mock()
+
+        def write_file(_handle, _buf, count, written_ref, _overlap):
+            # A write the cancellation aborts: the writer sits in it
+            # until the mocked CancelSynchronousIo lands, then fails
+            # like CONOUT$ does with ERROR_OPERATION_ABORTED.
+            write_entered.set()
+            cancelled.wait(0.5)
+            raise OSError("operation aborted")
+
+        def cancel_synchronous_io(_handle):
+            cancelled.set()
+            return 1
+
+        api.lib.WriteFile.side_effect = write_file
+        api.lib.CancelSynchronousIo.side_effect = cancel_synchronous_io
+        self.console._api = api
+        self.console._out_handle = 4242
+        self.console._start_output_pump()
+        tid = self.console._output_thread.native_id
+        try:
+            self.console.write_output(b"slow chunk")
+            self.assertTrue(write_entered.wait(2.0))
+            self.assertTrue(self.console._stop_output_pump())
+            api.lib.OpenThread.assert_called_once()
+            mask, inherit, opened = api.lib.OpenThread.call_args.args
+            self.assertEqual(mask, pi_conpty._THREAD_TERMINATE)
+            self.assertFalse(inherit)
+            self.assertEqual(opened, tid)
+            # A successfully opened handle is closed even when the
+            # cancellation request itself fails.
+            api.lib.CloseHandle.assert_called_once_with(
+                api.lib.OpenThread.return_value)
+            self.assertTrue(cancelled.is_set())
+            self.assertIsNone(self.console._output_thread)
+            self.assertIsNone(self.console.writable_fd())
+        finally:
+            cancelled.set()
+            self.console._stop_output_pump()
+            self.console._out_handle = None
+
+    def test_a_cancel_without_a_thread_handle_only_waits_the_join(self):
+        # OpenThread can return no handle; the stop then refuses to lean
+        # on the request and confirms the writer through the join.
+        write_entered = threading.Event()
+        release = threading.Event()
+        api = mock.Mock()
+        api.lib.OpenThread.return_value = None
+
+        def write_file(_handle, _buf, count, written_ref, _overlap):
+            write_entered.set()
+            release.wait(2.0)
+            written_ref._obj.value = count
+            return 1
+
+        api.lib.WriteFile.side_effect = write_file
+        self.console._api = api
+        self.console._out_handle = 4242
+        self.console._start_output_pump()
+        try:
+            self.console.write_output(b"parked")
+            self.assertTrue(write_entered.wait(2.0))
+            self.assertFalse(self.console._stop_output_pump())
+            api.lib.CancelSynchronousIo.assert_not_called()
+        finally:
+            release.set()
+            self.console._stop_output_pump()
+            self.console._out_handle = None
+
+    def test_a_cancellation_request_landing_early_still_refuses_the_stop(
+            self):
+        # CancelSynchronousIo is a request, never a completion: it can
+        # land after the abort check and before WriteFile begins; the
+        # writer then survives and the stop reports it instead of
+        # assuming the request completed the write.
+        write_entered = threading.Event()
+        completes = threading.Event()
+        api = mock.Mock()
+
+        def write_file(_handle, _buf, count, written_ref, _overlap):
+            # The write completes later regardless of the request; a
+            # later loop turn sees the abort flag and exits.
+            write_entered.set()
+            completes.wait(2.0)
+            if self.console._output_aborted:
+                raise OSError("output aborted")
+            written_ref._obj.value = count
+            return 1
+
+        def cancel_synchronous_io(_handle):
+            return 1
+
+        api.lib.WriteFile.side_effect = write_file
+        api.lib.CancelSynchronousIo.side_effect = cancel_synchronous_io
+        self.console._api = api
+        self.console._out_handle = 4242
+        self.console._start_output_pump()
+        try:
+            self.console.write_output(b"parked")
+            self.assertTrue(write_entered.wait(2.0))
+            self.assertFalse(self.console._stop_output_pump())
+            self.assertTrue(self.console._output_thread.is_alive())
+        finally:
+            completes.set()
+            self.console._stop_output_pump()
+            self.console._out_handle = None
+
+    def test_a_writer_that_survives_cancellation_refuses_the_stop(self):
+        write_entered = threading.Event()
+        gate = threading.Event()
+        api = mock.Mock()
+
+        def write_file(_handle, _buf, count, written_ref, _overlap):
+            # A write that cancellation never lands on: the writer stays
+            # parked past both joins.
+            write_entered.set()
+            gate.wait(2.0)
+            written_ref._obj.value = count
+            return 1
+
+        api.lib.WriteFile.side_effect = write_file
+        self.console._api = api
+        self.console._out_handle = 4242
+        self.console._start_output_pump()
+        try:
+            self.console.write_output(b"parked")
+            self.assertTrue(write_entered.wait(2.0))
+            self.assertFalse(self.console._stop_output_pump())
+            self.assertTrue(self.console._output_thread.is_alive())
+        finally:
+            gate.set()
+            self.console._stop_output_pump()
+            self.console._out_handle = None
+
+    def test_a_failed_console_write_surfaces_as_none(self):
+        write_entered = threading.Event()
+        api = mock.Mock()
+
+        def write_file(_handle, _buf, count, written_ref, _overlap):
+            # Win32 failure: the call reports success with zero bytes
+            # written, which the writer treats as a failed write.
+            write_entered.set()
+            written_ref._obj.value = 0
+            return 1
+
+        api.lib.WriteFile.side_effect = write_file
+        self.console._api = api
+        self.console._out_handle = 4242
+        self.console._start_output_pump()
+        try:
+            self.console.write_output(b"abc")
+            self.assertTrue(write_entered.wait(2.0))
+            result = None
+            end = time.monotonic() + 2.0
+            while time.monotonic() < end:
+                result = self.console.write_output(b"abc")
+                if result is None:
+                    break
+                time.sleep(0.02)
+            self.assertIsNone(result)
+        finally:
+            self.console._stop_output_pump()
+            self.console._out_handle = None
+
+    def test_a_pump_whose_writer_cannot_start_leaves_nothing_behind(self):
+        self.console._api = mock.Mock()
+        self.console._out_handle = 4242
+        with mock.patch.object(threading.Thread, "start",
+                               side_effect=RuntimeError("no threads")):
+            with self.assertRaises(RuntimeError):
+                self.console._start_output_pump()
+        self.assertIsNone(self.console._output_thread)
+        self.assertIsNone(self.console._output_sock)
+        self.assertIsNone(self.console.writable_fd())
+
+
 def main():
     if sys.platform != "win32":
         print("conpty: skipped (non-Windows)")
@@ -253,6 +553,7 @@ def main():
         loader.loadTestsFromTestCase(WindowsConPtyTest),
         loader.loadTestsFromTestCase(Win32InputModeFilterTest),
         loader.loadTestsFromTestCase(WindowsTerminateBudgetTests),
+        loader.loadTestsFromTestCase(WindowsConsoleOutputPumpTest),
     ])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1

@@ -302,6 +302,8 @@ def steps():
              [python, "tests/pi_rc_discovery_test.py", "-v"], suite=True),
         Step("pi-rc activation tests",
              [python, "tests/pi_rc_activation_test.py", "-v"], suite=True),
+        Step("pi-rc relay tests",
+             [python, "tests/pi_rc_relay_test.py", "-v"], suite=True),
         Step("extension tests (TS)",
              ["node", "--experimental-strip-types",
               "--experimental-transform-types", "tests/ts/run.ts"],

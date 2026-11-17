@@ -59,6 +59,8 @@ _ENABLE_EXTENDED_FLAGS = 0x0080
 _ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
 _ENABLE_PROCESSED_OUTPUT = 0x0001
 _ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+# Delay end-of-line wrapping until another character is written.
+_DISABLE_NEWLINE_AUTO_RETURN = 0x0008
 
 _CONSOLE_CP_UTF8 = 65001
 
@@ -68,6 +70,9 @@ DEFAULT_ROWS = 24
 _READ_CHUNK = 65536
 _PUMP_TICK = 0.1
 _KILL_TICK = 0.05
+# CancelSynchronousIo takes a thread handle opened with this access
+# right; CancelSynchronousIo is a request, never a guarantee.
+_THREAD_TERMINATE = 0x0001
 # A pseudoconsole input handle is a pipe that blocks when it fills, and
 # the relay writes for every conversation from one thread, so input is
 # queued here and dropped oldest-first past this bound instead.
@@ -221,6 +226,11 @@ class _Kernel32:
         lib.TerminateProcess.restype = wintypes.BOOL
         lib.ResumeThread.argtypes = [wintypes.HANDLE]
         lib.ResumeThread.restype = wintypes.DWORD
+        lib.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                   wintypes.DWORD]
+        lib.OpenThread.restype = wintypes.HANDLE
+        lib.CancelSynchronousIo.argtypes = [wintypes.HANDLE]
+        lib.CancelSynchronousIo.restype = wintypes.BOOL
         lib.CloseHandle.argtypes = [wintypes.HANDLE]
         lib.CloseHandle.restype = wintypes.BOOL
 
@@ -859,11 +869,14 @@ class WindowsConsole:
     those bytes into a socketpair so the select-based relay can watch one
     select-able fd (Windows select only accepts sockets). A console input
     handle is waitable, so the pump uses WaitForSingleObject with a short
-    bound and stops cleanly. Resize is not delivered by ReadFile, so
-    take_resize polls the CONOUT$ window size.
+    bound and stops cleanly. Console output is mirrored the same way: a
+    writer thread owns the blocking CONOUT$ writes behind a socketpair
+    front that the relay selects on. Resize is not delivered by ReadFile,
+    so take_resize polls the CONOUT$ window size.
     """
 
-    def __init__(self):
+    def __init__(self, drain_timeout=2.0):
+        self._drain_timeout = drain_timeout
         self._api = None
         self._in_handle = None
         self._out_handle = None
@@ -874,6 +887,10 @@ class WindowsConsole:
         self._input_sock = None
         self._reader_sock = None
         self._reader_thread = None
+        self._output_sock = None
+        self._writer_sock = None
+        self._output_thread = None
+        self._output_aborted = False
         self._stop = threading.Event()
         self._last_size = None
         self._chunker = _Utf8Chunker()
@@ -896,6 +913,7 @@ class WindowsConsole:
         lib.FlushConsoleInputBuffer(self._in_handle)
         self._last_size = self._query_size()
         self._start_pump()
+        self._start_output_pump()
 
     def _apply_console_modes(self, lib):
         self._saved_in_mode = self._get_mode(self._in_handle)
@@ -907,7 +925,8 @@ class WindowsConsole:
                    | _ENABLE_EXTENDED_FLAGS
                    | _ENABLE_VIRTUAL_TERMINAL_INPUT)
         out_mode = (self._saved_out_mode | _ENABLE_PROCESSED_OUTPUT
-                    | _ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+                    | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                    | _DISABLE_NEWLINE_AUTO_RETURN)
         self._set_mode(self._in_handle, in_mode)
         self._set_mode(self._out_handle, out_mode)
 
@@ -921,6 +940,10 @@ class WindowsConsole:
 
     def restore(self):
         self._stop_pump()
+        if not self._stop_output_pump():
+            # A writer still parked in a console write: restoring the
+            # terminal and closing CONOUT$ under it would be unsafe.
+            raise OSError("console output writer did not stop")
         if self._in_handle is not None and self._saved_in_mode is not None:
             self._set_mode(self._in_handle, self._saved_in_mode)
             self._saved_in_mode = None
@@ -1008,15 +1031,138 @@ class WindowsConsole:
             return None
         return self._input_sock.fileno()
 
+    # -- output pump -------------------------------------------------------
+
+    def _start_output_pump(self):
+        self._output_aborted = False
+        self._output_sock, self._writer_sock = socket.socketpair()
+        self._output_sock.setblocking(False)
+        self._output_thread = threading.Thread(
+            target=self._output_loop, daemon=True)
+        try:
+            self._output_thread.start()
+        except Exception:
+            # The pump never took the seam over: leave no sockets or
+            # thread field behind for restore to trip over.
+            self._output_thread = None
+            self._close_output_sockets()
+            raise
+
+    def _output_loop(self):
+        # Capture the socket in a local: _stop_output_pump closes and
+        # clears the attribute, and the writer must never dereference a
+        # cleared one.
+        writer_sock = self._writer_sock
+        try:
+            while True:
+                data = writer_sock.recv(_READ_CHUNK)
+                if not data:
+                    break
+                data = self._win32_input_filter.feed(data)
+                chunk = self._chunker.feed(data)
+                if chunk:
+                    self._write_console_chunk(chunk)
+        except OSError:
+            # Surface the failure to the relay: its next select turns the
+            # closed peer into an immediate send error.
+            try:
+                writer_sock.close()
+            except OSError:
+                pass
+            return
+        try:
+            writer_sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    def _write_console_chunk(self, chunk):
+        # A short write is not completion: only the full chunk, written
+        # in as many WriteFile calls as it takes, is. An abort abandons
+        # the remaining bytes of the chunk in flight.
+        buffer = ctypes.create_string_buffer(chunk, len(chunk))
+        offset = 0
+        while offset < len(chunk):
+            if self._output_aborted:
+                raise OSError("output aborted")
+            written = wintypes.DWORD(0)
+            ok = self._api.lib.WriteFile(
+                self._out_handle,
+                ctypes.byref(buffer, offset),
+                len(chunk) - offset,
+                ctypes.byref(written), None)
+            if not ok or written.value == 0:
+                raise OSError("console output failed")
+            offset += written.value
+
+    def _cancel_synchronous_io(self, thread):
+        # A writer parked in a console write needs the cancellation
+        # request; a writer parked in recv exits through the abort flag.
+        # Completion is confirmed by the join below, not by this call.
+        lib = self._api.lib
+        handle = lib.OpenThread(_THREAD_TERMINATE, False,
+                                thread.native_id)
+        if not handle:
+            return
+        try:
+            lib.CancelSynchronousIo(handle)
+        finally:
+            lib.CloseHandle(handle)
+
+    def _close_output_sockets(self):
+        for name in ("_output_sock", "_writer_sock"):
+            pump_sock = getattr(self, name)
+            if pump_sock is not None:
+                try:
+                    pump_sock.close()
+                except OSError:
+                    pass
+                setattr(self, name, None)
+
+    def _stop_output_pump(self):
+        """Stop the writer and return only once it is confirmed gone.
+
+        What arrived before the stop is drained through EOF first; a
+        writer still parked in a console write past the drain budget is
+        cancelled. The caller must not restore console state and close
+        CONOUT$ before this returns True.
+        """
+        if self._output_thread is None:
+            self._close_output_sockets()
+            return True
+        sock = self._output_sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+        deadline = time.monotonic() + self._drain_timeout
+        thread = self._output_thread
+        thread.join(max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            self._output_aborted = True
+            self._cancel_synchronous_io(thread)
+            thread.join(timeout=self._drain_timeout)
+            if thread.is_alive():
+                # Sockets stay open: the writer still holds references
+                # to them, and the caller has already been told this
+                # stop did not complete.
+                return False
+        self._output_thread = None
+        self._close_output_sockets()
+        return True
+
     def wake_fd(self):
         # Resize has no separate wakeup: the bridge polls take_resize on
         # every select timeout.
         return None
 
     def writable_fd(self):
-        # Console output handles are not select-able on Windows; the
-        # bridge writes directly through write_output.
-        return None
+        # CONOUT$ is not select-able on Windows; the writer's socketpair
+        # front is, and it carries the output until the writer completes
+        # the console write.
+        if self._output_sock is None:
+            return None
+        return self._output_sock.fileno()
 
     def read_input(self, limit=_READ_CHUNK):
         if self._input_sock is None:
@@ -1036,24 +1182,23 @@ class WindowsConsole:
         return True
 
     def write_output(self, data):
-        if self._out_handle is None or self._api is None:
+        """Queue output for the writer thread; never block the relay.
+
+        Returns the accepted byte count, 0 when the writer is still
+        draining the console and would block, and None when the writer
+        is gone. The accepted bytes are consumed completely; the writer
+        transforms them (Win32 Input Mode stripping, UTF-8 chunking)
+        before its WriteFile calls.
+        """
+        sock = self._output_sock
+        if sock is None or self._api is None:
             return None
-        # Consume all input; the filter strips ConPTY's Win32 Input Mode
-        # requests and the chunker holds any incomplete trailing UTF-8
-        # sequence for the next call so a split character is not decoded
-        # across two WriteFile calls.
-        consumed = len(data)
-        data = self._win32_input_filter.feed(data)
-        chunk = self._chunker.feed(data)
-        if chunk:
-            buffer = ctypes.create_string_buffer(chunk, len(chunk))
-            written = wintypes.DWORD(0)
-            ok = self._api.lib.WriteFile(
-                self._out_handle, buffer, len(chunk),
-                ctypes.byref(written), None)
-            if not ok:
-                return None
-        return consumed
+        try:
+            return sock.send(data)
+        except (BlockingIOError, InterruptedError):
+            return 0
+        except OSError:
+            return None
 
     # -- handles ----------------------------------------------------------
 

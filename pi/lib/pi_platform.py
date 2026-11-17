@@ -364,12 +364,25 @@ def send_json(sock, obj):
     sock.sendall(json.dumps(obj).encode("utf-8") + b"\n")
 
 
-def read_json_line(sock):
-    """One response line; returns (obj, unconsumed bytes after the line)."""
+def read_json_line(sock, deadline=None):
+    """One response line; returns (obj, unconsumed bytes after the line).
+
+    With a deadline, every recv rides the remaining budget: a trickling
+    partial reply cannot keep the line open past the bound.
+    """
     buf = b""
     while b"\n" not in buf:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("response deadline expired")
+            sock.settimeout(remaining)
         try:
             data = sock.recv(65536)
+        except socket.timeout:
+            # the per-op budget is the deadline's remainder, so a recv
+            # timing out is the expired bound, not a closed connection
+            raise TimeoutError("response deadline expired")
         except OSError:
             return None, buf
         if not data:
@@ -617,7 +630,7 @@ class ControlClient:
     def __init__(self, endpoint):
         self.endpoint = endpoint
 
-    def connect(self, timeout):
+    def connect(self, timeout, deadline=None):
         data = self.endpoint.read()
         host = data.get("host")
         port = data.get("port")
@@ -625,20 +638,31 @@ class ControlClient:
         if not host or not port:
             raise OSError("no endpoint published")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("control deadline expired")
+            sock.settimeout(min(remaining, timeout))
+        else:
+            sock.settimeout(timeout)
         try:
             sock.connect((host, port))
-            self._handshake(sock, token)
+            self._handshake(sock, token, deadline=deadline)
         except OSError:
             sock.close()
             raise
         sock.settimeout(None)
         return sock
 
-    def _handshake(self, sock, token):
+    def _handshake(self, sock, token, deadline=None):
         handshake = ControlHandshake(token)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("control deadline expired")
+            sock.settimeout(remaining)
         send_json(sock, {"cmd": "hello", "token": handshake.token})
-        reply, _ = read_json_line(sock)
+        reply, _ = read_json_line(sock, deadline=deadline)
         if not isinstance(reply, dict) or not reply.get("ok"):
             raise OSError("handshake rejected")
 
@@ -1146,11 +1170,15 @@ class TerminalMode:
     """Raw terminal + resize seam for the pi-rc attach bridge.
 
     The bridge selects on `input_fd()` (and `wake_fd()` when the platform
-    needs a separate wakeup) and writes through `write_output()`. A
-    platform whose output fd is not select-able (Windows console handles)
-    returns None from `writable_fd()`, and the bridge writes directly.
-    Resize is a flag (`take_resize()`), backed on POSIX by SIGWINCH and on
-    Windows by polling the console window size.
+    needs a separate wakeup) and drains `writable_fd()` through
+    `write_output()`. Where output is select-able, `writable_fd()` returns
+    it; where it is not, the platform fronts it with one that is (a pump
+    whose owner does the real writes) so the bridge always gets back a
+    select-able fd, and `write_output()` becomes a nonblocking queue with
+    the accepted byte count as its return (0 when the writer would
+    momentarily block, None when it is gone). Resize is a flag
+    (`take_resize()`), backed on POSIX by SIGWINCH and on Windows by
+    polling the console window size.
     """
 
     def enter(self):

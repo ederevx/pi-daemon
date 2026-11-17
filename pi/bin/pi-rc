@@ -180,6 +180,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -360,12 +361,23 @@ def send_json(sock, obj):
 	sock.sendall(json.dumps(obj).encode() + b"\n")
 
 
-def read_json_line(sock):
-	# one response line; returns (obj, unconsumed bytes after the line)
+def read_json_line(sock, deadline=None):
+	# one response line; returns (obj, unconsumed bytes after the line).
+	# With a deadline, every recv rides the remaining budget: a trickling
+	# partial reply cannot keep the line open past the bound.
 	buf = b""
 	while b"\n" not in buf:
+		if deadline is not None:
+			remaining = deadline - time.monotonic()
+			if remaining <= 0:
+				raise TimeoutError("response deadline expired")
+			sock.settimeout(remaining)
 		try:
 			data = sock.recv(65536)
+		except socket.timeout:
+			# the per-op budget is the deadline's remainder, so a recv
+			# timing out is the expired bound, not a closed connection
+			raise TimeoutError("response deadline expired")
 		except OSError:
 			return None, buf
 		if not data:
@@ -427,12 +439,12 @@ class DaemonClient:
 				pi_platform.EndpointFile(self.sock_path))
 		return self._control_client
 
-	def connect(self, timeout=CONTROL_TIMEOUT):
+	def connect(self, timeout=CONTROL_TIMEOUT, deadline=None):
 		# The endpoint file carries the loopback host/port and the token
 		# for the mandatory hello handshake; a missing or refused endpoint
 		# means the daemon is not running.
 		try:
-			return self.control_client.connect(timeout)
+			return self.control_client.connect(timeout, deadline=deadline)
 		except OSError:
 			die("background service is not running "
 				"(systemctl --user start pi-daemon)",
@@ -440,11 +452,16 @@ class DaemonClient:
 
 	def control(self, req, timeout=None):
 		# one JSON-line round-trip on a short-lived control connection;
-		# wait-shaped requests pass their own (longer) timeout
-		sock = self.connect(timeout if timeout is not None else CONTROL_TIMEOUT)
+		# wait-shaped requests pass their own (longer) timeout. One deadline
+		# owns the whole round-trip: connect, handshake, send and the
+		# response line each ride its remaining budget, so a daemon that
+		# trickles partial replies cannot run past the bound.
+		timeout = CONTROL_TIMEOUT if timeout is None else timeout
+		deadline = time.monotonic() + timeout
+		sock = self.connect(timeout, deadline=deadline)
 		try:
 			send_json(sock, req)
-			resp, _ = read_json_line(sock)
+			resp, _ = read_json_line(sock, deadline=deadline)
 		except OSError as exc:
 			# The request may already have been acted on: ambiguous.
 			die("control connection failed: %s" % exc, EXIT_AMBIGUOUS)
@@ -480,6 +497,63 @@ def find_daemon():
 	return None
 
 
+class BridgeResize:
+	"""Coalesced resize submits from the relay to one bounded control
+	worker: at most one round-trip is pending, and the newest size wins.
+	The worker reads only its pending dimensions; the terminal state stays
+	with the bridge."""
+
+	def __init__(self, client, session, timeout=None):
+		self.client = client
+		self.session = session
+		self.timeout = CONTROL_TIMEOUT if timeout is None else timeout
+		self._lock = threading.Lock()
+		self._pending = None
+		self._wakeup = threading.Event()
+		self._stopped = False
+		self._thread = threading.Thread(target=self._worker, daemon=True)
+		self._thread.start()
+
+	def submit(self, cols, rows):
+		with self._lock:
+			if self._stopped:
+				return False
+			self._pending = (cols, rows)
+		self._wakeup.set()
+		return True
+
+	def close(self):
+		with self._lock:
+			self._stopped = True
+		self._wakeup.set()
+		# One control round-trip may still be in flight; the join rides
+		# its own bound, and a worker still alive past it is a failed
+		# shutdown, never a silent one.
+		self._thread.join(timeout=self.timeout)
+		if self._thread.is_alive():
+			raise OSError("resize worker did not stop")
+
+	def _worker(self):
+		while True:
+			self._wakeup.wait()
+			with self._lock:
+				stopped = self._stopped
+				pending, self._pending = self._pending, None
+				if pending is None:
+					self._wakeup.clear()
+			if stopped:
+				return
+			if pending is None:
+				continue
+			cols, rows = pending
+			try:
+				self.client.control({"cmd": "resize", "name": self.session,
+									 "cols": cols, "rows": rows},
+									 timeout=self.timeout)
+			except (OSError, SystemExit):
+				pass
+
+
 class Bridge:
 	"""Raw byte relay between the terminal seam and the daemon bridge; the
 	only unbounded phase, and the terminal is restored on every exit path.
@@ -494,27 +568,37 @@ class Bridge:
 		self.initial = initial
 		self.terminal = (pi_platform.select_terminal_mode()
 						 if terminal is None else terminal)
+		self.resizer = BridgeResize(client, session)
 		self.status = "lost"
 
 	def run(self):
-		prev = self._install_exit_handlers()
+		prev = {}
 		try:
-			# enter() is inside the guard: a half-entered terminal (raw
-			# mode, wake pipe, console modes/CP) must still be restored.
+			# signal handlers and the terminal are inside the guard: a run
+			# that dies halfway (handlers half-installed, raw mode taken) is
+			# still unwound to its entry state.
+			self._install_exit_handlers(prev)
 			self.terminal.enter()
 			self.sock.setblocking(False)
 			self._relay()
 		finally:
-			self.terminal.restore()
-			self._restore_exit_handlers(prev)
-			self.sock.close()
+			try:
+				self.resizer.close()
+			finally:
+				try:
+					self.terminal.restore()
+				finally:
+					try:
+						self._restore_exit_handlers(prev)
+					finally:
+						self.sock.close()
 		return self.status
 
-	def _install_exit_handlers(self):
+	def _install_exit_handlers(self, prev):
 		# turn lethal signals into a normal unwind so the terminal is
-		# restored; resize belongs to the terminal seam
-		prev = {}
-
+		# restored; resize belongs to the terminal seam. Installed ones
+		# land in prev as they go, so a failed run restores exactly what
+		# was replaced.
 		def on_term(_signum, _frame):
 			raise SystemExit(0)
 
@@ -522,7 +606,6 @@ class Bridge:
 			if hasattr(signal, name):
 				prev[name] = signal.getsignal(getattr(signal, name))
 				signal.signal(getattr(signal, name), on_term)
-		return prev
 
 	def _restore_exit_handlers(self, prev):
 		for name, handler in prev.items():
@@ -530,13 +613,13 @@ class Bridge:
 
 	def _resize(self):
 		# the bridge connection is raw bytes; resize rides a second
-		# short-lived control connection
+		# short-lived control connection, submitted to the bridge's worker
+		# so the relay never waits on it
 		try:
 			cols, rows = self.terminal.size()
 			if cols <= 0 or rows <= 0:
 				return
-			self.client.control({"cmd": "resize", "name": self.session,
-								 "cols": cols, "rows": rows})
+			self.resizer.submit(cols, rows)
 		except (OSError, SystemExit):
 			pass
 
@@ -580,7 +663,8 @@ class Bridge:
 			if not self._drain_to_tty(wl, out_fd, to_tty):
 				break
 			if to_tty and out_fd is None:
-				# Windows console output is not select-able; write directly
+				# the output front is gone (pump stopped); write the queue
+				# directly so queued bytes still reach the console
 				if not self._write_direct(to_tty):
 					break
 		if to_tty:
@@ -606,10 +690,10 @@ class Bridge:
 		return True
 
 	def _pump_socket(self, ready, to_tty):
-		if self.sock not in ready:
+		if self.sock not in ready or len(to_tty) >= MAX_BUF:
 			return True
 		try:
-			data = self.sock.recv(65536)
+			data = self.sock.recv(min(65536, MAX_BUF - len(to_tty)))
 		except (BlockingIOError, InterruptedError):
 			return True
 		except OSError:
@@ -621,8 +705,6 @@ class Bridge:
 			return False
 		if data:
 			to_tty += data
-			if len(to_tty) > MAX_BUF:
-				del to_tty[:len(to_tty) - MAX_BUF]
 		return True
 
 	def _drain_to_socket(self, ready, to_sock):
