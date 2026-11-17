@@ -6,8 +6,8 @@ import json
 import threading
 import uuid
 
-from ..transport.rpc_codec import (CAPACITY, INVALID_PARAMS, METHOD_NOT_FOUND,
-                                   UNAUTHORIZED, UNAVAILABLE)
+from ..transport.rpc_codec import (CAPACITY, INVALID_PARAMS, UNAUTHORIZED,
+                                   UNAVAILABLE)
 from ..transport.rpc_error import RpcError
 from .error import CommsError
 from .mailbox_store import (BAD_REQUEST, IDENTITY_CLAIMED, QUEUED,
@@ -334,7 +334,7 @@ class CommsService:
         sender = {"nodeId": self._node_id, "agentId": agent_id}
         handler = self._operations.handlers(sender).get(method)
         if handler is None:
-            raise RpcError(METHOD_NOT_FOUND, f"no such method: {method}")
+            raise CommsError(METHOD_UNAVAILABLE)
         return handler(sender, params)
 
     @staticmethod

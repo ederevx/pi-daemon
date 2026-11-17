@@ -532,12 +532,12 @@ export class CommsTools {
 		}
 		if (report.replyFailed.length) {
 			lines.push(`The acknowledgement reply was not accepted for: ` +
-				`${report.replyFailed.join(", ")}; the reply retries with ` +
-				"the same request id on the next comms_ack.");
+				`${report.replyFailed.join(", ")}; it does not hold the gate, ` +
+				"and a later comms_ack retries it with the same request id.");
 		}
 		if (report.serviceAckFailed.length) {
-			lines.push(`Acknowledged by reply but not recorded: ` +
-				`${report.serviceAckFailed.join(", ")} — the tools stay ` +
+			lines.push(`Service acknowledgement not recorded for: ` +
+				`${report.serviceAckFailed.join(", ")}; the tools stay ` +
 				"blocked for these until comms_ack records them.");
 		}
 		return lines.join("\n");

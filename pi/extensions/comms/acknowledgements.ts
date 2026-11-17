@@ -13,7 +13,8 @@
  * fail-closed shape pi-consult's implementation gate uses. The reply's
  * request id is generated and persisted before the send, so a lost
  * reply never produces a duplicate acknowledgement message; the resend
- * reclaims the same send receipt.
+ * reclaims the same send receipt — and since the reply holds nothing,
+ * a later comms_ack may retry it at any time.
  */
 
 import { randomUUID } from "node:crypto";
@@ -74,10 +75,11 @@ export interface AckReport {
 	alreadyAcknowledged: string[];
 	/** Ids this session never received — replay first, never just ack. */
 	unknown: string[];
-	/** Ids whose reply the service could not take. */
+	/** Ids the reply of which the branch could not credit; reported, they
+	 *  never hold the id out of the service acknowledgement. */
 	replyFailed: string[];
-	/** Ids acknowledged by reply but whose service markers did not
-	 *  record; the gate stays for these. */
+	/** Ids whose service markers did not record or complete durably; the
+	 *  gate stays for these. */
 	serviceAckFailed: string[];
 }
 
@@ -231,9 +233,10 @@ export class CommsAcknowledgements {
 		};
 	}
 
-	/** One acknowledgement turn: the reply, then the service
-	 *  acknowledgement, per id — each step only when earlier steps
-	 *  recorded, so a retry resumes where it stopped. */
+	/** One acknowledgement turn, per id: the reply, best-effort and only
+	 *  reported, then the service acknowledgement of every id the ledger
+	 *  holds — the reply never holds an id back, and the recording opens
+	 *  the gate. A retry resumes where it stopped. */
 	async acknowledge(
 		messageIds: string[],
 		params: { node?: string },
@@ -371,8 +374,8 @@ export class CommsAcknowledgements {
 
 	/** Rewrite a reply's traffic entry the branch is missing — after a
 	 *  reply that was sent under an older write order, or a refused
-	 *  append. False is a still-refused append: the obligation stays
-	 *  owed and the next comms_ack retries the repair. */
+	 *  append. False is a still-refused append, reported as replyFailed:
+	 *  the next comms_ack retries the repair. */
 	private repairReply(record: PendingRecord): boolean {
 		return this.log.sent({
 			to: { agentId: record.from.agentId, nodeId: record.from.nodeId },
