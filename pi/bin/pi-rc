@@ -460,6 +460,13 @@ class DaemonClient:
 		deadline = time.monotonic() + timeout
 		sock = self.connect(timeout, deadline=deadline)
 		try:
+			# connect() clears the timeout for the streaming bridge; the
+			# request sendall must still ride the deadline or a daemon
+			# that stops reading strands the wait forever
+			remaining = deadline - time.monotonic()
+			if remaining <= 0:
+				raise TimeoutError("control deadline expired")
+			sock.settimeout(remaining)
 			send_json(sock, req)
 			resp, _ = read_json_line(sock, deadline=deadline)
 		except OSError as exc:

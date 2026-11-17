@@ -78,6 +78,17 @@ class DaemonClientControlTest(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             pi_rc.read_json_line(self.relay, deadline=time.monotonic() + 0.2)
 
+    def test_a_request_the_daemon_stops_reading_cannot_outwait_it(self):
+        # connect returned a connection whose peer never reads again;
+        # the request sendall must still die at the deadline, not
+        # strand the wait in blocking mode.
+        big = {"cmd": "state", "payload": "x" * (2 << 20)}
+        start = time.monotonic()
+        with self.assertRaises(SystemExit) as raised:
+            self.client.control(big, timeout=0.5)
+        self.assertEqual(raised.exception.code, pi_rc.EXIT_AMBIGUOUS)
+        self.assertLess(time.monotonic() - start, 5.0)
+
 
 class BridgePumpSocketTest(unittest.TestCase):
     """A full to_tty queue applies backpressure instead of dropping."""
