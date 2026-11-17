@@ -811,6 +811,21 @@ class ForwardTests(StoreCase):
                          {"agent": "a"})
         self.assertEqual(channel.closed, 1)
 
+    def test_a_forward_to_this_node_itself_serves_its_own_mailbox(self):
+        # An envelope here carries this node's own id in its address, so a
+        # forward the acknowledgement asks for lands on this node: the
+        # local handlers answer and no connection opens.
+        self.store.reserve("a")
+        outcome = self.store.accept(self._agent("b"), "r1", self._agent("a"),
+                                    "chat", {"text": "hi"})
+        message_id = outcome["messages"][0]["messageId"]
+        service = self.service(StubPeers())
+        self.assertEqual(
+            service.forward("local", "a", "comms.ack",
+                            {"messageIds": [message_id]}),
+            {"acknowledged": [message_id], "alreadyAcknowledged": [],
+             "unknown": []})
+
     def test_an_open_that_fails_reads_as_a_peer_that_could_not_answer(self):
         # A refused hello never produces a channel: the failure has to be
         # projected here, or it leaves as an exception no agent can read.

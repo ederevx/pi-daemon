@@ -397,7 +397,7 @@ test("acknowledgements: an id this session never received is never just acked", 
 	});
 });
 
-test("acknowledgements: a reply the service refused is retried with the same request id", async () => {
+test("acknowledgements: a refused reply is indicated and the service ack still settles", async () => {
 	const spec = scripted({
 		send: [
 			{ stderr: "pi-comms: declined: no-such-peer", exit: 2 },
@@ -410,14 +410,20 @@ test("acknowledgements: a reply the service refused is retried with the same req
 		const { ledger } = harness(pi);
 		arm(pi, ledger, "m1");
 		const first = await ledger.acknowledge(["m1"], {}, undefined);
-		assertEq(first.replyFailed.join(","), "m1", "the reply was refused");
-		assertEq(ledger.owing(), true, "still owed");
+		assertEq(first.replyFailed.join(","), "m1",
+			"the reply was refused, and said so");
+		assertEq(first.acknowledged.join(","), "m1",
+			"the service acknowledgement settled it anyway");
+		assertEq(first.serviceAckFailed.join(","), "", "nothing held the gate");
+		assertEq(ledger.owing(), false,
+			"the gate opened on the service acknowledgement");
 		const second = await ledger.acknowledge(["m1"], {}, undefined);
-		assertEq(second.acknowledged.join(","), "m1", "the retry settled it");
+		assertEq(second.replyFailed.join(","), "",
+			"the retry delivered the reply");
 		const lines = recorded(spec.env.STUB_LOG);
 		const idOf = (line: string[]) =>
 			line.find((part) => part.startsWith("--request-id="));
-		assertEq(idOf(lines[0]), idOf(lines[1]),
+		assertEq(idOf(lines[0]), idOf(lines[2]),
 			"the retried reply reclaimed the same send receipt");
 	});
 });
@@ -574,7 +580,10 @@ test("acknowledgements: a completed obligation survives reload without re-arming
 test("acknowledgements: appends the branch refuses keep the gate, and the retries settle from the reply progress", async () => {
 	const spec = scripted({
 		send: [{ stdout: { status: "accepted" } }, { stdout: { status: "accepted" } }],
-		ack: [{ stdout: { status: "ok", acknowledged: ["m1"] } }],
+		ack: [
+			{ stdout: { status: "ok", acknowledged: ["m1"] } },
+			{ stdout: { status: "ok", acknowledged: ["m1"] } },
+		],
 	});
 	await withEnv(spec.env, async () => {
 		const pi = new FakePi();
@@ -582,14 +591,15 @@ test("acknowledgements: appends the branch refuses keep the gate, and the retrie
 		arm(pi, ledger, "m1");
 		// From here every append refuses: the reply's progress cannot be
 		// recorded, so the first attempt reports the reply failed — even
-		// though the mail went out — and the gate stays.
+		// though the mail went out — and the marker the service recorded
+		// cannot complete durably, so the gate stays for both reasons.
 		pi.failOn.add(COMMS_ACK_STATE);
 		const first = await ledger.acknowledge(["m1"], {}, undefined);
 		assertEq(first.replyFailed.join(","), "m1",
 			"a reply without its durable progress is not credited");
+		assertEq(first.serviceAckFailed.join(","), "m1",
+			"a service acknowledgement the branch cannot settle keeps the gate");
 		assertEq(ledger.owing(), true, "the gate stays");
-		assertEq(new Set(ledgerPendingIds(pi)).size, 1,
-			"only the arm endures durably");
 		// Once the branch accepts again, the same request id reclaims the
 		// receipt and the completion lands: the gate opens.
 		pi.failOn.delete(COMMS_ACK_STATE);
@@ -597,11 +607,14 @@ test("acknowledgements: appends the branch refuses keep the gate, and the retrie
 		assertEq(second.acknowledged.join(","), "m1", "the retry settled it");
 		assertEq(ledger.owing(), false, "the gate opened");
 		const lines = recorded(spec.env.STUB_LOG);
-		assertEq(lines.length, 3,
-			"two reply attempts and one service acknowledgement");
+		assertEq(lines.length, 4,
+			"two reply attempts and two service acknowledgements");
+		assert(lines[1].join(" ").endsWith("ack m1") &&
+			lines[3].join(" ").endsWith("ack m1"),
+			"the service acknowledgement ran while the reply was stuck");
 		const idOf = (line: string[]) =>
 			line.find((part) => part.startsWith("--request-id="));
-		assertEq(idOf(lines[0]), idOf(lines[1]),
+		assertEq(idOf(lines[2]), idOf(lines[0]),
 			"the retried reply reclaimed the same send receipt");
 		// The settled state reloads as settled.
 		const reloaded = new FakePi();

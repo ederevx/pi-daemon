@@ -2,14 +2,18 @@
  * pi-daemon — the mandatory agent-comms acknowledgement.
  *
  * Every delivered application envelope carries an obligation: the
- * receiving agent must first answer its sender with one fixed, correlated
+ * receiving agent answers its sender with one fixed, correlated
  * acknowledgement message, and the service acknowledgement is recorded
- * only once that reply is accepted. Until a delivered message completes
- * both steps, one `tool_call` gate blocks every tool except `comms_ack`
- * itself and `pre_daemon` — the fail-closed shape pi-consult's
- * implementation gate uses. The reply's request id is generated and
- * persisted before the send, so a lost reply never produces a duplicate
- * acknowledgement message; the resend reclaims the same send receipt.
+ * beside it. The reply is best-effort: it is attempted with the
+ * persisted request id so a lost reply never duplicates mail, and a
+ * reply that cannot be delivered is reported but never holds the
+ * obligation — the gate opens once the service acknowledgement of each
+ * delivered id is recorded. Until then, one `tool_call` gate blocks
+ * every tool except `comms_ack` itself and `pre_daemon` — the
+ * fail-closed shape pi-consult's implementation gate uses. The reply's
+ * request id is generated and persisted before the send, so a lost
+ * reply never produces a duplicate acknowledgement message; the resend
+ * reclaims the same send receipt.
  */
 
 import { randomUUID } from "node:crypto";
@@ -243,7 +247,7 @@ export class CommsAcknowledgements {
 			replyFailed: [],
 			serviceAckFailed: [],
 		};
-		const ready: string[] = [];
+		const known: string[] = [];
 		for (const id of ids) {
 			const record = this.pendingMap.get(id);
 			if (!record) {
@@ -253,7 +257,9 @@ export class CommsAcknowledgements {
 			// The reply only goes out on a durably armed obligation: the
 			// persist retries here, since nothing else redelivers mail the
 			// branch already holds; a still nondurable record cannot give
-			// the reply its request id.
+			// the reply its request id. A reply that cannot be delivered
+			// is reported — it never holds the id out of the service
+			// acknowledgement, whose recording is what opens the gate.
 			if (!record.durable) record.durable = this.persist(record);
 			if (record.replySent ||
 				(record.durable && await this.sendReply(record, signal))) {
@@ -261,20 +267,17 @@ export class CommsAcknowledgements {
 				// a progress append that survived without its log entry is
 				// rewritten, so the branch never claims a reply it cannot
 				// show.
-				if (!this.repairReply(record)) {
-					report.replyFailed.push(id);
-					continue;
-				}
-				ready.push(id);
+				if (!this.repairReply(record)) report.replyFailed.push(id);
 			} else {
 				report.replyFailed.push(id);
 			}
+			known.push(id);
 		}
-		if (ready.length === 0) return report;
-		const mailbox = params.node ?? this.readyMailbox(ready);
+		if (known.length === 0) return report;
+		const mailbox = params.node ?? this.readyMailbox(known);
 		const outcome = await this.cli.run(
 			"ack",
-			CommsArgv.ack({ messageIds: ready, node: mailbox }),
+			CommsArgv.ack({ messageIds: known, node: mailbox }),
 			{ signal },
 		);
 		const answer = outcome.answer as
@@ -282,15 +285,16 @@ export class CommsAcknowledgements {
 				unknown?: unknown }
 			| undefined;
 		if (outcome.exitCode !== CommsExit.OK || !answer) {
-			// The reply went out; the service markers did not record. The
-			// gate stays for these ids and the next call retries the ack.
-			for (const id of ready) report.serviceAckFailed.push(id);
+			// The reply may have gone out, but the service markers did not
+			// record. The gate stays for these ids and the next call
+			// retries the ack.
+			for (const id of known) report.serviceAckFailed.push(id);
 			return report;
 		}
 		const settled = CommsAcknowledgements.strings(answer.acknowledged)
 			.concat(CommsAcknowledgements.strings(answer.alreadyAcknowledged));
 		const unsettled = CommsAcknowledgements.strings(answer.unknown);
-		for (const id of ready) {
+		for (const id of known) {
 			if (settled.includes(id)) {
 				if (this.complete(id)) {
 					report.acknowledged.push(id);

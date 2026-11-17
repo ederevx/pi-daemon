@@ -6,8 +6,8 @@ import json
 import threading
 import uuid
 
-from ..transport.rpc_codec import (CAPACITY, INVALID_PARAMS, UNAUTHORIZED,
-                                   UNAVAILABLE)
+from ..transport.rpc_codec import (CAPACITY, INVALID_PARAMS, METHOD_NOT_FOUND,
+                                   UNAUTHORIZED, UNAVAILABLE)
 from ..transport.rpc_error import RpcError
 from .error import CommsError
 from .mailbox_store import (BAD_REQUEST, IDENTITY_CLAIMED, QUEUED,
@@ -308,6 +308,11 @@ class CommsService:
 
     def forward(self, node_id, agent_id, method, params, timeout=None):
         """One call over a connection opened as the calling agent."""
+        if node_id == self._node_id:
+            # Mailboxes here hold the mail, and a node does not peer with
+            # itself: the same handlers answer as if a bound socket had
+            # asked, so locally-held mail is never a peer lookup.
+            return self._serve(agent_id, method, params)
         if self._peers is None:
             raise CommsError(BAD_REQUEST)
         channel = None
@@ -323,6 +328,14 @@ class CommsService:
         finally:
             if channel is not None:
                 channel.close()
+
+    def _serve(self, agent_id, method, params):
+        """One agent method answered here, without opening a connection."""
+        sender = {"nodeId": self._node_id, "agentId": agent_id}
+        handler = self._operations.handlers(sender).get(method)
+        if handler is None:
+            raise RpcError(METHOD_NOT_FOUND, f"no such method: {method}")
+        return handler(sender, params)
 
     @staticmethod
     def _forward_failure(failure):

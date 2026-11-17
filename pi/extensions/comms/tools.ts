@@ -185,8 +185,10 @@ export class CommsTools {
 			description:
 				"Acknowledge delivered agent-comms messages by message id. Each " +
 				"id is first answered with one acknowledgement reply to its " +
-				"sender, then the service acknowledgement is recorded; the " +
-				"acknowledgement gate opens only once every owed id completes.",
+				"sender, sent best-effort: a reply that cannot be delivered is " +
+				"reported, but does not hold the gate. The acknowledgement gate " +
+				"opens only once the service acknowledgement of every delivered " +
+				"id is recorded.",
 			parameters: Type.Object({
 				messageIds: Type.Array(Type.String(), {
 					minItems: 1,
