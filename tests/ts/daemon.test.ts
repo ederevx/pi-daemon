@@ -367,8 +367,9 @@ test("daemon: factory wires the command and events", () => {
   assert(pi.commands.has("daemon-purge"),
     "daemon-purge command registered");
   assert(pi.tools.has("daemon_gc_reap"), "gc reap tool registered");
-  assertEq(pi.onCalls.get("session_start") ?? 0, 4, "four session_start listeners");
-  assertEq(pi.onCalls.get("session_shutdown") ?? 0, 3);
+  assertEq(pi.onCalls.get("session_start") ?? 0, 5,
+    "five session_start listeners");
+  assertEq(pi.onCalls.get("session_shutdown") ?? 0, 4);
   assertEq(pi.onCalls.get("before_agent_start") ?? 0, 1);
   // Only a settled run publishes idle: agent_end fires before retries,
   // compaction recovery and queued follow-ups have finished.
@@ -632,10 +633,10 @@ test("daemon: session start auto-starts the service and says so", async () => wi
         ui: { notify: (t: string, k?: string) => void };
       };
       c.ui = { notify: (t: string, k?: string) => { notes.push([t, k ?? ""]); } };
-      // The ensureDaemon handler is the third session_start listener
+      // The ensureDaemon handler is the fourth session_start listener
       // (the reload watcher arms first, the finish query watcher
-      // second).
-      await pi.sessionStarters[2]({ reason: "startup" }, c);
+      // second, the agent-comms receiver third).
+      await pi.sessionStarters[3]({ reason: "startup" }, c);
       assert(exe.calls.some((a) => a[1] === "start"),
         "a dead unit is started at session start");
       assertEq(notes.length, 1, "the user is told once");
@@ -653,7 +654,7 @@ test("daemon: session_shutdown stops the watcher (no leaked watchers)", async ()
       factory(pi as never);
       await pi.sessionStarters[0]({ reason: "startup" });
       // the factory's session_shutdown handlers tear the watchers down
-      assertEq(pi.shutdownHandlers.length, 3);
+      assertEq(pi.shutdownHandlers.length, 4);
       await pi.shutdownHandlers[0]({ reason: "reload" });
       const sig = join(state, "pi-pty-host", "extensions-reload",
         "pi-sigstop", "round-3.json");
@@ -788,18 +789,20 @@ test("daemon: a quit silences publishing, the next session start lifts it", asyn
       // session_start listeners: [reload watcher, gc reap watcher]; the
       // publish stop is the last session_shutdown listener registered.
       await pi.sessionStarters[0]({ reason: "startup" });
-      await pi.agentStarters[0]({}, ctx());
+      // The publish-busy agent_start listener is the second registered:
+      // the agent-comms receiver arms first.
+      await pi.agentStarters[1]({}, ctx());
       assertEq(publishes(), 1, "a run publishes busy from agent_start");
       // A quit ends the runtime the stop guarded: a late publish is silent,
       // or a turn killed on the way out would rewrite the busy record.
       await pi.shutdownHandlers[pi.shutdownHandlers.length - 1](
         { reason: "quit" });
-      await pi.agentStarters[0]({}, ctx());
+      await pi.agentStarters[1]({}, ctx());
       assertEq(publishes(), 1, "a dying runtime publishes nothing");
       // The next runtime in this process must publish again, or every turn
       // after the first quit would be invisible.
       await pi.sessionStarters[0]({ reason: "startup" });
-      await pi.agentStarters[0]({}, ctx());
+      await pi.agentStarters[1]({}, ctx());
       assertEq(publishes(), 2, "the next session publishes");
     });
   });

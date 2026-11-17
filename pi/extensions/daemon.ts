@@ -97,8 +97,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { CommsCli } from "./comms/client.ts";
+import { CommsAcknowledgements } from "./comms/acknowledgements.ts";
+import { CommsDelivery } from "./comms/delivery.ts";
 import { CommsMessageLog } from "./comms/message-log.ts";
 import { CommsTools } from "./comms/tools.ts";
+import { CommsPolicy } from "./settings/comms-policy.ts";
 import { DaemonSettingsPresenter } from "./settings/presenter.ts";
 import { RunStatePublisher } from "./session-state/publisher.ts";
 import { resolveEndpointPath } from "./services/discovery.ts";
@@ -1281,10 +1284,48 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Agent comms: the documented operator CLI is the only client, so the
-	// tools shell out to it and return its JSON answer unchanged.
-	new CommsTools(new CommsCli(
-		new ProcessRunner((file, args, options) => pi.exec(file, args, options)),
-	), new CommsMessageLog(pi)).register(pi);
+	// tools shell out to it and return its JSON answer unchanged. The
+	// receiver holds the mailbox between waits so mail arrives while the
+	// agent works; every sent and received message is visible in the
+	// branch; and a delivered message must be acknowledged — and answered
+	// — before any other tool runs.
+	const commsPolicy = new CommsPolicy().settings();
+	if (commsPolicy.enabled) {
+		const commsCli = new CommsCli(
+			new ProcessRunner((file, args, options) => pi.exec(file, args, options)),
+		);
+		const commsLog = new CommsMessageLog(pi, commsPolicy.previewChars);
+		commsLog.registerRenderer(pi);
+		const commsAcks = new CommsAcknowledgements(commsCli, commsLog, pi);
+		const commsDelivery = new CommsDelivery(commsCli, commsLog, pi, commsAcks, {
+			holdMs: commsPolicy.holdMs,
+			retryInitialMs: commsPolicy.retryInitialMs,
+			retryMaxMs: commsPolicy.retryMaxMs,
+		});
+		new CommsTools(commsCli, commsLog, {
+			delivery: commsDelivery,
+			acks: commsAcks,
+			setWaitState: (waiting) => {
+				void app.setState(waiting ? "waiting" : "busy");
+			},
+			waitUpdateMs: commsPolicy.waitUpdateMs,
+		}).register(pi);
+		commsAcks.register(pi);
+		pi.on("session_start", async (_event, ctx) => {
+			commsLog.attach(ctx);
+			commsAcks.attach(ctx);
+			commsDelivery.attach(ctx);
+			// The launch environment may name the mailbox only after the
+			// first agent start resolved it; start is idempotent.
+			commsDelivery.start();
+		});
+		pi.on("agent_start", async () => {
+			commsDelivery.start();
+		});
+		pi.on("session_shutdown", async () => {
+			await commsDelivery.stop();
+		});
+	}
 
 	// Reload entrypoint queued by the signal watcher. With a fresh
 	// pending signal this is terminal per pi's ctx.reload() contract:

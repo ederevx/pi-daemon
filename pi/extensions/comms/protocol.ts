@@ -8,6 +8,46 @@
  * socket profile itself.
  */
 
+/** A mailbox address, as the service writes it on every envelope. */
+export interface CommsAddress {
+	/** The owning node; empty for this node's own agents. */
+	nodeId?: string;
+	agentId: string;
+}
+
+/** One envelope as a page carries it. Every field of the service's
+ *  projection is kept, so a field added later is not lost by this
+ *  reader. */
+export interface CommsEnvelope {
+	messageId: string;
+	from: CommsAddress;
+	to: CommsAddress;
+	sequence: number;
+	kind: string;
+	payload: unknown;
+	[key: string]: unknown;
+}
+
+/** The acknowledgement reply: the one message every delivered
+ *  application envelope is answered with, sent back to the sender
+ *  before the service acknowledgement is recorded. Protocol
+ *  acknowledgement envelopes match it and carry no reply of their own. */
+export const ACK_KIND = "ack";
+export const ACK_TYPE = "pi-agent-comms-ack";
+export const ACK_VERSION = 1;
+
+/** The protocol acknowledgement test: reserved kind plus the exact
+ *  payload shape, so ordinary application mail cannot become exempt
+ *  merely by saying "ack". */
+export function isProtocolAck(envelope: CommsEnvelope): boolean {
+	if (envelope.kind !== ACK_KIND || !envelope.payload ||
+			typeof envelope.payload !== "object") return false;
+	const payload = envelope.payload as Record<string, unknown>;
+	return payload.type === ACK_TYPE &&
+		payload.version === ACK_VERSION &&
+		typeof payload.messageId === "string";
+}
+
 /** `comms_send`: one direct message. */
 export interface CommsSendParams {
 	to: string;

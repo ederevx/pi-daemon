@@ -25,6 +25,7 @@ await import("./settings.test.ts");
 await import("./provisioning.test.ts");
 await import("./discovery.test.ts");
 await import("./comms-tools.test.ts");
+await import("./comms-delivery.test.ts");
 await import("./settings-reconciler.test.ts");
 await import("./transcript.test.ts");
 await import("./sessions.test.ts");

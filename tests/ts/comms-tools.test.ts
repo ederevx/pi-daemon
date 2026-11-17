@@ -7,10 +7,8 @@
  * case, and the CLI's failure vocabulary is covered as tool errors.
  */
 
-import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ExecOptions, ExecResult } from "@earendil-works/pi-coding-agent";
 
 import { test, assert, assertEq, withEnv, scratchDir } from "./harness.ts";
 import { ProcessRunner } from "../../pi/extensions/daemon.ts";
@@ -21,57 +19,7 @@ import {
 	CommsMessageLog,
 } from "../../pi/extensions/comms/message-log.ts";
 import { CommsTools } from "../../pi/extensions/comms/tools.ts";
-
-/** A stub `pi-comms`: log argv, print the canned answer, exit as told. */
-function stub(): string {
-	const path = join(scratchDir(), "pi-comms-stub");
-	writeFileSync(path, `#!/usr/bin/env python3
-import json, os, sys
-log = os.environ.get("STUB_LOG")
-if log:
-    with open(log, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(sys.argv[1:]) + "\\n")
-sys.stdout.write(os.environ.get("STUB_STDOUT", ""))
-sys.stderr.write(os.environ.get("STUB_STDERR", ""))
-sys.exit(int(os.environ.get("STUB_EXIT", "0")))
-`, { mode: 0o755 });
-	return path;
-}
-
-/** The real child-process seam, shaped like pi's `exec`. */
-function execProcess(
-	file: string,
-	args: string[],
-	options: ExecOptions = {},
-): Promise<ExecResult> {
-	return new Promise((resolve) => {
-		const child = spawn(file, args, {
-			cwd: options.cwd,
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-		let stdout = "";
-		let stderr = "";
-		let killed = false;
-		const stop = () => {
-			killed = true;
-			child.kill("SIGKILL");
-		};
-		const timer = options.timeout === undefined
-			? undefined
-			: setTimeout(stop, options.timeout);
-		options.signal?.addEventListener("abort", stop, { once: true });
-		child.stdout.on("data", (chunk: Buffer) => { stdout += String(chunk); });
-		child.stderr.on("data", (chunk: Buffer) => { stderr += String(chunk); });
-		child.on("error", () => {
-			if (timer) clearTimeout(timer);
-			resolve({ stdout, stderr, code: 1, killed });
-		});
-		child.on("close", (code) => {
-			if (timer) clearTimeout(timer);
-			resolve({ stdout, stderr, code: code ?? 0, killed });
-		});
-	});
-}
+import { execProcess, recorded, stub } from "./comms-stub.ts";
 
 /** The branch a received envelope is appended to, as the session manager
  *  exposes it: the log reads it back on every call, and a navigation is a
@@ -131,17 +79,6 @@ async function call(
 	});
 }
 
-/** The argv lines the stub recorded, in call order. */
-function recorded(log: string): string[][] {
-	let raw = "";
-	try {
-		raw = readFileSync(log, "utf8");
-	} catch {
-		return [];
-	}
-	return raw.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
-}
-
 /** One canned invocation: the stub script, a log, and its answer. */
 function invocation(stdout: unknown, exit = 0, stderr = ""): Record<string, string> {
 	return {
@@ -158,6 +95,38 @@ function sameJson(actual: unknown, expected: unknown, message: string): void {
 	assertEq(JSON.stringify(actual), JSON.stringify(expected), message);
 }
 
+/** The wait's streamed tool-window update. */
+type ToolUpdate = (update: {
+	content: Array<{ type: "text"; text: string }>;
+	details: Record<string, unknown>;
+}) => void;
+
+/** Run one tool handler with the tool's own options and a shaped
+ *  invocation: the wait's alignment is only visible through them. */
+async function callWith(
+	name: string,
+	params: Record<string, unknown>,
+	options: Record<string, unknown> = {},
+	run: {
+		signal?: AbortSignal;
+		onUpdate?: ToolUpdate;
+		ctx?: Record<string, unknown>;
+	} = {},
+	pi: FakePi = new FakePi(),
+): Promise<any> {
+	new CommsTools(
+		new CommsCli(new ProcessRunner(execProcess)),
+		new CommsMessageLog(pi as never),
+		options as never,
+	).register(pi as never);
+	const tool = pi.tools.get(name);
+	return tool.execute("call1", params, run.signal, run.onUpdate, {
+		cwd: scratchDir(),
+		sessionManager: pi.session,
+		...run.ctx,
+	});
+}
+
 test("comms_send: a string payload uses --text and returns the answer", async () => {
 	const env = invocation({ status: "accepted", sequence: 3 });
 	await withEnv(env, async () => {
@@ -171,6 +140,28 @@ test("comms_send: a string payload uses --text and returns the answer", async ()
 			recorded(env.STUB_LOG)[0].join(" "),
 			"--format json --agent pi-test send bob --node=n2 --request-id=r1 --text=hello",
 			"argv");
+	});
+});
+
+test("comms_send: a retried send appends the branch's traffic record once", async () => {
+	const env = invocation({ status: "accepted", sequence: 3 });
+	await withEnv(env, async () => {
+		const pi = new FakePi();
+		const ctx = { sessionManager: {
+			getEntries: () => pi.session.entries,
+			getBranch: () => pi.session.entries,
+		} };
+		await callWith(
+			"comms_send", { to: "bob", payload: "hello", requestId: "r1" },
+			{}, { ctx }, pi);
+		await callWith(
+			"comms_send", { to: "bob", payload: "hello", requestId: "r1" },
+			{}, { ctx }, pi);
+		const traffic = pi.session.entries.filter((entry) =>
+			(entry as Record<string, unknown>).customType === COMMS_LOG);
+		assertEq(traffic.length, 1, "the same request id is recorded once");
+		assertEq(recorded(env.STUB_LOG).length, 2,
+			"and both attempts still reach the service");
 	});
 });
 
@@ -221,7 +212,7 @@ test("comms_wait: an empty wait is a page, not an error", async () => {
 	await withEnv(env, async () => {
 		const result = await call("comms_wait", { timeoutMs: 100 });
 		assert(!result.isError, "empty wait is accepted");
-		assertEq(result.details.timedOut, true, "marked timed out");
+		assertEq(result.details.stoppedBy, "timeout", "the hold ended empty");
 		sameJson(result.structuredContent, answer, "empty page returned");
 	});
 });
@@ -265,8 +256,9 @@ test("comms_wait: a received page is recorded whole and once on the branch", asy
 		// Every field the service put on the envelope is still there, so a
 		// reader that quotes the verdict quotes the envelope itself.
 		sameJson(first.data, {
-		...page.messages[0], direction: "received",
-		}, "the envelope is recorded whole");
+			...page.messages[0], direction: "received",
+			preview: "the verdict",
+		}, "the envelope is recorded whole, with its preview");
 		// A reload reads the branch back, so the same delivery records once.
 		await call("comms_wait", { timeoutMs: 100 }, pi);
 		assertEq(pi.session.entries.length, 2, "one delivery records once");
@@ -609,5 +601,220 @@ test("peers: a node lists the peers that node reaches", async () => {
 		assert(!result.isError, "not an error");
 		assertEq(recorded(env.STUB_LOG)[0].join(" "),
 			"--format json --agent pi-test --at=peer peer list", "argv");
+	});
+});
+
+// -- the wait among pi's blocking tools -----------------------------------
+
+/** The receiver stand-in the foreground hold coordinates with: active
+ *  by default, a cursor to continue from, and one ingest of record. */
+function fakeDelivery(presented: string[] = []): Record<string, unknown> {
+	return {
+		active: () => true,
+		cursorHint: () => 12,
+		acquireMailbox: () => Promise.resolve(() => {}),
+		clearLatch: () => {},
+		latched: () => false,
+		ingest: (_answer: unknown, _options: unknown) =>
+			Promise.resolve({ presented: [...presented] }),
+	};
+}
+
+test("comms_wait: the waiting state publishes and is restored, also on failure", async () => {
+	const states: string[] = [];
+	const state = (waiting: boolean) => states.push(waiting ? "on" : "off");
+	const empty = invocation({ status: "timed-out", messages: [] }, 3);
+	const failing = invocation(undefined, 1, "pi-comms: usage: bad flag");
+	await withEnv(empty, async () => {
+		await callWith("comms_wait", { timeoutMs: 20 }, { setWaitState: state });
+		await withEnv(failing, async () => {
+			await callWith("comms_wait", { timeoutMs: 20 }, { setWaitState: state });
+		});
+		assertEq(states.join(","), "on,off,on,off",
+			"published at the hold, restored in every ending");
+	});
+});
+
+test("comms_wait: the tool window streams elapsed time while the hold lasts", async () => {
+	const env = invocation({ status: "timed-out", messages: [] }, 3);
+	env.STUB_DELAY = "0.35";
+	const updates: Array<Record<string, unknown>> = [];
+	await withEnv(env, async () => {
+		await callWith("comms_wait", { timeoutMs: 2000 }, { waitUpdateMs: 50 }, {
+			onUpdate: (update: { details: Record<string, unknown> }) =>
+				updates.push(update.details),
+		});
+		assert(updates.length >= 2, "more than one update streamed");
+		for (const details of updates.slice(0, -1)) {
+			assert(typeof details.waitedMs === "number" && details.waitedMs > 0,
+				"each carries the elapsed time");
+		}
+	});
+});
+
+test("comms_wait: mail already queued yields before any CLI runs", async () => {
+	const env = invocation({ status: "ok", messages: [] });
+	await withEnv(env, async () => {
+		const pi = new FakePi();
+		const result = await callWith("comms_wait", { timeoutMs: 100 }, {}, {
+			ctx: { hasPendingMessages: () => true },
+		}, pi);
+		assertEq(result.details.stoppedBy, "yield", "yielded at once");
+		sameJson(result.structuredContent, { status: "yielded", stoppedBy: "yield" },
+			"the yield is an answered page of nothing");
+		assertEq(recorded(env.STUB_LOG).length, 0, "the CLI never ran");
+		assertEq(pi.session.entries.length, 0, "no mail was taken");
+	});
+});
+
+test("comms_wait: mail arriving mid-hold yields instead of answering", async () => {
+	const env = invocation({ status: "timed-out", messages: [] }, 3);
+	env.STUB_DELAY = "1";
+	let queued = false;
+	await withEnv(env, async () => {
+		// The tick raises it just after the hold is under way.
+		const timer = setTimeout(() => { queued = true; }, 200);
+		const result = await callWith("comms_wait", { timeoutMs: 5000 }, {
+			waitUpdateMs: 40,
+		}, {
+			ctx: { hasPendingMessages: () => queued },
+		});
+		clearTimeout(timer);
+		assertEq(result.details.stoppedBy, "yield", "yielded mid-hold");
+		assertEq(result.details.waitedMs >= 100, true, "it did hold first");
+	});
+});
+
+test("comms_wait: a caller abort before the hold answers with no CLI run", async () => {
+	const env = invocation({ status: "ok", messages: [] });
+	await withEnv(env, async () => {
+		const pi = new FakePi();
+		const controller = new AbortController();
+		controller.abort();
+		const result = await callWith("comms_wait", { timeoutMs: 100 }, {}, {
+			signal: controller.signal,
+		}, pi);
+		assertEq(result.details.stoppedBy, "abort", "aborted before the hold");
+		assert(result.content[0].text.includes("aborted"), "the text says so");
+		assertEq(recorded(env.STUB_LOG).length, 0, "the CLI never ran");
+		assertEq(pi.session.entries.length, 0, "no mail was taken");
+	});
+});
+
+test("comms_wait: a caller abort mid-hold cancels the CLI child", async () => {
+	const env = invocation({ status: "timed-out", messages: [] }, 3);
+	env.STUB_DELAY = "1";
+	await withEnv(env, async () => {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 150);
+		const result = await callWith("comms_wait", { timeoutMs: 5000 }, {}, {
+			signal: controller.signal,
+		});
+		clearTimeout(timer);
+		assertEq(result.details.stoppedBy, "abort", "aborted mid-hold");
+		assertEq(result.details.waitedMs >= 100, true, "it did hold first");
+	});
+});
+
+test("comms_wait: a hold continues from the receiver's cursor, and never replays", async () => {
+	const env = invocation({ status: "timed-out", messages: [] }, 3);
+	await withEnv(env, async () => {
+		const delivery = fakeDelivery();
+		await callWith("comms_wait", { timeoutMs: 100 }, { delivery });
+		assert(recorded(env.STUB_LOG)[0].includes("--after=12"),
+			"an unnamed hold continues from the receiver's cursor");
+		await callWith("comms_wait", { after: 4, timeoutMs: 100 }, { delivery });
+		assert(recorded(env.STUB_LOG)[1].includes("--after=4"),
+			"a named cursor is kept");
+		await callWith(
+			"comms_wait", { node: "peer", timeoutMs: 100 }, { delivery });
+		assertEq(recorded(env.STUB_LOG)[2].filter((part: string) =>
+			part.startsWith("--after=")).length, 0,
+			"another mailbox has no cursor to continue from");
+	});
+});
+
+test("comms_wait: a hold on this mailbox leases the mailbox; another mailbox does not", async () => {
+	const env = invocation({ status: "timed-out", messages: [] }, 3);
+	await withEnv(env, async () => {
+		const events: string[] = [];
+		const delivery = fakeDelivery();
+		delivery.acquireMailbox = () => {
+			events.push("acquire");
+			return Promise.resolve(() => events.push("release"));
+		};
+		await callWith("comms_wait", { timeoutMs: 100 }, { delivery });
+		await callWith("comms_wait", { node: "peer", timeoutMs: 100 }, { delivery });
+		assertEq(events.join(","), "acquire,release",
+			"one lease around the local hold only");
+	});
+});
+
+test("comms_wait: a wired receiver ingests the page once, and the tool logs nothing itself", async () => {
+	const page = {
+		status: "ok",
+		messages: [{ messageId: "m9", sequence: 9, payload: "hi" }],
+		cursor: { sequence: 9 },
+	};
+	const env = invocation(page);
+	await withEnv(env, async () => {
+		const ingested: Array<unknown> = [];
+		const delivery = fakeDelivery();
+		delivery.ingest = (answer: unknown) => {
+			ingested.push(answer);
+			return Promise.resolve({ presented: ["m9"] });
+		};
+		const pi = new FakePi();
+		const result = await callWith("comms_wait", { timeoutMs: 100 },
+			{ delivery }, {}, pi);
+		assertEq(ingested.length, 1, "one ingest of the answer");
+		sameJson(ingested[0], page, "the whole page went to the receiver");
+		assertEq(pi.session.entries.length, 0,
+			"the tool does not log the page itself");
+		assertEq(result.details.stoppedBy, "message", "mail arrived");
+		sameJson(result.details.presented, ["m9"], "presented ids surface");
+	});
+});
+
+test("comms_send: an accepted send records the session's own mail on the branch", async () => {
+	const env = invocation({ status: "accepted", sequence: 2 });
+	await withEnv(env, async () => {
+		const pi = new FakePi();
+		await callWith("comms_send", {
+			to: "bob", payload: "hi", requestId: "r8",
+		}, {}, {}, pi);
+		assertEq(pi.session.entries.length, 1, "one entry");
+		const entry = pi.session.entries[0];
+		assertEq(entry.customType, COMMS_LOG, "the log's own type");
+		sameJson(entry.data, {
+			direction: "sent",
+			to: { agentId: "bob", nodeId: "" },
+			kind: "text",
+			requestId: "r8",
+			status: "accepted",
+			payload: "hi",
+			preview: "hi",
+		}, "the send is recorded whole");
+	});
+});
+
+test("comms_send: a queued send records too, and a failed send records nothing", async () => {
+	const queued = invocation({ status: "queued" });
+	await withEnv(queued, async () => {
+		const pi = new FakePi();
+		await callWith("comms_send", {
+			to: "bob", payload: "hi", requestId: "r9",
+		}, {}, {}, pi);
+		assertEq(pi.session.entries.length, 1, "a queued send is mail too");
+	});
+	const declined = invocation({ status: "undeliverable" }, 2,
+		"pi-comms: declined: no-such-peer");
+	await withEnv(declined, async () => {
+		const pi = new FakePi();
+		const result = await callWith("comms_send", {
+			to: "bob", payload: "hi", requestId: "r10",
+		}, {}, {}, pi);
+		assertEq(result.isError, true, "is an error");
+		assertEq(pi.session.entries.length, 0, "a failed send records nothing");
 	});
 });
