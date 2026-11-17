@@ -38,6 +38,9 @@
       "./pi/extensions"
     ]
   },
+  "dependencies": {
+    "typebox": "1.4.7"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
