@@ -99,6 +99,9 @@ import { Type } from "typebox";
 import { CommsCli } from "./comms/client.ts";
 import { CommsAcknowledgements } from "./comms/acknowledgements.ts";
 import { CommsDelivery } from "./comms/delivery.ts";
+import {
+	CommsSessionTools,
+} from "./comms/session-tools.ts";
 import { CommsMessageLog } from "./comms/message-log.ts";
 import { CommsTools } from "./comms/tools.ts";
 import { CommsPolicy } from "./settings/comms-policy.ts";
@@ -1305,6 +1308,12 @@ export default function (pi: ExtensionAPI) {
 		new CommsTools(commsCli, commsLog, {
 			delivery: commsDelivery,
 			acks: commsAcks,
+			setWaitState: (waiting) => {
+				void app.setState(waiting ? "waiting" : "busy");
+			},
+			waitUpdateMs: commsPolicy.waitUpdateMs,
+		}).register(pi);
+		new CommsSessionTools(commsCli, {
 			setWaitState: (waiting) => {
 				void app.setState(waiting ? "waiting" : "busy");
 			},

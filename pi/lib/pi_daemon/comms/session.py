@@ -47,11 +47,14 @@ class CommsSession:
             "agent": dict(self._agent),
             "mailbox": dict(self._mailbox),
             "headSequence": self._store.head_sequence(self.agent_id()),
+            "capabilities": self._operations.capabilities(),
             "limits": {"maxWaitMs": int(self._config.comms_wait_max * 1000),
                        # A forwarded call may spend one peer round trip here
                        # before the destination's own hold begins.
                        "forwardMs": int(
-                           self._config.comms_peer_request_timeout * 1000)},
+                           self._config.comms_peer_request_timeout * 1000),
+                       "feedPageBytes":
+                           self._config.feed_page_bytes},
         }
 
     def methods(self, sender=None):
@@ -67,6 +70,8 @@ class CommsSession:
                                                   False)}
         if method == "comms.wait":
             return self._wait(request)
+        if method == "comms.session.feed":
+            return self._feed(request)
         handler = self._handlers.get(method)
         if handler is None:
             raise LookupError(method)
@@ -101,18 +106,8 @@ class CommsSession:
         return None
 
     def complete(self, request_id, result):
-        """Answer a wait the registry finished. Nobody else sends it."""
-        try:
-            reply = self._operations.wait_result(self._mailbox, result)
-        except RpcError as exc:
-            self._send(self._codec.failure(request_id, exc.code, exc.message))
-            return
-        try:
-            self._writer.send(self._codec.result(request_id, reply))
-        except RpcError as exc:
-            self._send(self._codec.failure(request_id, exc.code, exc.message))
-        except OSError:
-            self._end(False)
+        """Answer a held request the registry finished. Nobody else sends it."""
+        self._send(self._codec.result(request_id, result))
 
     def refuse(self, request_id, code, message):
         self._send(self._codec.failure(request_id, code, message))
@@ -128,12 +123,39 @@ class CommsSession:
         self._end(wait)
 
     def _wait(self, request):
-        """Register a wait. The registry answers it from another thread."""
+        """Register a mailbox wait. The registry answers it from another thread."""
         wait = self._operations.wait_request(self._mailbox,
                                             self._params(request))
+        agent = dict(self._mailbox)
+
+        def probe(expired):
+            """One look at the mailbox, shaped as `comms.replay` shapes it."""
+            result = self._store.replay(agent["agentId"], wait["cursor"],
+                                        wait["limit"])
+            if result["status"] == "cursor-expired" or result["messages"]:
+                return self._operations.wait_result(agent, result), None
+            if expired:
+                return {"status": "timed-out", "messages": [],
+                        "cursor": {"agent": agent,
+                                   "sequence": wait["cursor"] or 0},
+                        "more": False}, None
+            return None, None
+
         try:
             self._waits.begin(self, request.get("id"), self.agent_id(),
-                              wait["cursor"], wait["limit"], wait["timeout"])
+                              probe, wait["timeout"])
+        except CommsError as exc:
+            raise RpcError(CODES.get(exc.code, UNAVAILABLE),
+                           str(exc.code)) from None
+        return None
+
+    def _feed(self, request):
+        """Register a held feed. A request without a cursor answers at once."""
+        plan = self._operations.feed_plan(self._agent,
+                                          self._params(request))
+        try:
+            self._waits.begin(self, request.get("id"), plan["key"],
+                              plan["probe"], plan["timeout"])
         except CommsError as exc:
             raise RpcError(CODES.get(exc.code, UNAVAILABLE),
                            str(exc.code)) from None

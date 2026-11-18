@@ -197,6 +197,59 @@ class MailTests(unittest.TestCase):
         self.assertTrue(completed.stdout.strip().endswith("cursor 1"))
 
 
+class SessionTests(unittest.TestCase):
+    """The session wire as the CLI reaches it: listing, and the refusals."""
+
+    def setUp(self):
+        self.fixture = Fixture().start()
+
+    def tearDown(self):
+        self.fixture.stop()
+
+    def test_a_listing_names_the_node_and_counts_the_ended_records(self):
+        completed = self.fixture.run("session", "list")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        answer = output(completed)
+        self.assertEqual(answer["status"], "ok")
+        self.assertEqual(answer["sessions"], [])
+        self.assertEqual(answer["stopped"], 0)
+        self.assertTrue(answer["nodeId"])
+
+    def test_a_conversation_listing_answers_a_page(self):
+        completed = self.fixture.run("session", "conversations",
+                                     "--dir", self.fixture.sessions)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        answer = output(completed)
+        self.assertEqual(answer["status"], "ok")
+        self.assertIsInstance(answer["conversations"], list)
+
+    def test_an_unknown_session_is_refused_by_the_wire_that_owns_it(self):
+        for arguments in (("session", "feed", "ghost"),
+                          ("session", "open", "--name", "ghost"),
+                          ("session", "stop", "ghost")):
+            completed = self.fixture.run(*arguments)
+            self.assertEqual(completed.returncode, 5, completed.stderr)
+            self.assertIn("no-session", completed.stderr)
+
+    def test_an_open_needs_exactly_one_target(self):
+        completed = self.fixture.run("session", "open")
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        self.assertIn("exactly one of name, file or sessionId",
+                      completed.stderr)
+
+    def test_input_needs_text(self):
+        completed = self.fixture.run("session", "input", "ghost")
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        self.assertIn("text is required", completed.stderr)
+
+    def test_a_feed_cursor_belongs_to_one_session(self):
+        completed = self.fixture.run(
+            "session", "feed", "ghost", "--cursor",
+            json.dumps({"name": "other"}))
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        self.assertIn("one session", completed.stderr)
+
+
 class DiscoveryTests(unittest.TestCase):
     def setUp(self):
         self.fixture = Fixture().start()

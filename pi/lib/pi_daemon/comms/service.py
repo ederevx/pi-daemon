@@ -20,6 +20,7 @@ from .peer_operations import PeerOperations
 from .peer_link_error import PeerLinkError
 from .peer_session import PeerSession
 from .session import CommsSession
+from .session_wire import feed_key
 from .spawn_ledger import (ENV_AGENT_ID, ENV_HOST, ENV_NODE_ID,
                            ENV_PARENT_AGENT_ID, ENV_PARENT_NODE_ID, ENV_PORT,
                            ENV_SPAWN_ID, SPAWNED)
@@ -49,8 +50,9 @@ class CommsService:
         self._peer_sessions = []
         self._peer_lock = threading.Lock()
         self._relay = MessageRelay()
-        self._waits = WaitRegistry(store, config)
+        self._waits = WaitRegistry(config)
         self._operations = CommsOperations(self, config)
+        self._sessions_wire = None
         # Acceptance and its notifications share one order, or mail arrives
         # out of sequence.
         self._send_lock = threading.Lock()
@@ -84,6 +86,34 @@ class CommsService:
         if self._peer_operations is None:
             return {}
         return self._peer_operations.handlers()
+
+    def use_sessions(self, wire):
+        """Attach the session wire another domain composed, before start()."""
+        self._sessions_wire = wire
+        return self
+
+    def session_handlers(self):
+        """The session methods this node serves, control only when allowed."""
+        if self._sessions_wire is None:
+            return {}
+        return self._sessions_wire.handlers(
+            self._config.comms_session_control)
+
+    def feed_plan(self, sender, params):
+        """One validated held feed, ready for the wait registry."""
+        if self._sessions_wire is None:
+            raise CommsError(METHOD_UNAVAILABLE)
+        return self._sessions_wire.feed_plan(sender, params)
+
+    def signal_feed(self, keys):
+        """A run produced output or ended: wake the feeds reading it."""
+        self._waits.signal({feed_key(key) for key in keys})
+
+    def capabilities(self):
+        """The additive capability names a greeting may carry."""
+        if self._sessions_wire is None:
+            return []
+        return ["session.reach.v1", "session.feed.v1"]
 
     def begin_shutdown(self):
         """No new wait is registered while the pending ones are answered."""
@@ -303,8 +333,11 @@ class CommsService:
                 "headSequence": self._store.head_sequence(
                     mailbox["agentId"]),
                 "methods": self._operations.methods(sender),
+                "capabilities": self.capabilities(),
                 "limits": {"maxWaitMs": int(self._config.comms_wait_max
-                                            * 1000)}}
+                                            * 1000),
+                           "feedPageBytes":
+                               self._config.feed_page_bytes}}
 
     def forward(self, node_id, agent_id, method, params, timeout=None):
         """One call over a connection opened as the calling agent."""

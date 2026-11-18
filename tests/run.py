@@ -294,6 +294,8 @@ def steps():
              suite=True),
         Step("comms socket tests",
              [python, "tests/comms_rpc_test.py", "-v"], suite=True),
+        Step("comms session wire tests",
+             [python, "tests/comms_session_test.py", "-v"], suite=True),
         Step("service discovery tests",
              [python, "tests/comms_discovery_test.py", "-v"], suite=True),
         Step("pi-comms CLI tests", [python, "tests/pi_comms_test.py", "-v"],
