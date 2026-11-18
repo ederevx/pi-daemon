@@ -323,22 +323,29 @@ test("message log: an append the branch refused claims nothing and is retried", 
 	assertEq(pi.session.entries.length, 1, "the same logger retries it");
 });
 
-test("comms_ack: an answer that carries no envelope records nothing", async () => {
-	const env = invocation({ status: "ok", acknowledged: 1 });
-	await withEnv(env, async () => {
-		const pi = new FakePi();
-		await call("comms_ack", { messageIds: ["m1"] }, pi);
-		assertEq(pi.session.entries.length, 0, "no mail, no record");
-	});
-});
-
-test("comms_ack: message ids are positional", async () => {
+test("comms_ack: positional ids, no mail recorded, and only the ack's own escape declared", async () => {
 	const env = invocation({ status: "ok", acknowledged: 2 });
 	await withEnv(env, async () => {
-		const result = await call("comms_ack", { messageIds: ["m1", "m2"] });
+		const pi = new FakePi();
+		const result = await call("comms_ack", { messageIds: ["m1", "m2"] }, pi);
 		assert(!result.isError, "not an error");
 		assertEq(recorded(env.STUB_LOG)[0].join(" "),
 			"--format json --agent pi-test ack m1 m2", "argv");
+		assertEq(pi.session.entries.length, 0, "no mail, no record");
+
+		// The same registration's metadata, read back after it ran.
+		const ack = pi.tools.get(CommsTools.ACK);
+		assertEq(ack.annotations.readOnlyHint, false,
+			"the acknowledgement writes the service, so it is not read-only");
+		const declaration = ack.annotations.piGateEscape;
+		assertEq(declaration?.version, 1, "the escape declaration is versioned");
+		assertEq(JSON.stringify(declaration?.admits), JSON.stringify(["comms_ack"]),
+			"every extension publishes only its own tools");
+		for (const name of [CommsTools.SEND, CommsTools.WAIT, CommsTools.REPLAY,
+			CommsTools.SPAWN, CommsTools.PEERS]) {
+			assertEq(pi.tools.get(name).annotations.piGateEscape, undefined,
+				`${name} declares no escape`);
+		}
 	});
 });
 

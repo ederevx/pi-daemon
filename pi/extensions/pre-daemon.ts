@@ -9,7 +9,9 @@
  *
  * It is also the gate: until `pre_daemon` has been called in a session,
  * every tool this extension registers is blocked with a reason pointing
- * here. That includes `bash`, which the offload extension only offloads -
+ * here — except a tool an extension declares as its own escape (see
+ * tool-gate-escapes.ts). That includes `bash`, which the offload
+ * extension only offloads -
  * and therefore only gates - while command offloading is enabled, so a
  * session with offloading disabled keeps its plain local shell. Other
  * extensions' and pi's own tools are never touched. The gate resets on
@@ -25,9 +27,14 @@ import type {
 import { Type } from "typebox";
 
 import { OffloadPolicy } from "./settings/offload-policy.ts";
+import { ToolGateEscapes } from "./tool-gate-escapes.ts";
 
 /** The name of this extension's onboarding tool. */
 const TOOL_NAME = "pre_daemon";
+
+/** The tools this extension declares reachable while another
+ *  prerequisite is unmet. */
+const ADMITS = [TOOL_NAME];
 
 /** Owns the `pre_daemon` tool, its first-call gate, and the collapse
  *  default. One instance per extension runtime. */
@@ -58,6 +65,13 @@ export class PreDaemonTool {
 
 	/** Register the tool, the per-session reset, and the gate. */
 	register(pi: ExtensionAPI): void {
+		const annotations = {
+			readOnlyHint: true,
+			[ToolGateEscapes.KEY]: {
+				version: ToolGateEscapes.VERSION,
+				admits: [...ADMITS],
+			},
+		};
 		pi.registerTool({
 			name: TOOL_NAME,
 			label: TOOL_NAME,
@@ -66,7 +80,7 @@ export class PreDaemonTool {
 				"session. Returns the pi-daemon tool catalog, conventions, " +
 				"and feature summary.",
 			parameters: Type.Object({}),
-			annotations: { readOnlyHint: true },
+			annotations,
 			execute: async () => {
 				this.acknowledged = true;
 				return {
@@ -78,7 +92,7 @@ export class PreDaemonTool {
 		pi.on("session_start", async () => {
 			this.beginSession();
 		});
-		pi.on("tool_call", (event) => this.gate(event));
+		pi.on("tool_call", (event) => this.gate(pi, event));
 	}
 
 	/** Model-facing catalog: tools, conventions, and features. */
@@ -98,7 +112,7 @@ export class PreDaemonTool {
 			"",
 			"Conventions:",
 			"- Delivered agent-comms mail arrives in this session by itself: the daemon's receiver holds the mailbox and wakes you with the message even outside a comms_wait, and every sent or received message is logged in the conversation as it moves.",
-			"- An agent-comms message you were given owes an acknowledgement reply FIRST, before anything else: comms_ack answers the sender and records the service acknowledgement, and every other tool stays blocked until it completes.",
+			"- An agent-comms message you were given owes an acknowledgement reply FIRST, before anything else: comms_ack answers the sender and records the service acknowledgement. Ordinary tools stay blocked until it completes; declared prerequisite escapes remain reachable.",
 			"- Call pre_daemon once per session before daemon_tasks, daemon_gc_reap, transcript_read, any comms_* tool, or peers, and before bash when offloading is enabled. When offloading is disabled, bash runs locally without this prerequisite.",
 			"- Every bash call is already daemon-owned and non-blocking; pass the bash timeout to bound it daemon-side, and use daemon_tasks result <id> wait=<seconds> only to block for a result deliberately.",
 			"- A blocking result wait is interruptible and steerable: Escape or a queued message releases it; the ticket keeps running and still delivers on completion.",
@@ -131,8 +145,12 @@ export class PreDaemonTool {
 	}
 
 	/** Block this extension's tools until `pre_daemon` has been called;
-	 *  never touch any other tool. */
-	private gate(event: ToolCallEvent): ToolCallEventResult | undefined {
+	 *  never touch any other tool, except one another extension declared
+	 *  as its own prerequisite's escape. */
+	private gate(
+		pi: Pick<ExtensionAPI, "getAllTools">,
+		event: ToolCallEvent,
+	): ToolCallEventResult | undefined {
 		const name = String(event.toolName ?? "");
 		if (name === TOOL_NAME) {
 			this.acknowledged = true;
@@ -142,6 +160,7 @@ export class PreDaemonTool {
 		// A disabled offload leaves the plain local shell, which owes nothing
 		// to the daemon: it stays ungated and unacknowledged.
 		if (name === "bash" && !this.policy.enabled()) return undefined;
+		if (ToolGateEscapes.admits(pi, name)) return undefined;
 		return {
 			block: true,
 			reason:

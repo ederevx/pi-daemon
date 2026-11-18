@@ -9,8 +9,10 @@
  * reply that cannot be delivered is reported but never holds the
  * obligation — the gate opens once the service acknowledgement of each
  * delivered id is recorded. Until then, one `tool_call` gate blocks
- * every tool except `comms_ack` itself and `pre_daemon` — the
- * fail-closed shape pi-consult's implementation gate uses. The reply's
+ * every tool except `comms_ack` itself, `pre_daemon`, and any tool
+ * another extension declares as its own prerequisite's escape (see
+ * tool-gate-escapes.ts) — the fail-closed shape pi-consult's
+ * implementation gate uses. The reply's
  * request id is generated and persisted before the send, so a lost
  * reply never produces a duplicate acknowledgement message; the resend
  * reclaims the same send receipt — and since the reply holds nothing,
@@ -40,6 +42,7 @@ import {
 	COMMS_LOG,
 	CommsMessageLog,
 } from "./message-log.ts";
+import { ToolGateEscapes } from "../tool-gate-escapes.ts";
 
 /** The custom entry type acknowledgement progress is stored under. */
 export const COMMS_ACK_STATE = "pi-agent-comms-ack-state";
@@ -207,8 +210,9 @@ export class CommsAcknowledgements {
 	}
 
 	/** The gate: no tool runs while an acknowledgement is owed, except
-	 *  the two the acknowledgement itself needs. Fails closed: a state
-	 *  read that cannot be trusted blocks rather than allows. */
+	 *  the tools the acknowledgement itself needs and a tool a live
+	 *  registration declares as its escape. Fails closed: a state read
+	 *  that cannot be trusted blocks rather than allows. */
 	register(pi: ExtensionAPI): void {
 		pi.on("tool_call", (event: ToolCallEvent): ToolCallEventResult | undefined => {
 			try {
@@ -226,6 +230,7 @@ export class CommsAcknowledgements {
 		if (!this.owing()) return undefined;
 		const name = String(event.toolName ?? "");
 		if (name === "comms_ack" || name === "pre_daemon") return undefined;
+		if (ToolGateEscapes.admits(this.pi, name)) return undefined;
 		return {
 			block: true,
 			reason: CommsAcknowledgements.denial(

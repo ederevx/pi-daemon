@@ -30,6 +30,7 @@ import { CommsCli, type CommsOutcome } from "./client.ts";
 import { type CommsAcknowledgements } from "./acknowledgements.ts";
 import { type CommsDelivery } from "./delivery.ts";
 import { CommsMessageLog } from "./message-log.ts";
+import { ToolGateEscapes } from "../tool-gate-escapes.ts";
 import {
 	CommsArgv,
 	CommsExit,
@@ -76,6 +77,10 @@ export class CommsTools {
 	static readonly ACK = "comms_ack";
 	static readonly SPAWN = "comms_spawn";
 	static readonly PEERS = "peers";
+
+	/** The tools this extension declares reachable while another
+	 *  prerequisite is unmet. */
+	static readonly ADMITS = [CommsTools.ACK];
 
 	/** The model-facing answer is a compact JSON line; keep it bounded like
 	 *  the transcript tool bounds a page. */
@@ -179,6 +184,14 @@ export class CommsTools {
 			) => this.replay(params, signal, ctx),
 		});
 
+		const ackAnnotations = {
+			readOnlyHint: false,
+			openWorldHint: false,
+			[ToolGateEscapes.KEY]: {
+				version: ToolGateEscapes.VERSION,
+				admits: [...CommsTools.ADMITS],
+			},
+		};
 		pi.registerTool({
 			name: CommsTools.ACK,
 			label: "comms ack",
@@ -198,7 +211,7 @@ export class CommsTools {
 					description: "Acknowledge mail in the mailbox kept for this agent there.",
 				})),
 			}),
-			annotations: { readOnlyHint: false, openWorldHint: false },
+			annotations: ackAnnotations,
 			execute: async (
 				_toolCallId, params: CommsAckParams, signal, _update, ctx,
 			) => this.ack(params, signal, ctx),

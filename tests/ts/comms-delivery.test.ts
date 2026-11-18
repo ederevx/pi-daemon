@@ -31,6 +31,7 @@ import {
 	CommsAcknowledgements,
 } from "../../pi/extensions/comms/acknowledgements.ts";
 import { COMMS_LOG, CommsMessageLog } from "../../pi/extensions/comms/message-log.ts";
+import { ToolGateEscapes } from "../../pi/extensions/tool-gate-escapes.ts";
 import { execProcess, recorded, sleep, stub } from "./comms-stub.ts";
 
 /** The receiver's timing: short retries, a long hold the tests cancel. */
@@ -47,18 +48,32 @@ class FakePi {
 	/** Entry types the branch refuses before taking, as a full store. */
 	readonly failOn = new Set<string>();
 	readonly messages: Array<Record<string, unknown>> = [];
-	readonly handlers = new Map<string, (event: unknown) => unknown>();
-	/** The tools registered on this fake API, by name. */
+	readonly handlers = new Map<
+		string,
+		Array<(event: unknown, ctx: unknown) => unknown>
+	>();
+	/** The tools registered on this fake API, by name, with the metadata a
+	 *  gate reads back through `getAllTools`. */
 	readonly tools = new Map<string, {
 		name: string;
+		annotations?: Record<string, unknown>;
 		execute: (...args: unknown[]) => Promise<unknown>;
 	}>();
 
 	registerTool(spec: {
 		name: string;
+		annotations?: Record<string, unknown>;
 		execute: (...args: unknown[]) => Promise<unknown>;
 	}): void {
 		this.tools.set(spec.name, spec);
+	}
+
+	/** What pi hands a gate: every registered tool and its annotations. */
+	getAllTools(): Array<{ name: string; annotations?: Record<string, unknown> }> {
+		return [...this.tools.values()].map((tool) => ({
+			name: tool.name,
+			...(tool.annotations ? { annotations: tool.annotations } : {}),
+		}));
 	}
 
 	appendEntry(customType: string, data: unknown): void {
@@ -72,13 +87,23 @@ class FakePi {
 		this.messages.push({ ...message, ...options });
 	}
 
-	on(name: string, handler: (event: unknown) => unknown): void {
-		this.handlers.set(name, handler);
+	on(name: string, handler: (event: unknown, ctx: unknown) => unknown): void {
+		const list = this.handlers.get(name) ?? [];
+		list.push(handler);
+		this.handlers.set(name, list);
 	}
 
-	fire(name: string, event: unknown): unknown {
-		const handler = this.handlers.get(name);
-		return handler ? handler(event) : undefined;
+	/** pi awaits every handler in registration order and stops at the first
+	 *  one that blocks, with the session context. */
+	async fire(name: string, event: unknown): Promise<unknown> {
+		let answer: unknown;
+		for (const handler of this.handlers.get(name) ?? []) {
+			const returned = await handler(event, this.ctx());
+			if (returned === undefined || returned === null) continue;
+			answer = returned;
+			if ((returned as { block?: unknown }).block) return returned;
+		}
+		return answer;
 	}
 
 	/** The session context the delivery attaches to. */
@@ -329,23 +354,123 @@ function arm(pi: FakePi, ledger: CommsAcknowledgements, id: string): void {
 	ledger.markPending(envelope(id, 1, "hello"));
 }
 
-test("acknowledgements: the gate blocks every tool but the ack itself while mail is owed", () => {
+test("acknowledgements: the armed gate admits only live valid escapes", async () => {
 	const pi = new FakePi();
 	const { ledger } = harness(pi);
 	arm(pi, ledger, "m1");
 	ledger.register(pi as never);
-	const blocked = pi.fire("tool_call", { toolName: "bash" }) as
-		| { block: boolean; reason: string }
-		| undefined;
+	const answer = (name: string) => pi.fire("tool_call", { toolName: name }) as
+		Promise<{ block?: boolean; reason?: string } | undefined>;
+
+	// Baseline: nothing declares an escape, so only the ack and the
+	// daemon's own calls run, and the denial names the id and the call.
+	const blocked = await answer("bash");
 	assertEq(blocked?.block, true, "an ordinary tool is blocked");
-	assert(blocked?.reason.includes("m1"), "the denial names the owed ids");
-	assert(blocked?.reason.includes("comms_ack { messageIds: [\"m1\"] }"),
+	assert(blocked?.reason?.includes("m1") === true,
+		"the denial names the owed ids");
+	assert(blocked?.reason?.includes("comms_ack { messageIds: [\"m1\"] }"),
 		"the denial names the exact call");
-	assertEq(pi.fire("tool_call", { toolName: "comms_ack" }), undefined,
-		"the ack itself runs");
-	assertEq(pi.fire("tool_call", { toolName: "pre_daemon" }), undefined,
+	assertEq(await answer("comms_ack"), undefined, "the ack itself runs");
+	assertEq(await answer("pre_daemon"), undefined,
 		"the daemon's own calls run");
+
+	// One registration declares the acquisition its own prerequisite
+	// needs; every other tool stays blocked behind the owed id.
+	declare(pi, ["pre_memory", "read", "rm_tree_exec"]);
+	for (const name of ["pre_memory", "read", "rm_tree_exec"]) {
+		assertEq(await answer(name), undefined,
+			`${name} is admitted while the acknowledgement is owed`);
+	}
+	for (const name of ["write", "bash", "comms_send", "memory_update",
+		"unknown_tool"]) {
+		const denial = await answer(name);
+		assertEq(denial?.block, true, `${name} stays blocked`);
+		assert(denial?.reason?.includes("m1") === true,
+			`${name}'s denial names the owed id`);
+	}
+	assertEq(ledger.owing(), true, "an admission settles nothing by itself");
+
+	// The union follows the live registrations: a second declaring tool
+	// adds its own admission, and removing either closes only its own.
+	declare(pi, ["pre_consult"], "pre_consult");
+	assertEq(await answer("pre_consult"), undefined,
+		"a second declaration admits its own tool");
+	assertEq(await answer("read"), undefined,
+		"the first declaration still admits");
+	pi.tools.delete("pre_consult");
+	assertEq((await answer("pre_consult"))?.block, true,
+		"removing that registration closes its admission");
+	assertEq(await answer("read"), undefined,
+		"the other declaration is untouched");
+	pi.tools.delete("pre_memory");
+	assertEq((await answer("read"))?.block, true,
+		"removing the declaring registration closes its admissions");
+
+	// A malformed declaration admits nothing, and no other declaration in
+	// the session may rescue the probed tool.
+	const key = ToolGateEscapes.KEY;
+	const version = ToolGateEscapes.VERSION;
+	const inheritedVersion = Object.assign(
+		Object.create({ version }), { admits: ["read"] });
+	const inheritedAdmits = Object.assign(
+		Object.create({ admits: ["read"] }), { version });
+	const cases: Array<[string, Record<string, unknown> | undefined]> = [
+		["a future version", { [key]: { version: version + 1, admits: ["read"] } }],
+		["no version", { [key]: { admits: ["read"] } }],
+		["null", { [key]: null }],
+		["an array", { [key]: ["read"] }],
+		["false", { [key]: false }],
+		["a string", { [key]: "true" }],
+		["no admits", { [key]: { version } }],
+		["admits that is not a list", { [key]: { version, admits: "read" } }],
+		["an inherited declaration", Object.create({
+			[key]: { version, admits: ["read"] },
+		}) as Record<string, unknown>],
+		["an inherited version", { [key]: inheritedVersion }],
+		["an inherited admits", { [key]: inheritedAdmits }],
+	];
+	for (const [label, annotations] of cases) {
+		pi.registerTool({ name: "pre_memory", annotations, execute: async () => ({}) });
+		assertEq((await answer("read"))?.block, true,
+			`${label} admits nothing`);
+	}
+
+	// A registry the gate cannot read admits nothing, and the declaration
+	// admits again as soon as the registry answers.
+	declare(pi, ["read"]);
+	const registry = pi.getAllTools.bind(pi);
+	pi.getAllTools = () => {
+		throw new Error("the registry is unavailable");
+	};
+	try {
+		assertEq((await answer("read"))?.block, true,
+			"an unreadable registry admits nothing");
+	} finally {
+		pi.getAllTools = registry;
+	}
+	assertEq(await answer("read"), undefined,
+		"the declaration admits once the registry reads again");
+	assertEq(ledger.owing(), true, "the mail is still owed through every phase");
 });
+
+/** Register a tool whose extension declares the escape a blocked session
+ *  may still take, as agent-mem-struct's and pi-consult's will. */
+function declare(
+	pi: FakePi,
+	admits: string[],
+	name = "pre_memory",
+): void {
+	pi.registerTool({
+		name,
+		annotations: {
+			[ToolGateEscapes.KEY]: {
+				version: ToolGateEscapes.VERSION,
+				admits,
+			},
+		},
+		execute: async () => ({ content: [] }),
+	});
+}
 
 test("acknowledgements: one ack answers the sender, records, and settles the gate", async () => {
 	const spec = scripted({

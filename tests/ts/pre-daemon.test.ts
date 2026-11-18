@@ -41,6 +41,14 @@ class MockPi {
     this.tools.set(def.name, def);
   }
 
+  /** What pi hands a gate: every registered tool and its annotations. */
+  getAllTools(): Array<{ name: string; annotations?: Record<string, unknown> }> {
+    return [...this.tools.values()].map((tool) => ({
+      name: tool.name,
+      ...(tool.annotations ? { annotations: tool.annotations } : {}),
+    }));
+  }
+
   exec(): never {
     this.contacted += 1;
     throw new Error("the catalog must not run anything");
@@ -102,9 +110,16 @@ test("pre-daemon: registers the catalog tool, gate, and session reset", () => {
   const wired = new MockPi();
   factory(wired as never);
   assert(wired.tools.has("pre_daemon"), "the factory registers the tool too");
+  const declaration = pi.tools.get("pre_daemon").annotations.piGateEscape;
+  assertEq(declaration?.version, 1, "the escape declaration is versioned");
+  assertEq(
+    JSON.stringify(declaration?.admits),
+    JSON.stringify(["pre_daemon"]),
+    "the catalog declares only its own escape",
+  );
 });
 
-test("pre-daemon: gate blocks its own tools, bash included, until the catalog is read", async () => {
+test("pre-daemon: gates ordinary work while admitting live valid escapes", async () => {
   const { pi } = mount();
   const gate = pi.gate();
   for (const name of GATED) {
@@ -117,6 +132,40 @@ test("pre-daemon: gate blocks its own tools, bash included, until the catalog is
     "bash's reason rules out both execution paths",
   );
   assert(bash.reason.includes("Call pre_daemon first"), "bash's reason names the way in");
+
+  // A declaration is resolved from the live registrations and admits only
+  // the tools it names. `peers` is this extension's own, so a declaration
+  // on another registration is the whole escape here.
+  const declare = (escape: unknown) =>
+    pi.registerTool({
+      name: "pre_memory",
+      annotations: { piGateEscape: escape },
+      execute: async () => ({ content: [] }),
+    });
+  declare({ version: 2, admits: ["peers"] });
+  assertEq(
+    (await gate({ toolName: "peers" }))?.block,
+    true,
+    "an unknown declaration version admits nothing",
+  );
+  declare({ version: 1, admits: ["peers"] });
+  assertEq(await gate({ toolName: "peers" }), undefined, "a declared escape runs");
+  assertEq(
+    (await gate({ toolName: "daemon_tasks" }))?.block,
+    true,
+    "and it opens nothing else",
+  );
+  pi.tools.delete("pre_memory");
+  assertEq(
+    (await gate({ toolName: "peers" }))?.block,
+    true,
+    "removing the declaration closes it again",
+  );
+  assertEq(
+    (await gate({ toolName: "daemon_tasks" }))?.block,
+    true,
+    "ordinary daemon work stayed blocked throughout",
+  );
 });
 
 test("pre-daemon: gate never touches other tools", async () => {
