@@ -5,7 +5,7 @@
  *   node --experimental-strip-types --experimental-transform-types tests/ts/run.ts
  */
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -146,6 +146,22 @@ export function cleanupScratch(): void {
     rmSync(scratchRoot, { recursive: true, force: true });
     scratchRoot = undefined;
   }
+}
+
+/** The host packages package.json declares as peers that do not resolve
+ *  from this checkout: a module importing one cannot load. */
+export function unresolvedPeers(): string[] {
+  const manifest = JSON.parse(
+    readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+  );
+  return Object.keys(manifest.peerDependencies ?? {}).filter((name) => {
+    try {
+      import.meta.resolve(name);
+      return false;
+    } catch {
+      return true;
+    }
+  });
 }
 
 /** The roots, service identities and session identities the suite owns.
