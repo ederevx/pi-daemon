@@ -219,7 +219,6 @@ class SessionWire:
                 # can carry must never hold a sealed run's ending back.
                 candidate = {"type": "activity", "kind": event.get("kind"),
                              "entryId": event["entryId"], "elided": True}
-                size = len(json.dumps(candidate))
             events.append(candidate)
             admitted += 1
             cursor = event["entryId"]
