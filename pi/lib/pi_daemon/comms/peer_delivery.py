@@ -269,13 +269,16 @@ class PeerDelivery:
                 return None
             outcome = {"status": ACCEPTED, "deliveryId": delivery_id,
                        "messageId": message_id, "sequence": sequence}
-            # An older remote reports no deadline, and its answer keeps
-            # the shorter shape the receipt has always carried.
             expires_at = answer.get("expiresAt")
             if isinstance(expires_at, (int, float)) and \
-                    not isinstance(expires_at, bool) and \
-                    math.isfinite(expires_at):
-                outcome["expiresAt"] = float(expires_at)
+                    not isinstance(expires_at, bool):
+                try:
+                    expires_at = float(expires_at)
+                except OverflowError:
+                    pass
+                else:
+                    if math.isfinite(expires_at):
+                        outcome["expiresAt"] = expires_at
             return outcome
         if status == UNDELIVERABLE:
             reason = answer.get("reason")

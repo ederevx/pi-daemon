@@ -2309,12 +2309,12 @@ class PeerWorkerTests(PeerCase):
         receipt = self.store.receipt(self._agent("a"), "r1")
         self.assertEqual(receipt["messageId"], "m1")
         self.assertEqual(receipt["sequence"], 4)
-        # The remote's own deadline survives to the sender's receipt.
         self.assertEqual(receipt["expiresAt"], deadline)
         self.assertEqual(self.store.queued(NODE_B), 0)
 
     def test_an_answer_without_a_usable_deadline_keeps_the_shorter_shape(self):
-        for deadline in (None, "later", True, float("inf")):
+        for deadline in (None, "later", True, float("inf"), float("nan"),
+                         10 ** 400):
             answer = {"status": "accepted", "deliveryId": "d1",
                       "messageId": "m1", "sequence": 4}
             if deadline is not None:
