@@ -402,7 +402,7 @@ class FeedTests(WireCase):
                                      "include": ["activity"]})
         reply, _wake = plan["probe"](False)
         # The entry no page could carry still names itself and moves the
-        # cursor, and the page that follows drains the rest and ends.
+        # cursor, and the same page drains the rest and ends.
         self.assertEqual(reply["events"][0]["entryId"], "m00")
         self.assertTrue(reply["events"][0].get("elided"))
         self.assertEqual(reply["cursor"]["activity"], "m01")

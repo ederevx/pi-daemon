@@ -221,9 +221,9 @@ class SessionWire:
                              "entryId": event["entryId"], "elided": True}
                 size = len(json.dumps(candidate))
             events.append(candidate)
-            used += size
             admitted += 1
             cursor = event["entryId"]
+            used = len(json.dumps(events))
             if used >= budget:
                 return cursor, index + 1 < last or page["hasMore"]
         return cursor, page["hasMore"]
