@@ -60,6 +60,7 @@ interface FeedEvent {
 	state?: string;
 	reason?: string;
 	skipped?: number;
+	elided?: boolean;
 }
 
 /** One feed page. */
@@ -364,7 +365,8 @@ export class CommsSessionTools {
 					break;
 				case "activity":
 					lines.push(`· ${event.kind ?? "activity"}` +
-						(event.entryId ? ` ${event.entryId}` : ""));
+						(event.entryId ? ` ${event.entryId}` : "") +
+						(event.elided ? " (elided: too large for a page)" : ""));
 					break;
 				case "state":
 					lines.push(`state: ${event.state ?? "unknown"}`);

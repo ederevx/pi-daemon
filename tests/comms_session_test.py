@@ -391,6 +391,33 @@ class FeedTests(WireCase):
         self.assertEqual(page["events"][-1], {"type": "ended",
                                                "reason": "exit"})
 
+    def test_an_entry_too_large_for_the_page_never_hides_the_ending(self):
+        sessions = self.sessions_for({"text": "bye"})
+        sessions.seals["pi-a"] = {"verdict": "exited", "cause": "exit"}
+        wire = self.wire(sessions)
+        self.transcripts._catalog.activities[FILE] = [
+            {"entryId": "m00", "kind": "tool_call", "text": "x" * 500},
+            {"entryId": "m01", "kind": "tool_call", "text": "ls"}]
+        plan = wire.feed_plan(None, {"name": "pi-a", "maxBytes": 120,
+                                     "include": ["activity"]})
+        reply, _wake = plan["probe"](False)
+        # The entry no page could carry still names itself and moves the
+        # cursor, so the page after it can report the run's ending.
+        self.assertEqual(reply["events"][0]["entryId"], "m00")
+        self.assertTrue(reply["events"][0].get("elided"))
+        self.assertNotEqual(reply["cursor"]["activity"], None)
+        cursor = reply["cursor"]
+        for _page in range(3):
+            plan = wire.feed_plan(None, {"name": "pi-a", "cursor": cursor,
+                                         "include": ["activity"],
+                                         "maxBytes": 120})
+            reply, _wake = plan["probe"](False)
+            if reply is None or reply["status"] == "ended":
+                break
+            cursor = reply["cursor"]
+        self.assertIsNotNone(reply)
+        self.assertEqual(reply["status"], "ended")
+
     def test_a_partial_page_never_declares_the_run_ended(self):
         sessions = self.sessions_for({"text": "z" * 400, "ended": "exit"})
         wire = self.wire(sessions)

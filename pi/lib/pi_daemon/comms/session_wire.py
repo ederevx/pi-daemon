@@ -22,6 +22,9 @@ INCLUDE = ("output", "activity", "state")
 # byte can cost six in an escaped frame, and a page must fit one frame.
 ESCAPE_FACTOR = 6
 ACTIVITY_EVENTS = 20
+# A page keeps at least this much room, so an activity entry that cannot fit
+# in it still names itself: a caller's smaller maxBytes is raised to it.
+PAGE_FLOOR = 256
 PATH_LIMIT = 4096
 
 
@@ -201,14 +204,22 @@ class SessionWire:
                 ACTIVITY_EVENTS)
         used = len(json.dumps(events))
         cursor = since
-        for event in page["events"]:
+        last = len(page["events"])
+        for index, event in enumerate(page["events"]):
             candidate = dict(event, type="activity")
-            size = len(json.dumps(candidate))
-            if used + size > budget:
-                return cursor, True
+            if used + len(json.dumps(candidate)) > budget:
+                if cursor != since:
+                    return cursor, True
+                # Not even one entry fits this page. Name it without its
+                # text, so the cursor always moves: an entry no page can
+                # carry must never hold a sealed run's ending back.
+                candidate = {"type": "activity", "kind": event.get("kind"),
+                             "entryId": event["entryId"], "elided": True}
             events.append(candidate)
-            used += size
+            used += len(json.dumps(candidate))
             cursor = event["entryId"]
+            if used >= budget:
+                return cursor, index + 1 < last or page["hasMore"]
         return cursor, page["hasMore"]
 
     def _gone(self, plan):
@@ -243,7 +254,8 @@ class SessionWire:
                 "include": include,
                 "timeout": self._config.comms_wait_max if timeout is None
                 else min(timeout, self._config.comms_wait_max),
-                "max_bytes": budget if limit is None else min(limit, budget)}
+                "max_bytes": budget if limit is None else
+                min(max(limit, PAGE_FLOOR), budget)}
 
     def _cursor(self, value, name):
         if value is None:
@@ -340,7 +352,8 @@ class SessionWire:
         if value is None:
             return None
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise RpcError(INVALID_PARAMS, "maxBytes must be a positive integer")
+            raise RpcError(INVALID_PARAMS,
+                           "maxBytes must be a positive integer")
         return value
 
     @staticmethod
@@ -349,7 +362,8 @@ class SessionWire:
             return None
         if isinstance(value, bool) or not isinstance(value, (int, float)) or \
                 value < 0:
-            raise RpcError(INVALID_PARAMS, "a number of milliseconds is required")
+            raise RpcError(INVALID_PARAMS,
+                           "a number of milliseconds is required")
         return float(value) / 1000.0
 
     @staticmethod
