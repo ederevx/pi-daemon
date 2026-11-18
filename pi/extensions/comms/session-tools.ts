@@ -13,6 +13,7 @@
  * takes the mailbox lease the receiver owns.
  */
 
+import { resolve } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionToolContext,
@@ -110,7 +111,8 @@ export class CommsSessionTools {
 				dir: Type.Optional(Type.String({
 					description: "For conversations: only this directory.",
 				})),
-				limit: Type.Optional(Type.Number({
+				limit: Type.Optional(Type.Integer({
+					minimum: 1,
 					description: "For conversations: at most this many.",
 				})),
 				after: Type.Optional(Type.String({
@@ -208,10 +210,12 @@ export class CommsSessionTools {
 				cursor: Type.Optional(Type.Unknown({
 					description: "The previous page's cursor; omit for the tail.",
 				})),
-				timeoutMs: Type.Optional(Type.Number({
+				timeoutMs: Type.Optional(Type.Integer({
+					minimum: 0,
 					description: "Bound the hold, in milliseconds.",
 				})),
-				maxBytes: Type.Optional(Type.Number({
+				maxBytes: Type.Optional(Type.Integer({
+					minimum: 1,
 					description: "Bound the page, in bytes.",
 				})),
 				node: Type.Optional(Type.String({
@@ -229,8 +233,9 @@ export class CommsSessionTools {
 		signal: AbortSignal | undefined,
 		ctx: ExtensionToolContext | undefined,
 	): Promise<SessionToolResult> {
+		// A relative directory is the caller's, resolved before it is sent.
 		const dir = params.dir && !params.node
-			? CommsSessionTools.within(ctx?.cwd ?? process.cwd(), params.dir)
+			? resolve(ctx?.cwd ?? process.cwd(), params.dir)
 			: params.dir;
 		const outcome = await this.cli.run(
 			CommsSessionTools.SESSIONS,
@@ -395,7 +400,7 @@ export class CommsSessionTools {
 				type: "text",
 				text: stoppedBy === "yield"
 					? "comms_feed yielded: a message was already queued; read it now."
-					: "comms_feed aborted before its hold began.",
+					: "comms_feed aborted: nothing was taken from the run.",
 			}],
 			structuredContent: { status: "yielded", stoppedBy },
 			details: { stoppedBy },
@@ -462,10 +467,5 @@ export class CommsSessionTools {
 				answer: outcome.answer,
 			},
 		};
-	}
-
-	/** A relative directory is the caller's, resolved before it is sent. */
-	private static within(cwd: string, dir: string): string {
-		return dir.startsWith("/") ? dir : `${cwd.replace(/\/+$/, "")}/${dir}`;
 	}
 }
