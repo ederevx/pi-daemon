@@ -275,10 +275,11 @@ test("extension: a headless session start provisions without a UI", async () => 
   const start = sessionStartHandler();
   await withEnv(scratch.env(), async () => {
     await start({ ui: undefined });
-    // A package install writes a whole generation; on Windows that is
-    // tens of seconds, so the wait is bounded by completion, not by the
-    // harness's three-second default for cheap predicates.
-    await waitFor(() => scratch.stamp().isCurrent(),
+    // The session start provisions the clone the extension belongs to,
+    // which is this repo, not the scratch copy: the stamp must name that
+    // clone. A package install writes a whole generation, so the wait is
+    // bounded by completion, not by the harness's three-second default.
+    await waitFor(() => new ProvisionStamp(REPO, scratch.manifest).isCurrent(),
       "the session start provisions a stale clone", 120_000);
   });
   assert(existsSync(join(scratch.home, ".local", "bin", "pi-daemon")),
@@ -299,7 +300,7 @@ test("extension: a failing notice never escapes the session start", async () => 
         },
       },
     });
-    await waitFor(() => scratch.stamp().isCurrent(),
+    await waitFor(() => new ProvisionStamp(REPO, scratch.manifest).isCurrent(),
       "provisioning finished despite the throwing notice", 120_000);
   });
 });

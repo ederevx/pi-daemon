@@ -30,6 +30,13 @@ def feed_key(key):
     return ("feed", key)
 
 
+def seal_reason(seal):
+    """The word a sealed run's ending is reported as, or None."""
+    if not isinstance(seal, dict):
+        return None
+    return seal.get("cause") or seal.get("verdict")
+
+
 class SessionWire:
     """It validates the session wire and projects the two domains.
 
@@ -146,8 +153,15 @@ class SessionWire:
                 events.append({"type": "output", "offset": output["offset"],
                                "text": output["text"],
                                "skipped": output["skipped"]})
-        ended = output is not None and output["ended"] is not None and \
-            output["next"] >= output["end"]
+        ended = None
+        if output is not None:
+            if output["ended"] is not None and output["next"] >= output["end"]:
+                ended = output["ended"]
+        else:
+            # A run that has ended says so without being read for output:
+            # a watcher reading only activity would otherwise hold until its
+            # deadline on every page and never learn the run is over.
+            ended = seal_reason(record.get("ended"))
         if "state" in include and cursor.get("stateSeq") != record.get("seq"):
             events.append({"type": "state", "state": record.get("state"),
                            "seq": record.get("seq")})
@@ -156,7 +170,7 @@ class SessionWire:
             next_activity, more = self._activity(
                 name, cursor.get("activity"), events, budget)
         if ended:
-            events.append({"type": "ended", "reason": output["ended"]})
+            events.append({"type": "ended", "reason": ended})
         return {"status": "ended" if ended else "ok",
                 "nodeId": self._node_id, "name": name,
                 "generation": generation, "state": record.get("state"),
@@ -224,8 +238,7 @@ class SessionWire:
                 "include": include,
                 "timeout": self._config.comms_wait_max if timeout is None
                 else min(timeout, self._config.comms_wait_max),
-                "max_bytes": budget if limit is None else min(int(limit),
-                                                              budget)}
+                "max_bytes": budget if limit is None else min(limit, budget)}
 
     def _cursor(self, value, name):
         if value is None:
@@ -300,7 +313,8 @@ class SessionWire:
             raise RpcError(INVALID_PARAMS, f"{label} must be text")
         return value
 
-    def _path(self, value):
+    @staticmethod
+    def _path(value):
         if value is None:
             return None
         if not isinstance(value, str) or not value or \
@@ -308,14 +322,16 @@ class SessionWire:
             raise RpcError(INVALID_PARAMS, "a path is required")
         return value
 
-    def _count(self, value):
+    @staticmethod
+    def _count(value):
         if value is None:
             return None
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise RpcError(INVALID_PARAMS, "limit must be a positive integer")
         return value
 
-    def _bytes(self, value):
+    @staticmethod
+    def _bytes(value):
         if value is None:
             return None
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:

@@ -39,6 +39,7 @@ class FakeSessions:
                        "phase": None}]
         self.outputs = {}
         self.states = {}
+        self.seals = {}
         self.opened = []
         self.inputs = []
         self.stopped = []
@@ -65,7 +66,7 @@ class FakeSessions:
             raise SessionError("no-session")
         return {"name": name,
                 "record": {"state": "busy", "seq": self.states.get(name, 3),
-                           "history": []},
+                           "ended": self.seals.get(name), "history": []},
                 "hosted": True}
 
     def output(self, name, offset, limit):
@@ -356,6 +357,18 @@ class FeedTests(WireCase):
         self.assertEqual(reply["status"], "ended")
         self.assertEqual(reply["events"][-1],
                          {"type": "ended", "reason": "exit"})
+
+    def test_an_activity_only_watch_still_learns_the_run_ended(self):
+        sessions = self.sessions_for({"text": "bye"})
+        sessions.seals["pi-a"] = {"verdict": "exited", "cause": "exit"}
+        wire = self.wire(sessions)
+        plan = wire.feed_plan(None, {"name": "pi-a",
+                                     "include": ["activity"]})
+        reply, wake = plan["probe"](False)
+        self.assertIsNone(wake)
+        self.assertEqual(reply["status"], "ended")
+        self.assertEqual(reply["events"], [{"type": "ended",
+                                             "reason": "exit"}])
 
     def test_a_partial_page_never_declares_the_run_ended(self):
         sessions = self.sessions_for({"text": "z" * 400, "ended": "exit"})
