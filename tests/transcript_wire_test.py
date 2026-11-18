@@ -8,7 +8,8 @@ ack capabilities, the legacy hello, open->path, entries paging and the
 `since` cursor, an entry-aligned byte range, the tree, stat, rebuild,
 and the two rejection paths (unknown handle, path outside the store).
 
-Scratch and the session store live under ~/tmp; stdlib only.
+Scratch and the session store live under the host's scratch directory;
+stdlib only.
 """
 
 import base64
@@ -56,7 +57,7 @@ class WireDaemon:
 
     def __init__(self):
         self.scratch = tempfile.mkdtemp(
-            prefix="pi-daemon-twire-", dir=os.path.expanduser("~/tmp"))
+            prefix="pi-daemon-twire-", dir=isolation.host_scratch())
         self.runtime = os.path.join(self.scratch, "runtime")
         self.state = os.path.join(self.scratch, "state")
         self.agent = os.path.join(self.scratch, "agent")

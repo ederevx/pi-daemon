@@ -53,7 +53,7 @@ class ScratchEnvironment:
 
     def __init__(self, root=None):
         self.root = root or tempfile.mkdtemp(
-            prefix="pi-daemon-tests-", dir=host_scratch())
+            prefix="pdt-", dir=host_scratch())
         self._saved = None
 
     def path(self, name):
@@ -69,8 +69,6 @@ class ScratchEnvironment:
             os.makedirs(target, exist_ok=True)
             for name in names:
                 environment[name] = target
-        # Modules keep their scratch under ~/tmp, which now names this tree.
-        os.makedirs(os.path.join(self.path("home"), "tmp"), exist_ok=True)
         return environment
 
     def apply(self):
@@ -98,8 +96,17 @@ class ScratchEnvironment:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
+# This suite's own task directory under ~/.tmp when no harness provides one.
+# Kept short: a case binds a unix socket several levels below it, inside the
+# 108-byte socket path limit.
+SCRATCH_TASK = "pdt"
+
+
 def host_scratch():
-    """The host's scratch directory, created on first use (never /tmp)."""
-    scratch = os.path.expanduser("~/tmp")
+    """The host's scratch directory: a harness-provided TMPDIR first, else
+    this suite's directory under ~/.tmp, created on first use (never /tmp,
+    never ~/tmp)."""
+    scratch = os.environ.get("TMPDIR") or os.path.join(
+        os.path.expanduser("~/.tmp"), SCRATCH_TASK)
     os.makedirs(scratch, exist_ok=True)
     return scratch

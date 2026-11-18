@@ -33,7 +33,7 @@ import pi_platform
 import pi_services
 
 SCRATCH = tempfile.mkdtemp(prefix="pi-rc-discovery-",
-                           dir=os.path.expanduser("~/tmp"))
+                           dir=isolation.host_scratch())
 
 
 def tearDownModule():

@@ -3,7 +3,8 @@
 
 Covers the build/tail/rebuild algorithm, the tolerant index reader, the
 skip rules, the orphan sweep, concurrent syncs and the watch's live-file
-gate. Scratch lives under ~/tmp, never /tmp; stdlib only.
+gate. Scratch lives under the host's scratch directory, never /tmp;
+stdlib only.
 """
 
 import base64
@@ -67,7 +68,7 @@ class Fixture:
 
     def __init__(self, testcase):
         self.root = tempfile.mkdtemp(
-            prefix="pi-transcript-", dir=os.path.expanduser("~/tmp"))
+            prefix="pi-transcript-", dir=isolation.host_scratch())
         testcase.addCleanup(shutil.rmtree, self.root, True)
         self.slug = os.path.join(self.root, "slug")
         os.makedirs(self.slug, exist_ok=True)
@@ -404,7 +405,7 @@ class ReaderTests(unittest.TestCase):
         self.assertFalse(self.idx.owns(outside))
 
     def test_owns_rejects_a_symlinked_ancestor(self):
-        outside = tempfile.mkdtemp(dir=os.path.expanduser("~/tmp"))
+        outside = tempfile.mkdtemp(dir=isolation.host_scratch())
         self.addCleanup(shutil.rmtree, outside, True)
         open(os.path.join(outside, "secret.jsonl"), "w").close()
         link = os.path.join(self.fx.root, "linkdir")

@@ -31,7 +31,7 @@ import pi_platform
 from pi_daemon.runtime_layout import RuntimeLayout as InstalledLayout
 
 SCRATCH = tempfile.mkdtemp(prefix="pi-rc-activation-",
-                           dir=os.path.expanduser("~/tmp"))
+                           dir=isolation.host_scratch())
 
 
 def tearDownModule():

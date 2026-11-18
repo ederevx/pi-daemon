@@ -4,8 +4,8 @@
 Each case runs the installer against a scratch HOME with a fake `pi` and
 fake systemd tools on PATH, then inspects what it published. The package
 mode is exercised from a scratch clone, so a case can edit a source and
-watch a new generation appear. Scratch lives under ~/tmp, never the system
-/tmp. The suite skips without bash.
+watch a new generation appear. Scratch lives under the host's scratch
+directory, never the system /tmp. The suite skips without bash.
 """
 
 import hashlib
@@ -24,7 +24,6 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 INSTALL = ROOT / "scripts" / "install.sh"
 UNINSTALL = ROOT / "scripts" / "uninstall.sh"
 BASH = shutil.which("bash")
-SCRATCH = os.path.expanduser("~/tmp")
 
 sys.path.insert(0, str(ROOT / "pi" / "lib"))
 
@@ -46,9 +45,10 @@ class ScratchHome:
     """A disposable HOME with fake external tools for one installer run."""
 
     def __init__(self):
-        os.makedirs(SCRATCH, exist_ok=True)
+        # Inside this module's own tree, not its temp root: the legacy
+        # endpoint is bound three levels below, inside the socket path limit.
         self.root = pathlib.Path(tempfile.mkdtemp(
-            prefix="pi-daemon-install-", dir=SCRATCH))
+            prefix="home-", dir=ISOLATION.root))
         (self.root / ".pi" / "agent").mkdir(parents=True)
         self.fakebin = self.root / "fakebin"
         self.fakebin.mkdir()
@@ -76,6 +76,25 @@ class ScratchHome:
         path = self.fakebin / name
         path.write_text("#!/bin/sh\n" + extra + "exit 0\n")
         path.chmod(0o755)
+
+    def serve_legacy_endpoint(self):
+        """Listen where the legacy daemon publishes its unix socket.
+
+        The endpoint's place is what a case proves, so it is never moved to
+        fit: a scratch tree too deep for the host to bind there leaves the
+        case blocked, with the host's own refusal as the reason.
+        """
+        endpoint = self.runtime_dir / "pi-pty-host.sock"
+        listening = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listening.bind(str(endpoint))
+        except OSError as failure:
+            listening.close()
+            raise unittest.SkipTest(
+                "blocked: this host cannot bind the scratch unix endpoint "
+                "(%d bytes): %s" % (len(os.fsencode(str(endpoint))), failure))
+        listening.listen(1)
+        return listening
 
     def clone(self):
         """A copy of this package to install from, so a case can edit it.
@@ -444,10 +463,7 @@ class InstallScriptTests(unittest.TestCase):
     def test_install_refuses_beside_a_serving_socket(self):
         # The legacy daemon publishes a unix socket, which no `-f` test sees:
         # the endpoint probe has to reach it as a socket.
-        endpoint = self.scratch.runtime_dir / "pi-pty-host.sock"
-        listening = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listening.bind(str(endpoint))
-        listening.listen(1)
+        listening = self.scratch.serve_legacy_endpoint()
         self.addCleanup(listening.close)
         result = self.scratch.package()
         self.assertEqual(result.returncode, 76, result.stdout + result.stderr)
@@ -698,10 +714,7 @@ class InstallScriptTests(unittest.TestCase):
         manifest["retained"] = [msysform(newest), msysform(older)]
         (self.scratch.path(".pi/agent/.pi-daemon/manifest.json")
          .write_text(json.dumps(manifest)))
-        endpoint = self.scratch.runtime_dir / "pi-pty-host.sock"
-        listening = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listening.bind(str(endpoint))
-        listening.listen(1)
+        listening = self.scratch.serve_legacy_endpoint()
         self.addCleanup(listening.close)
         self.assertEqual(self.scratch.package().returncode, 0)
         self.assertTrue(older.is_dir(), "a serving daemon keeps every one")

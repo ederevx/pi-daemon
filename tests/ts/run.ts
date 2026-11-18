@@ -6,7 +6,8 @@
  *   node --experimental-strip-types --experimental-transform-types tests/ts/run.ts
  *
  * Requires the gitignored `node_modules` symlink farm to the pi global
- * install (see repo .gitignore). Scratch lives under ~/tmp.
+ * install (see repo .gitignore). Scratch lives under $TMPDIR when a
+ * harness provides one, else ~/.tmp/pi-daemon-tests.
  */
 
 import { registry, cleanupScratch, isolateHost } from "./harness.ts";

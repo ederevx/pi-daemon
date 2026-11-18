@@ -24,7 +24,7 @@ ISOLATION = isolation.ScratchEnvironment()
 ISOLATION.apply()
 
 SCRATCH = tempfile.mkdtemp(
-    prefix="pi-tasks-", dir=os.path.expanduser("~/tmp"))
+    prefix="pi-tasks-", dir=isolation.host_scratch())
 os.environ["PI_DAEMON_STATE_DIR"] = os.path.join(SCRATCH, "state")
 os.environ["XDG_STATE_HOME"] = os.path.join(SCRATCH, "xdg-state")
 os.environ["XDG_RUNTIME_DIR"] = os.path.join(SCRATCH, "run")

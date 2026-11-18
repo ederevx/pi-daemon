@@ -19,16 +19,16 @@ import tempfile
 import time
 import shutil
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import isolation  # noqa: E402
+
 SCRATCH = tempfile.mkdtemp(
-    prefix="pi-daemon-itest-", dir=os.path.expanduser("~/tmp"))
+    prefix="pi-daemon-itest-", dir=isolation.host_scratch())
 RUNTIME = os.path.join(SCRATCH, "runtime")
 STATE = os.path.join(SCRATCH, "state")
 SERVICES = os.path.join(SCRATCH, "services")
 os.makedirs(RUNTIME, exist_ok=True)
 os.makedirs(STATE, exist_ok=True)
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import isolation  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DAEMON_PATH = os.path.join(REPO, "pi", "daemon", "pi-daemon")

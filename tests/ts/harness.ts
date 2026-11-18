@@ -124,10 +124,19 @@ export async function waitFor(
 
 let scratchRoot: string | undefined;
 
-/** One scratch root per run, under ~/tmp (never /tmp). */
+/** The host's scratch directory: a harness-provided TMPDIR first, else this
+ *  suite's directory under ~/.tmp (never /tmp, never ~/tmp). */
+function hostScratch(): string {
+  const scratch =
+    process.env.TMPDIR || join(homedir(), ".tmp", "pdt");
+  mkdirSync(scratch, { recursive: true });
+  return scratch;
+}
+
+/** One scratch root per run, under the host's scratch directory. */
 export function scratchDir(): string {
   if (scratchRoot === undefined) {
-    scratchRoot = mkdtempSync(join(homedir(), "tmp", "pi-daemon-ts-tests-"));
+    scratchRoot = mkdtempSync(join(hostScratch(), "pi-daemon-ts-tests-"));
   }
   return scratchRoot;
 }
@@ -174,7 +183,6 @@ export function isolateHost(): void {
     mkdirSync(target, { recursive: true });
     for (const name of names) process.env[name] = target;
   }
-  mkdirSync(join(root, "home", "tmp"), { recursive: true });
   for (const name of CLEARED_VARIABLES) delete process.env[name];
 }
 
