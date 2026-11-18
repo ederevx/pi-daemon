@@ -10,7 +10,7 @@
  * It is also the gate: until `pre_daemon` has been called in a session,
  * every tool this extension registers is blocked with a reason pointing
  * here — except a tool an extension declares as its own escape (see
- * tool-gate-escapes.ts). That includes `bash`, which the offload
+ * guards/tool-gate-escapes.ts). That includes `bash`, which the offload
  * extension only offloads -
  * and therefore only gates - while command offloading is enabled, so a
  * session with offloading disabled keeps its plain local shell. Other
@@ -27,18 +27,18 @@ import type {
 import { Type } from "typebox";
 
 import { OffloadPolicy } from "./settings/offload-policy.ts";
-import { ToolGateEscapes } from "./tool-gate-escapes.ts";
+import { ToolGateEscapes } from "./guards/tool-gate-escapes.ts";
 
 /** The name of this extension's onboarding tool. */
 const TOOL_NAME = "pre_daemon";
 
-/** The tools this extension declares reachable while another
- *  prerequisite is unmet. */
-const ADMITS = [TOOL_NAME];
-
 /** Owns the `pre_daemon` tool, its first-call gate, and the collapse
  *  default. One instance per extension runtime. */
 export class PreDaemonTool {
+	/** The tools this extension declares reachable while another
+	 *  prerequisite is unmet. */
+	static readonly ADMITS = [TOOL_NAME];
+
 	private acknowledged = false;
 
 	/** The tools this extension gates. `bash` is the offload extension's
@@ -69,7 +69,7 @@ export class PreDaemonTool {
 			readOnlyHint: true,
 			[ToolGateEscapes.KEY]: {
 				version: ToolGateEscapes.VERSION,
-				admits: [...ADMITS],
+				admits: [...PreDaemonTool.ADMITS],
 			},
 		};
 		pi.registerTool({

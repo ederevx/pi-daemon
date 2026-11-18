@@ -31,7 +31,7 @@ import {
 	CommsAcknowledgements,
 } from "../../pi/extensions/comms/acknowledgements.ts";
 import { COMMS_LOG, CommsMessageLog } from "../../pi/extensions/comms/message-log.ts";
-import { ToolGateEscapes } from "../../pi/extensions/tool-gate-escapes.ts";
+import { ToolGateEscapes } from "../../pi/extensions/guards/tool-gate-escapes.ts";
 import { execProcess, recorded, sleep, stub } from "./comms-stub.ts";
 
 /** The receiver's timing: short retries, a long hold the tests cancel. */

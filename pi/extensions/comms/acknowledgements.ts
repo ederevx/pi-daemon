@@ -11,7 +11,7 @@
  * delivered id is recorded. Until then, one `tool_call` gate blocks
  * every tool except `comms_ack` itself, `pre_daemon`, and any tool
  * another extension declares as its own prerequisite's escape (see
- * tool-gate-escapes.ts) — the fail-closed shape pi-consult's
+ * guards/tool-gate-escapes.ts) — the fail-closed shape pi-consult's
  * implementation gate uses. The reply's
  * request id is generated and persisted before the send, so a lost
  * reply never produces a duplicate acknowledgement message; the resend
@@ -42,7 +42,7 @@ import {
 	COMMS_LOG,
 	CommsMessageLog,
 } from "./message-log.ts";
-import { ToolGateEscapes } from "../tool-gate-escapes.ts";
+import { ToolGateEscapes } from "../guards/tool-gate-escapes.ts";
 
 /** The custom entry type acknowledgement progress is stored under. */
 export const COMMS_ACK_STATE = "pi-agent-comms-ack-state";

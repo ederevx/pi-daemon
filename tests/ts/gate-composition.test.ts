@@ -43,7 +43,7 @@ import {
 import { CommsMessageLog } from "../../pi/extensions/comms/message-log.ts";
 import { CommsTools } from "../../pi/extensions/comms/tools.ts";
 import { PreDaemonTool } from "../../pi/extensions/pre-daemon.ts";
-import { ToolGateEscapes } from "../../pi/extensions/tool-gate-escapes.ts";
+import { ToolGateEscapes } from "../../pi/extensions/guards/tool-gate-escapes.ts";
 
 /** The four owners, in the names the assertions and failure labels use. */
 type OwnerName = "comms" | "daemon" | "memory" | "consult";

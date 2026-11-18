@@ -30,7 +30,7 @@ import { CommsCli, type CommsOutcome } from "./client.ts";
 import { type CommsAcknowledgements } from "./acknowledgements.ts";
 import { type CommsDelivery } from "./delivery.ts";
 import { CommsMessageLog } from "./message-log.ts";
-import { ToolGateEscapes } from "../tool-gate-escapes.ts";
+import { ToolGateEscapes } from "../guards/tool-gate-escapes.ts";
 import {
 	CommsArgv,
 	CommsExit,
