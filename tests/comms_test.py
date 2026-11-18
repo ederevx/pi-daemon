@@ -1948,6 +1948,8 @@ class PeerBoundTests(PeerCase):
         self.assertEqual(accepted["outcome"]["status"], "accepted")
         self.assertEqual(accepted["envelope"]["expiresAt"],
                          self.now + self.config.comms_max_ttl)
+        self.assertEqual(accepted["outcome"]["expiresAt"],
+                         self.now + self.config.comms_max_ttl)
 
     def test_inbound_deliveries_are_bounded_in_count(self):
         store = self._peer_store(comms_peer_inbound_records=1)
@@ -2296,16 +2298,29 @@ class PeerWorkerTests(PeerCase):
 
     def test_an_accepted_answer_settles_the_receipt(self):
         first = self.send()
+        deadline = self.now + 90
         link = FakeLink(answers=[{"status": "accepted",
                                   "deliveryId": first["deliveryId"],
-                                  "messageId": "m1", "sequence": 4}])
+                                  "messageId": "m1", "sequence": 4,
+                                  "expiresAt": deadline}])
         self.worker(link).start()
         self.assertTrue(_await(lambda: self.store.receipt(
             self._agent("a"), "r1")["status"] == "accepted"))
         receipt = self.store.receipt(self._agent("a"), "r1")
         self.assertEqual(receipt["messageId"], "m1")
         self.assertEqual(receipt["sequence"], 4)
+        # The remote's own deadline survives to the sender's receipt.
+        self.assertEqual(receipt["expiresAt"], deadline)
         self.assertEqual(self.store.queued(NODE_B), 0)
+
+    def test_an_answer_without_a_usable_deadline_keeps_the_shorter_shape(self):
+        for deadline in (None, "later", True, float("inf")):
+            answer = {"status": "accepted", "deliveryId": "d1",
+                      "messageId": "m1", "sequence": 4}
+            if deadline is not None:
+                answer["expiresAt"] = deadline
+            self.assertNotIn("expiresAt",
+                             PeerDelivery._outcome("d1", answer))
 
     def test_an_answer_for_another_delivery_is_not_accepted(self):
         first = self.send()

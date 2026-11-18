@@ -628,7 +628,10 @@ class MailboxStore:
                     outcome = {"status": ACCEPTED,
                                "deliveryId": delivery_id,
                                "messageId": envelope["messageId"],
-                               "sequence": envelope["sequence"]}
+                               "sequence": envelope["sequence"],
+                               # Our clamped deadline, not the remote's
+                               # proposal: it is what ends this mail.
+                               "expiresAt": expires_at}
             inbound = dict(self._peer_deliveries)
             # A marker only has to outlive the sender's retries: the expiry
             # the sender chose, the skew between the clocks, and one request
