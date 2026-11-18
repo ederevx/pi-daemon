@@ -217,7 +217,7 @@ export class CommsSessionTools {
 				})),
 				maxBytes: Type.Optional(Type.Integer({
 					minimum: 1,
-					description: "Bound the page, in bytes.",
+					description: "Bound the page, in bytes (at least 256).",
 				})),
 				node: Type.Optional(Type.String({
 					description: "Watch that peer's session.",
