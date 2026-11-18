@@ -10,7 +10,10 @@
  * It is also the gate: until `pre_daemon` has been called in a session,
  * every tool this extension registers is blocked with a reason pointing
  * here — except a tool an extension declares as its own escape (see
- * guards/tool-gate-escapes.ts). That includes `bash`, which the offload
+ * guards/tool-gate-escapes.ts), and nothing at all while `pre_daemon`
+ * itself is not declared to the model: a conversation resumed after a
+ * reinstall can keep it inactive, and a gate with no reachable way in only
+ * deadlocks. The gated set includes `bash`, which the offload
  * extension only offloads -
  * and therefore only gates - while command offloading is enabled, so a
  * session with offloading disabled keeps its plain local shell. Other
@@ -144,11 +147,26 @@ export class PreDaemonTool {
 		this.acknowledged = false;
 	}
 
+	/** Whether pi offers `pre_daemon` to the model. A resumed transcript that
+	 *  recorded it removed keeps it registered but inactive, so it cannot be
+	 *  called; an unreadable active set reads as declared. */
+	private declared(pi: Pick<ExtensionAPI, "getActiveTools">): boolean {
+		try {
+			const read = pi?.getActiveTools;
+			if (typeof read !== "function") return true;
+			const active = read.call(pi);
+			return !Array.isArray(active) || active.includes(TOOL_NAME);
+		} catch {
+			return true;
+		}
+	}
+
 	/** Block this extension's tools until `pre_daemon` has been called;
 	 *  never touch any other tool, except one another extension declared
-	 *  as its own prerequisite's escape. */
+	 *  as its own prerequisite's escape, and block nothing while
+	 *  `pre_daemon` is not declared to the model. */
 	private gate(
-		pi: Pick<ExtensionAPI, "getAllTools">,
+		pi: Pick<ExtensionAPI, "getAllTools" | "getActiveTools">,
 		event: ToolCallEvent,
 	): ToolCallEventResult | undefined {
 		const name = String(event.toolName ?? "");
@@ -161,6 +179,9 @@ export class PreDaemonTool {
 		// to the daemon: it stays ungated and unacknowledged.
 		if (name === "bash" && !this.policy.enabled()) return undefined;
 		if (ToolGateEscapes.admits(pi, name)) return undefined;
+		// Undeclared, pre_daemon cannot be called: gating would only deadlock.
+		// Admitting acknowledges nothing, so declaring it closes the gate again.
+		if (!this.declared(pi)) return undefined;
 		return {
 			block: true,
 			reason:

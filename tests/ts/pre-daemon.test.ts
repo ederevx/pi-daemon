@@ -49,6 +49,14 @@ class MockPi {
     }));
   }
 
+  /** The tools declared to the model; unset means every registration,
+   *  as pi activates a direct tool when it is registered. */
+  active?: Set<string>;
+
+  getActiveTools(): string[] {
+    return this.active ? [...this.active] : [...this.tools.keys()];
+  }
+
   exec(): never {
     this.contacted += 1;
     throw new Error("the catalog must not run anything");
@@ -218,6 +226,27 @@ test("pre-daemon: the gate acknowledges a direct call and session_start resets i
     (await pi.gate()({ toolName: "daemon_tasks" }))?.block,
     true,
     "a new session starts closed",
+  );
+});
+
+test("pre-daemon: an undeclared pre_daemon admits instead of deadlocking", async () => {
+  const { pi } = mount();
+  const gate = pi.gate();
+  // A conversation resumed after a reinstall recorded pre_daemon removed:
+  // it is registered and its hook is live, but the model is not offered it.
+  pi.active = new Set(GATED);
+  for (const name of GATED) {
+    assertEq(
+      await gate({ toolName: name }),
+      undefined,
+      `${name} admitted while pre_daemon is undeclared`,
+    );
+  }
+  pi.active.add("pre_daemon");
+  assertEq(
+    (await gate({ toolName: "daemon_tasks" }))?.block,
+    true,
+    "declaring the way in closes the gate again: admitting never acknowledged",
   );
 });
 
