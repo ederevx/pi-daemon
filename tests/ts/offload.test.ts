@@ -148,7 +148,7 @@ class FakePi {
     const rest = logical.slice(1);
     // Record the normalized pi-rc call (subcommand first, then its
     // arguments) so assertions can name the verb and its flags alike.
-    this.execCalls.push({ file: args[0] ?? file, args: [cmd, ...rest] });
+    this.execCalls.push({ file, args: [cmd, ...rest] });
     if (this.daemonDown) return { code: 4, stdout: "", stderr: "down", killed: false };
     if (cmd === "ticket-submit") {
       return ok(`ticket ${this.submitIds.shift() ?? "t-1"}\n`);
