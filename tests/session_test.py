@@ -177,6 +177,14 @@ class StoreTests(unittest.TestCase):
         self.assertNotEqual(first.id, second.id)
         self.assertNotEqual(first.generation, second.generation)
 
+    def test_a_generation_is_text_because_a_cursor_carries_it_back(self):
+        # The session wire's cursor repeats a run's generation verbatim, so
+        # the store must keep issuing text: a number would be refused by the
+        # daemon that emitted it (v2.9.161's defect).
+        record, _ = reserve(self.store)
+        self.assertIsInstance(record.generation, str)
+        self.assertTrue(record.generation)
+
     def test_a_publish_needs_a_live_session(self):
         record, _ = reserve(self.store)
         self.store.finish(record.id, "stop", 0)

@@ -26,6 +26,9 @@ ACTIVITY_EVENTS = 20
 # in it still names itself: a caller's smaller maxBytes is raised to it.
 PAGE_FLOOR = 256
 PATH_LIMIT = 4096
+# A run's generation is the store's opaque id for one run; a cursor carries
+# it back verbatim, so it is text, bounded, and never a number.
+GENERATION_LIMIT = 128
 
 
 def feed_key(key):
@@ -268,8 +271,15 @@ class SessionWire:
         if not isinstance(value, dict) or value.get("name") != name:
             raise RpcError(INVALID_PARAMS, "a cursor belongs to one session")
         cursor = {"name": name}
-        for field, kind in (("generation", int), ("output", int),
-                            ("stateSeq", int)):
+        generation = value.get("generation")
+        if generation is not None and (
+                not isinstance(generation, str) or not generation
+                or len(generation) > GENERATION_LIMIT
+                or "\x00" in generation):
+            raise RpcError(INVALID_PARAMS,
+                           "cursor.generation must be a run's generation")
+        cursor["generation"] = generation
+        for field, kind in (("output", int), ("stateSeq", int)):
             entry = value.get(field)
             if entry is None:
                 cursor[field] = None

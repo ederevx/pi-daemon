@@ -24,6 +24,10 @@ from pi_daemon.transcripts.error import CatalogError  # noqa: E402
 from pi_daemon.transport.rpc_codec import INVALID_PARAMS, RpcError  # noqa: E402
 
 FILE = "/home/a/.pi/agent/sessions/-home-a/2026-01-01T00-00-00_s1.jsonl"
+# A run's generation is the store's opaque id, which is text: a cursor taken
+# from a page carries that string back verbatim.
+GEN_A = "3f2a1c9d8e7b6a5f4c3d2e1f0a9b8c7d"
+GEN_B = "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b"
 
 
 def config(**overrides):
@@ -75,7 +79,7 @@ class FakeSessions:
             raise SessionError("no-session")
         tail = self.outputs[name]
         chunk = tail["text"][offset:offset + limit]
-        return {"generation": tail.get("generation", 1),
+        return {"generation": tail.get("generation", GEN_A),
                 "offset": offset, "next": offset + len(chunk),
                 "text": chunk, "skipped": 0,
                 "end": len(tail["text"]), "ended": tail.get("ended")}
@@ -311,7 +315,7 @@ class FeedTests(WireCase):
     def test_a_page_with_nothing_new_waits_for_a_signal(self):
         wire = self.wire(self.sessions_for({"text": "hello"}))
         plan = wire.feed_plan(None, {"name": "pi-a"})
-        cursor = {"name": "pi-a", "generation": 1, "output": 5,
+        cursor = {"name": "pi-a", "generation": GEN_A, "output": 5,
                   "activity": None, "stateSeq": 3}
         reply, wake = plan["probe"](False)
         self.assertIsNotNone(reply)
@@ -329,7 +333,7 @@ class FeedTests(WireCase):
 
     def test_a_deadline_answers_a_page_that_found_nothing(self):
         wire = self.wire(self.sessions_for({"text": "hello"}))
-        cursor = {"name": "pi-a", "generation": 1, "output": 5,
+        cursor = {"name": "pi-a", "generation": GEN_A, "output": 5,
                   "activity": None, "stateSeq": 3}
         plan = wire.feed_plan(None, {"name": "pi-a", "cursor": cursor,
                                      "include": ["state"]})
@@ -340,14 +344,14 @@ class FeedTests(WireCase):
 
     def test_a_restarted_run_is_announced_and_read_from_its_start(self):
         wire = self.wire(self.sessions_for({"text": "again",
-                                            "generation": 2}))
-        cursor = {"name": "pi-a", "generation": 1, "output": 9,
+                                            "generation": GEN_B}))
+        cursor = {"name": "pi-a", "generation": GEN_A, "output": 9,
                   "activity": None, "stateSeq": 3}
         plan = wire.feed_plan(None, {"name": "pi-a", "cursor": cursor,
                                      "include": ["output"]})
         reply, _wake = plan["probe"](False)
         self.assertEqual(reply["events"][0]["type"], "reset")
-        self.assertEqual(reply["events"][0]["generation"], 2)
+        self.assertEqual(reply["events"][0]["generation"], GEN_B)
         self.assertEqual(reply["events"][1]["text"], "again")
 
     def test_an_ended_run_says_so_once_its_tail_is_read(self):
@@ -492,6 +496,29 @@ class FeedTests(WireCase):
             "name": "pi-a", "cursor": {"name": "pi-a", "output": -1}})
         self.refused(wire.feed_plan, None, {
             "name": "pi-a", "cursor": {"name": "pi-a", "activity": 4}})
+
+    def test_a_generation_that_is_not_a_run_s_id_is_refused(self):
+        wire = self.wire(self.sessions_for({"text": "x"}))
+        for generation in (1, True, "", "g" * 129, "a\x00b"):
+            self.refused(wire.feed_plan, None, {
+                "name": "pi-a",
+                "cursor": {"name": "pi-a", "generation": generation}})
+
+    def test_a_page_s_own_cursor_can_be_fed_back(self):
+        # The defect v2.9.162 fixes: a page that carried output names the
+        # run's generation as text, and the daemon that emitted it refused
+        # that same cursor as "must be a number".
+        wire = self.wire(self.sessions_for({"text": "hello"}))
+        _plan, page, _wake = self.page(
+            wire, {"name": "pi-a", "include": ["output", "state"]})
+        self.assertEqual(page["cursor"]["generation"], GEN_A)
+        plan = wire.feed_plan(None, {"name": "pi-a",
+                                     "cursor": page["cursor"],
+                                     "include": ["output", "state"]})
+        reply, _wake = plan["probe"](True)
+        self.assertIsNotNone(reply)
+        self.assertEqual(reply["events"], [])
+        self.assertEqual(reply["status"], "timed-out")
 
     def test_include_names_the_three_sources(self):
         wire = self.wire(self.sessions_for({"text": "x"}))

@@ -199,8 +199,8 @@ test("comms_feed: a page that found nothing is a page, not a failure", async () 
 });
 
 test("comms_feed: the cursor is sent as JSON and only a hold waits", async () => {
-	const cursor = { name: "pi-a", generation: 1, output: 6, activity: "m1",
-		stateSeq: 3 };
+	const cursor = { name: "pi-a", generation: "3f2a1c9d8e7b6a5f4c3d2e1f0a9b8c7d",
+		output: 6, activity: "m1", stateSeq: 3 };
 	const env = invocation({ status: "timed-out", events: [], cursor }, 3);
 	const states: boolean[] = [];
 	await withEnv(env, async () => {
