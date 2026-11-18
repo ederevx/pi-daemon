@@ -26,6 +26,8 @@ await import("./provisioning.test.ts");
 await import("./discovery.test.ts");
 await import("./comms-tools.test.ts");
 await import("./comms-delivery.test.ts");
+// The four gates composed: every handler order, both full walk orders.
+await import("./gate-composition.test.ts");
 await import("./settings-reconciler.test.ts");
 await import("./transcript.test.ts");
 await import("./sessions.test.ts");
