@@ -4,6 +4,7 @@ The worker never decides that mail arrived. It records the answer the remote
 daemon gave, and keeps the delivery queued whenever the answer is missing.
 """
 
+import math
 import threading
 
 from ..transport.rpc_codec import UNAUTHORIZED
@@ -266,8 +267,17 @@ class PeerDelivery:
             if isinstance(sequence, bool) or not isinstance(sequence, int) \
                     or sequence < 1:
                 return None
-            return {"status": ACCEPTED, "deliveryId": delivery_id,
-                    "messageId": message_id, "sequence": sequence}
+            outcome = {"status": ACCEPTED, "deliveryId": delivery_id,
+                       "messageId": message_id, "sequence": sequence}
+            # A remote that reports the deadline it applied lets the
+            # sender's receipt say when retention ends over there; one
+            # that does not is answered in the older, shorter shape.
+            expires_at = answer.get("expiresAt")
+            if isinstance(expires_at, (int, float)) and \
+                    not isinstance(expires_at, bool) and \
+                    math.isfinite(expires_at):
+                outcome["expiresAt"] = float(expires_at)
+            return outcome
         if status == UNDELIVERABLE:
             reason = answer.get("reason")
             if not isinstance(reason, str) or not reason:
