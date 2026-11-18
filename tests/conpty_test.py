@@ -3,8 +3,8 @@
 
 Spawns cmd.exe on a pseudoconsole, checks that its output reaches the
 select-able output fd, exercises ResizePseudoConsole, and terminates the
-child. On any non-Windows platform it prints a skip line and exits 0 so
-the file stays loadable from a Linux checkout.
+child. On any non-Windows platform every case reports itself skipped, so
+ the gate counts what this host cannot show instead of a silent exit 0.
 """
 
 import ctypes
@@ -32,6 +32,13 @@ def tearDownModule():
     ISOLATION.cleanup()
 
 
+# Every case here drives the Windows ConPTY backend; elsewhere each one
+# reports itself skipped, which the gate counts as unsupported.
+WINDOWS_ONLY = unittest.skipUnless(sys.platform == "win32",
+                                  "Windows ConPTY backend")
+
+
+@WINDOWS_ONLY
 class WindowsConPtyTest(unittest.TestCase):
     """Smoke exercises for WindowsPtyBackend and WindowsPtyChild."""
 
@@ -120,6 +127,7 @@ class WindowsConPtyTest(unittest.TestCase):
         self.assertTrue(WindowsPtyBackend.available())
 
 
+@WINDOWS_ONLY
 class Win32InputModeFilterTest(unittest.TestCase):
     """Unit coverage for the ConPTY Win32 Input Mode request filter."""
 
@@ -156,6 +164,7 @@ class Win32InputModeFilterTest(unittest.TestCase):
         return _Win32InputModeFilter()
 
 
+@WINDOWS_ONLY
 class WindowsTerminateBudgetTests(unittest.TestCase):
     """Two budgets: taskkill's own, then grace for the reap.
 
@@ -247,6 +256,7 @@ class WindowsTerminateBudgetTests(unittest.TestCase):
                          "could not terminate process 4242")
 
 
+@WINDOWS_ONLY
 class WindowsConsoleOutputPumpTest(unittest.TestCase):
     """The attach client's CONOUT$ writer seams behind a socket front.
 
@@ -545,9 +555,6 @@ class WindowsConsoleOutputPumpTest(unittest.TestCase):
 
 
 def main():
-    if sys.platform != "win32":
-        print("conpty: skipped (non-Windows)")
-        return 0
     loader = unittest.TestLoader()
     suite = unittest.TestSuite([
         loader.loadTestsFromTestCase(WindowsConPtyTest),

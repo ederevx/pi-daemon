@@ -373,7 +373,9 @@ def report(ran_steps, invocation, before, after, sentinel):
         print("This host does not implement every property the suite "
               "asserts; the cases above are named, and the POSIX-only ones "
               "are expected on Windows: owner/group/other mode equality, "
-              "POSIX terminal signal semantics and real systemd user units.")
+              "POSIX terminal signal semantics and real systemd user units. "
+              "The Windows-only ones are expected elsewhere: ConPTY "
+              "hosting and the ConPTY backend.")
     return failed_steps, blocked
 
 
