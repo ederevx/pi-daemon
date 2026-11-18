@@ -169,6 +169,11 @@ class SessionWire:
         if "activity" in include:
             next_activity, more = self._activity(
                 name, cursor.get("activity"), events, budget)
+        # Like a page that stops short of the tail, a page with activity
+        # still to read never declares the run over: a watcher that stops
+        # on `ended` would lose the rest. The next page says it.
+        if more:
+            ended = None
         if ended:
             events.append({"type": "ended", "reason": ended})
         return {"status": "ended" if ended else "ok",

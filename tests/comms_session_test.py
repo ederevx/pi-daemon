@@ -16,7 +16,8 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "pi", "lib"))
 
-from pi_daemon.comms.session_wire import SessionWire, feed_key  # noqa: E402
+from pi_daemon.comms.session_wire import (  # noqa: E402
+    ACTIVITY_EVENTS, SessionWire, feed_key)
 from pi_daemon.config import ServiceConfig  # noqa: E402
 from pi_daemon.sessions.error import SessionError  # noqa: E402
 from pi_daemon.transcripts.error import CatalogError  # noqa: E402
@@ -369,6 +370,26 @@ class FeedTests(WireCase):
         self.assertEqual(reply["status"], "ended")
         self.assertEqual(reply["events"], [{"type": "ended",
                                              "reason": "exit"}])
+
+    def test_an_activity_only_watch_never_ends_before_its_activity(self):
+        sessions = self.sessions_for({"text": "bye"})
+        sessions.seals["pi-a"] = {"verdict": "exited", "cause": "exit"}
+        wire = self.wire(sessions)
+        self.transcripts._catalog.activities[FILE] = [
+            {"entryId": f"m{index:02d}", "kind": "tool_call", "text": "ls"}
+            for index in range(ACTIVITY_EVENTS + 1)]
+        plan = wire.feed_plan(None, {"name": "pi-a",
+                                     "include": ["activity"]})
+        reply, _wake = plan["probe"](False)
+        self.assertEqual(reply["status"], "ok")
+        self.assertTrue(reply["more"])
+        self.assertNotIn("ended", [event["type"] for event in reply["events"]])
+        plan = wire.feed_plan(None, {"name": "pi-a", "cursor": reply["cursor"],
+                                     "include": ["activity"]})
+        page, _wake = plan["probe"](False)
+        self.assertEqual(page["status"], "ended")
+        self.assertEqual(page["events"][-1], {"type": "ended",
+                                               "reason": "exit"})
 
     def test_a_partial_page_never_declares_the_run_ended(self):
         sessions = self.sessions_for({"text": "z" * 400, "ended": "exit"})
