@@ -1256,6 +1256,12 @@ class RecordingSession:
 
 
 class WaitRegistryTests(StoreCase):
+    """The registry over probes: it schedules, answers and refuses them.
+
+    A probe is what a connection's wait or feed hands the registry, so these
+    tests hold the scheduling instead of the mailbox: the store only has to
+    answer the probe the way `comms.replay` or a feed page would.
+    """
 
     def setUp(self):
         super().setUp()
@@ -1263,9 +1269,9 @@ class WaitRegistryTests(StoreCase):
         self.store.reserve("b")
         self.session = RecordingSession()
 
-    def _registry(self, store=None, **overrides):
+    def _registry(self, **overrides):
         config = ServiceConfig.load(overrides=overrides)
-        registry = WaitRegistry(store or self.store, config)
+        registry = WaitRegistry(config)
         registry.start()
         self.addCleanup(registry.stop)
         return registry
@@ -1282,10 +1288,34 @@ class WaitRegistryTests(StoreCase):
         return self.store.accept(self._agent("a"), request_id,
                                  self._agent(agent_id), "chat", {"text": "hi"})
 
+    def _probe(self, store=None, agent_id="b", cursor=None, limit=None):
+        """A mailbox probe, shaped the way a connection's wait shapes one."""
+        source = store or self.store
+
+        def probe(expired):
+            page = source.replay(agent_id, cursor, limit)
+            if page["status"] == "cursor-expired" or page["messages"]:
+                return page, None
+            if expired:
+                return {"status": "timed-out", "messages": [],
+                        "cursor": {"agent": {"nodeId": "n",
+                                             "agentId": agent_id},
+                                   "sequence": cursor or 0},
+                        "more": False}, None
+            return None, None
+        return probe
+
+    @staticmethod
+    def _idle(retry=None):
+        """A probe that never answers, so the test owns the next look."""
+        def probe(expired):
+            return None, retry
+        return probe
+
     def test_mail_already_in_the_mailbox_answers_at_once(self):
         self._send()
         registry = self._registry()
-        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry.begin(self.session, "w1", "b", self._probe(), 5.0)
         self.assertTrue(self._until(lambda: self.session.completed))
         request_id, result = self.session.completed[0]
         self.assertEqual(request_id, "w1")
@@ -1294,25 +1324,53 @@ class WaitRegistryTests(StoreCase):
 
     def test_a_signal_answers_a_pending_wait(self):
         registry = self._registry()
-        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry.begin(self.session, "w1", "b", self._probe(), 5.0)
         self.assertEqual(registry.pending(), 1)
         self._send()
         registry.signal({"b"})
         self.assertTrue(self._until(lambda: self.session.completed))
         self.assertEqual(self.session.completed[0][1]["status"], "ok")
 
+    def test_a_retry_instant_is_looked_at_without_a_signal(self):
+        looks = []
+
+        def probe(expired):
+            looks.append(expired)
+            if len(looks) == 1:
+                return None, time.monotonic() + 0.02
+            return {"status": "ok", "messages": [], "cursor": 1,
+                    "more": False}, None
+
+        registry = self._registry()
+        registry.begin(self.session, "w1", "b", probe, 5.0)
+        self.assertTrue(self._until(lambda: self.session.completed))
+        self.assertEqual(len(looks), 2)
+        self.assertFalse(any(looks))
+
+    def test_a_retry_keeps_looking_after_its_deadline(self):
+        def probe(expired):
+            if expired:
+                return {"status": "timed-out", "messages": [],
+                        "cursor": 0, "more": False}, None
+            return None, time.monotonic() + 0.02
+
+        registry = self._registry()
+        registry.begin(self.session, "w1", "b", probe, 0.05)
+        self.assertTrue(self._until(lambda: self.session.completed))
+        self.assertEqual(self.session.completed[0][1]["status"], "timed-out")
+
     def test_a_wait_times_out_and_names_its_position(self):
         registry = self._registry()
-        registry.begin(self.session, "w1", "b", 3, None, 0.05)
+        registry.begin(self.session, "w1", "b", self._probe(cursor=3), 0.05)
         self.assertTrue(self._until(lambda: self.session.completed))
         result = self.session.completed[0][1]
         self.assertEqual(result["status"], "timed-out")
         self.assertEqual(result["messages"], [])
-        self.assertEqual(result["cursor"], 3)
+        self.assertEqual(result["cursor"]["sequence"], 3)
 
     def test_a_cancelled_wait_is_answered_cancelled(self):
         registry = self._registry()
-        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry.begin(self.session, "w1", "b", self._idle(), 5.0)
         self.assertTrue(registry.cancel(self.session, "w1"))
         self.assertFalse(registry.cancel(self.session, "w1"))
         self.assertEqual(self.session.refused, [("w1", -32800, "cancelled")])
@@ -1321,22 +1379,22 @@ class WaitRegistryTests(StoreCase):
 
     def test_one_wait_at_a_time_per_connection(self):
         registry = self._registry(comms_waits_per_connection=1)
-        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry.begin(self.session, "w1", "b", self._idle(), 5.0)
         with self.assertRaises(CommsError) as caught:
-            registry.begin(self.session, "w2", "b", None, None, 5.0)
+            registry.begin(self.session, "w2", "b", self._idle(), 5.0)
         self.assertEqual(caught.exception.code, "busy")
 
     def test_the_registry_cap_refuses_a_second_connection(self):
         registry = self._registry(comms_wait_cap=1,
                                   comms_waits_per_connection=1)
-        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry.begin(self.session, "w1", "b", self._idle(), 5.0)
         with self.assertRaises(CommsError) as caught:
-            registry.begin(RecordingSession(), "w2", "b", None, None, 5.0)
+            registry.begin(RecordingSession(), "w2", "b", self._idle(), 5.0)
         self.assertEqual(caught.exception.code, "busy")
 
     def test_a_dropped_connection_leaves_no_pending_wait(self):
         registry = self._registry()
-        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry.begin(self.session, "w1", "b", self._idle(), 5.0)
         registry.drop(self.session)
         self.assertEqual(registry.pending(), 0)
         self._send()
@@ -1346,7 +1404,7 @@ class WaitRegistryTests(StoreCase):
 
     def test_a_pending_wait_is_refused_at_shutdown(self):
         registry = self._registry(comms_wait_max=5.0)
-        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry.begin(self.session, "w1", "b", self._idle(), 5.0)
         registry.stop()
         self.assertEqual(self.session.refused, [("w1", -32003, "closing")])
         self.assertEqual(registry.pending(), 0)
@@ -1354,15 +1412,15 @@ class WaitRegistryTests(StoreCase):
     def test_a_store_failure_refuses_one_wait_and_keeps_answering(self):
         store = GatedStore()
         store.fail = True
-        registry = self._registry(store=store)
-        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry = self._registry()
+        registry.begin(self.session, "w1", "b", self._probe(store=store), 5.0)
         self.assertTrue(self._until(lambda: self.session.refused))
         self.assertEqual(self.session.refused,
                          [("w1", -32003, "unavailable")])
         store.fail = False
         store.answer = {"status": "ok", "messages": [{"sequence": 1}],
                         "cursor": 1, "more": False}
-        registry.begin(self.session, "w2", "b", None, None, 5.0)
+        registry.begin(self.session, "w2", "b", self._probe(store=store), 5.0)
         self.assertTrue(self._until(lambda: self.session.completed))
         self.assertEqual(self.session.completed[0][1]["messages"],
                          [{"sequence": 1}])
@@ -1372,16 +1430,17 @@ class WaitRegistryTests(StoreCase):
         store.gate.clear()
         store.answer = {"status": "ok", "messages": [{"sequence": 1}],
                         "cursor": 1, "more": False}
-        registry = self._registry(store=store)
         store.by_agent["c"] = {"status": "ok", "messages": [{"sequence": 9}],
                                "cursor": 9, "more": False}
-        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry = self._registry()
+        registry.begin(self.session, "w1", "b", self._probe(store=store), 5.0)
         self.assertTrue(self._until(lambda: store.calls))
         self.assertTrue(registry.cancel(self.session, "w1"))
-        registry.begin(self.session, "w1", "c", None, None, 5.0)
+        registry.begin(self.session, "w1", "c",
+                       self._probe(store=store, agent_id="c"), 5.0)
         store.gate.set()
-        # The old evaluator finished replay and found a replacement: only the
-        # replacement itself may answer, so the thread loops for its own look.
+        # The old probe finished replay and found a replacement: only the
+        # replacement itself may answer, so the thread looks again for it.
         self.assertTrue(self._until(lambda: len(store.calls) == 2))
         self.assertTrue(self._until(lambda: self.session.completed))
         # The replacement answered with its own mailbox, not the one the
@@ -1400,11 +1459,11 @@ class WaitRegistryTests(StoreCase):
         store.gate.clear()
         store.answer = {"status": "ok", "messages": [{"sequence": 1}],
                         "cursor": 1, "more": False}
-        registry = self._registry(store=store, stop_grace=0.05)
-        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry = self._registry(stop_grace=0.05)
+        registry.begin(self.session, "w1", "b", self._probe(store=store), 5.0)
         self.assertTrue(self._until(lambda: store.calls))
         registry.stop()
-        # The replay is still held, and shutdown has already answered.
+        # The probe is still held, and shutdown has already answered.
         self.assertEqual(self.session.refused,
                          [("w1", -32003, "closing")])
         self.assertEqual(registry.pending(), 0)
@@ -1414,35 +1473,36 @@ class WaitRegistryTests(StoreCase):
         self.assertEqual(self.session.completed, [])
         self.assertEqual(len(self.session.refused), 1)
 
-    def test_an_unexpected_store_bug_refuses_only_its_wait(self):
+    def test_an_unexpected_probe_bug_refuses_only_its_wait(self):
         store = GatedStore()
         store.explode = True
-        registry = self._registry(store=store)
-        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry = self._registry()
+        registry.begin(self.session, "w1", "b", self._probe(store=store), 5.0)
         self.assertTrue(self._until(lambda: self.session.refused))
         self.assertEqual(self.session.refused,
                          [("w1", -32003, "unavailable")])
         store.explode = False
         store.answer = {"status": "ok", "messages": [{"sequence": 7}],
                         "cursor": 7, "more": False}
-        registry.begin(self.session, "w2", "b", None, None, 5.0)
+        registry.begin(self.session, "w2", "b", self._probe(store=store), 5.0)
         self.assertTrue(self._until(lambda: self.session.completed))
         self.assertEqual(self.session.completed[0][1]["messages"],
                          [{"sequence": 7}])
 
     def test_a_reused_pending_request_id_is_refused(self):
         registry = self._registry(comms_waits_per_connection=2)
-        registry.begin(self.session, "w1", "b", None, None, 5.0)
+        registry.begin(self.session, "w1", "b", self._idle(), 5.0)
         with self.assertRaises(CommsError) as caught:
-            registry.begin(self.session, "w1", "b", None, None, 5.0)
+            registry.begin(self.session, "w1", "b", self._idle(), 5.0)
         self.assertEqual(caught.exception.code, "wait-pending")
 
     def test_a_cursor_behind_the_retained_history_is_reported(self):
         store = GatedStore()
         store.answer = {"status": "cursor-expired",
                         "oldestAvailableSequence": 4, "cursor": 0}
-        registry = self._registry(store=store)
-        registry.begin(self.session, "w1", "b", 0, None, 5.0)
+        registry = self._registry()
+        registry.begin(self.session, "w1", "b",
+                       self._probe(store=store, cursor=0), 5.0)
         self.assertTrue(self._until(lambda: self.session.completed))
         result = self.session.completed[0][1]
         self.assertEqual(result["status"], "cursor-expired")
@@ -1452,7 +1512,7 @@ class WaitRegistryTests(StoreCase):
         registry = self._registry()
         registry.stop()
         with self.assertRaises(CommsError) as caught:
-            registry.begin(self.session, "w1", "b", None, None, 5.0)
+            registry.begin(self.session, "w1", "b", self._idle(), 5.0)
         self.assertEqual(caught.exception.code, "closing")
 
 

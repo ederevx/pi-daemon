@@ -60,30 +60,45 @@ class SessionCarry:
         name = self._free_name(source.dir, source.name)
         if name is None:
             raise SessionError(NO_FREE_NAME)
-        return self._spawn(name, source.dir, self._command.fresh(argv), source)
+        return self._spawn(name, source.dir, self._command.fresh(argv),
+                           source.cols, source.rows)
 
     def _host(self, source, file):
         """The target resuming a conversation no live session holds."""
+        return self._spawn_host(file, source.dir, source.cols, source.rows,
+                                source)
+
+    def open_host(self, file, dir_, cols=None, rows=None):
+        """Host a conversation for a caller that has no session to inherit.
+
+        Nothing here selects a source: the name and directory the
+        conversation was last held under stand in for one.
+        """
+        return self._spawn_host(file, dir_, cols, rows, None)
+
+    def _spawn_host(self, file, dir_, cols, rows, source):
         if not os.path.isfile(file):
             raise SessionError(NO_FILE)
         name = self._store.stopped_holder(file)
-        dir_ = source.dir
+        directory = dir_
         if name is not None:
             recorded = self._store.get(name).dir
             if recorded and os.path.isdir(recorded):
-                dir_ = recorded
+                directory = recorded
         else:
-            name = self._free_name(source.dir, source.name)
+            name = self._free_name(directory or "",
+                                   source.name if source is not None else "")
             if name is None:
                 raise SessionError(NO_FREE_NAME)
         argv, durable = self._command.resume(file)
-        return self._spawn(name, dir_, argv, source, file=file,
+        return self._spawn(name, directory, argv, cols, rows, file=file,
                            durable_argv=durable)
 
-    def _spawn(self, name, dir_, argv, source, file=None, durable_argv=None):
+    def _spawn(self, name, dir_, argv, cols, rows, file=None,
+               durable_argv=None):
         try:
             record, created = self._runner.start(
-                name, dir_, argv, source.cols, source.rows, file=file,
+                name, dir_, argv, cols, rows, file=file,
                 durable_argv=durable_argv)
         except SessionError as failure:
             raise SessionError(failure.code or SPAWN_FAILED) from failure

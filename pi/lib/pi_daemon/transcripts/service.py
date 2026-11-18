@@ -5,20 +5,26 @@ import threading
 
 import pi_transcript
 
+from .catalog import ConversationCatalog
+
 
 class TranscriptService:
     """It owns the index and the read handles; a reader is made per
     request, so a sidecar rebuilt underneath never leaves one stale."""
 
-    def __init__(self, config, store_root, live_files, recorded_file):
+    def __init__(self, config, store_root, live_files, recorded_file,
+                 holders=None, revivable=None):
         self._config = config
         self._root = os.path.abspath(store_root) if store_root else store_root
         self._live_files = live_files
         self._recorded_file = recorded_file
+        self._holders = holders
+        self._revivable = revivable
         self._stopping = threading.Event()
         self._index = None
         self._handles = None
         self._watch = None
+        self._catalog = None
 
     def start(self):
         self._index = pi_transcript.TranscriptIndex(
@@ -26,6 +32,10 @@ class TranscriptService:
             max_line=self._config.transcript_index_max_line,
             root=self._root)
         self._handles = pi_transcript.TranscriptHandles()
+        self._catalog = ConversationCatalog(
+            self._index, self._root, self._holders or (lambda _file: []),
+            self._revivable or (lambda _file: None),
+            self._config.comms_session_page)
         self._watch = pi_transcript.TranscriptIndexWatch(
             self._index, self._root, self._live_files, self._stopping,
             interval=self._config.transcript_index_interval
@@ -37,6 +47,10 @@ class TranscriptService:
 
     def root(self):
         return self._root
+
+    def catalog(self):
+        """The conversations and their activity, over the same index."""
+        return self._catalog
 
     def owns(self, file):
         """The daemon never serves a path outside the conversation store."""

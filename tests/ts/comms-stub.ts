@@ -27,7 +27,7 @@ log = os.environ.get("STUB_LOG")
 if log:
     with open(log, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(sys.argv[1:]) + "\\n")
-commands = {"send", "wait", "replay", "ack", "spawn", "peer"}
+commands = {"send", "wait", "replay", "ack", "spawn", "peer", "session"}
 cmd = None
 for arg in sys.argv[1:]:
     if arg in commands:

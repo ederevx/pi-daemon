@@ -7,6 +7,7 @@ import time
 from ..wire import NO_SESSION
 from .error import SessionError
 from .identity import ProcessIdentity
+from .terminal_text import TerminalText
 
 PROJECTED = ("state", "run", "seq", "opened", "changed", "ended", "history",
              "file", "child_pid", "open")
@@ -40,6 +41,9 @@ class SessionService:
         # One round at a time: two rounds would overwrite each other's
         # request and neither absence nor a token could tell them apart.
         self._reload_lock = threading.Lock()
+        # A conversation is hosted once: two opens must not mint two runs.
+        self._open_lock = threading.Lock()
+        self._text = TerminalText()
 
     # -- hosting -----------------------------------------------------------
 
@@ -88,6 +92,14 @@ class SessionService:
         record = self._store.get(canonical)
         return {"name": canonical, "dir": record.dir if record else None,
                 "file": self._store.file_of(canonical)}
+
+    def holders(self, file):
+        """Live runs holding one conversation, busiest viewers first."""
+        return self._holders(file)
+
+    def revivable(self, file):
+        """The stopped name a conversation can be hosted under, if any."""
+        return self._store.stopped_holder(file)
 
     def attach_plan(self, name, cols, rows):
         """Resolve an attach without taking the socket yet."""
@@ -160,6 +172,46 @@ class SessionService:
         record = self._record(name)
         written = self._runner.send(record.name, text.encode("utf-8"))
         return {"name": record.name, "bytes": written}
+
+    def open(self, file, dir_=None, cols=None, rows=None):
+        """Reach a conversation by its file: its live run, or one hosting it.
+
+        Idempotent per conversation: a file another run already holds is
+        answered with that run, never hosted a second time.
+        """
+        with self._open_lock:
+            holders = self._holders(file)
+            if holders:
+                record = self._store.get(holders[0][0])
+                return {"status": "live", "name": record.name,
+                        "state": record.state(), "dir": record.dir,
+                        "file": file, "created": False}
+            record, created = self._carry.open_host(file, dir_, cols, rows)
+            return {"status": "hosted", "name": record.name,
+                    "state": record.state(), "dir": record.dir,
+                    "file": file, "created": created}
+
+    def output(self, name, offset, limit):
+        """One page of what a run printed, from a byte offset, as text."""
+        canonical = self._store.resolve(name)
+        if canonical is None:
+            raise SessionError(NO_SESSION)
+        tail = self._relay.tail(self._store.get(canonical).id)
+        if tail is None:
+            raise SessionError(NO_SESSION)
+        page = tail.read(offset, limit)
+        text, consumed = self._text.render(page["data"])
+        return {"generation": tail.generation,
+                "offset": page["offset"],
+                "next": page["offset"] + consumed,
+                "text": text,
+                "skipped": page["skipped"],
+                "end": page["end"],
+                "ended": page["ended"]}
+
+    def key(self, name):
+        """The relay key one name resolves to, live or not."""
+        return self._key(self._store.resolve(name))
 
     def resize(self, name, cols, rows):
         record = self._record(name)

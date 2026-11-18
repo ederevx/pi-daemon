@@ -37,6 +37,7 @@ if (missing.length > 0) {
   await import("./provisioning.test.ts");
   await import("./discovery.test.ts");
   await import("./comms-tools.test.ts");
+  await import("./comms-session-tools.test.ts");
   await import("./comms-delivery.test.ts");
   // The four gates composed: every handler order, both full walk orders.
   await import("./gate-composition.test.ts");

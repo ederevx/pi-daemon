@@ -24,6 +24,17 @@
 #   wait [--after SEQ] [--limit N] [--timeout-ms MS]
 #                                         hold until mail arrives
 #   ack MESSAGE_ID...                     acknowledge delivered mail
+#   session list [--all]                  the sessions this node hosts
+#   session conversations [--dir DIR] [--limit N] [--after CURSOR]
+#                                         the conversations /resume lists
+#   session open (--name N|--file F|--id ID) [--dir DIR]
+#                                         reach one: its live run, or
+#                                         host it here
+#   session input NAME TEXT               type into a hosted session
+#   session stop NAME                     end one hosted session
+#   session feed NAME [--cursor JSON] [--include A,B] [--timeout-ms MS]
+#                                         one page of output and activity,
+#                                         or held until the next page
 #   spawn [--agent-id ID] [--name NAME] [--env K=V]... DIR -- ARGV...
 #         [--task TEXT]
 #                                         launch another agent; every
@@ -87,13 +98,16 @@ UNAUTHORIZED = -32001
 UNAVAILABLE = -32003
 TIMEOUT = -32004
 
-SUCCESS = ("accepted", "queued", "spawned", "ok")
+SUCCESS = ("accepted", "queued", "spawned", "ok", "live", "hosted", "ended")
+# Held methods answer after their own hold: the socket deadline grows by it.
+HELD = frozenset({"comms.wait", "comms.session.feed"})
 DECLINED = ("undeliverable", "cursor-expired", "failed", "request-conflict",
             "unknown")
 
 USAGE = """usage: pi-comms [global options] <command> [args]
 
-  node | send | broadcast | receipt | replay | wait | ack | spawn | peer
+  node | send | broadcast | receipt | replay | wait | ack | spawn | session
+  | peer
 
 run 'pi-comms help' for the full list"""
 
@@ -201,7 +215,7 @@ class Command:
         an agent that wants a longer hold names one: `unknown` is never read
         as `zero`, and an absent request keeps the socket bound alone.
         """
-        if method != "comms.wait":
+        if method not in HELD:
             return 0.0
         limit = self._wait_limit_ms()
         asked = params.get("timeoutMs")
@@ -429,6 +443,49 @@ def _run_spawn(command, options):
     return command.call("comms.spawn", params, mutating=True)
 
 
+def _run_session(command, options):
+    action = options.session_command
+    if action == "list":
+        return command.call("comms.session.list",
+                            {"all": True} if options.all else {})
+    if action == "conversations":
+        params = {}
+        for name, value in (("dir", options.dir), ("limit", options.limit),
+                            ("after", options.after)):
+            if value is not None:
+                params[name] = value
+        return command.call("comms.session.conversations", params)
+    if action == "open":
+        params = {}
+        for name, value in (("name", options.name), ("file", options.file),
+                            ("sessionId", options.session_id),
+                            ("dir", options.dir)):
+            if value is not None:
+                params[name] = value
+        return command.call("comms.session.open", params, mutating=True)
+    if action == "input":
+        text = options.text if options.text is not None else options.words
+        return command.call("comms.session.input",
+                            {"name": options.name, "text": text},
+                            mutating=True)
+    if action == "stop":
+        return command.call("comms.session.stop", {"name": options.name},
+                            mutating=True)
+    params = {"name": options.name}
+    if options.cursor is not None:
+        try:
+            params["cursor"] = json.loads(options.cursor)
+        except ValueError:
+            raise Declined("--cursor takes the cursor object as JSON")
+    if options.include is not None:
+        params["include"] = [part for part in options.include.split(",") if part]
+    for name, value in (("timeoutMs", options.timeout_ms),
+                        ("maxBytes", options.max_bytes)):
+        if value is not None:
+            params[name] = value
+    return command.call("comms.session.feed", params)
+
+
 def _run_peer(command, options):
     if options.peer_command == "list":
         return command.call("comms.peer.list", {})
@@ -461,6 +518,7 @@ def _dispatch(command, options):
                            if options.all else _run_replay(command, options)),
         "wait": lambda: _run_wait(command, options),
         "ack": lambda: _run_ack(command, options),
+        "session": lambda: _run_session(command, options),
         "spawn": lambda: _run_spawn(command, options),
         "peer": lambda: _run_peer(command, options),
     }
@@ -474,6 +532,8 @@ def _execute(options):
         mutating = options.command in ("send", "broadcast", "ack", "spawn")
         if options.command == "peer":
             mutating = options.peer_command != "list"
+        if options.command == "session":
+            mutating = options.session_command in ("open", "input", "stop")
         if isinstance(result, list):
             for page in result:
                 _print_result(page, options)
@@ -575,6 +635,36 @@ def _parser():
     spawn.add_argument("--request-id", metavar="ID")
     spawn.add_argument("argv", nargs=argparse.REMAINDER, metavar="ARGV")
 
+    session = commands.add_parser("session", help="reach a hosted session")
+    sessions = session.add_subparsers(dest="session_command",
+                                      metavar="<action>")
+    listing = sessions.add_parser("list", help="the sessions hosted here")
+    listing.add_argument("--all", action="store_true",
+                         help="include the records whose run ended")
+    talks = sessions.add_parser("conversations",
+                                help="the conversations /resume lists")
+    talks.add_argument("--dir", metavar="DIR")
+    talks.add_argument("--limit", type=int, metavar="N")
+    talks.add_argument("--after", metavar="CURSOR")
+    opening = sessions.add_parser("open", help="reach one conversation")
+    opening.add_argument("--name", metavar="NAME")
+    opening.add_argument("--file", metavar="FILE")
+    opening.add_argument("--id", dest="session_id", metavar="ID")
+    opening.add_argument("--dir", metavar="DIR")
+    typing = sessions.add_parser("input", help="type into a session")
+    typing.add_argument("name", metavar="NAME")
+    typing.add_argument("words", nargs="?", metavar="TEXT")
+    typing.add_argument("--text", help="the text, escapes not interpreted")
+    stopping = sessions.add_parser("stop", help="end one hosted session")
+    stopping.add_argument("name", metavar="NAME")
+    feed = sessions.add_parser("feed", help="one page of a session's life")
+    feed.add_argument("name", metavar="NAME")
+    feed.add_argument("--cursor", metavar="JSON")
+    feed.add_argument("--include", metavar="A,B",
+                      help="output, activity or state")
+    feed.add_argument("--timeout-ms", type=int, metavar="MS")
+    feed.add_argument("--max-bytes", type=int, metavar="N")
+
     peer = commands.add_parser("peer", help="peer administration")
     peers = peer.add_subparsers(dest="peer_command", metavar="<action>")
     peers.add_parser("list", help="list the configured peers")
@@ -600,6 +690,9 @@ def main(argv):
         print(USAGE, file=sys.stderr)
         return EXIT_USAGE
     if options.command == "peer" and not options.peer_command:
+        print(USAGE, file=sys.stderr)
+        return EXIT_USAGE
+    if options.command == "session" and not options.session_command:
         print(USAGE, file=sys.stderr)
         return EXIT_USAGE
     try:

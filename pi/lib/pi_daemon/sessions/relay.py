@@ -12,6 +12,8 @@ from .relay_session import RelaySession
 # A carried viewer repaints from a cleared screen: the old conversation's
 # queued output is dropped and the clear sequence leads the new one.
 CLEAR_SEQ = b"\x1b[H\x1b[2J\x1b[m"
+# What a run that ended without a named cause is recorded as.
+EXIT_REASON = "exit"
 
 
 def stepped_size(cols, rows):
@@ -39,6 +41,13 @@ class SessionRelay:
         self._wake_read = None
         self._wake_write = None
         self._sessions = {}
+        # What a run left behind when it ended, so a reader still gets its
+        # last bytes and an honest end; bounded, oldest dropped first.
+        self._ended = {}
+        # Sessions that produced something since the last tick; a watcher
+        # is told once per tick, never once per chunk.
+        self._fresh = set()
+        self._observer = None
         # A nudged size still owes its restore: keyed by session, so a
         # session that ends drops the debt with it.
         self._repaints = {}
@@ -93,6 +102,14 @@ class SessionRelay:
 
     def viewer_count(self, key):
         return int(self._call(lambda: self._count(key)) or 0)
+
+    def tail(self, key):
+        """The live run's tail, or the one it left when it ended."""
+        return self._call(lambda: self._tail(key))
+
+    def observe(self, callback):
+        """Tell `callback(keys)` once per tick which runs produced output."""
+        self._observer = callback
 
     def close(self, key):
         self._call(lambda: self._complete(key))
@@ -159,8 +176,10 @@ class SessionRelay:
     # -- commands (run on the relay thread) --------------------------------
 
     def _register(self, key, generation, child):
+        self._ended.pop(key, None)
         self._sessions[key] = RelaySession(key, generation, child,
-                                          self._config.relay_buffer_bytes)
+                                          self._config.relay_buffer_bytes,
+                                          self._config.relay_tail_bytes)
         return True
 
     def _attach(self, key, generation, viewer_id, connection, initial):
@@ -198,6 +217,7 @@ class SessionRelay:
         session = self._sessions.get(key)
         if session is None:
             return None
+        session.reason = reason
         session.closing = True
         session.deadline = time.monotonic() + self._config.settle_grace
         return session
@@ -205,6 +225,19 @@ class SessionRelay:
     def _count(self, key):
         session = self._sessions.get(key)
         return session.viewer_count() if session is not None else 0
+
+    def _tail(self, key):
+        session = self._sessions.get(key)
+        if session is not None:
+            return session.tail
+        return self._ended.get(key)
+
+    def _keep_tail(self, key, tail):
+        """Retain an ended run's tail, dropping the oldest beyond the cap."""
+        self._ended.pop(key, None)
+        self._ended[key] = tail
+        while len(self._ended) > self._config.relay_ended_tails:
+            self._ended.pop(next(iter(self._ended)))
 
     def _drop_viewers(self, key):
         session = self._sessions.get(key)
@@ -290,6 +323,9 @@ class SessionRelay:
         session = self._sessions.pop(key, None)
         if session is None:
             return False
+        session.tail.end(session.reason or EXIT_REASON)
+        self._keep_tail(key, session.tail)
+        self._fresh.add(key)
         for viewer_id in list(session.viewers):
             session.drop_viewer(viewer_id)
         session.child.close()
@@ -307,6 +343,7 @@ class SessionRelay:
 
     def _pump(self):
         self._restore_repaints()
+        self._notify()
         readable = [self._wake_read]
         writable = []
         watched = list(self._sessions.values())
@@ -367,8 +404,18 @@ class SessionRelay:
                     self._config.settle_grace
             return
         session.broadcast(data)
+        self._fresh.add(session.key)
         for viewer_id in list(session.viewers):
             self._flush(session, viewer_id)
+
+    def _notify(self):
+        """One watcher call per tick, carrying the runs that moved."""
+        if not self._fresh:
+            return
+        fresh, self._fresh = frozenset(self._fresh), set()
+        observer = self._observer
+        if observer is not None:
+            observer(fresh)
 
     def _from_viewer(self, session, viewer_id, connection):
         try:

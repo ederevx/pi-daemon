@@ -15,8 +15,7 @@ UNAVAILABLE_REASON = "unavailable"
 class WaitRegistry:
     """One thread answers waits from the mailbox, so a socket keeps reading."""
 
-    def __init__(self, store, config, clock=None):
-        self._store = store
+    def __init__(self, config, clock=None):
         self._cap = config.comms_wait_cap
         self._per_connection = config.comms_waits_per_connection
         self._grace = config.stop_grace
@@ -62,35 +61,41 @@ class WaitRegistry:
 
     # -- registration ------------------------------------------------------
 
-    def begin(self, session, request_id, agent_id, cursor, limit, timeout):
-        """Register a wait. The caller answers nothing until it completes."""
-        key = (session, request_id)
+    def begin(self, session, request_id, key, probe, timeout):
+        """Register a held request. `probe(expired)` answers `(reply, retry)`.
+
+        A reply ends the wait and is written where it came from. A `retry`
+        instant asks to be looked at again without a signal; `None` waits
+        for one. Nothing here knows what a reply means, so a mailbox wait
+        and a feed wait are the same entry.
+        """
+        now = self._clock()
         with self._condition:
             if self._closing:
                 raise CommsError(CLOSING)
-            if key in self._waits:
+            if (session, request_id) in self._waits:
                 raise CommsError(WAIT_PENDING)
             if len(self._waits) >= self._cap or \
                     self._mine(session) >= self._per_connection:
                 raise CommsError(BUSY)
-            self._waits[key] = {
-                "agent_id": agent_id,
-                "cursor": cursor,
-                "limit": limit,
-                "deadline": self._clock() + float(timeout),
+            self._waits[(session, request_id)] = {
+                "key": key,
+                "probe": probe,
+                "deadline": now + float(timeout),
                 "ready": True,
                 "busy": False,
+                "retry_at": None,
             }
             self._condition.notify_all()
 
-    def signal(self, agent_ids):
-        """Mail was committed for these mailboxes. Their waits may answer."""
-        if not agent_ids:
+    def signal(self, keys):
+        """Something happened for these keys. Their waits may answer."""
+        if not keys:
             return
         with self._condition:
             changed = False
             for entry in self._waits.values():
-                if entry["agent_id"] in agent_ids:
+                if entry["key"] in keys:
                     entry["ready"] = True
                     changed = True
             if changed:
@@ -136,47 +141,52 @@ class WaitRegistry:
     def _collect(self):
         """Take the entries to look at, or all of them when closing."""
         with self._condition:
+            now = self._clock()
             while True:
                 if self._closing:
                     return list(self._waits.items()), True
                 ready = [(key, entry)
                          for key, entry in self._waits.items()
                          if not entry["busy"] and
-                         (entry["ready"] or self._clock() >= entry["deadline"])]
+                         (entry["ready"] or now >= entry["deadline"] or
+                          (entry["retry_at"] is not None and
+                           now >= entry["retry_at"]))]
                 if ready:
                     for _, entry in ready:
                         entry["busy"] = True
                         entry["ready"] = False
                     return ready, False
                 self._condition.wait(self._next_deadline())
+                now = self._clock()
 
     def _next_deadline(self):
-        waiting = [entry["deadline"] for entry in self._waits.values()
-                   if not entry["busy"]]
+        waiting = []
+        for entry in self._waits.values():
+            if entry["busy"]:
+                continue
+            waiting.append(entry["deadline"])
+            if entry["retry_at"] is not None:
+                waiting.append(entry["retry_at"])
         if not waiting:
             return None
         return max(0.0, min(waiting) - self._clock())
 
     def _evaluate(self, key, entry):
+        expired = self._clock() >= entry["deadline"]
         try:
-            result = self._store.replay(entry["agent_id"], entry["cursor"],
-                                        entry["limit"])
-        except (CommsError, OSError, ValueError):
+            reply, retry = entry["probe"](expired)
+        except Exception:
             self._refuse(key, entry, UNAVAILABLE_REASON)
             return
-        if result["status"] == "cursor-expired" or result["messages"]:
+        if reply is not None:
             if self._take(key, entry):
-                self._answer(key, entry, result)
-            return
-        if self._clock() >= entry["deadline"]:
-            if self._take(key, entry):
-                self._answer(key, entry, {
-                    "status": "timed-out", "messages": [],
-                    "cursor": entry["cursor"], "more": False})
+                self._answer(key, entry, reply)
             return
         with self._condition:
             if self._waits.get(key) is entry:
                 entry["busy"] = False
+                entry["ready"] = False
+                entry["retry_at"] = retry
                 self._condition.notify_all()
 
     def _take(self, key, entry, refusal=False):

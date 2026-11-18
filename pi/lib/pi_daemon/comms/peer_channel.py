@@ -7,7 +7,8 @@ calling agent, and closes when the answer arrives.
 
 from .peer_link_error import PeerLinkError
 
-HELD = "comms.wait"
+# Held methods answer after their own hold, so the deadline grows by it.
+HELD = frozenset({"comms.wait", "comms.session.feed"})
 CLOSED = "channel-closed"
 
 
@@ -67,8 +68,8 @@ class PeerChannel:
     # -- deadlines ---------------------------------------------------------
 
     def _deadline(self, method, params, timeout):
-        """A held wait answers within the limit that node advertises."""
-        if timeout is None or method != HELD:
+        """A held call answers within the limit that node advertises."""
+        if timeout is None or method not in HELD:
             return timeout
         return max(float(timeout), 0.0) + self._hold(params)
 

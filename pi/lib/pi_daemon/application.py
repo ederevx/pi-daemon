@@ -16,6 +16,7 @@ from .comms.peer_config_store import PeerConfigStore
 from .comms.peer_manager import PeerManager
 from .comms.peer_mailboxes import PeerMailboxes
 from .comms.service import CommsService
+from .comms.session_wire import SessionWire
 from .comms.spawn_ledger import SpawnLedger
 from .config import ServiceConfig
 from .lifecycle.instance_coordinator import InstanceCoordinator
@@ -180,7 +181,8 @@ class DaemonApplication:
         resolved once, from the environment this application was given."""
         service = TranscriptService(self._config, self._session_store_root,
                                     sessions.live_files,
-                                    sessions.recorded_file)
+                                    sessions.recorded_file,
+                                    sessions.holders, sessions.revivable)
         service.start()
         return service
 
@@ -199,6 +201,12 @@ class DaemonApplication:
                                    self._pi_command)
         service = CommsService(store, self._config, token, identity.id(),
                                spawns, launcher)
+        # A session reached over comms is served by the domains that own it;
+        # the wire only shapes the request. The relay's output wakes a held
+        # feed, so watching never counts as a viewer.
+        service.use_sessions(SessionWire(self._sessions, self._transcripts,
+                                         self._config, identity.id()))
+        self._relay.observe(service.signal_feed)
         peers = PeerConfigStore(self._layout.comms_peers_path(), self._config)
         self._comms_peers = peers
         credentials = self._layout.comms_peer_credentials_path()

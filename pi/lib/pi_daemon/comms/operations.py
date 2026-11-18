@@ -65,11 +65,25 @@ class CommsOperations:
         if self._service.peers_enabled() and self._local(sender):
             handlers[REMOTE] = self.remote
         handlers.update(self._service.peer_handlers())
+        handlers.update(self._service.session_handlers())
         return handlers
 
     def methods(self, sender=None):
         """Every method a connection as this sender answers, in one place."""
-        return sorted(set(self.handlers(sender)) | SESSION_METHODS)
+        methods = set(self.handlers(sender)) | SESSION_METHODS
+        if self._service.session_handlers():
+            # A feed is held like a wait, so the wire always lists it here
+            # and the connection answers it through the registry.
+            methods.add("comms.session.feed")
+        return sorted(methods)
+
+    def feed_plan(self, sender, params):
+        """The held feed one request names, validated by its owner."""
+        return self._service.feed_plan(sender, params)
+
+    def capabilities(self):
+        """The additive capability names a greeting may carry."""
+        return self._service.capabilities()
 
     def send(self, sender, params):
         request_id = self._identifier(params, "requestId")

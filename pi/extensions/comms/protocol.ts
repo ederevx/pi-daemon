@@ -103,6 +103,46 @@ export interface CommsPeersParams {
 	node?: string;
 }
 
+/** `comms_sessions`: the sessions and conversations a node can be reached for. */
+export interface CommsSessionsParams {
+	/** Live sessions, or the conversations `/resume` lists. */
+	view?: "live" | "conversations";
+	all?: boolean;
+	dir?: string;
+	limit?: number;
+	after?: string;
+	/** Ask that peer instead of this node. */
+	node?: string;
+}
+
+/** `comms_reach`: open one conversation there, or end one hosted session. */
+export interface CommsReachParams {
+	action?: "open" | "stop";
+	name?: string;
+	file?: string;
+	sessionId?: string;
+	dir?: string;
+	node?: string;
+}
+
+/** `comms_input`: type into a hosted session. */
+export interface CommsInputParams {
+	name: string;
+	text: string;
+	node?: string;
+}
+
+/** `comms_feed`: one page of a session's output, activity and state. */
+export interface CommsFeedParams {
+	name: string;
+	include?: Array<"output" | "activity" | "state">;
+	/** The previous page's cursor; its absence asks for the tail now. */
+	cursor?: unknown;
+	timeoutMs?: number;
+	maxBytes?: number;
+	node?: string;
+}
+
 /** The CLI's exit codes; they are the failure vocabulary of the profile. */
 export class CommsExit {
 	static readonly OK = 0;
@@ -189,5 +229,56 @@ export class CommsArgv {
 
 	static peers(node?: string): string[] {
 		return [...CommsArgv.at(node), "peer", "list"];
+	}
+
+	static sessions(params: CommsSessionsParams): string[] {
+		const argv = [...CommsArgv.at(params.node), "session"];
+		if (params.view === "conversations") {
+			argv.push("conversations");
+			if (params.dir) argv.push(`--dir=${params.dir}`);
+			if (params.limit !== undefined) argv.push(`--limit=${params.limit}`);
+			if (params.after !== undefined) argv.push(`--after=${params.after}`);
+			return argv;
+		}
+		argv.push("list");
+		if (params.all) argv.push("--all");
+		return argv;
+	}
+
+	static reach(params: CommsReachParams): string[] {
+		const argv = [...CommsArgv.at(params.node), "session"];
+		if (params.action === "stop") {
+			return [...argv, "stop", params.name ?? ""];
+		}
+		argv.push("open");
+		if (params.name) argv.push(`--name=${params.name}`);
+		if (params.file) argv.push(`--file=${params.file}`);
+		if (params.sessionId) argv.push(`--id=${params.sessionId}`);
+		if (params.dir) argv.push(`--dir=${params.dir}`);
+		return argv;
+	}
+
+	/** The text travels through `--text` so it stays exactly as given. */
+	static input(params: CommsInputParams): string[] {
+		return [...CommsArgv.at(params.node), "session", "input", params.name,
+			`--text=${params.text}`];
+	}
+
+	static feed(params: CommsFeedParams): string[] {
+		const argv = [...CommsArgv.at(params.node), "session", "feed",
+			params.name];
+		if (params.include && params.include.length) {
+			argv.push(`--include=${params.include.join(",")}`);
+		}
+		if (params.cursor !== undefined) {
+			argv.push(`--cursor=${JSON.stringify(params.cursor)}`);
+		}
+		if (params.timeoutMs !== undefined) {
+			argv.push(`--timeout-ms=${params.timeoutMs}`);
+		}
+		if (params.maxBytes !== undefined) {
+			argv.push(`--max-bytes=${params.maxBytes}`);
+		}
+		return argv;
 	}
 }
