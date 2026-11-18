@@ -26,7 +26,7 @@ STDERR_BYTES = 8192
 class PeerTunnel:
     """It owns one child process; it never speaks the RPC protocol."""
 
-    def __init__(self, config, spawn=None):
+    def __init__(self, config, spawn=None, control=None):
         self._config = config
         self._spawn = spawn or subprocess.Popen
         self._lock = threading.Lock()
@@ -38,7 +38,7 @@ class PeerTunnel:
         self._stopping = threading.Event()
         # One platform seam owns how the child is grouped and how its tree
         # ends; this domain only decides when.
-        self._control = pi_platform.ProcessControl()
+        self._control = control or pi_platform.ProcessControl()
 
     def start(self, peer, cancel=None):
         """Launch the forward and wait for its readiness marker."""

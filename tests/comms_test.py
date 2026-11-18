@@ -7,6 +7,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -2133,6 +2134,17 @@ class TunnelTests(PeerCase):
                 self.returncode = 0
             return self.returncode
 
+    class ScriptedControl:
+        """Ends a scripted child the way a signal ends a real one, and never
+        signals a pid on the host."""
+
+        def group_kwargs(self):
+            return {}
+
+        def terminate_tree(self, pid, grace, process=None):
+            if process is not None and process.returncode is None:
+                process.returncode = -signal.SIGTERM
+
     def spawner(self, marker=True, error=b"", returncode=None):
         def spawn(argv, **_kwargs):
             out = b""
@@ -2144,7 +2156,8 @@ class TunnelTests(PeerCase):
         return spawn
 
     def test_the_readiness_marker_opens_the_tunnel(self):
-        tunnel = PeerTunnel(self.config, spawn=self.spawner())
+        tunnel = PeerTunnel(self.config, spawn=self.spawner(),
+                            control=self.ScriptedControl())
         self.addCleanup(tunnel.close)
         host, port = tunnel.start({"nodeId": NODE_B, "sshTarget": "t",
                                    "remotePort": 5000, "localPort": 0})
@@ -2154,7 +2167,8 @@ class TunnelTests(PeerCase):
 
     def test_a_tunnel_without_its_marker_never_opens(self):
         tunnel = PeerTunnel(self.config, spawn=self.spawner(marker=False,
-                                                            returncode=0))
+                                                            returncode=0),
+                            control=self.ScriptedControl())
         with self.assertRaises(TunnelError):
             tunnel.start({"nodeId": NODE_B, "sshTarget": "t",
                           "remotePort": 5000, "localPort": 0})
@@ -2162,7 +2176,7 @@ class TunnelTests(PeerCase):
     def test_a_port_collision_reports_itself(self):
         tunnel = PeerTunnel(self.config, spawn=self.spawner(
             marker=False, error=b"bind: Address already in use\n",
-            returncode=255))
+            returncode=255), control=self.ScriptedControl())
         with self.assertRaises(TunnelError) as caught:
             tunnel.start({"nodeId": NODE_B, "sshTarget": "t",
                           "remotePort": 5000, "localPort": 6000})
@@ -2582,7 +2596,8 @@ class TunnelArgvTests(PeerCase):
 
     def test_the_forward_runs_in_the_foreground_and_never_forks(self):
         calls, spawn = self.capture()
-        tunnel = PeerTunnel(self.config, spawn=spawn)
+        tunnel = PeerTunnel(self.config, spawn=spawn,
+                            control=TunnelTests.ScriptedControl())
         self.addCleanup(tunnel.close)
         tunnel.start(self.peer(local_port=6000))
         argv, options = calls[0]
@@ -2600,7 +2615,8 @@ class TunnelArgvTests(PeerCase):
 
     def test_a_child_that_dies_before_its_marker_ends_the_wait(self):
         _calls, spawn = self.capture(marker=False, returncode=255)
-        tunnel = PeerTunnel(self.config, spawn=spawn)
+        tunnel = PeerTunnel(self.config, spawn=spawn,
+                            control=TunnelTests.ScriptedControl())
         with self.assertRaises(TunnelError) as caught:
             tunnel.start(self.peer())
         self.assertTrue(caught.exception.reason.startswith("tunnel-exited"))
@@ -2608,7 +2624,8 @@ class TunnelArgvTests(PeerCase):
     def test_close_ends_a_start_that_is_still_waiting(self):
         self._peer_store(comms_peer_ready_timeout=2.0)
         _calls, spawn = self.capture(marker=False, returncode=None)
-        tunnel = PeerTunnel(self.config, spawn=spawn)
+        tunnel = PeerTunnel(self.config, spawn=spawn,
+                            control=TunnelTests.ScriptedControl())
         caught = []
 
         def run():
