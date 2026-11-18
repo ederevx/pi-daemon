@@ -203,20 +203,26 @@ class SessionWire:
                 file, None, self._config.comms_feed_text_chars,
                 ACTIVITY_EVENTS)
         used = len(json.dumps(events))
-        cursor = since
+        cursor, admitted = since, 0
         last = len(page["events"])
         for index, event in enumerate(page["events"]):
             candidate = dict(event, type="activity")
-            if used + len(json.dumps(candidate)) > budget:
-                if cursor != since:
+            size = len(json.dumps(candidate))
+            if used + size > budget:
+                # An entry admitted already, or room taken by output or
+                # state, leaves this one to a page of its own: it keeps its
+                # text there, where eliding it would lose it for good.
+                if admitted or len(json.dumps([candidate])) <= budget:
                     return cursor, True
-                # Not even one entry fits this page. Name it without its
-                # text, so the cursor always moves: an entry no page can
-                # carry must never hold a sealed run's ending back.
+                # Not even an empty page could carry it. Name it without
+                # its text, so the cursor always moves: an entry no page
+                # can carry must never hold a sealed run's ending back.
                 candidate = {"type": "activity", "kind": event.get("kind"),
                              "entryId": event["entryId"], "elided": True}
+                size = len(json.dumps(candidate))
             events.append(candidate)
-            used += len(json.dumps(candidate))
+            used += size
+            admitted += 1
             cursor = event["entryId"]
             if used >= budget:
                 return cursor, index + 1 < last or page["hasMore"]

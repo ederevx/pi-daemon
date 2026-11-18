@@ -402,21 +402,33 @@ class FeedTests(WireCase):
                                      "include": ["activity"]})
         reply, _wake = plan["probe"](False)
         # The entry no page could carry still names itself and moves the
-        # cursor, so the page after it can report the run's ending.
+        # cursor, and the page that follows drains the rest and ends.
         self.assertEqual(reply["events"][0]["entryId"], "m00")
         self.assertTrue(reply["events"][0].get("elided"))
-        self.assertNotEqual(reply["cursor"]["activity"], None)
-        cursor = reply["cursor"]
-        for _page in range(3):
-            plan = wire.feed_plan(None, {"name": "pi-a", "cursor": cursor,
-                                         "include": ["activity"],
-                                         "maxBytes": 120})
-            reply, _wake = plan["probe"](False)
-            if reply is None or reply["status"] == "ended":
-                break
-            cursor = reply["cursor"]
-        self.assertIsNotNone(reply)
+        self.assertEqual(reply["cursor"]["activity"], "m01")
         self.assertEqual(reply["status"], "ended")
+
+    def test_output_never_costs_an_activity_entry_its_text(self):
+        sessions = self.sessions_for({"text": "o" * 40})
+        wire = self.wire(sessions)
+        entry = {"entryId": "m00", "kind": "tool_call", "text": "y" * 178}
+        self.transcripts._catalog.activities[FILE] = [entry]
+        plan = wire.feed_plan(None, {"name": "pi-a", "maxBytes": 300,
+                                     "include": ["output", "activity"]})
+        reply, _wake = plan["probe"](False)
+        # The page held output and had no room left, so the entry waits for
+        # the page after it instead of arriving stripped of its text.
+        self.assertFalse(any(event.get("elided")
+                             for event in reply["events"]))
+        self.assertTrue(reply["more"])
+        plan = wire.feed_plan(None, {"name": "pi-a", "maxBytes": 300,
+                                     "cursor": reply["cursor"],
+                                     "include": ["output", "activity"]})
+        page, _wake = plan["probe"](False)
+        carried = [event for event in page["events"]
+                   if event.get("entryId") == "m00"]
+        self.assertEqual(carried[0].get("text"), entry["text"])
+        self.assertNotIn("elided", carried[0])
 
     def test_a_partial_page_never_declares_the_run_ended(self):
         sessions = self.sessions_for({"text": "z" * 400, "ended": "exit"})
