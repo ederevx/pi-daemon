@@ -8,7 +8,7 @@
  * early without running a command.
  */
 
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { test, assert, assertEq, withEnv, scratchDir } from "./harness.ts";
 import { ProcessRunner } from "../../pi/extensions/daemon.ts";
@@ -92,7 +92,8 @@ test("comms_sessions: all and view reach the CLI as named options", async () => 
 		const calls = recorded(env.STUB_LOG);
 		assertEq(calls[0].join(" "),
 			"--format json --agent pi-test session conversations " +
-			"--dir=/srv/a --limit=5 --after=c1", "the conversations argv");
+			`--dir=${resolve("/srv/a")} --limit=5 --after=c1`,
+			"the conversations argv");
 		assertEq(calls[1].join(" "),
 			"--format json --agent pi-test session list --all",
 			"the listing with ended records");
@@ -104,7 +105,8 @@ test("comms_sessions: a relative directory is resolved here", async () => {
 	await withEnv(env, async () => {
 		await call("comms_sessions", { view: "conversations", dir: "sub" });
 		assert(recorded(env.STUB_LOG)[0].join(" ")
-			.includes(`--dir=${scratchDir()}/sub`), "resolved against cwd");
+			.includes(`--dir=${join(scratchDir(), "sub")}`),
+			"resolved against cwd");
 	});
 });
 
