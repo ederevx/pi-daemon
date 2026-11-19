@@ -18,7 +18,7 @@
  *
  * The daemon sources come from this test's own checkout.
  * AGENT_MEM_STRUCT_ROOT and PI_CONSULT_ROOT configure the other checkouts.
- * With neither configured the composition cases report themselves unsupported;
+ * With neither configured the composition cases report themselves blocked;
  * partial configuration or an invalid root fails.
  *
  * The last case is the registration smoke: the production entry files are
@@ -445,7 +445,7 @@ async function expectBlocked(
 test("every handler order admits each owner's declared escape", async () => {
 	const roots = configuredRoots();
 	if (!roots) {
-		skip("no AGENT_MEM_STRUCT_ROOT / PI_CONSULT_ROOT configured");
+		skip("blocked: no AGENT_MEM_STRUCT_ROOT / PI_CONSULT_ROOT configured");
 	}
 	for (const order of PERMUTATIONS) {
 		const label = `order ${order.join(">")}`;
@@ -500,7 +500,7 @@ async function walkToOrdinaryWork(
 ): Promise<void> {
 	const roots = configuredRoots();
 	if (!roots) {
-		skip("no AGENT_MEM_STRUCT_ROOT / PI_CONSULT_ROOT configured");
+		skip("blocked: no AGENT_MEM_STRUCT_ROOT / PI_CONSULT_ROOT configured");
 	}
 	const label = `walk ${order.join(">")} settling ${settle.join(">")}`;
 	const fixture = memoryFixture(label, roots);
@@ -678,7 +678,7 @@ async function walkToOrdinaryWork(
 test("production entries preserve gate escape declarations", async () => {
 	const roots = configuredRoots();
 	if (!roots) {
-		skip("no AGENT_MEM_STRUCT_ROOT / PI_CONSULT_ROOT configured");
+		skip("blocked: no AGENT_MEM_STRUCT_ROOT / PI_CONSULT_ROOT configured");
 	}
 	const fixture = memoryFixture("registration smoke", roots);
 	// The entries exactly as a package install loads them: the daemon
