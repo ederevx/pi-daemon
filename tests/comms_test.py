@@ -9,12 +9,14 @@ import os
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -30,6 +32,8 @@ ISOLATION.apply()
 def tearDownModule():
     ISOLATION.cleanup()
 
+
+import pi_platform  # noqa: E402
 
 from pi_daemon.comms.error import CommsError
 from pi_daemon.comms.operations import (METHOD_UNAVAILABLE, PEER_LOST_ANSWER,
@@ -2067,6 +2071,41 @@ class PeerBoundTests(PeerCase):
         self.assertEqual(caught.exception.code, "bad-request")
 
 
+class StubWindowsFiles:
+    """The Windows file API, answering in place of the kernel.
+
+    The credential decision reads one handle's attributes, so a stub that
+    reports them proves the flags the file was opened with and the answer
+    the attributes produce, on any host.
+    """
+
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+    FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+
+    def __init__(self, attributes):
+        self.attribute_bits = attributes
+        self.opened = []
+        self.closed = []
+
+    def create(self, path, flags):
+        self.opened.append((path, flags))
+        return "handle"
+
+    def attributes(self, handle):
+        return self.attribute_bits
+
+    def security_problem(self, handle):
+        raise AssertionError("the DACL of a refused file is never read")
+
+    def descriptor(self, handle):
+        raise AssertionError("a refused file is never handed over")
+
+    def close(self, handle):
+        self.closed.append(handle)
+
+
 class PeerCredentialTests(PeerCase):
     """The credential file a peer link reads is ours, and only ours."""
 
@@ -2103,21 +2142,74 @@ class PeerCredentialTests(PeerCase):
             auth.outbound_credential({"outboundCredentialFile": path})
         self.assertEqual(str(caught.exception), "credential-unreadable")
 
-    def test_a_symlinked_credential_is_refused(self):
-        directory, path = self.write("cred")
+    def test_a_platform_refusal_makes_the_credential_unreadable(self):
+        # The platform decides what a path opens; the authenticator adds
+        # nothing to that answer and reads no byte of it.
+        directory, _ = self.write("cred")
         link = os.path.join(directory, "link")
-        try:
-            os.symlink(path, link)
-        except (OSError, NotImplementedError) as failure:
-            # Creating a symlink needs a privilege Windows does not grant by
-            # default; where the platform cannot make one, it cannot be
-            # pointed at either, and the reparse-point refusal stands untested.
-            self.skipTest("blocked: this host cannot create symlinks: %s"
-                          % failure)
         auth = PeerAuthenticator(self.config, self.peers(),
                                  directory=directory)
-        with self.assertRaises(ValueError):
-            auth.outbound_credential({"outboundCredentialFile": link})
+        refused = ("a reparse point is not a credential", None, None)
+        with mock.patch.object(pi_platform, "open_private_file",
+                               return_value=refused):
+            with self.assertRaises(ValueError) as caught:
+                auth.outbound_credential({"outboundCredentialFile": link})
+        self.assertEqual(str(caught.exception), "credential-unreadable")
+
+    def test_the_posix_decision_asks_for_a_descriptor_it_cannot_follow(self):
+        # The decision's whole POSIX input is the open, its fstat and the
+        # effective uid, so standing those in for the kernel reads the
+        # same on every host and opens nothing: the flag is requested, and
+        # the answer is the fstat's, handed back with its descriptor.
+        info = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=42)
+        nofollow = 0x00020000  # only its presence matters, not its value
+        with mock.patch.multiple(
+                pi_platform.os,
+                open=mock.Mock(return_value=17),
+                fstat=mock.Mock(return_value=info),
+                geteuid=mock.Mock(return_value=42),
+                O_NOFOLLOW=nofollow,
+                create=True):
+            self.assertEqual(pi_platform._posix_open_private("/credential"),
+                             (None, 17, info))
+            pi_platform.os.open.assert_called_once_with(
+                "/credential", os.O_RDONLY | nofollow)
+            pi_platform.os.fstat.assert_called_once_with(17)
+
+    def test_the_posix_decision_closes_what_it_refuses(self):
+        # A refusal must not leak the descriptor it was asked about, and
+        # the mode it refuses is the one any other reader could use.
+        info = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=42)
+        with mock.patch.multiple(
+                pi_platform.os,
+                open=mock.Mock(return_value=17),
+                fstat=mock.Mock(return_value=info),
+                geteuid=mock.Mock(return_value=42),
+                close=mock.Mock(),
+                create=True):
+            self.assertEqual(pi_platform._posix_open_private("/credential"),
+                             ("the file is readable by others", None, info))
+            pi_platform.os.close.assert_called_once_with(17)
+
+    def test_an_entry_is_refused_from_the_attributes_of_one_handle(self):
+        for bits, expected in (
+            (StubWindowsFiles.FILE_ATTRIBUTE_REPARSE_POINT,
+             "a reparse point is not a credential"),
+            (StubWindowsFiles.FILE_ATTRIBUTE_DIRECTORY,
+             "a regular file is required"),
+        ):
+            with self.subTest(attributes=hex(bits)):
+                files = StubWindowsFiles(bits)
+                problem, descriptor, info = pi_platform._open_windows_private(
+                    "C:\\credentials\\cred", files)
+                self.assertEqual(problem, expected)
+                self.assertIsNone(descriptor)
+                self.assertIsNone(info)
+                self.assertEqual(len(files.opened), 1)
+                self.assertTrue(
+                    files.opened[0][1]
+                    & StubWindowsFiles.FILE_FLAG_OPEN_REPARSE_POINT)
+                self.assertEqual(files.closed, ["handle"])
 
     def test_a_credential_readable_by_others_is_refused(self):
         directory, path = self.write("cred")
@@ -2455,12 +2547,18 @@ class PeerWorkerTests(PeerCase):
                          ["reason"], "payload-too-large")
 
     def test_a_failed_link_reports_a_bounded_reason(self):
+        # The reason is read from the decision itself: a reconnect clears
+        # it within milliseconds, so polling a started worker for it is a
+        # race, and the bounded answer is what this case is about.
         self.send()
         link = FakeLink(failure=PeerLinkError("x" * 10000))
         worker = self.worker(link)
-        worker.start()
-        self.assertTrue(_await(lambda: worker.snapshot()["lastError"]))
-        self.assertLessEqual(len(worker.snapshot()["lastError"]), 256)
+        self.assertTrue(worker._connect())
+        self.assertFalse(worker._drain())
+        self.assertEqual(worker.snapshot(),
+                         {"state": "down", "lastError": "x" * 256})
+        self.assertEqual(self.store.receipt(self._agent("a"), "r1")
+                         ["status"], "queued")
 
 
 class PeerOperationsTests(PeerCase):

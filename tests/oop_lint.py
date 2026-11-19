@@ -20,11 +20,21 @@ Checks:
   4. Subagent feature removal completeness: none of the removed
      feature identifiers appears anywhere in pi/, scripts/, or the
      README.
+  5. No test source creates a link: a symlink, a junction, or any other
+     reparse point is prohibited in tests/ (house rule). A test proves a
+     link refusal by standing in for the decision's owner, never by
+     making an alias on the host. Hard links are not symlinks and are
+     not covered; a fixture that reaches for one is a review question,
+     not this check.
 """
 
 import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from link_guard import LinkCreationGuard  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FAILURES: list[str] = []
@@ -217,6 +227,15 @@ def check_service_shape(root: str) -> None:
             fail(rel, f"{len(classes)} top-level classes in one file")
 
 
+def check_no_link_creation(root: str) -> None:
+    """Check 5: no test source creates a link (tests/link_guard.py)."""
+    guard = LinkCreationGuard(root)
+    for problem in guard.self_test():
+        fail("tests/link_guard.py", problem)
+    for finding in guard.check():
+        fail("tests", finding)
+
+
 def _extension_ts_files(root: str) -> list[str]:
     """Repo-relative .ts paths under pi/extensions, support dirs included."""
     ext_dir = os.path.join(root, "pi", "extensions")
@@ -252,6 +271,7 @@ def main() -> int:
     check_service_shape(REPO)
     check_extension_format(REPO)
     check_no_subagent_residue(REPO)
+    check_no_link_creation(REPO)
     if FAILURES:
         for item in FAILURES:
             print("OOP-LINT FAIL: " + item)

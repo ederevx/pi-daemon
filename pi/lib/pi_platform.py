@@ -102,49 +102,89 @@ def _posix_open_private(path):
 
 def _windows_open_private(path):
     """One CreateFileW, then the DACL of that handle, then read it."""
-    import ctypes
-    import msvcrt
-    from ctypes import wintypes
+    return _open_windows_private(path, _WindowsFiles())
+
+
+class _WindowsFiles:
+    """The kernel calls a credential check makes, named in one object.
+
+    A reparse point is refused from the handle's attributes, before any
+    DACL is read, so those attributes are the whole Windows decision this
+    module owns. Naming the calls here lets a test stand in for the kernel
+    and ask what flags and attributes the decision used, on any host.
+    """
 
     GENERIC_READ = 0x80000000
     FILE_SHARE_READ = 0x00000001
     OPEN_EXISTING = 3
     FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
     FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
-    FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+    FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
     FILE_ATTRIBUTE_DIRECTORY = 0x00000010
-    INVALID_HANDLE = wintypes.HANDLE(-1).value
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    _declare_file_apis(kernel32, advapi32, ctypes, wintypes)
-    handle = kernel32.CreateFileW(
-        path, GENERIC_READ, FILE_SHARE_READ, None, OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, None)
-    if not handle or handle == INVALID_HANDLE:
-        return ("the file is unreadable: %s"
-                % ctypes.WinError(ctypes.get_last_error()), None, None)
+
+    def __init__(self):
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        self.ctypes = ctypes
+        self.wintypes = wintypes
+        self.msvcrt = msvcrt
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        _declare_file_apis(self.kernel32, self.advapi32, ctypes, wintypes)
+
+    def create(self, path, flags):
+        handle = self.kernel32.CreateFileW(
+            path, self.GENERIC_READ, self.FILE_SHARE_READ, None,
+            self.OPEN_EXISTING, flags, None)
+        if not handle or handle == self.wintypes.HANDLE(-1).value:
+            raise OSError(
+                str(self.ctypes.WinError(self.ctypes.get_last_error())))
+        return handle
+
+    def attributes(self, handle):
+        details = _BY_HANDLE_FILE_INFORMATION(self.ctypes, self.wintypes)
+        if not self.kernel32.GetFileInformationByHandle(
+                handle, self.ctypes.byref(details)):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        return details.dwFileAttributes
+
+    def security_problem(self, handle):
+        return _windows_security_problem(handle, self.kernel32, self.advapi32,
+                                         self.ctypes, self.wintypes)
+
+    def descriptor(self, handle):
+        return self.msvcrt.open_osfhandle(int(handle), os.O_RDONLY)
+
+    def close(self, handle):
+        self.kernel32.CloseHandle(handle)
+
+
+def _open_windows_private(path, files):
+    """The credential decision, over the file API `files` names."""
+    try:
+        handle = files.create(
+            path,
+            files.FILE_FLAG_BACKUP_SEMANTICS | files.FILE_FLAG_OPEN_REPARSE_POINT)
+    except OSError as failure:
+        return ("the file is unreadable: %s" % failure, None, None)
     handed_over = False
     try:
-        details = _BY_HANDLE_FILE_INFORMATION(ctypes, wintypes)
-        if not kernel32.GetFileInformationByHandle(handle,
-                                                   ctypes.byref(details)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        attributes = details.dwFileAttributes
-        if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+        attributes = files.attributes(handle)
+        if attributes & files.FILE_ATTRIBUTE_REPARSE_POINT:
             return ("a reparse point is not a credential", None, None)
-        if attributes & FILE_ATTRIBUTE_DIRECTORY:
+        if attributes & files.FILE_ATTRIBUTE_DIRECTORY:
             return ("a regular file is required", None, None)
-        problem = _windows_security_problem(handle, kernel32, advapi32,
-                                            ctypes, wintypes)
+        problem = files.security_problem(handle)
         if problem is not None:
             return (problem, None, None)
-        descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDONLY)
+        descriptor = files.descriptor(handle)
         handed_over = True
     except OSError as failure:
         return ("the file is unreadable: %s" % failure, None, None)
     finally:
         if not handed_over:
-            kernel32.CloseHandle(handle)
+            files.close(handle)
     return (None, descriptor, os.fstat(descriptor))
 
 

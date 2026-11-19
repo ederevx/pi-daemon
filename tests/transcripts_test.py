@@ -14,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
@@ -24,6 +25,8 @@ import isolation
 # the host's live daemon.
 ISOLATION = isolation.ScratchEnvironment()
 ISOLATION.apply()
+
+import pi_transcript  # noqa: E402
 
 from pi_daemon.config import ServiceConfig
 from pi_daemon.sessions.store import SessionStore
@@ -266,19 +269,29 @@ class LiveSetTest(unittest.TestCase):
         self.assertFalse(service.owns(os.path.abspath(outside)))
         service.stop()
 
-    def test_a_symlink_out_of_the_store_is_refused(self):
+    def test_a_transcript_canonicalized_outside_the_store_is_refused(self):
+        # Containment is decided on the canonical path, never on the
+        # spelling the request carried into the store.
         outside = os.path.join(SCRATCH, "escape-%s.jsonl" % os.getpid())
         with open(outside, "w", encoding="utf-8") as handle:
             handle.write(HEADER)
-        link = os.path.join(self.root, "--home-wire--", "link.jsonl")
-        try:
-            os.symlink(outside, link)
-        except (OSError, NotImplementedError):
-            self.skipTest("blocked: this host cannot create symlinks")
+        candidate = os.path.join(self.root, "--home-wire--", "link.jsonl")
+        with open(candidate, "w", encoding="utf-8") as handle:
+            handle.write(HEADER)
         service = service_for(self.root)
-        self.assertFalse(service.owns(link))
-        reply = TranscriptOperations(service).handlers()["transcript-open"](
-            {"file": link})
+        self.assertTrue(service.owns(candidate))
+        real = os.path.realpath
+
+        def resolve(path):
+            if os.path.abspath(path) == candidate:
+                return outside
+            return real(path)
+
+        with mock.patch.object(pi_transcript.os.path, "realpath",
+                               side_effect=resolve):
+            self.assertFalse(service.owns(candidate))
+            reply = TranscriptOperations(service).handlers()[
+                "transcript-open"]({"file": candidate})
         self.assertEqual(reply, {"ok": False, "error": "bad-transcript"})
         service.stop()
 

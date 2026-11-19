@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "pi", "lib"))
@@ -37,23 +38,6 @@ SESSION_LINE = {
     "type": "session", "version": 3, "id": "sess-1",
     "timestamp": "2026-10-01T00:00:00Z", "cwd": "/tmp",
 }
-
-
-def symlink_or_skip(testcase, src, dst):
-    """Symlink src to dst, skipping the test if the OS refuses.
-
-    Windows without the symlink privilege raises OSError 1314; that is a
-    host-environment limit, not a failure of the code under test.
-    """
-    try:
-        os.symlink(src, dst)
-    except OSError as exc:
-        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
-            testcase.skipTest("blocked: this host cannot create symlinks: %s"
-                              % exc)
-            return False
-        raise
-    return True
 
 
 def entry(entry_id, parent, kind="message", **extra):
@@ -219,10 +203,16 @@ class IndexBuildTests(unittest.TestCase):
         self.assertEqual(
             self.idx.sync(os.path.join(self.fx.slug, "gone.jsonl")),
             "missing")
-        link = os.path.join(self.fx.slug, "link.jsonl")
-        if hasattr(os, "symlink"):
-            if symlink_or_skip(self, self.fx.file, link):
-                self.assertEqual(self.idx.sync(link), "skip")
+        # The skip is decided by the entry's type, so a candidate the
+        # filesystem reports as an alias is skipped while the same file
+        # under its own name is indexed.
+        alias = os.path.join(self.fx.slug, "alias.jsonl")
+        self.fx.write([])
+        shutil.copyfile(self.fx.file, alias)
+        self.assertEqual(self.idx.sync(alias), "ok")
+        with mock.patch.object(pi_transcript.os.path, "islink",
+                               side_effect=lambda path: path == alias):
+            self.assertEqual(self.idx.sync(alias), "skip")
 
 
 class IndexReaderTests(unittest.TestCase):
@@ -404,14 +394,25 @@ class ReaderTests(unittest.TestCase):
         outside = os.path.join(os.path.dirname(self.fx.root), "x.jsonl")
         self.assertFalse(self.idx.owns(outside))
 
-    def test_owns_rejects_a_symlinked_ancestor(self):
+    def test_owns_refuses_a_candidate_canonicalized_outside_the_store(self):
+        # Containment is decided on the canonical path, never on the
+        # spelling the request carried into the store.
         outside = tempfile.mkdtemp(dir=isolation.host_scratch())
         self.addCleanup(shutil.rmtree, outside, True)
-        open(os.path.join(outside, "secret.jsonl"), "w").close()
-        link = os.path.join(self.fx.root, "linkdir")
-        if not symlink_or_skip(self, outside, link):
-            return
-        self.assertFalse(self.idx.owns(os.path.join(link, "secret.jsonl")))
+        outside_file = os.path.join(outside, "secret.jsonl")
+        open(outside_file, "w").close()
+        candidate = os.path.join(self.fx.slug, "sess-1.jsonl")
+        self.assertTrue(self.idx.owns(candidate))
+        real = os.path.realpath
+
+        def resolve(path):
+            if os.path.abspath(path) == candidate:
+                return outside_file
+            return real(path)
+
+        with mock.patch.object(pi_transcript.os.path, "realpath",
+                               side_effect=resolve):
+            self.assertFalse(self.idx.owns(candidate))
 
     def test_body_read_after_replacement_is_refused(self):
         other = os.path.join(self.fx.slug, "other.jsonl")
