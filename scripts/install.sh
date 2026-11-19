@@ -17,7 +17,7 @@ set -euo pipefail
 
 usage() {
   echo "install: pi-daemon installs as a pi package:" >&2
-  echo "  pi install git:github.com/ederevx/pi-daemon@<tag>" >&2
+  echo "  pi install git:github.com/ederevx/pi-daemon" >&2
   echo "  bash scripts/install.sh --package refreshes the service files." >&2
   exit 2
 }

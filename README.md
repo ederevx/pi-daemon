@@ -30,14 +30,15 @@ reattachment, background command tickets, and transcript retrieval.
 
 ## Install
 
-### As a pi package
-
 The package is the only install: it loads the extensions from its own
 clone, and a bare `bash scripts/install.sh` writes nothing.
 
 ```bash
-pi install git:github.com/ederevx/pi-daemon@v2.9.59
+pi install git:github.com/ederevx/pi-daemon
 ```
+
+Unpinned, it follows the default branch on `pi update --extensions`; append
+`@<tag>` to pin a release tag, and install another tag to move the pin.
 
 `npm install` runs `scripts/postinstall.mjs` on a fresh install, and the
 package's `provision` extension reconciles on every session start: when
@@ -46,7 +47,7 @@ recorded (an edited module, or an added or removed one) it re-runs
 `scripts/install.sh --package` in the background. Together they provision
 the systemd user unit, the public launchers (`pi-daemon`, `pi-rc`,
 `pi-comms`, `pi-daemon-migrate`, `pi`), and one release directory.
-pi skips `npm install` when an updated pin resolves to the commit already
+pi skips `npm install` when a new ref resolves to the commit already
 checked out, so the session-start reconciliation is what applies such an
 update. Provisioning removes extension copies a prior install owned
 so only one loader source remains; if a leftover copy aborts sessions with
@@ -153,8 +154,8 @@ pi remove git:github.com/ederevx/pi-daemon
 bash scripts/uninstall.sh
 ```
 
-Remove the pin first: with the manifest gone and the package still
-pinned, the next session start sees a stale clone and provisions again.
+Remove the package first: while `settings.json` still lists it, the next
+session start finds the clone without its manifest and provisions again.
 
 ## Layout
 

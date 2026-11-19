@@ -834,7 +834,7 @@ session issuing it (see Cutover for the `systemd-run --user` invocation
 and the environment it needs).
 
 1. Publish the release and let it prove the lock exit. `pi install
-git:github.com:ederevx/pi-daemon@<tag>` starts nothing here: the unit is
+git:github.com/ederevx/pi-daemon@<tag>` starts nothing here: the unit is
 re-rendered and reloaded, its next attempt runs the new release, exits
 3 on the held lock and stays failed, so `SubState` reads `failed` and
 `NRestarts` stops growing instead of the unit restarting every two
@@ -912,13 +912,15 @@ written:
 
 1. `systemctl --user stop pi-daemon.service`, from outside the unit's
    cgroup when a hosted session is asking (see Cutover: `systemd-run`).
-2. `pi install git:github.com/ederevx/pi-daemon@<the tag the running
+2. `pi install git:github.com/ederevx/pi-daemon@<the ref the running
    install came from>`: its postinstall restores the previous
-   `pi-daemon` launcher and unit. The target is the tag `settings.json`
-   named before the cutover, not the previous tag by number: a host can
-   run a tag the release list has moved past, and rolling back below it
-   would drop whatever that tag carried. Record it before the cutover,
-   because the entry then names the new one.
+   `pi-daemon` launcher and unit. The target is the ref recorded before
+   the cutover, not the previous tag by number: a host can run a tag the
+   release list has moved past, and rolling back below it would drop
+   whatever that tag carried. Record it before the cutover, because the
+   install moves it: the tag a pinned `settings.json` entry names, or for
+   an unpinned entry the clone's commit (`git -C
+   ~/.pi/agent/git/github.com/ederevx/pi-daemon rev-parse HEAD`).
 3. `rm -f ~/.local/bin/pi-comms ~/.local/bin/pi-daemon-migrate
    ~/.local/bin/pi-daemon-migrate.cmd ~/.local/bin/pi_rpc_client.py`: the
    previous release's manifest does not own them, so its `uninstall.sh`
