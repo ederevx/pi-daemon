@@ -693,6 +693,70 @@ test("acknowledgements: one service call per mailbox, each in its own", async ()
 	});
 });
 
+test("acknowledgements: the acknowledgement runs as the mailbox's own agent", async () => {
+	const spec = scripted({
+		send: [{ stdout: { status: "accepted" } }],
+		ack: [{ stdout: { status: "ok", acknowledged: [], unknown: ["m1"] } }],
+	});
+	// The session resolves an identity other than the mailbox the mail was
+	// kept in — a host resumed under another name. The service must be asked
+	// about the mailbox that kept the mail, or its silence proves nothing.
+	await withEnv(spec.script({ PI_COMMS_AGENT_ID: "pi-other" }), async () => {
+		const pi = new FakePi();
+		const { ledger } = harness(pi);
+		receiveAt(pi, ledger, "m1", "n1");
+		const report = await ledger.acknowledge(["m1"], {}, undefined, pi.ctx());
+		assertEq(report.lapsed.join(","), "m1", "settled locally");
+		assertEq(ledger.owing(), false, "the gate opened");
+		const acknowledgements = recorded(spec.env.STUB_LOG)
+			.filter((line) => line.some((arg) => arg === "ack"));
+		assertEq(acknowledgements.length, 1, "one service call");
+		const at = acknowledgements[0].indexOf("--agent");
+		assertEq(acknowledgements[0].slice(at, at + 2).join(" "),
+			"--agent pi-test",
+			"the call named the mailbox that kept the mail, not this session");
+	});
+});
+
+test("acknowledgements: a settlement finishing after the branch switched settles nothing", async () => {
+	const spec = scripted({
+		send: [{ stdout: { status: "accepted" } }],
+		ack: [{ stdout: { status: "ok", acknowledged: [], unknown: ["m1"] } }],
+	});
+	await withEnv(spec.script({ STUB_DELAY: "0.2" }), async () => {
+		const pi = new FakePi();
+		const { ledger } = harness(pi);
+		receiveAt(pi, ledger, "m1", "n1");
+
+		// A branch this turn never saw holds an obligation with that same id.
+		const other = new FakePi();
+		other.appendEntry(COMMS_ACK_STATE, {
+			messageId: "m1",
+			toAgentId: "pi-test",
+			toNodeId: "n1",
+			from: { agentId: "ann" },
+			kind: "message",
+			sequence: 1,
+			replyRequestId: "rr-other",
+			acknowledged: false,
+		});
+
+		const inFlight = ledger.acknowledge(["m1"], {}, undefined, pi.ctx());
+		ledger.attach(other.ctx());
+		const report = await inFlight;
+		assertEq(report.lapsed.join(","), "",
+			"nothing settled against the branch that left");
+		assertEq(report.serviceAckFailed.join(","), "m1",
+			"the settlement was reported as unfinished");
+		assertEq(ledger.owing(), true, "the attached branch still owes m1");
+		const marked = other.session.entries
+			.filter((entry) => entry.customType === COMMS_ACK_STATE)
+			.map((entry) => entry.data as Record<string, unknown>)
+			.filter((data) => data.acknowledged === true);
+		assertEq(marked.length, 0, "no completion was written on that branch");
+	});
+});
+
 test("acknowledgements: the pending set is rebuilt from the session's own entries", () => {
 	const pi = new FakePi();
 	const { ledger } = harness(pi);

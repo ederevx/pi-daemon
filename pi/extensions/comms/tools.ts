@@ -200,8 +200,10 @@ export class CommsTools {
 				"id is first answered with one acknowledgement reply to its " +
 				"sender, sent best-effort: a reply that cannot be delivered is " +
 				"reported, but does not hold the gate. The acknowledgement gate " +
-				"opens only once the service acknowledgement of every delivered " +
-				"id is recorded.",
+				"opens once the service acknowledgement of every delivered id is " +
+				"recorded, or once the mailbox that kept an id no longer holds it " +
+				"and this session's own record proves it received the mail there " +
+				"— a lapsed acknowledgement, reported separately.",
 			parameters: Type.Object({
 				messageIds: Type.Array(Type.String(), {
 					minItems: 1,

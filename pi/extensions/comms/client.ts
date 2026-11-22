@@ -38,13 +38,18 @@ export class CommsCli {
 		private readonly env: NodeJS.ProcessEnv = process.env,
 	) {}
 
-	/** One command; `timeoutMs` bounds the whole child, not the hold. */
+	/** One command; `timeoutMs` bounds the whole child, not the hold. An
+	 *  explicit `agent` runs the call as that mailbox instead of this
+	 *  session's own identity: an acknowledgement settles mail kept for the
+	 *  agent it was addressed to, and the service answers for the mailbox
+	 *  the call names. */
 	async run(
 		command: string,
 		argv: string[],
 		options: ExecOptions = {},
+		agent?: string,
 	): Promise<CommsOutcome> {
-		const argvWithAgent = this.withAgent(argv, this.identity());
+		const argvWithAgent = this.withAgent(argv, agent || this.identity());
 		const binary = this.binary();
 		if (!existsSync(binary)) {
 			return {

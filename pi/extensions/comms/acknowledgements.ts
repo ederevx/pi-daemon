@@ -97,8 +97,19 @@ export interface AckReport {
 	serviceAckFailed: string[];
 }
 
+/** One mailbox's share of an acknowledgement turn: the agent whose mail is
+ *  kept there, the node it is kept on, and the ids that arrived in it. */
+interface MailboxGroup {
+	agent: string;
+	node: string;
+	records: PendingRecord[];
+}
+
 export class CommsAcknowledgements {
 	private readonly pendingMap = new Map<string, PendingRecord>();
+	/** Bumped by every `attach`: an acknowledgement turn that started on an
+	 *  earlier mapping may not settle anything in this one. */
+	private generation = 0;
 
 	constructor(
 		private readonly cli: CommsCli,
@@ -115,6 +126,7 @@ export class CommsAcknowledgements {
 			| Array<Record<string, unknown>>
 			| undefined;
 		if (!Array.isArray(entries)) return;
+		this.generation += 1;
 		this.pendingMap.clear();
 		for (const entry of entries) {
 			if (!entry || entry.type !== "custom"
@@ -261,6 +273,7 @@ export class CommsAcknowledgements {
 		signal?: AbortSignal,
 		ctx?: ExtensionContext,
 	): Promise<AckReport> {
+		const generation = this.generation;
 		const ids = messageIds.map(String);
 		const report: AckReport = {
 			acknowledged: [],
@@ -270,7 +283,7 @@ export class CommsAcknowledgements {
 			replyFailed: [],
 			serviceAckFailed: [],
 		};
-		const mailboxes = new Map<string, PendingRecord[]>();
+		const mailboxes = new Map<string, MailboxGroup>();
 		for (const id of ids) {
 			const record = this.pendingMap.get(id);
 			if (!record) {
@@ -278,13 +291,21 @@ export class CommsAcknowledgements {
 				continue;
 			}
 			await this.answer(record, report, signal);
-			const mailbox = params.node ?? record.toNodeId;
-			const group = mailboxes.get(mailbox) ?? [];
-			group.push(record);
-			mailboxes.set(mailbox, group);
+			// A marker records only where the mail was kept: the agent it was
+			// addressed to on the node it arrived at. One call per mailbox,
+			// never one per caller.
+			const agent = record.toAgentId;
+			const node = params.node ?? record.toNodeId;
+			const key = `${agent}\u0000${node}`;
+			const group = mailboxes.get(key) ?? { agent, node, records: [] };
+			group.records.push(record);
+			mailboxes.set(key, group);
 		}
-		for (const [mailbox, records] of mailboxes) {
-			await this.settle(records, mailbox, ctx, report, signal);
+		for (const group of mailboxes.values()) {
+			await this.settle(
+				group.records, group.node, group.agent, ctx, report, signal,
+				generation,
+			);
 		}
 		return report;
 	}
@@ -313,21 +334,24 @@ export class CommsAcknowledgements {
 	}
 
 	/** The service acknowledgement of one mailbox's records: a recorded
-	 *  marker settles the id, and an id the mailbox no longer holds settles
-	 *  as lapsed when the branch proves it received it there. Anything else
+	 *  marker settles the id, and an id that mailbox no longer holds settles
+	 *  as lapsed when this branch proves it received it there. Anything else
 	 *  stays owed. */
 	private async settle(
 		records: PendingRecord[],
 		mailbox: string,
+		mailboxAgent: string,
 		ctx: ExtensionContext | undefined,
 		report: AckReport,
 		signal?: AbortSignal,
+		generation = this.generation,
 	): Promise<void> {
 		const ids = records.map((record) => record.messageId);
 		const outcome = await this.cli.run(
 			"ack",
 			CommsArgv.ack({ messageIds: ids, node: mailbox || undefined }),
 			{ signal },
+			mailboxAgent,
 		);
 		const answer = outcome.answer as
 			| { acknowledged?: unknown; alreadyAcknowledged?: unknown;
@@ -346,7 +370,7 @@ export class CommsAcknowledgements {
 		for (const record of records) {
 			const id = record.messageId;
 			if (settled.includes(id)) {
-				if (this.complete(id, "service")) {
+				if (this.complete(id, "service", generation)) {
 					report.acknowledged.push(id);
 				} else {
 					// The gate stays: the durable completion is its opening,
@@ -354,10 +378,10 @@ export class CommsAcknowledgements {
 					report.serviceAckFailed.push(id);
 				}
 			} else if (unsettled.includes(id)
-				&& this.lapsed(record, mailbox, ctx)) {
+				&& this.lapsed(record, mailbox, mailboxAgent, ctx)) {
 				// The mailbox holds no record of mail this branch received
 				// there; the reply already answered its sender.
-				if (this.complete(id, "lapsed")) {
+				if (this.complete(id, "lapsed", generation)) {
 					report.lapsed.push(id);
 				} else {
 					report.serviceAckFailed.push(id);
@@ -448,7 +472,16 @@ export class CommsAcknowledgements {
 	 *  the gate's opening. The completed snapshot is appended before the
 	 *  live record is marked, so a failed append leaves the obligation owed
 	 *  and reported. */
-	private complete(id: string, settlement: "service" | "lapsed"): boolean {
+	private complete(
+		id: string,
+		settlement: "service" | "lapsed",
+		generation = this.generation,
+	): boolean {
+		// The branch this turn started on may be gone: an attach rebuilt the
+		// map, and a record that shares this id belongs to a branch that
+		// never saw this turn's mail. Settling it here would claim an
+		// obligation as carried out that was never asked.
+		if (generation !== this.generation) return false;
 		const record = this.pendingMap.get(id);
 		if (!record) return false;
 		if (!this.persist({ ...record, acknowledged: true, settlement })) {
@@ -461,15 +494,18 @@ export class CommsAcknowledgements {
 	}
 
 	/** Whether an id the ledger holds is proven delivered to the mailbox
-	 *  whose service no longer recognizes it: the branch recorded the
-	 *  envelope, addressed to that same mailbox, that armed the record. A
-	 *  caller's own choice of node proves nothing. */
+	 *  whose service no longer recognizes it: the call ran as that mailbox's
+	 *  own agent, and the branch recorded the envelope, addressed to that
+	 *  same mailbox, that armed the record. A caller's own choice of node
+	 *  proves nothing, and neither does another agent's silence. */
 	private lapsed(
 		record: PendingRecord,
 		mailbox: string,
+		mailboxAgent: string,
 		ctx: ExtensionContext | undefined,
 	): boolean {
-		if (!record.toAgentId || mailbox !== record.toNodeId) return false;
+		if (!record.toAgentId || mailboxAgent !== record.toAgentId
+			|| mailbox !== record.toNodeId) return false;
 		const to = { agentId: record.toAgentId, nodeId: record.toNodeId };
 		return CommsMessageLog.receivedEntries(ctx).some((entry) =>
 			entry.messageId === record.messageId
