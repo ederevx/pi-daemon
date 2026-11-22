@@ -547,7 +547,8 @@ export class CommsAcknowledgements {
 
 	private static reported(report: AckReport, id: string): boolean {
 		return report.acknowledged.includes(id) || report.lapsed.includes(id)
-			|| report.unknown.includes(id);
+			|| report.unknown.includes(id)
+			|| report.serviceAckFailed.includes(id);
 	}
 
 	private static sameAddress(value: unknown, address: CommsAddress): boolean {

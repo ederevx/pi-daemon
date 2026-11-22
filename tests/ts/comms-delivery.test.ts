@@ -765,6 +765,54 @@ test("acknowledgements: a turn that outlives its branch writes nothing into the 
 	});
 });
 
+test("acknowledgements: a switch during the service call reports one failure", async () => {
+	// The service call is held long enough for the branch to change under
+	// the turn that is waiting on it.
+	const spec = scripted({
+		send: [{ stdout: { status: "accepted" } }],
+		ack: [{ stdout: { status: "ok", acknowledged: ["m1"], unknown: [] } }],
+	});
+	await withEnv(spec.script({ STUB_DELAY: "0.25" }), async () => {
+		const pi = new FakePi();
+		const { ledger } = harness(pi);
+		receiveAt(pi, ledger, "m1", "n1");
+
+		const other = new FakePi();
+		other.appendEntry(COMMS_ACK_STATE, {
+			messageId: "m1",
+			toAgentId: "pi-test",
+			toNodeId: "n1",
+			from: { agentId: "ann" },
+			kind: "message",
+			sequence: 1,
+			replyRequestId: "rr-other",
+			acknowledged: false,
+		});
+
+		const inFlight = ledger.acknowledge(["m1"], {}, undefined, pi.ctx());
+		// The reply settles first; the switch lands while the service call
+		// that follows it is still pending.
+		const replied = () => pi.session.entries.some((entry) =>
+			entry.customType === COMMS_ACK_STATE
+			&& (entry.data as Record<string, unknown>).replySent === true);
+		for (let waited = 0; waited < 200 && !replied(); waited++) {
+			await sleep(5);
+		}
+		assert(replied(), "the reply finished before the switch");
+		ledger.attach(other.ctx());
+		const afterSwitch = pi.session.entries.length;
+		const report = await inFlight;
+
+		assertEq(report.serviceAckFailed.join(","), "m1",
+			"one unfinished settlement, named once");
+		assertEq(report.acknowledged.join(","), "",
+			"nothing was settled against the branch that left");
+		assertEq(ledger.owing(), true, "the attached branch still owes m1");
+		assertEq(pi.session.entries.slice(afterSwitch).length, 0,
+			"the stale turn wrote nothing into the branch it outlived");
+	});
+});
+
 test("acknowledgements: the pending set is rebuilt from the session's own entries", () => {
 	const pi = new FakePi();
 	const { ledger } = harness(pi);
