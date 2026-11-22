@@ -354,6 +354,20 @@ function arm(pi: FakePi, ledger: CommsAcknowledgements, id: string): void {
 	ledger.markPending(envelope(id, 1, "hello"));
 }
 
+/** One delivered envelope the branch recorded and the ledger armed, both
+ *  naming the mailbox it arrived in. */
+function receiveAt(
+	pi: FakePi,
+	ledger: CommsAcknowledgements,
+	id: string,
+	nodeId: string,
+): void {
+	const delivered = { ...envelope(id, 1, "hello"),
+		to: { agentId: "pi-test", nodeId } };
+	pi.appendEntry(COMMS_LOG, { ...delivered, direction: "received" });
+	ledger.markPending(delivered);
+}
+
 test("acknowledgements: the armed gate admits only live valid escapes", async () => {
 	const pi = new FakePi();
 	const { ledger } = harness(pi);
@@ -371,6 +385,10 @@ test("acknowledgements: the armed gate admits only live valid escapes", async ()
 	assert(blocked?.reason?.includes("comms_ack { messageIds: [\"m1\"] }"),
 		"the denial names the exact call");
 	assertEq(await answer("comms_ack"), undefined, "the ack itself runs");
+	assertEq(await answer("comms_replay"), undefined,
+		"the replay its report names runs");
+	assertEq((await answer("comms_wait"))?.block, true,
+		"the foreground hold stays blocked");
 	assertEq(await answer("pre_daemon"), undefined,
 		"the daemon's own calls run");
 
@@ -568,6 +586,110 @@ test("acknowledgements: a reply that records but the service will not keeps the 
 		assertEq(ledger.owing(), true, "the gate stays for the owed id");
 		assertEq(new Set(ledgerPendingIds(pi)).size, 1,
 			"one durable record, with its reply progress, to retry");
+	});
+});
+
+test("acknowledgements: mail the mailbox no longer holds settles as lapsed", async () => {
+	const spec = scripted({
+		send: [{ stdout: { status: "accepted" } }],
+		ack: [{ stdout: { status: "ok", acknowledged: [], unknown: ["m1"] } }],
+	});
+	await withEnv(spec.env, async () => {
+		const pi = new FakePi();
+		const { ledger } = harness(pi);
+		receiveAt(pi, ledger, "m1", "n1");
+		const report = await ledger.acknowledge(["m1"], {}, undefined, pi.ctx());
+		assertEq(report.lapsed.join(","), "m1", "settled locally");
+		assertEq(report.unknown.join(","), "", "the session received it");
+		assertEq(report.serviceAckFailed.join(","), "", "nothing held");
+		assertEq(ledger.owing(), false, "the gate opened");
+		const completion = pi.session.entries
+			.filter((entry) => entry.customType === COMMS_ACK_STATE)
+			.map((entry) => entry.data as Record<string, unknown>)
+			.find((data) => data.acknowledged === true);
+		assertEq(completion?.settlement, "lapsed",
+			"the durable record names what settled it");
+		const lines = recorded(spec.env.STUB_LOG);
+		assertEq(lines.length, 2, "one reply, one service acknowledgement");
+		assert(lines[1].includes("--at=n1"),
+			"the acknowledgement ran in the mailbox the mail arrived in");
+		const again = await ledger.acknowledge(["m1"], {}, undefined, pi.ctx());
+		assertEq(again.lapsed.join(","), "m1",
+			"a retry reports the same settlement");
+		assertEq(recorded(spec.env.STUB_LOG).length, 3,
+			"and sends no second reply");
+		ledger.attach(pi.ctx());
+		assertEq(ledger.owing(), false, "a reload keeps it settled");
+	});
+});
+
+test("acknowledgements: an unproven id never settles on a mailbox's silence", async () => {
+	const spec = scripted({
+		send: [{ stdout: { status: "accepted" } }],
+		ack: [{ stdout: { status: "ok", acknowledged: [], unknown: ["m1"] } }],
+	});
+	await withEnv(spec.env, async () => {
+		// Nothing in the branch says this session ever received m1.
+		const plain = new FakePi();
+		const first = harness(plain);
+		arm(plain, first.ledger, "m1");
+		const unproven = await first.ledger.acknowledge(
+			["m1"], {}, undefined, plain.ctx());
+		assertEq(unproven.lapsed.join(","), "", "no record, no settlement");
+		assertEq(first.ledger.owing(), true, "the gate stays");
+
+		// The receipt is real, but the caller asked another mailbox.
+		const elsewhere = new FakePi();
+		const second = harness(elsewhere);
+		receiveAt(elsewhere, second.ledger, "m1", "n1");
+		const conflicted = await second.ledger.acknowledge(
+			["m1"], { node: "n2" }, undefined, elsewhere.ctx());
+		assertEq(conflicted.lapsed.join(","), "",
+			"a caller's own node proves nothing");
+		assertEq(second.ledger.owing(), true, "the gate stays");
+
+		// The receipt sits on a sibling branch, which this one never saw.
+		const sibling = new FakePi();
+		const third = harness(sibling);
+		receiveAt(sibling, third.ledger, "m1", "n1");
+		const ctx = sibling.ctx();
+		const ownBranch = { sessionManager: {
+			getEntries: ctx.sessionManager.getEntries,
+			getBranch: () => [],
+		} };
+		const branched = await third.ledger.acknowledge(
+			["m1"], {}, undefined, ownBranch as never);
+		assertEq(branched.lapsed.join(","), "",
+			"another branch's receipt is not this one's");
+		assertEq(third.ledger.owing(), true, "the gate stays");
+	});
+});
+
+test("acknowledgements: one service call per mailbox, each in its own", async () => {
+	const spec = scripted({
+		send: [{ stdout: { status: "accepted" } }],
+		ack: [
+			{ stdout: { status: "ok", acknowledged: ["m1"], unknown: [] } },
+			{ stdout: { status: "ok", acknowledged: [], unknown: ["m2"] } },
+		],
+	});
+	await withEnv(spec.env, async () => {
+		const pi = new FakePi();
+		const { ledger } = harness(pi);
+		receiveAt(pi, ledger, "m1", "n1");
+		receiveAt(pi, ledger, "m2", "n2");
+		const report = await ledger.acknowledge(
+			["m1", "m2"], {}, undefined, pi.ctx());
+		assertEq(report.acknowledged.join(","), "m1", "the marked one settled");
+		assertEq(report.lapsed.join(","), "m2", "the dropped one lapsed");
+		assertEq(ledger.owing(), false, "both settled");
+		const acknowledgements = recorded(spec.env.STUB_LOG)
+			.filter((line) => line.some((arg) => arg === "ack"));
+		assertEq(acknowledgements.length, 2, "one call per mailbox");
+		assertEq(acknowledgements[0].slice(-3).join(" "), "--at=n1 ack m1",
+			"the first mailbox got only its own id");
+		assertEq(acknowledgements[1].slice(-3).join(" "), "--at=n2 ack m2",
+			"and the second its own");
 	});
 });
 
@@ -1084,5 +1206,29 @@ test("delivery: concurrent mailbox leases serialize, and a cancel frees only its
 		await sleep(900);
 		assertEq(delivery.active(), false, "the resumed receiver stopped itself");
 		await delivery.stop();
+	});
+});
+
+test("acknowledgements: the tool reports a lapsed settlement as settled", async () => {
+	const spec = scripted({
+		send: [{ stdout: { status: "accepted" } }],
+		ack: [{ stdout: { status: "ok", acknowledged: [], unknown: ["m1"] } }],
+	});
+	await withEnv(spec.env, async () => {
+		const pi = new FakePi();
+		const { delivery, ledger } = harness(pi);
+		new CommsTools(
+			new CommsCli(new ProcessRunner(execProcess)),
+			new CommsMessageLog(pi as never),
+			{ delivery, acks: ledger, waitUpdateMs: 100 } as never,
+		).register(pi as never);
+		receiveAt(pi, ledger, "m1", "n1");
+		const result = await pi.tools.get("comms_ack")?.execute(
+			"call1", { messageIds: ["m1"] }, undefined, undefined,
+			{ cwd: scratchDir(), ...pi.ctx() });
+		assertEq(result?.isError, false, "a lapsed id is settled, not an error");
+		assert(String(result?.content[0].text).includes(
+			"no longer recognizes: m1"), "and the report says what settled it");
+		assertEq(ledger.owing(), false, "the gate opened");
 	});
 });

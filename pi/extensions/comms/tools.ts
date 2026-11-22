@@ -500,15 +500,16 @@ export class CommsTools {
 	private async ack(
 		params: CommsAckParams,
 		signal: AbortSignal | undefined,
-		_ctx: ExtensionToolContext | undefined,
+		ctx: ExtensionToolContext | undefined,
 	): Promise<CommsToolResult> {
 		const acks = this.options.acks;
 		if (acks) {
 			this.options.delivery?.clearLatch();
 			const report = await acks.acknowledge(
-				params.messageIds, { node: params.node }, signal);
+				params.messageIds, { node: params.node }, signal, ctx);
 			const settled = report.acknowledged.length
-				+ report.alreadyAcknowledged.length > 0;
+				+ report.alreadyAcknowledged.length
+				+ report.lapsed.length > 0;
 			const text = CommsTools.ackText(report);
 			return {
 				content: [{ type: "text", text }],
@@ -527,6 +528,7 @@ export class CommsTools {
 	private static ackText(report: {
 		acknowledged: string[];
 		alreadyAcknowledged: string[];
+		lapsed: string[];
 		unknown: string[];
 		replyFailed: string[];
 		serviceAckFailed: string[];
@@ -538,6 +540,10 @@ export class CommsTools {
 		if (report.alreadyAcknowledged.length) {
 			lines.push(`Already acknowledged: ` +
 				report.alreadyAcknowledged.join(", "));
+		}
+		if (report.lapsed.length) {
+			lines.push(`Acknowledged locally; the mailbox no longer ` +
+				`recognizes: ${report.lapsed.join(", ")}`);
 		}
 		if (report.unknown.length) {
 			lines.push(`Not received here — replay first, then acknowledge: ` +

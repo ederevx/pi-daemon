@@ -8,15 +8,20 @@
  * persisted request id so a lost reply never duplicates mail, and a
  * reply that cannot be delivered is reported but never holds the
  * obligation — the gate opens once the service acknowledgement of each
- * delivered id is recorded. Until then, one `tool_call` gate blocks
- * every tool except `comms_ack` itself, `pre_daemon`, and any tool
- * another extension declares as its own prerequisite's escape (see
+ * delivered id is recorded. A delivered id the mailbox no longer holds
+ * settles as lapsed instead, but only for a branch that recorded the
+ * envelope, addressed to that same mailbox, its record was armed from:
+ * the gate never opens for an id this session cannot show it received.
+ * Until then, one `tool_call` gate blocks every tool except `comms_ack`
+ * and `comms_replay` — the call the ack's own report names for an id
+ * this session never received — `pre_daemon`, and any tool another
+ * extension declares as its own prerequisite's escape (see
  * guards/tool-gate-escapes.ts) — the fail-closed shape pi-consult's
- * implementation gate uses. The reply's
- * request id is generated and persisted before the send, so a lost
- * reply never produces a duplicate acknowledgement message; the resend
- * reclaims the same send receipt — and since the reply holds nothing,
- * a later comms_ack may retry it at any time.
+ * implementation gate uses. The reply's request id is generated and
+ * persisted before the send, so a lost reply never produces a duplicate
+ * acknowledgement message; the resend reclaims the same send receipt —
+ * and since the reply holds nothing, a later comms_ack may retry it at
+ * any time.
  */
 
 import { randomUUID } from "node:crypto";
@@ -63,6 +68,9 @@ interface PendingRecord {
 	replySent?: boolean;
 	/** The service acknowledgement of the original was recorded. */
 	acknowledged?: boolean;
+	/** What settled it: a recorded service marker, or a mailbox that no
+	 *  longer holds what the branch received there. */
+	settlement?: "service" | "lapsed";
 	/** The model was shown the message (steered or tool result). */
 	presented?: boolean;
 	/** Whether the durable append of this record itself succeeded. */
@@ -76,6 +84,9 @@ export interface AckReport {
 	/** Ids the service already had markers for; their reply, if not yet
 	 *  sent, still ran here. */
 	alreadyAcknowledged: string[];
+	/** Ids settled locally because the mailbox no longer holds mail this
+	 *  branch received there. */
+	lapsed: string[];
 	/** Ids this session never received — replay first, never just ack. */
 	unknown: string[];
 	/** Ids the reply of which the branch could not credit; reported, they
@@ -229,7 +240,8 @@ export class CommsAcknowledgements {
 	private decide(event: ToolCallEvent): ToolCallEventResult | undefined {
 		if (!this.owing()) return undefined;
 		const name = String(event.toolName ?? "");
-		if (name === "comms_ack" || name === "pre_daemon") return undefined;
+		if (name === "comms_ack" || name === "comms_replay"
+			|| name === "pre_daemon") return undefined;
 		if (ToolGateEscapes.admits(this.pi, name)) return undefined;
 		return {
 			block: true,
@@ -238,54 +250,83 @@ export class CommsAcknowledgements {
 		};
 	}
 
-	/** One acknowledgement turn, per id: the reply, best-effort and only
-	 *  reported, then the service acknowledgement of every id the ledger
-	 *  holds — the reply never holds an id back, and the recording opens
-	 *  the gate. A retry resumes where it stopped. */
+	/** One acknowledgement turn: every id's reply first, best-effort and
+	 *  only reported, then the service acknowledgement of the mailbox each
+	 *  id arrived in — one call per mailbox, since a marker records only
+	 *  where the mail was kept. The reply never holds an id back. A retry
+	 *  resumes where it stopped. */
 	async acknowledge(
 		messageIds: string[],
 		params: { node?: string },
 		signal?: AbortSignal,
+		ctx?: ExtensionContext,
 	): Promise<AckReport> {
 		const ids = messageIds.map(String);
 		const report: AckReport = {
 			acknowledged: [],
 			alreadyAcknowledged: [],
+			lapsed: [],
 			unknown: [],
 			replyFailed: [],
 			serviceAckFailed: [],
 		};
-		const known: string[] = [];
+		const mailboxes = new Map<string, PendingRecord[]>();
 		for (const id of ids) {
 			const record = this.pendingMap.get(id);
 			if (!record) {
 				report.unknown.push(id);
 				continue;
 			}
-			// The reply only goes out on a durably armed obligation: the
-			// persist retries here, since nothing else redelivers mail the
-			// branch already holds; a still nondurable record cannot give
-			// the reply its request id. A reply that cannot be delivered
-			// is reported — it never holds the id out of the service
-			// acknowledgement, whose recording is what opens the gate.
-			if (!record.durable) record.durable = this.persist(record);
-			if (record.replySent ||
-				(record.durable && await this.sendReply(record, signal))) {
-				// The reply's traffic entry repairs itself from the record:
-				// a progress append that survived without its log entry is
-				// rewritten, so the branch never claims a reply it cannot
-				// show.
-				if (!this.repairReply(record)) report.replyFailed.push(id);
-			} else {
-				report.replyFailed.push(id);
-			}
-			known.push(id);
+			await this.answer(record, report, signal);
+			const mailbox = params.node ?? record.toNodeId;
+			const group = mailboxes.get(mailbox) ?? [];
+			group.push(record);
+			mailboxes.set(mailbox, group);
 		}
-		if (known.length === 0) return report;
-		const mailbox = params.node ?? this.readyMailbox(known);
+		for (const [mailbox, records] of mailboxes) {
+			await this.settle(records, mailbox, ctx, report, signal);
+		}
+		return report;
+	}
+
+	/** Answer one delivered id's sender, once. The reply only goes out on a
+	 *  durably armed obligation: the persist retries here, since nothing
+	 *  else redelivers mail the branch already holds, and a still nondurable
+	 *  record cannot give the reply its request id. A reply that cannot be
+	 *  delivered is reported; it never holds the id out of the settlement. */
+	private async answer(
+		record: PendingRecord,
+		report: AckReport,
+		signal?: AbortSignal,
+	): Promise<void> {
+		const id = record.messageId;
+		if (!record.durable) record.durable = this.persist(record);
+		if (record.replySent ||
+			(record.durable && await this.sendReply(record, signal))) {
+			// The reply's traffic entry repairs itself from the record: a
+			// progress append that survived without its log entry is
+			// rewritten, so the branch never claims a reply it cannot show.
+			if (!this.repairReply(record)) report.replyFailed.push(id);
+		} else {
+			report.replyFailed.push(id);
+		}
+	}
+
+	/** The service acknowledgement of one mailbox's records: a recorded
+	 *  marker settles the id, and an id the mailbox no longer holds settles
+	 *  as lapsed when the branch proves it received it there. Anything else
+	 *  stays owed. */
+	private async settle(
+		records: PendingRecord[],
+		mailbox: string,
+		ctx: ExtensionContext | undefined,
+		report: AckReport,
+		signal?: AbortSignal,
+	): Promise<void> {
+		const ids = records.map((record) => record.messageId);
 		const outcome = await this.cli.run(
 			"ack",
-			CommsArgv.ack({ messageIds: known, node: mailbox }),
+			CommsArgv.ack({ messageIds: ids, node: mailbox || undefined }),
 			{ signal },
 		);
 		const answer = outcome.answer as
@@ -294,29 +335,37 @@ export class CommsAcknowledgements {
 			| undefined;
 		if (outcome.exitCode !== CommsExit.OK || !answer) {
 			// The reply may have gone out, but the service markers did not
-			// record. The gate stays for these ids and the next call
-			// retries the ack.
-			for (const id of known) report.serviceAckFailed.push(id);
-			return report;
+			// record. The gate stays for these ids and the next call retries
+			// the ack.
+			report.serviceAckFailed.push(...ids);
+			return;
 		}
 		const settled = CommsAcknowledgements.strings(answer.acknowledged)
 			.concat(CommsAcknowledgements.strings(answer.alreadyAcknowledged));
 		const unsettled = CommsAcknowledgements.strings(answer.unknown);
-		for (const id of known) {
+		for (const record of records) {
+			const id = record.messageId;
 			if (settled.includes(id)) {
-				if (this.complete(id)) {
+				if (this.complete(id, "service")) {
 					report.acknowledged.push(id);
 				} else {
 					// The gate stays: the durable completion is its opening,
 					// and the next comms_ack retries it.
 					report.serviceAckFailed.push(id);
 				}
+			} else if (unsettled.includes(id)
+				&& this.lapsed(record, mailbox, ctx)) {
+				// The mailbox holds no record of mail this branch received
+				// there; the reply already answered its sender.
+				if (this.complete(id, "lapsed")) {
+					report.lapsed.push(id);
+				} else {
+					report.serviceAckFailed.push(id);
+				}
 			} else {
 				report.serviceAckFailed.push(id);
-				if (unsettled.includes(id)) report.unknown.push(id);
 			}
 		}
-		return report;
 	}
 
 	/** The protocol acknowledgement of an arriving reply: bookkeeping
@@ -395,30 +444,43 @@ export class CommsAcknowledgements {
 		});
 	}
 
-	/** Settle one id: the durable completion is the gate's opening. The
-	 *  completed snapshot is appended before the live record is marked,
-	 *  so a failed append leaves the obligation owed and reported. */
-	private complete(id: string): boolean {
+	/** Settle one id, naming what settled it: the durable completion is
+	 *  the gate's opening. The completed snapshot is appended before the
+	 *  live record is marked, so a failed append leaves the obligation owed
+	 *  and reported. */
+	private complete(id: string, settlement: "service" | "lapsed"): boolean {
 		const record = this.pendingMap.get(id);
 		if (!record) return false;
-		if (!this.persist({ ...record, acknowledged: true })) return false;
+		if (!this.persist({ ...record, acknowledged: true, settlement })) {
+			return false;
+		}
 		record.acknowledged = true;
+		record.settlement = settlement;
 		record.durable = true;
 		return true;
 	}
 
-	/** The mailbox the acknowledged ids belong to, when the caller named
-	 *  no node: a remote mailbox stores on the node that held it. */
-	private readyMailbox(ids: string[]): string | undefined {
-		let mailbox: string | undefined;
-		for (const id of ids) {
-			const record = this.pendingMap.get(id);
-			if (!record || !record.toNodeId) continue;
-			const node = record.toNodeId;
-			if (mailbox !== undefined && mailbox !== node) return undefined;
-			mailbox = node;
-		}
-		return mailbox;
+	/** Whether an id the ledger holds is proven delivered to the mailbox
+	 *  whose service no longer recognizes it: the branch recorded the
+	 *  envelope, addressed to that same mailbox, that armed the record. A
+	 *  caller's own choice of node proves nothing. */
+	private lapsed(
+		record: PendingRecord,
+		mailbox: string,
+		ctx: ExtensionContext | undefined,
+	): boolean {
+		if (!record.toAgentId || mailbox !== record.toNodeId) return false;
+		const to = { agentId: record.toAgentId, nodeId: record.toNodeId };
+		return CommsMessageLog.receivedEntries(ctx).some((entry) =>
+			entry.messageId === record.messageId
+				&& CommsAcknowledgements.sameAddress(entry.to, to));
+	}
+
+	private static sameAddress(value: unknown, address: CommsAddress): boolean {
+		const other = value as CommsAddress | undefined;
+		return !!other
+			&& other.agentId === address.agentId
+			&& (other.nodeId ?? "") === (address.nodeId ?? "");
 	}
 
 	/** One durable progress append; a failure keeps the in-memory state
@@ -451,6 +513,7 @@ export class CommsAcknowledgements {
 			replyRequestId: record.replyRequestId,
 			replySent: record.replySent ?? false,
 			acknowledged: record.acknowledged ?? false,
+			settlement: record.settlement,
 			presented: record.presented ?? false,
 		};
 	}
@@ -472,6 +535,10 @@ export class CommsAcknowledgements {
 				: randomUUID(),
 			replySent: data.replySent === true,
 			acknowledged: data.acknowledged === true,
+			settlement: data.settlement === "service"
+				|| data.settlement === "lapsed"
+				? data.settlement
+				: undefined,
 			presented: data.presented === true,
 			durable: true,
 		};
