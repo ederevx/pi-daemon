@@ -285,12 +285,13 @@ export class CommsAcknowledgements {
 		};
 		const mailboxes = new Map<string, MailboxGroup>();
 		for (const id of ids) {
+			if (this.stale(generation)) break;
 			const record = this.pendingMap.get(id);
 			if (!record) {
 				report.unknown.push(id);
 				continue;
 			}
-			await this.answer(record, report, signal);
+			if (!await this.answer(record, report, signal, generation)) break;
 			// A marker records only where the mail was kept: the agent it was
 			// addressed to on the node it arrived at. One call per mailbox,
 			// never one per caller.
@@ -302,10 +303,20 @@ export class CommsAcknowledgements {
 			mailboxes.set(key, group);
 		}
 		for (const group of mailboxes.values()) {
+			if (this.stale(generation)) break;
 			await this.settle(
 				group.records, group.node, group.agent, ctx, report, signal,
 				generation,
 			);
+		}
+		if (this.stale(generation)) {
+			// The branch this turn started on is gone: whatever it had not
+			// settled yet stays owed to the branch that holds it now.
+			for (const id of ids) {
+				if (!CommsAcknowledgements.reported(report, id)) {
+					report.serviceAckFailed.push(id);
+				}
+			}
 		}
 		return report;
 	}
@@ -314,16 +325,21 @@ export class CommsAcknowledgements {
 	 *  durably armed obligation: the persist retries here, since nothing
 	 *  else redelivers mail the branch already holds, and a still nondurable
 	 *  record cannot give the reply its request id. A reply that cannot be
-	 *  delivered is reported; it never holds the id out of the settlement. */
+	 *  delivered is reported; it never holds the id out of the settlement.
+	 *  False means the branch changed under the turn, which then stops
+	 *  without writing anything into the mapping that replaced it. */
 	private async answer(
 		record: PendingRecord,
 		report: AckReport,
-		signal?: AbortSignal,
-	): Promise<void> {
+		signal: AbortSignal | undefined,
+		generation: number,
+	): Promise<boolean> {
 		const id = record.messageId;
 		if (!record.durable) record.durable = this.persist(record);
-		if (record.replySent ||
-			(record.durable && await this.sendReply(record, signal))) {
+		const replied = record.replySent
+			|| (record.durable && await this.sendReply(record, signal, generation));
+		if (this.stale(generation)) return false;
+		if (replied) {
 			// The reply's traffic entry repairs itself from the record: a
 			// progress append that survived without its log entry is
 			// rewritten, so the branch never claims a reply it cannot show.
@@ -331,6 +347,7 @@ export class CommsAcknowledgements {
 		} else {
 			report.replyFailed.push(id);
 		}
+		return true;
 	}
 
 	/** The service acknowledgement of one mailbox's records: a recorded
@@ -408,6 +425,7 @@ export class CommsAcknowledgements {
 	private async sendReply(
 		record: PendingRecord,
 		signal?: AbortSignal,
+		generation = this.generation,
 	): Promise<boolean> {
 		const payload = {
 			type: ACK_TYPE,
@@ -424,7 +442,15 @@ export class CommsAcknowledgements {
 				payload,
 			}),
 			{ signal },
+			// The reply answers as the mailbox that received the mail: the
+			// turn acts as that agent throughout, not as whatever identity
+			// the session resolves now.
+			record.toAgentId || undefined,
 		);
+		// A send that outlived its branch records nothing: the request id it
+		// carried is already durable, so a retry on the original branch
+		// reclaims this same send instead of duplicating the mail.
+		if (this.stale(generation)) return false;
 		const status = (outcome.answer as { status?: string } | undefined)
 			?.status;
 		if (outcome.exitCode !== CommsExit.OK ||
@@ -510,6 +536,18 @@ export class CommsAcknowledgements {
 		return CommsMessageLog.receivedEntries(ctx).some((entry) =>
 			entry.messageId === record.messageId
 				&& CommsAcknowledgements.sameAddress(entry.to, to));
+	}
+
+	/** Whether the branch this turn started on was replaced under it by a
+	 *  reload or a session switch: such a turn settles nothing and writes
+	 *  nothing. */
+	private stale(generation: number): boolean {
+		return generation !== this.generation;
+	}
+
+	private static reported(report: AckReport, id: string): boolean {
+		return report.acknowledged.includes(id) || report.lapsed.includes(id)
+			|| report.unknown.includes(id);
 	}
 
 	private static sameAddress(value: unknown, address: CommsAddress): boolean {

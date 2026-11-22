@@ -708,17 +708,24 @@ test("acknowledgements: the acknowledgement runs as the mailbox's own agent", as
 		const report = await ledger.acknowledge(["m1"], {}, undefined, pi.ctx());
 		assertEq(report.lapsed.join(","), "m1", "settled locally");
 		assertEq(ledger.owing(), false, "the gate opened");
-		const acknowledgements = recorded(spec.env.STUB_LOG)
+		const calls = recorded(spec.env.STUB_LOG);
+		const agentOf = (line: string[]) => {
+			const at = line.indexOf("--agent");
+			return line.slice(at, at + 2).join(" ");
+		};
+		const send = calls.find((line) => line.some((arg) => arg === "send")) ?? [];
+		assertEq(agentOf(send), "--agent pi-test",
+			"the reply answered as the mailbox that received the mail");
+		const acknowledgements = calls
 			.filter((line) => line.some((arg) => arg === "ack"));
 		assertEq(acknowledgements.length, 1, "one service call");
-		const at = acknowledgements[0].indexOf("--agent");
-		assertEq(acknowledgements[0].slice(at, at + 2).join(" "),
-			"--agent pi-test",
+		assertEq(agentOf(acknowledgements[0]), "--agent pi-test",
 			"the call named the mailbox that kept the mail, not this session");
 	});
 });
 
-test("acknowledgements: a settlement finishing after the branch switched settles nothing", async () => {
+test("acknowledgements: a turn that outlives its branch writes nothing into the next", async () => {
+	// The send is held long enough for the branch to change under the turn.
 	const spec = scripted({
 		send: [{ stdout: { status: "accepted" } }],
 		ack: [{ stdout: { status: "ok", acknowledged: [], unknown: ["m1"] } }],
@@ -728,7 +735,7 @@ test("acknowledgements: a settlement finishing after the branch switched settles
 		const { ledger } = harness(pi);
 		receiveAt(pi, ledger, "m1", "n1");
 
-		// A branch this turn never saw holds an obligation with that same id.
+		// The branch this turn never saw holds an obligation with that id.
 		const other = new FakePi();
 		other.appendEntry(COMMS_ACK_STATE, {
 			messageId: "m1",
@@ -743,17 +750,18 @@ test("acknowledgements: a settlement finishing after the branch switched settles
 
 		const inFlight = ledger.acknowledge(["m1"], {}, undefined, pi.ctx());
 		ledger.attach(other.ctx());
+		const afterSwitch = pi.session.entries.length;
 		const report = await inFlight;
+
 		assertEq(report.lapsed.join(","), "",
 			"nothing settled against the branch that left");
 		assertEq(report.serviceAckFailed.join(","), "m1",
 			"the settlement was reported as unfinished");
 		assertEq(ledger.owing(), true, "the attached branch still owes m1");
-		const marked = other.session.entries
-			.filter((entry) => entry.customType === COMMS_ACK_STATE)
-			.map((entry) => entry.data as Record<string, unknown>)
-			.filter((data) => data.acknowledged === true);
-		assertEq(marked.length, 0, "no completion was written on that branch");
+		const written = pi.session.entries.slice(afterSwitch);
+		assertEq(written.length, 0,
+			"neither a reply traffic entry nor a completion reached the" +
+			" branch the turn outlived");
 	});
 });
 
