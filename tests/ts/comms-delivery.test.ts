@@ -623,20 +623,21 @@ test("acknowledgements: mail the mailbox no longer holds settles as lapsed", asy
 	});
 });
 
-test("acknowledgements: an unproven id never settles on a mailbox's silence", async () => {
+test("acknowledgements: the arm record is the receipt, and its mailbox must match", async () => {
 	const spec = scripted({
 		send: [{ stdout: { status: "accepted" } }],
 		ack: [{ stdout: { status: "ok", acknowledged: [], unknown: ["m1"] } }],
 	});
 	await withEnv(spec.env, async () => {
-		// Nothing in the branch says this session ever received m1.
+		// The record that armed the gate names the mailbox the envelope
+		// arrived in, so it is the receipt itself.
 		const plain = new FakePi();
 		const first = harness(plain);
 		arm(plain, first.ledger, "m1");
-		const unproven = await first.ledger.acknowledge(
+		const proven = await first.ledger.acknowledge(
 			["m1"], {}, undefined, plain.ctx());
-		assertEq(unproven.lapsed.join(","), "", "no record, no settlement");
-		assertEq(first.ledger.owing(), true, "the gate stays");
+		assertEq(proven.lapsed.join(","), "m1", "the arm record proves receipt");
+		assertEq(first.ledger.owing(), false, "the gate opened");
 
 		// The receipt is real, but the caller asked another mailbox.
 		const elsewhere = new FakePi();
@@ -648,20 +649,137 @@ test("acknowledgements: an unproven id never settles on a mailbox's silence", as
 			"a caller's own node proves nothing");
 		assertEq(second.ledger.owing(), true, "the gate stays");
 
-		// The receipt sits on a sibling branch, which this one never saw.
+		// A receipt on a sibling branch is not this branch's obligation.
 		const sibling = new FakePi();
 		const third = harness(sibling);
 		receiveAt(sibling, third.ledger, "m1", "n1");
-		const ctx = sibling.ctx();
 		const ownBranch = { sessionManager: {
-			getEntries: ctx.sessionManager.getEntries,
 			getBranch: () => [],
 		} };
+		third.ledger.attach(ownBranch as never);
 		const branched = await third.ledger.acknowledge(
 			["m1"], {}, undefined, ownBranch as never);
-		assertEq(branched.lapsed.join(","), "",
-			"another branch's receipt is not this one's");
-		assertEq(third.ledger.owing(), true, "the gate stays");
+		assertEq(branched.unknown.join(","), "m1",
+			"another branch's record is not this one's");
+		assertEq(third.ledger.owing(), false, "and this branch owes nothing");
+	});
+});
+
+test("acknowledgements: a release clears the gate without answering or acking", async () => {
+	const spec = scripted({ send: [], ack: [] });
+	await withEnv(spec.env, async () => {
+		const pi = new FakePi();
+		const { ledger } = harness(pi);
+		arm(pi, ledger, "m1");
+		ledger.markPending({ ...envelope("m2", 2, "two"),
+			to: { agentId: "pi-test", nodeId: "n1" } });
+		ledger.register(pi as never);
+		const answer = (name: string) => pi.fire("tool_call", { toolName: name }) as
+			Promise<{ block?: boolean; reason?: string } | undefined>;
+		assertEq((await answer("bash"))?.block, true,
+			"an ordinary tool is blocked first");
+
+		const report = ledger.release();
+		sameJson(report.released, [
+			{ messageId: "m1", replySent: false, durable: true },
+			{ messageId: "m2", replySent: false, durable: true },
+		], "every owed id is released, with its state");
+		assertEq(report.unreadable, false, "the branch itself was readable");
+		assertEq(ledger.owing(), false, "the gate opened");
+		assertEq(await answer("bash"), undefined, "ordinary work resumes");
+		assertEq(recorded(spec.env.STUB_LOG).length, 0, "no CLI ran");
+		const snapshots = pi.session.entries
+			.filter((entry) => entry.customType === COMMS_ACK_STATE)
+			.map((entry) => entry.data as Record<string, unknown>)
+			.filter((data) => data.settlement === "released");
+		assertEq(snapshots.length, 2, "each release was appended");
+		assert(snapshots.every((data) => data.acknowledged === false),
+			"and claims no service acknowledgement");
+
+		const later = await ledger.acknowledge(
+			["m1", "m2"], {}, undefined, pi.ctx());
+		assertEq(later.released.join(","), "m1,m2",
+			"a later ack reports the release instead");
+		assertEq(recorded(spec.env.STUB_LOG).length, 0,
+			"without answering or asking the service");
+		ledger.attach(pi.ctx());
+		assertEq(ledger.owing(), false, "a reload keeps the release");
+	});
+});
+
+test("acknowledgements: a release the branch refuses opens this session and is retried", async () => {
+	const pi = new FakePi();
+	const { ledger } = harness(pi);
+	arm(pi, ledger, "m1");
+	pi.failOn.add(COMMS_ACK_STATE);
+	const refused = ledger.release();
+	sameJson(refused.released,
+		[{ messageId: "m1", replySent: false, durable: false }],
+		"the refusal is reported, not hidden");
+	assertEq(ledger.owing(), false, "the live gate opens anyway");
+
+	pi.failOn.delete(COMMS_ACK_STATE);
+	const retried = ledger.release();
+	sameJson(retried.released,
+		[{ messageId: "m1", replySent: false, durable: true }],
+		"the next release retries the same id");
+	ledger.attach(pi.ctx());
+	assertEq(ledger.owing(), false, "and the durable release survives a reload");
+});
+
+test("acknowledgements: an unreadable branch fails closed, and the release clears it", async () => {
+	const pi = new FakePi();
+	const { ledger } = harness(pi);
+	arm(pi, ledger, "m1");
+	const broken = { sessionManager: {
+		getBranch: () => { throw new Error("no branch"); },
+	} };
+	ledger.attach(broken as never);
+	assertEq(ledger.owing(), false, "no obligation can be named");
+	ledger.register(pi as never);
+	const blocked = await pi.fire("tool_call", { toolName: "bash" }) as
+		{ block?: boolean; reason?: string } | undefined;
+	assertEq(blocked?.block, true, "the gate fails closed");
+	assert(blocked?.reason?.includes("/comms-release") === true,
+		"and names the way out");
+	assertEq(await pi.fire("tool_call", { toolName: "comms_ack" }), undefined,
+		"the ack itself still runs");
+
+	const report = ledger.release();
+	assertEq(report.unreadable, true, "the release says what it could not read");
+	assertEq(report.released.length, 0, "and names no id");
+	assertEq(await pi.fire("tool_call", { toolName: "bash" }), undefined,
+		"ordinary work resumes");
+	ledger.attach(pi.ctx());
+	assertEq(ledger.owing(), true,
+		"a readable branch owns its obligation again");
+});
+
+test("acknowledgements: a turn in flight cannot write over a release", async () => {
+	const spec = scripted({
+		send: [{ stdout: { status: "accepted" } }],
+		ack: [{ stdout: { status: "ok", acknowledged: ["m1"] } }],
+	});
+	await withEnv(spec.script({ STUB_DELAY: "0.2" }), async () => {
+		const pi = new FakePi();
+		const { ledger } = harness(pi);
+		receiveAt(pi, ledger, "m1", "n1");
+		const inFlight = ledger.acknowledge(["m1"], {}, undefined, pi.ctx());
+		const report = ledger.release();
+		assertEq(report.released.map((item) => item.messageId).join(","), "m1",
+			"the release names the id");
+		await inFlight;
+		assertEq(ledger.owing(), false, "the release stands");
+		const states = pi.session.entries
+			.filter((entry) => entry.customType === COMMS_ACK_STATE)
+			.map((entry) => entry.data as Record<string, unknown>);
+		assertEq(states.filter((data) => data.settlement === "service").length, 0,
+			"the stale turn recorded no service settlement");
+		const last = states.at(-1);
+		assertEq(last?.settlement, "released",
+			"the release remains the last word");
+		assertEq(last?.acknowledged, false,
+			"and still claims no service acknowledgement");
 	});
 });
 

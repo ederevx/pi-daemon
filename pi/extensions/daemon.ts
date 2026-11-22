@@ -94,6 +94,7 @@ import { spawn, spawnSync } from "node:child_process";
 import type {
 	ExecOptions,
 	ExtensionAPI,
+	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { CommsCli } from "./comms/client.ts";
@@ -1320,19 +1321,66 @@ export default function (pi: ExtensionAPI) {
 			waitUpdateMs: commsPolicy.waitUpdateMs,
 		}).register(pi);
 		commsAcks.register(pi);
-		pi.on("session_start", async (_event, ctx) => {
+		// The ledger, the traffic log, and the receiver all rebuild from the
+		// active branch, so every transition that changes it re-attaches them
+		// together and a turn may not carry one branch's state into another.
+		const attachComms = (ctx: ExtensionContext) => {
 			commsLog.attach(ctx);
 			commsAcks.attach(ctx);
 			commsDelivery.attach(ctx);
+		};
+		pi.on("session_start", async (_event, ctx) => {
+			attachComms(ctx);
 			// The launch environment may name the mailbox only after the
 			// first agent start resolved it; start is idempotent.
 			commsDelivery.start();
+		});
+		pi.on("session_tree", async (_event, ctx) => {
+			attachComms(ctx);
 		});
 		pi.on("agent_start", async () => {
 			commsDelivery.start();
 		});
 		pi.on("session_shutdown", async () => {
 			await commsDelivery.stop();
+		});
+
+		// The operator's escape from the acknowledgement gate: a slash command
+		// is not a tool call, so it runs while the gate blocks every tool. It
+		// claims no service acknowledgement for the ids it releases.
+		pi.registerCommand("comms-release", {
+			description:
+				"Release every outstanding agent-comms acknowledgement this " +
+				"session owes, opening the acknowledgement gate",
+			handler: async (args, ctx) => {
+				if (commandArgs(args).trim()) {
+					ctx.ui?.notify?.("Usage: /comms-release", "warning");
+					return;
+				}
+				const report = commsAcks.release();
+				if (!report.released.length) {
+					ctx.ui?.notify?.(
+						report.unreadable
+							? "The agent-comms branch could not be read. The gate " +
+								"was cleared, but its obligations could not be " +
+								"enumerated or durably released; they may return " +
+								"when the branch is readable."
+							: "No agent-comms acknowledgements are owed.",
+						report.unreadable ? "warning" : "info");
+					return;
+				}
+				const lines = report.released.map((item) =>
+					`${item.messageId}: reply ` +
+					`${item.replySent ? "recorded" : "not recorded"}; ` +
+					"service acknowledgement not recorded locally; release " +
+					(item.durable ? "durable" : "NOT durable"));
+				const durable = report.released.every((item) => item.durable);
+				ctx.ui?.notify?.(
+					`Released agent-comms obligations:\n${lines.join("\n")}` +
+						(durable ? "" : "\nA release the branch refused opens " +
+							"this session now but can re-arm after a reload."),
+					durable ? "info" : "warning");
+			},
 		});
 	}
 

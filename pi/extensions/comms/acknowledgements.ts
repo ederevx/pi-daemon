@@ -9,19 +9,20 @@
  * reply that cannot be delivered is reported but never holds the
  * obligation — the gate opens once the service acknowledgement of each
  * delivered id is recorded. A delivered id the mailbox no longer holds
- * settles as lapsed instead, but only for a branch that recorded the
- * envelope, addressed to that same mailbox, its record was armed from:
- * the gate never opens for an id this session cannot show it received.
- * Until then, one `tool_call` gate blocks every tool except `comms_ack`
- * and `comms_replay` — the call the ack's own report names for an id
- * this session never received — `pre_daemon`, and any tool another
- * extension declares as its own prerequisite's escape (see
- * guards/tool-gate-escapes.ts) — the fail-closed shape pi-consult's
- * implementation gate uses. The reply's request id is generated and
- * persisted before the send, so a lost reply never produces a duplicate
- * acknowledgement message; the resend reclaims the same send receipt —
- * and since the reply holds nothing, a later comms_ack may retry it at
- * any time.
+ * settles as lapsed instead, for the branch whose own arm record shows
+ * the envelope arrived in that same mailbox: the gate never opens for an
+ * id this session cannot show it received. An operator's `/comms-release`
+ * settles every remaining id as released, which opens the gate without
+ * claiming a service acknowledgement. Until then, one `tool_call` gate
+ * blocks every tool except `comms_ack` and `comms_replay` — the call the
+ * ack's own report names for an id this session never received —
+ * `pre_daemon`, and any tool another extension declares as its own
+ * prerequisite's escape (see guards/tool-gate-escapes.ts) — the
+ * fail-closed shape pi-consult's implementation gate uses. The reply's
+ * request id is generated and persisted before the send, so a lost reply
+ * never produces a duplicate acknowledgement message; the resend reclaims
+ * the same send receipt — and since the reply holds nothing, a later
+ * comms_ack may retry it at any time.
  */
 
 import { randomUUID } from "node:crypto";
@@ -66,11 +67,14 @@ interface PendingRecord {
 	replyRequestId: string;
 	/** The reply was accepted by the service (or queued for it). */
 	replySent?: boolean;
-	/** The service acknowledgement of the original was recorded. */
+	/** A service or lapsed acknowledgement of the original was recorded. */
 	acknowledged?: boolean;
-	/** What settled it: a recorded service marker, or a mailbox that no
-	 *  longer holds what the branch received there. */
-	settlement?: "service" | "lapsed";
+	/** What settled it: a recorded service marker, a mailbox that no longer
+	 *  holds what the branch received there, or the operator's release. */
+	settlement?: "service" | "lapsed" | "released";
+	/** Whether a released record's own snapshot was appended; in memory
+	 *  only, and meaningful only while `settlement` is `released`. */
+	releaseDurable?: boolean;
 	/** The model was shown the message (steered or tool result). */
 	presented?: boolean;
 	/** Whether the durable append of this record itself succeeded. */
@@ -87,6 +91,8 @@ export interface AckReport {
 	/** Ids settled locally because the mailbox no longer holds mail this
 	 *  branch received there. */
 	lapsed: string[];
+	/** Ids the operator released; no service acknowledgement is claimed. */
+	released: string[];
 	/** Ids this session never received — replay first, never just ack. */
 	unknown: string[];
 	/** Ids the reply of which the branch could not credit; reported, they
@@ -95,6 +101,17 @@ export interface AckReport {
 	/** Ids whose service markers did not record or complete durably; the
 	 *  gate stays for these. */
 	serviceAckFailed: string[];
+}
+
+/** What one `/comms-release` did, per id and for the branch itself. */
+export interface ReleaseReport {
+	released: Array<{
+		messageId: string;
+		replySent: boolean;
+		durable: boolean;
+	}>;
+	/** The branch could not be read, so no obligation could be named. */
+	unreadable: boolean;
 }
 
 /** One mailbox's share of an acknowledgement turn: the agent whose mail is
@@ -110,6 +127,9 @@ export class CommsAcknowledgements {
 	/** Bumped by every `attach`: an acknowledgement turn that started on an
 	 *  earlier mapping may not settle anything in this one. */
 	private generation = 0;
+	/** Set by an `attach` that could not read the branch: the gate fails
+	 *  closed until an operator releases it or a later attach succeeds. */
+	private unreadable = false;
 
 	constructor(
 		private readonly cli: CommsCli,
@@ -117,17 +137,28 @@ export class CommsAcknowledgements {
 		private readonly pi: ExtensionAPI,
 	) {}
 
-	/** Rebuild the pending set from the session's own entries, so a
+	/** Rebuild the pending set from the session's current branch, so a
 	 *  reload or a session switch keeps every obligation — including
 	 *  completed ones, so a repeated envelope cannot arm a fresh reply
-	 *  — and so a different session starts from its own record alone. */
+	 *  — and so a different branch starts from its own record alone. An
+	 *  unreadable branch leaves the gate closed until it can be read. */
 	attach(ctx?: ExtensionContext): void {
-		const entries = ctx?.sessionManager?.getEntries?.() as
-			| Array<Record<string, unknown>>
-			| undefined;
-		if (!Array.isArray(entries)) return;
 		this.generation += 1;
+		let entries: Array<Record<string, unknown>> | undefined;
+		try {
+			const branch = ctx?.sessionManager?.getBranch?.();
+			if (Array.isArray(branch)) entries = branch;
+		} catch {
+			entries = undefined;
+		}
 		this.pendingMap.clear();
+		if (!entries) {
+			// The branch could not be read: an obligation it holds cannot
+			// be named, but the gate must not open as if none existed.
+			this.unreadable = true;
+			return;
+		}
+		this.unreadable = false;
 		for (const entry of entries) {
 			if (!entry || entry.type !== "custom"
 				|| entry.customType !== COMMS_ACK_STATE) continue;
@@ -168,7 +199,8 @@ export class CommsAcknowledgements {
 
 	/** Arm the obligation for one newly delivered envelope; returns
 	 *  whether the durable record succeeded. A repeated delivery is a
-	 *  no-op that retries a known nondurable record's persist first. */
+	 *  no-op that retries a known nondurable record's persist first, and
+	 *  a released id is never armed again. */
 	markPending(
 		envelope: CommsEnvelope,
 		replyRequestId?: string,
@@ -179,6 +211,11 @@ export class CommsAcknowledgements {
 		}
 		const known = this.pendingMap.get(envelope.messageId);
 		if (known) {
+			// A released id is never re-armed by a redelivery: its own
+			// snapshot is written only by a deliberate release.
+			if (known.settlement === "released") {
+				return known.releaseDurable === true;
+			}
 			if (!known.durable) known.durable = this.persist(known);
 			return known.durable;
 		}
@@ -205,7 +242,11 @@ export class CommsAcknowledgements {
 		const record = this.pendingMap.get(messageId);
 		if (!record || record.presented) return;
 		record.presented = true;
-		this.persist(record);
+		// A volatile release stays volatile until the operator releases it
+		// again: presentation never turns one into a durable snapshot.
+		if (record.settlement !== "released" || record.releaseDurable) {
+			this.persist(record);
+		}
 	}
 
 	/** The message ids the ledger treats as shown to the model: marked
@@ -221,15 +262,54 @@ export class CommsAcknowledgements {
 		return shown;
 	}
 
-	/** Every obligation not yet fully carried out. */
+	/** Every obligation not yet fully carried out; a release settles one
+	 *  for the gate's purposes without claiming a service acknowledgement. */
 	pending(): PendingRecord[] {
 		return [...this.pendingMap.values()].filter((record) =>
-			!record.acknowledged);
+			!record.acknowledged && record.settlement !== "released");
 	}
 
 	/** Whether anything is owed — the gate's whole question. */
 	owing(): boolean {
 		return this.pending().length > 0;
+	}
+
+	/** The operator's override: settle every id the gate still holds as
+	 *  released — including one whose earlier release the branch refused,
+	 *  which is retried here — and open the gate. No reply is sent and no
+	 *  service acknowledgement is claimed. A refused append still opens
+	 *  the live gate and is reported as not durable, so the operator knows
+	 *  the id can re-arm from the branch. */
+	release(): ReleaseReport {
+		// An acknowledgement turn still in flight must not write over a
+		// release, so its mapping is replaced before any record changes.
+		this.generation += 1;
+		const report: ReleaseReport = {
+			released: [],
+			unreadable: this.unreadable,
+		};
+		this.unreadable = false;
+		for (const record of this.pendingMap.values()) {
+			if (record.acknowledged
+				|| (record.settlement === "released" && record.releaseDurable)) {
+				continue;
+			}
+			const durable = this.persist({
+				...record,
+				acknowledged: false,
+				settlement: "released",
+			});
+			record.acknowledged = false;
+			record.settlement = "released";
+			record.releaseDurable = durable;
+			if (durable) record.durable = true;
+			report.released.push({
+				messageId: record.messageId,
+				replySent: record.replySent === true,
+				durable,
+			});
+		}
+		return report;
 	}
 
 	/** The gate: no tool runs while an acknowledgement is owed, except
@@ -250,11 +330,15 @@ export class CommsAcknowledgements {
 	}
 
 	private decide(event: ToolCallEvent): ToolCallEventResult | undefined {
-		if (!this.owing()) return undefined;
 		const name = String(event.toolName ?? "");
-		if (name === "comms_ack" || name === "comms_replay"
-			|| name === "pre_daemon") return undefined;
-		if (ToolGateEscapes.admits(this.pi, name)) return undefined;
+		const admitted = name === "comms_ack" || name === "comms_replay"
+			|| name === "pre_daemon" || ToolGateEscapes.admits(this.pi, name);
+		if (!this.owing()) {
+			return this.unreadable && !admitted
+				? { block: true, reason: CommsAcknowledgements.UNREADABLE }
+				: undefined;
+		}
+		if (admitted) return undefined;
 		return {
 			block: true,
 			reason: CommsAcknowledgements.denial(
@@ -266,12 +350,13 @@ export class CommsAcknowledgements {
 	 *  only reported, then the service acknowledgement of the mailbox each
 	 *  id arrived in — one call per mailbox, since a marker records only
 	 *  where the mail was kept. The reply never holds an id back. A retry
-	 *  resumes where it stopped. */
+	 *  resumes where it stopped. The branch context is not read here: an
+	 *  id's receipt proof is its own arm record. */
 	async acknowledge(
 		messageIds: string[],
 		params: { node?: string },
 		signal?: AbortSignal,
-		ctx?: ExtensionContext,
+		_ctx?: ExtensionContext,
 	): Promise<AckReport> {
 		const generation = this.generation;
 		const ids = messageIds.map(String);
@@ -279,6 +364,7 @@ export class CommsAcknowledgements {
 			acknowledged: [],
 			alreadyAcknowledged: [],
 			lapsed: [],
+			released: [],
 			unknown: [],
 			replyFailed: [],
 			serviceAckFailed: [],
@@ -289,6 +375,11 @@ export class CommsAcknowledgements {
 			const record = this.pendingMap.get(id);
 			if (!record) {
 				report.unknown.push(id);
+				continue;
+			}
+			if (record.settlement === "released") {
+				// An operator already settled it: no reply, no service call.
+				report.released.push(id);
 				continue;
 			}
 			if (!await this.answer(record, report, signal, generation)) break;
@@ -305,7 +396,7 @@ export class CommsAcknowledgements {
 		for (const group of mailboxes.values()) {
 			if (this.stale(generation)) break;
 			await this.settle(
-				group.records, group.node, group.agent, ctx, report, signal,
+				group.records, group.node, group.agent, report, signal,
 				generation,
 			);
 		}
@@ -358,7 +449,6 @@ export class CommsAcknowledgements {
 		records: PendingRecord[],
 		mailbox: string,
 		mailboxAgent: string,
-		ctx: ExtensionContext | undefined,
 		report: AckReport,
 		signal?: AbortSignal,
 		generation = this.generation,
@@ -395,7 +485,7 @@ export class CommsAcknowledgements {
 					report.serviceAckFailed.push(id);
 				}
 			} else if (unsettled.includes(id)
-				&& this.lapsed(record, mailbox, mailboxAgent, ctx)) {
+				&& this.lapsed(record, mailbox, mailboxAgent)) {
 				// The mailbox holds no record of mail this branch received
 				// there; the reply already answered its sender.
 				if (this.complete(id, "lapsed", generation)) {
@@ -509,7 +599,9 @@ export class CommsAcknowledgements {
 		// obligation as carried out that was never asked.
 		if (generation !== this.generation) return false;
 		const record = this.pendingMap.get(id);
-		if (!record) return false;
+		// An operator's release is final: no later acknowledgement turn may
+		// replace it with a service or lapsed completion.
+		if (!record || record.settlement === "released") return false;
 		if (!this.persist({ ...record, acknowledged: true, settlement })) {
 			return false;
 		}
@@ -520,22 +612,20 @@ export class CommsAcknowledgements {
 	}
 
 	/** Whether an id the ledger holds is proven delivered to the mailbox
-	 *  whose service no longer recognizes it: the call ran as that mailbox's
-	 *  own agent, and the branch recorded the envelope, addressed to that
-	 *  same mailbox, that armed the record. A caller's own choice of node
-	 *  proves nothing, and neither does another agent's silence. */
+	 *  whose service no longer recognizes it: the arm record itself names
+	 *  that mailbox as the one the envelope arrived in, and the call ran as
+	 *  that mailbox's own agent. A caller's own choice of node proves
+	 *  nothing, and neither does another agent's silence; an empty recorded
+	 *  recipient proves nothing either, since the call would have run as
+	 *  whatever identity the session resolves now. */
 	private lapsed(
 		record: PendingRecord,
 		mailbox: string,
 		mailboxAgent: string,
-		ctx: ExtensionContext | undefined,
 	): boolean {
-		if (!record.toAgentId || mailboxAgent !== record.toAgentId
-			|| mailbox !== record.toNodeId) return false;
-		const to = { agentId: record.toAgentId, nodeId: record.toNodeId };
-		return CommsMessageLog.receivedEntries(ctx).some((entry) =>
-			entry.messageId === record.messageId
-				&& CommsAcknowledgements.sameAddress(entry.to, to));
+		return !!record.toAgentId
+			&& mailboxAgent === record.toAgentId
+			&& mailbox === record.toNodeId;
 	}
 
 	/** Whether the branch this turn started on was replaced under it by a
@@ -547,15 +637,8 @@ export class CommsAcknowledgements {
 
 	private static reported(report: AckReport, id: string): boolean {
 		return report.acknowledged.includes(id) || report.lapsed.includes(id)
-			|| report.unknown.includes(id)
+			|| report.released.includes(id) || report.unknown.includes(id)
 			|| report.serviceAckFailed.includes(id);
-	}
-
-	private static sameAddress(value: unknown, address: CommsAddress): boolean {
-		const other = value as CommsAddress | undefined;
-		return !!other
-			&& other.agentId === address.agentId
-			&& (other.nodeId ?? "") === (address.nodeId ?? "");
 	}
 
 	/** One durable progress append; a failure keeps the in-memory state
@@ -612,8 +695,10 @@ export class CommsAcknowledgements {
 			acknowledged: data.acknowledged === true,
 			settlement: data.settlement === "service"
 				|| data.settlement === "lapsed"
+				|| data.settlement === "released"
 				? data.settlement
 				: undefined,
+			releaseDurable: data.settlement === "released",
 			presented: data.presented === true,
 			durable: true,
 		};
@@ -628,4 +713,10 @@ export class CommsAcknowledgements {
 	private static readonly FAIL_CLOSED =
 		"agent-comms acknowledgement state could not be read; refusing to " +
 		"run tools until it can be trusted.";
+
+	private static readonly UNREADABLE =
+		"The agent-comms acknowledgement branch could not be read, so an " +
+		"obligation it holds cannot be named. Call comms_ack for any id the " +
+		"turn names, or release the gate from the keyboard with " +
+		"`/comms-release`.";
 }

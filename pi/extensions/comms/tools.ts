@@ -511,7 +511,8 @@ export class CommsTools {
 				params.messageIds, { node: params.node }, signal, ctx);
 			const settled = report.acknowledged.length
 				+ report.alreadyAcknowledged.length
-				+ report.lapsed.length > 0;
+				+ report.lapsed.length
+				+ report.released.length > 0;
 			const text = CommsTools.ackText(report);
 			return {
 				content: [{ type: "text", text }],
@@ -531,6 +532,7 @@ export class CommsTools {
 		acknowledged: string[];
 		alreadyAcknowledged: string[];
 		lapsed: string[];
+		released: string[];
 		unknown: string[];
 		replyFailed: string[];
 		serviceAckFailed: string[];
@@ -546,6 +548,10 @@ export class CommsTools {
 		if (report.lapsed.length) {
 			lines.push(`Acknowledged locally; the mailbox no longer ` +
 				`recognizes: ${report.lapsed.join(", ")}`);
+		}
+		if (report.released.length) {
+			lines.push(`Operator-released; no service acknowledgement ` +
+				`recorded locally: ${report.released.join(", ")}`);
 		}
 		if (report.unknown.length) {
 			lines.push(`Not received here — replay first, then acknowledge: ` +
