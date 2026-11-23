@@ -283,11 +283,18 @@ class SessionStore:
                 self._write_run_state(record.id, state)
             self._write_document()
 
-    def set_handoff(self, name, target):
+    def set_handoff(self, name, target, file):
+        """Record that a name handed its viewers to another for one file.
+
+        The destination conversation is part of the entry: the target keeps
+        a name across rebinding, so a handoff that stored only the name could
+        later deliver a viewer to whatever conversation that name holds by
+        then. What the handoff was made for is what makes it checkable.
+        """
         with self._lock:
             if self._sessions.get(name) is None:
                 raise SessionError("no-session")
-            self._handoffs[name] = {"name": target}
+            self._handoffs[name] = {"name": target, "file": file}
             self._write_document()
 
     def handoff(self, name):

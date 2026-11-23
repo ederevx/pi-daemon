@@ -299,11 +299,12 @@ class StoreTests(unittest.TestCase):
     def test_a_handoff_survives_a_reload(self):
         reserve(self.store, "pi-a")
         reserve(self.store, "pi-b")
-        self.store.set_handoff("pi-a", "pi-b")
+        self.store.set_handoff("pi-a", "pi-b", "/conv.jsonl")
         reloaded = SessionStore(os.path.join(self.base[0], "sessions.json"),
                                 os.path.join(self.base[0], "runs"), self.config)
         reloaded.load()
-        self.assertEqual(reloaded.handoff("pi-a"), {"name": "pi-b"})
+        self.assertEqual(reloaded.handoff("pi-a"),
+                         {"name": "pi-b", "file": "/conv.jsonl"})
         reloaded.clear_handoff("pi-a")
         self.assertIsNone(reloaded.handoff("pi-a"))
 
@@ -401,7 +402,8 @@ class AnnounceTests(unittest.TestCase):
         self.assertIsNone(reply["handoff"], "the busier holder keeps it")
         self.assertEqual(reply["tookOver"], ["pi-b"],
                          "the duplicate holder hands over")
-        self.assertEqual(self.store.handoff("pi-b"), {"name": "pi-a"})
+        self.assertEqual(self.store.handoff("pi-b"),
+                         {"name": "pi-a", "file": "/conv.jsonl"})
         self.assertEqual(self.relay.dropped, [self.second.id],
                          "the other holder's viewers are dropped")
         self.assertEqual(self.store.get("pi-b").child["clients"], 0)
@@ -412,7 +414,8 @@ class AnnounceTests(unittest.TestCase):
         self.assertEqual(reply["handoff"], {"name": "pi-b",
                                             "state": self.second.state()})
         self.assertEqual(reply["tookOver"], [])
-        self.assertEqual(self.store.handoff("pi-a"), {"name": "pi-b"})
+        self.assertEqual(self.store.handoff("pi-a"),
+                         {"name": "pi-b", "file": "/conv.jsonl"})
         self.assertEqual(self.relay.moved, [(self.first.id, self.second.id)],
                          "its viewers follow the conversation")
         self.assertEqual(self.store.get("pi-b").child["clients"], 1)
@@ -423,6 +426,45 @@ class AnnounceTests(unittest.TestCase):
         reply = service.announce("pi-a", "/other.jsonl", takeover=True)
         self.assertIsNone(reply["handoff"])
         self.assertEqual(reply["tookOver"], [])
+        self.assertIsNone(self.store.handoff("pi-a"))
+
+
+class HandoffTests(unittest.TestCase):
+    """A handoff follows one conversation, never whatever its name holds."""
+
+    def setUp(self):
+        self.base = roots()
+        self.addCleanup(shutil.rmtree, self.base[0], True)
+        self.store, self.config = store_for(self.base)
+        self.service = SessionService(self.store, None, ViewerRelay(),
+                                      self.config)
+        reserve(self.store, "pi-a", "/conv/a.jsonl")
+        target, _ = reserve(self.store, "pi-b", "/conv/a.jsonl")
+        self.store.mark_started(target.id, os.getpid(),
+                                ProcessIdentity.current(os.getpid()))
+
+    def test_a_handoff_to_a_rebound_destination_is_cleared(self):
+        self.store.set_handoff("pi-a", "pi-b", "/conv/a.jsonl")
+        self.store.announce("pi-b", "/conv/b.jsonl")
+        self.assertIsNone(self.service.handoff_target("pi-a"),
+                          "pi-b holds another conversation by then")
+        self.assertIsNone(self.store.handoff("pi-a"),
+                          "an entry that cannot be followed is not kept")
+
+    def test_a_legacy_handoff_without_a_file_is_cleared(self):
+        # Entries written before a handoff stored its file cannot be checked
+        # at all, so they are refused rather than followed blindly.
+        self.store._handoffs["pi-a"] = {"name": "pi-b"}
+        self.assertIsNone(self.service.handoff_target("pi-a"))
+        self.assertIsNone(self.store.handoff("pi-a"))
+
+    def test_a_refused_handoff_does_not_stand_in_for_the_record(self):
+        self.store.set_handoff("pi-a", "pi-b", "/conv/a.jsonl")
+        self.store.announce("pi-b", "/conv/b.jsonl")
+        with self.assertRaises(SessionError) as caught:
+            self.service.attach_plan("pi-a", 80, 24)
+        self.assertEqual(caught.exception.code, "no-session",
+                         "the reservation has no child to attach to")
         self.assertIsNone(self.store.handoff("pi-a"))
 
 
@@ -734,6 +776,27 @@ class OperationsTests(unittest.TestCase):
             {"cmd": "attach", "name": "pi-a"}, None)
         self.assertEqual(reply["handoff"]["name"], "pi-b")
         self.assertNotIsInstance(reply, ControlAction)
+
+    def test_an_attach_answers_a_real_handoff_plan(self):
+        base = roots()
+        self.addCleanup(shutil.rmtree, base[0], True)
+        store, config = store_for(base)
+        source, _ = reserve(store, "pi-a", "/conv.jsonl")
+        target, _ = reserve(store, "pi-b", "/conv.jsonl")
+        store.mark_started(target.id, os.getpid(),
+                           ProcessIdentity.current(os.getpid()))
+        store.set_handoff("pi-a", "pi-b", "/conv.jsonl")
+        reply = self.operations(
+            SessionService(store, None, ViewerRelay(), config)).attach(
+                {"cmd": "attach", "name": "pi-a"}, None)
+        self.assertNotIsInstance(reply, ControlAction,
+                                 "a handoff is answered, not taken")
+        self.assertEqual(reply["name"], "pi-a")
+        self.assertEqual(reply["state"], source.state())
+        self.assertEqual(reply["handoff"],
+                         {"name": "pi-b",
+                          "state": store.get("pi-b").state()})
+        self.assertEqual(reply["clients"], 0)
 
     def test_an_announce_passes_takeover_through(self):
         operations = self.operations()
@@ -1272,10 +1335,23 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(self.relay.calls, [])
         self.assertEqual(self.relay.moved, [(self.source.id, holder.id)])
 
+    def test_a_resume_handoff_keeps_the_requested_destination_file(self):
+        holder, _ = reserve(self.store, "pi-b", self.file)
+        self.store.mark_started(holder.id, os.getpid(),
+                                ProcessIdentity.current(os.getpid()))
+        reply = self.service.resume("pi-a", self.file)
+        self.assertEqual(reply["name"], "pi-b")
+        self.assertEqual(self.store.handoff("pi-a"),
+                         {"name": "pi-b", "file": self.file})
+        self.assertEqual(self.service.handoff_target("pi-a"),
+                         {"name": "pi-b",
+                          "state": self.store.get("pi-b").state()},
+                         "the destination still holds what was asked for")
+
     def test_a_stopped_name_is_revived_under_its_stored_spelling(self):
         old, _ = self.store.reserve("old", self.dir, ["sh"], 80, 24, None,
                                     self.file, ["sh"], owner())
-        self.store.set_handoff("old", "pi-a")
+        self.store.set_handoff("old", "pi-a", self.file)
         self.store.finish(old.id, "done", None)
         reply = self.service.resume("pi-a", self.file)
         self.assertEqual(reply["name"], "old")
@@ -1362,7 +1438,7 @@ class ResumeTests(unittest.TestCase):
         store, config = store_for(roots())
         old, _ = store.reserve("pi-old", self.dir, ["sh"], 80, 24, None,
                                self.file, ["sh"], owner())
-        store.set_handoff("pi-old", "pi-a")
+        store.set_handoff("pi-old", "pi-a", self.file)
         store.finish(old.id, "done", None)
         reserve(store, "pi-a", "/current.jsonl")
         relay = ResumeRelay()
@@ -1377,7 +1453,8 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(kept.generation, old.generation)
         self.assertFalse(kept.live())
         self.assertEqual(store._run_keys["pi-old"], old.id)
-        self.assertEqual(store.handoff("pi-old"), {"name": "pi-a"})
+        self.assertEqual(store.handoff("pi-old"),
+                         {"name": "pi-a", "file": self.file})
         self.assertEqual({view["name"] for view in store.snapshot(True)},
                          {"pi-a", "pi-old"})
 

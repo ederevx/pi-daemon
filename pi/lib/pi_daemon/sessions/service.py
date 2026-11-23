@@ -104,14 +104,12 @@ class SessionService:
     def attach_plan(self, name, cols, rows):
         """Resolve an attach without taking the socket yet."""
         record = self._record(name, live=True)
-        handoff = self._store.handoff(record.name)
+        handoff = self.handoff_target(record.name)
         if handoff is not None:
-            target = self._store.resolve(handoff.get("name"))
-            live = self._store.get(target) if target else None
-            if live is not None and live.phase == "running":
-                return {"name": record.name, "handoff": {
-                    "name": live.name, "state": live.state()}}
-            self._store.clear_handoff(record.name)
+            # The plan carries the source's own state beside the handoff so
+            # a client that follows the target still learns what it leaves.
+            return {"name": record.name, "state": record.state(),
+                    "handoff": handoff}
         identity = ProcessIdentity.from_dict(record.child.get("identity"))
         if record.pid() <= 0 or ProcessIdentity.current(record.pid()) \
                 .classify(identity) == ProcessIdentity.GONE:
@@ -258,12 +256,12 @@ class SessionService:
         mine = self._relay.viewer_count(record.id)
         theirs = self._relay.viewer_count(self._key(primary))
         if mine > theirs:
-            self._store.set_handoff(primary, record.name)
+            self._store.set_handoff(primary, record.name, file)
             self._relay.drop_viewers(self._key(primary))
             self._store.set_clients(primary, 0)
             remaining = others[1:]
             return self._announced(record.name, None, [primary], remaining)
-        self._store.set_handoff(record.name, primary)
+        self._store.set_handoff(record.name, primary, file)
         self._relay.move_viewers(record.id, self._key(primary))
         self._store.set_clients(primary,
                                 self._relay.viewer_count(self._key(primary)))
@@ -273,6 +271,16 @@ class SessionService:
                                [], others[1:])
 
     def handoff_target(self, name):
+        """The live destination this name handed its viewers to, if any.
+
+        A handoff is made for one conversation, so it stores the file it was
+        made for and is followed only while the destination still holds that
+        same file. A destination rebound to another conversation, or an entry
+        written before handoffs recorded their file, cannot be checked; it is
+        cleared instead of followed, because a refused handoff costs a
+        refusal while a wrong one moves the viewer's terminal into a
+        conversation they never asked for.
+        """
         if not name:
             return None
         canonical = self._store.resolve(name)
@@ -281,9 +289,11 @@ class SessionService:
         handoff = self._store.handoff(canonical)
         if handoff is None:
             return None
+        file = handoff.get("file")
         target = self._store.resolve(handoff.get("name"))
         live = self._store.get(target) if target else None
-        if live is None or live.phase != "running":
+        if not file or live is None or live.phase != "running" \
+                or live.file != file:
             self._store.clear_handoff(canonical)
             return None
         return {"name": live.name, "state": live.state()}
@@ -298,7 +308,7 @@ class SessionService:
         if not holders:
             return self._carry.resume(record.name, file)
         target, target_state = holders[0]
-        self._store.set_handoff(record.name, target)
+        self._store.set_handoff(record.name, target, file)
         self._relay.move_viewers(record.id, self._key(target))
         self._store.set_clients(record.name, 0)
         self._store.set_clients(target, self._relay.viewer_count(
