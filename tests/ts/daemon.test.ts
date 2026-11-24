@@ -388,6 +388,9 @@ class MockPi {
   readonly commands = new Map<string, unknown>();
   readonly tools = new Map<string, any>();
   readonly onCalls = new Map<string, number>();
+  /** Every handler by event name, in registration order, so a test can
+   *  dispatch through the chain the way pi does. */
+  readonly handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
   readonly sessionStarters: Array<(event: any) => Promise<void>> = [];
   readonly shutdownHandlers: Array<(event: any) => Promise<void>> = [];
   readonly agentStarters:
@@ -397,8 +400,16 @@ class MockPi {
   readonly messages: string[] = [];
   readonly messageOptions: Array<Record<string, unknown>> = [];
   readonly execCalls: Array<{ file: string; args: string[] }> = [];
+  /** The active branch's custom entries, appended the way pi records them. */
+  readonly entries: Array<Record<string, unknown>> = [];
+  appendEntry(customType: string, data: unknown): void {
+    this.entries.push({ type: "custom", customType, data });
+  }
   on(name: string, handler: any): void {
     this.onCalls.set(name, (this.onCalls.get(name) ?? 0) + 1);
+    const list = this.handlers.get(name) ?? [];
+    list.push(handler);
+    this.handlers.set(name, list);
     if (name === "session_start") this.sessionStarters.push(handler);
     if (name === "session_shutdown") this.shutdownHandlers.push(handler);
     if (name === "agent_start") this.agentStarters.push(handler);
@@ -408,6 +419,18 @@ class MockPi {
   }
   registerCommand(name: string, def: unknown): void {
     this.commands.set(name, def);
+  }
+  /** pi dispatches an event through every handler in order and stops at the
+   *  first one that blocks; the session context travels with each call. */
+  async fire(name: string, event: any, ctx: any): Promise<any> {
+    let answer: any;
+    for (const handler of this.handlers.get(name) ?? []) {
+      const returned = await handler(event, ctx);
+      if (returned === undefined || returned === null) continue;
+      answer = returned;
+      if (returned.block) return returned;
+    }
+    return answer;
   }
   registerTool(def: any): void {
     this.tools.set(def.name, def);
@@ -430,6 +453,54 @@ class MockPi {
     return this.sendUserMessage(text, options);
   }
 }
+
+test("daemon: /comms-release opens the acknowledgement gate from the keyboard", async () => {
+  const pi = new MockPi();
+  factory(pi as never);
+  const notes: Array<{ text: string; kind?: string }> = [];
+  const ctx = {
+    sessionManager: {
+      getEntries: () => { throw new Error("no branch"); },
+      getBranch: () => { throw new Error("no branch"); },
+    },
+    ui: { notify: (text: string, kind?: string) => notes.push({ text, kind }) },
+  };
+  await withEnv({ XDG_STATE_HOME: scratchDir() }, async () => {
+    try {
+      // The comms attach is one of several session_start listeners. The one
+      // that owns the gate is found by its effect, never by its position:
+      // with an unreadable branch it blocks an ordinary tool.
+      let armed = false;
+      for (const handler of pi.sessionStarters) {
+        try {
+          await handler({ reason: "startup" }, ctx);
+        } catch {
+          continue; // a listener that needs a hosted run is not this one
+        }
+        const verdict = await pi.fire("tool_call", { toolName: "bash" }, ctx);
+        if (verdict?.block) {
+          assert(String(verdict.reason).includes("/comms-release"),
+            "the refused tool names the keyboard escape");
+          armed = true;
+          break;
+        }
+      }
+      assert(armed, "an unreadable branch keeps the gate closed");
+      const command = pi.commands.get("comms-release") as
+        { handler: (args: string, ctx: unknown) => Promise<void> };
+      await command.handler("", ctx);
+      assertEq(await pi.fire("tool_call", { toolName: "bash" }, ctx), undefined,
+        "the operator's release admits ordinary work");
+      assert(notes.some((note) => note.text.includes("could not be read")
+        && note.kind === "warning"),
+        "and the warning says what it could not read");
+    } finally {
+      for (const handler of pi.shutdownHandlers) {
+        await handler({ reason: "quit" });
+      }
+    }
+  });
+});
 
 test("daemon: auto /reload is silent and never messages the agent", async () => {
   const pi = new MockPi();

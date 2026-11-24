@@ -5,8 +5,12 @@
  * The stub records its whole argv and prints a canned JSON answer with
  * a canned exit code. A per-command script (STUB_ANSWERS) carries a
  * whole scenario: each command's entry list is consumed in order, the
- * last repeating, and STUB_STATE counts the calls per command. A delay
- * (STUB_DELAY) holds each invocation, so waits and aborts are exact.
+ * last repeating, and STUB_STATE counts the calls per command; the argv
+ * line lands as the call takes its slot, so an order the test reads off
+ * the log is the order the answers were handed out. A delay
+ * (STUB_DELAY) holds each invocation, so waits and aborts are exact; a
+ * gate file (STUB_GATE, optionally for one command via STUB_GATE_ON) holds a
+ * call while the test acts on it.
  */
 
 import { spawn } from "node:child_process";
@@ -23,17 +27,16 @@ import json, os, sys, time
 delay = os.environ.get("STUB_DELAY")
 if delay:
     time.sleep(float(delay))
-log = os.environ.get("STUB_LOG")
-if log:
-    with open(log, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(sys.argv[1:]) + "\\n")
 commands = {"send", "wait", "replay", "ack", "spawn", "peer", "session"}
 cmd = None
 for arg in sys.argv[1:]:
     if arg in commands:
         cmd = arg
         break
+# The script's slot is taken before the gate: a call the test aborts while the
+# gate holds it must not leave its answer to the call that follows.
 answers = os.environ.get("STUB_ANSWERS")
+entry = None
 if answers:
     state_path = os.environ.get("STUB_STATE")
     seen = {}
@@ -50,6 +53,22 @@ if answers:
             json.dump(seen, handle)
     spec = json.loads(answers).get(cmd or "") or []
     entry = spec[min(order, len(spec) - 1)] if spec else {}
+# The argv line is written as this call takes its slot, so a test that sees it
+# knows both that the call started and that it consumed an answer: an abort
+# after the line leaves nothing for the call that follows.
+log = os.environ.get("STUB_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(sys.argv[1:]) + "\\n")
+# A gate file holds the named command after its argv is on record, so a test
+# can act while that one call is in flight.
+gate = os.environ.get("STUB_GATE")
+held = os.environ.get("STUB_GATE_ON") or cmd
+if gate and held == cmd:
+    deadline = time.time() + 20
+    while os.path.exists(gate) and time.time() < deadline:
+        time.sleep(0.01)
+if entry is not None:
     if "stdout" in entry:
         sys.stdout.write(json.dumps(entry["stdout"]))
     sys.stderr.write(entry.get("stderr", ""))

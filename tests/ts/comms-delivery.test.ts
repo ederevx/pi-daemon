@@ -8,10 +8,12 @@
  * the answers are exact and every hold's argv is observable.
  */
 
-import { writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { test, assert, assertEq, withEnv, scratchDir } from "./harness.ts";
+import {
+	test, assert, assertEq, waitFor, withEnv, scratchDir,
+} from "./harness.ts";
 import { ProcessRunner } from "../../pi/extensions/daemon.ts";
 import { CommsCli } from "../../pi/extensions/comms/client.ts";
 import {
@@ -1468,5 +1470,88 @@ test("acknowledgements: the tool reports a lapsed settlement as settled", async 
 		assert(String(result?.content[0].text).includes(
 			"no longer recognizes: m1"), "and the report says what settled it");
 		assertEq(ledger.owing(), false, "the gate opened");
+	});
+});
+
+test("acknowledgements: a service answer that arrives after a release is not a failure", async () => {
+	const spec = scripted({
+		send: [{ stdout: { status: "accepted" } }],
+		ack: [{ stdout: { status: "ok", acknowledged: ["m1"] } }],
+	});
+	// The stub logs its argv and then holds: the log line proves the service
+	// call started, so the release lands while that call is genuinely open.
+	const gate = join(scratchDir(), `gate-${Math.random().toString(16).slice(2)}`);
+	writeFileSync(gate, "");
+	await withEnv(spec.script({ STUB_GATE: gate, STUB_GATE_ON: "ack" }), async () => {
+		const pi = new FakePi();
+		const { ledger } = harness(pi);
+		receiveAt(pi, ledger, "m1", "n1");
+		const inFlight = ledger.acknowledge(["m1"], {}, undefined, pi.ctx());
+		try {
+			await waitFor(
+				() => recorded(spec.env.STUB_LOG).some((line) => line.includes("ack")),
+				"the service acknowledgement started");
+			const report = ledger.release();
+			assertEq(report.released.map((item) => item.messageId).join(","), "m1",
+				"the operator released the id while the call was open");
+			rmSync(gate);
+			const answered = await inFlight;
+			assertEq(answered.serviceAckFailed.join(","), "",
+				"a late answer is not a service failure once the operator released");
+			assertEq(answered.released.join(","), "m1",
+				"the in-flight turn reports the operator's release");
+			assertEq(answered.acknowledged.join(","), "",
+				"and it claims no acknowledgement the release did not make");
+			const states = pi.session.entries
+				.filter((entry) => entry.customType === COMMS_ACK_STATE)
+				.map((entry) => entry.data as Record<string, unknown>);
+			assertEq(states.filter((data) => data.settlement === "service").length, 0,
+				"no service settlement was written");
+			assertEq(states.at(-1)?.settlement, "released",
+				"the release remains the last word");
+		} finally {
+			// A failed wait leaves the stub holding its gate: release it and let
+			// the operation finish before the environment is restored.
+			rmSync(gate, { force: true });
+			await inFlight;
+		}
+	});
+});
+
+test("acknowledgements: a mailbox that forgot the id after a release is not a failure", async () => {
+	const spec = scripted({
+		send: [{ stdout: { status: "accepted" } }],
+		ack: [{ stdout: { status: "ok", acknowledged: [], unknown: ["m1"] } }],
+	});
+	const gate = join(scratchDir(), `gate-${Math.random().toString(16).slice(2)}`);
+	writeFileSync(gate, "");
+	await withEnv(spec.script({ STUB_GATE: gate, STUB_GATE_ON: "ack" }), async () => {
+		const pi = new FakePi();
+		const { ledger } = harness(pi);
+		receiveAt(pi, ledger, "m1", "n1");
+		const inFlight = ledger.acknowledge(["m1"], {}, undefined, pi.ctx());
+		try {
+			await waitFor(
+				() => recorded(spec.env.STUB_LOG).some((line) => line.includes("ack")),
+				"the service acknowledgement started");
+			ledger.release();
+			rmSync(gate);
+			const answered = await inFlight;
+			assertEq(answered.serviceAckFailed.join(","), "",
+				"an id the mailbox forgot is not reported as a failed acknowledgement");
+			assertEq(answered.lapsed.join(","), "",
+				"and no lapsed settlement writes over the release");
+			assertEq(answered.released.join(","), "m1",
+				"the mailbox's silence reports the operator's release");
+			const snapshots = pi.session.entries
+				.filter((entry) => entry.customType === COMMS_ACK_STATE)
+				.map((entry) => entry.data as Record<string, unknown>);
+			assertEq(snapshots.filter((data) => data.settlement === "lapsed").length, 0,
+				"no lapsed snapshot wrote over the release");
+			assertEq(ledger.owing(), false, "the release stands");
+		} finally {
+			rmSync(gate, { force: true });
+			await inFlight;
+		}
 	});
 });

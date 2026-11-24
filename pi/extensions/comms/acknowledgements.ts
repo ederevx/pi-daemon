@@ -402,9 +402,14 @@ export class CommsAcknowledgements {
 		}
 		if (this.stale(generation)) {
 			// The branch this turn started on is gone: whatever it had not
-			// settled yet stays owed to the branch that holds it now.
+			// settled yet stays owed to the branch that holds it now. An id
+			// the operator released meanwhile names no failure: the release
+			// already settled it, so the report says so.
 			for (const id of ids) {
-				if (!CommsAcknowledgements.reported(report, id)) {
+				if (CommsAcknowledgements.reported(report, id)) continue;
+				if (this.pendingMap.get(id)?.settlement === "released") {
+					report.released.push(id);
+				} else {
 					report.serviceAckFailed.push(id);
 				}
 			}
@@ -467,8 +472,12 @@ export class CommsAcknowledgements {
 		if (outcome.exitCode !== CommsExit.OK || !answer) {
 			// The reply may have gone out, but the service markers did not
 			// record. The gate stays for these ids and the next call retries
-			// the ack.
-			report.serviceAckFailed.push(...ids);
+			// the ack. An id the operator released meanwhile is not a service
+			// failure: its obligation was already settled elsewhere.
+			for (const record of records) {
+				if (this.settledElsewhere(record.messageId, generation)) continue;
+				report.serviceAckFailed.push(record.messageId);
+			}
 			return;
 		}
 		const settled = CommsAcknowledgements.strings(answer.acknowledged)
@@ -479,7 +488,7 @@ export class CommsAcknowledgements {
 			if (settled.includes(id)) {
 				if (this.complete(id, "service", generation)) {
 					report.acknowledged.push(id);
-				} else {
+				} else if (!this.settledElsewhere(id, generation)) {
 					// The gate stays: the durable completion is its opening,
 					// and the next comms_ack retries it.
 					report.serviceAckFailed.push(id);
@@ -490,13 +499,25 @@ export class CommsAcknowledgements {
 				// there; the reply already answered its sender.
 				if (this.complete(id, "lapsed", generation)) {
 					report.lapsed.push(id);
-				} else {
+				} else if (!this.settledElsewhere(id, generation)) {
 					report.serviceAckFailed.push(id);
 				}
 			} else {
-				report.serviceAckFailed.push(id);
+				if (!this.settledElsewhere(id, generation)) {
+					report.serviceAckFailed.push(id);
+				}
 			}
 		}
+	}
+
+	/** Whether a completion this turn could not record is settled somewhere
+	 *  else rather than a failed service acknowledgement: the branch moved on
+	 *  under the turn, or the operator released the ids it names. Either way
+	 *  nothing is owed here, so nothing is reported as a service failure. */
+	private settledElsewhere(id: string, generation: number): boolean {
+		if (this.stale(generation)) return true;
+		const record = this.pendingMap.get(id);
+		return !record || record.settlement === "released";
 	}
 
 	/** The protocol acknowledgement of an arriving reply: bookkeeping
