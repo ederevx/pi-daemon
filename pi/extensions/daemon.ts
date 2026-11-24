@@ -1336,7 +1336,13 @@ export default function (pi: ExtensionAPI) {
 			commsDelivery.start();
 		});
 		pi.on("session_tree", async (_event, ctx) => {
+			// A hold belongs to the branch it started on: its answer would
+			// advance the cursor of the branch just landed on, skipping mail
+			// that branch has not seen. Abort it and let the loop leave before
+			// the landed branch's records are restored.
+			await commsDelivery.stop();
 			attachComms(ctx);
+			commsDelivery.start();
 		});
 		pi.on("agent_start", async () => {
 			commsDelivery.start();

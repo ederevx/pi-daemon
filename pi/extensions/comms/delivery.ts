@@ -109,18 +109,28 @@ export class CommsDelivery {
 		this.steerOutstanding();
 	}
 
-	/** Rebuild cursors and presentation memory from the session's own
-	 *  entries, so a reload or a session switch resumes where it left
-	 *  off rather than replaying the mailbox. The cursor is the latest
-	 *  valid record per mailbox — a deliberate restart down to the
-	 *  mailbox's surviving history is a record itself — and the mail
-	 *  the model was shown lives in the ledger's own records. */
+	/** Rebuild cursors and presentation memory from the active branch's own
+	 *  entries, so a reload or a tree switch resumes where that branch left
+	 *  off rather than replaying the mailbox or inheriting a sibling's place.
+	 *  The session file holds every branch after a switch, and a cursor names
+	 *  what one conversation already read; taking it from the file would let
+	 *  a sibling's later record skip mail this branch never saw. The cursor is
+	 *  the latest valid record per mailbox — a deliberate restart down to the
+	 *  mailbox's surviving history is a record itself — and the mail the model
+	 *  was shown lives in the ledger's own records. A branch that cannot be
+	 *  read restores nothing: an empty cursor replays mail, a foreign one
+	 *  skips it. */
 	private restore(): void {
-		const entries = this.ctx?.sessionManager?.getEntries?.();
-		if (!Array.isArray(entries)) return;
+		let entries: Array<Record<string, unknown>> | undefined;
+		try {
+			const branch = this.ctx?.sessionManager?.getBranch?.();
+			if (Array.isArray(branch)) entries = branch;
+		} catch {
+			entries = undefined;
+		}
 		const cursors = new Map<string, number>();
 		const persisted = new Map<string, number>();
-		for (const entry of entries) {
+		for (const entry of entries ?? []) {
 			if (!entry || entry.type !== "custom"
 				|| entry.customType !== COMMS_CURSOR) continue;
 			const data = entry.data as Record<string, unknown> | undefined;

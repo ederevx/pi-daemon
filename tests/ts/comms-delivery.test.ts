@@ -47,6 +47,11 @@ const policy: DeliveryPolicy = {
  *  refuse by entry type, and the messages the receiver steers. */
 class FakePi {
 	readonly session = { entries: [] as Array<Record<string, unknown>> };
+	/** The active branch's own entries once a tree switch left the session file
+	 *  holding more than one; unset means the file is that one branch. */
+	branch: Array<Record<string, unknown>> | null = null;
+	/** Set when the branch cannot be read at all. */
+	branchUnreadable = false;
 	/** Entry types the branch refuses before taking, as a full store. */
 	readonly failOn = new Set<string>();
 	readonly messages: Array<Record<string, unknown>> = [];
@@ -112,7 +117,12 @@ class FakePi {
 	ctx = () => ({
 		sessionManager: {
 			getEntries: () => this.session.entries,
-			getBranch: () => this.session.entries,
+			getBranch: () => {
+				if (this.branchUnreadable) {
+					throw new Error("the branch is unreadable");
+				}
+				return this.branch ?? this.session.entries;
+			},
 		},
 	});
 }
@@ -315,12 +325,15 @@ test("delivery: an expired cursor restarts from the oldest surviving sequence", 
 		pi.appendEntry(COMMS_CURSOR, { mailbox: "@pi-test", sequence: 45 });
 		const { delivery } = harness(pi);
 		delivery.start();
-		await sleep(400);
+		// Waiting for the restart itself, not the clock, keeps this exact on a
+		// loaded machine: the second hold's argv is the evidence it happened.
+		await waitFor(
+			() => recorded(spec.env.STUB_LOG)
+				.some((line) => line.includes("--after=39")),
+			"the restart hold started", 10000);
 		await delivery.stop();
 		const lines = recorded(spec.env.STUB_LOG);
 		assert(lines[0].includes("--after=45"), "the first hold used the cursor");
-		assert(lines.some((line) => line.includes("--after=39")),
-			"the next hold restarted at the oldest survivor minus one");
 		const gap = pi.messages.filter((message) =>
 			message.customType === COMMS_DELIVERY &&
 			String(message.content).includes("no longer retained"));
@@ -1159,14 +1172,159 @@ test("delivery: the latest cursor record stands, including a restart to a lower 
 		});
 		const { delivery } = harness(pi);
 		delivery.start();
-		await sleep(500);
-		assertEq(delivery.active(), false, "the resumed hold stopped the receiver");
+		// The second hold's argv, then the stop it ends in: waiting on the
+		// spawns themselves keeps this exact on a loaded machine.
+		await waitFor(() => recorded(spec.env.STUB_LOG)
+			.filter((line) => line[4] === "wait").length >= 2,
+			"the hold after the restart started", 10000);
+		await waitFor(() => !delivery.active(),
+			"the resumed hold stopped the receiver", 10000);
 		const lines = recorded(spec.env.STUB_LOG).filter((line) =>
 			line[4] === "wait");
 		assert(lines[0] && lines[0].includes("--after=2"),
 			"the restart record stands over the higher one");
 		assertEq(cursorEntries(pi).length, 2,
 			"the equal advance of the restored cursor adds nothing");
+	});
+});
+
+test("delivery: a tree switch restores this branch's cursor, not a sibling's", async () => {
+	const spec = scripted({
+		wait: [
+			{ stdout: { status: "timed-out", messages: [], cursor: { sequence: 3 } } },
+			{ stderr: "pi-comms: usage: bad flag", exit: 1 },
+		],
+	});
+	await withEnv(spec.env, async () => {
+		const pi = new FakePi();
+		const at = (sequence: number) => ({
+			type: "custom", customType: COMMS_CURSOR,
+			data: { mailbox: "@pi-test", sequence },
+		});
+		// After a switch the session file holds both branches: this one read the
+		// mailbox to 3, the sibling it left went on to 9. Only this branch's
+		// record describes what this conversation has already been shown.
+		pi.session.entries.push(at(3));
+		pi.branch = [at(3)];
+		pi.session.entries.push(at(9));
+		const { delivery } = harness(pi);
+		delivery.start();
+		try {
+			// The hold's argv is the evidence it started: waiting on it, not on
+			// the clock, keeps this exact on a loaded machine.
+			await waitFor(
+				() => recorded(spec.env.STUB_LOG).some((line) => line[4] === "wait"),
+				"the receiver's first hold started", 10000);
+		} finally {
+			await delivery.stop();
+		}
+		const lines = recorded(spec.env.STUB_LOG).filter((line) =>
+			line[4] === "wait");
+		assert(lines[0] && lines[0].includes("--after=3"),
+			"the sibling's later cursor is not this branch's place in the mailbox");
+	});
+});
+
+test("delivery: a switch stops the hold of the branch it left", async () => {
+	// The hold was started with the branch being left's place (9). Its answer
+	// names a later sequence than the branch now landed on (3) has read; if
+	// the stale answer were ingested, the landed branch would skip 4 to 9.
+	const spec = scripted({
+		wait: [
+			{
+				stdout: {
+					status: "ok",
+					messages: [envelope("m42", 42, "from the branch left")],
+					cursor: { sequence: 42 },
+				},
+			},
+			{ stdout: { status: "timed-out", messages: [], cursor: { sequence: 3 } } },
+			{ stderr: "pi-comms: usage: bad flag", exit: 1 },
+		],
+	});
+	const gate = join(scratchDir(), `gate-${Math.random().toString(16).slice(2)}`);
+	writeFileSync(gate, "");
+	await withEnv(spec.script({ STUB_GATE: gate, STUB_GATE_ON: "wait" }), async () => {
+		const pi = new FakePi();
+		const at = (sequence: number) => ({
+			type: "custom", customType: COMMS_CURSOR,
+			data: { mailbox: "@pi-test", sequence },
+		});
+		const ctxWith = (entries: Array<Record<string, unknown>>) => ({
+			sessionManager: {
+				getEntries: () => entries,
+				getBranch: () => entries,
+			},
+		});
+		const { delivery } = harness(pi);
+		delivery.attach(ctxWith([at(9)]));
+		delivery.start();
+		const holds = () => recorded(spec.env.STUB_LOG)
+			.filter((line) => line[4] === "wait");
+		try {
+			await waitFor(() => holds().length >= 1,
+				"the hold on the branch being left started", 10000);
+			assert(holds()[0].includes("--after=9"), "it used that branch's place");
+
+			// The switch as the daemon performs it: stop, restore the landed
+			// branch, start again — the old hold must not survive the stop.
+			await delivery.stop();
+			delivery.attach(ctxWith([at(3)]));
+			delivery.start();
+			rmSync(gate);
+			await waitFor(() => holds().length >= 2,
+				"the landed branch's hold started", 10000);
+		} finally {
+			rmSync(gate, { force: true });
+			await delivery.stop();
+		}
+
+		assert(holds()[1].includes("--after=3"),
+			"the landed branch's hold continues where that branch left off");
+		assert(!holds().some((line) => line.includes("--after=42")),
+			"no hold of this branch ever adopts the stale answer's place");
+		const cursors = pi.session.entries
+			.filter((entry) => entry.customType === COMMS_CURSOR)
+			.map((entry) => entry.data as Record<string, unknown>);
+		assert(cursors.every((data) => data.sequence !== 42),
+			"the stale answer's cursor was never recorded on the landed branch");
+		assert(!pi.messages.some((message) =>
+			message.customType === COMMS_DELIVERY &&
+			String(message.content).includes("from the branch left")),
+			"nor was its mail shown in the branch that landed");
+	});
+});
+
+test("delivery: an unreadable branch restores no cursor, so mail replays", async () => {
+	const spec = scripted({
+		wait: [
+			{ stdout: { status: "timed-out", messages: [], cursor: { sequence: 4 } } },
+			{ stderr: "pi-comms: usage: bad flag", exit: 1 },
+		],
+	});
+	await withEnv(spec.env, async () => {
+		const pi = new FakePi();
+		pi.session.entries.push({
+			type: "custom", customType: COMMS_CURSOR,
+			data: { mailbox: "@pi-test", sequence: 9 },
+		});
+		// The branch itself cannot be read, so no record in the file can be
+		// shown to belong to it. Reading nothing replays mail; reading the
+		// file's cursor would skip it.
+		pi.branchUnreadable = true;
+		const { delivery } = harness(pi);
+		delivery.start();
+		try {
+			await waitFor(
+				() => recorded(spec.env.STUB_LOG).some((line) => line[4] === "wait"),
+				"the receiver's first hold started", 10000);
+		} finally {
+			await delivery.stop();
+		}
+		const lines = recorded(spec.env.STUB_LOG).filter((line) =>
+			line[4] === "wait");
+		assert(lines[0] && lines[0].includes("--after=0"),
+			"an unreadable branch starts from the mailbox's beginning");
 	});
 });
 
@@ -1443,8 +1601,8 @@ test("delivery: concurrent mailbox leases serialize, and a cancel frees only its
 		// The owner's release stands the receiver up: the resumed hold
 		// re-reads the unconsumed slot and stops on the scripted failure.
 		(secondRelease ?? (() => {}))();
-		await sleep(900);
-		assertEq(delivery.active(), false, "the resumed receiver stopped itself");
+		await waitFor(() => !delivery.active(),
+			"the resumed receiver stopped itself", 10000);
 		await delivery.stop();
 	});
 });

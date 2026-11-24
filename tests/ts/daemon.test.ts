@@ -28,6 +28,9 @@ import {
   settledAborted,
   default as factory,
 } from "../../pi/extensions/daemon.ts";
+import { COMMS_ACK_STATE } from "../../pi/extensions/comms/acknowledgements.ts";
+import { COMMS_CURSOR } from "../../pi/extensions/comms/delivery.ts";
+import { execProcess, recorded, stub } from "./comms-stub.ts";
 
 /** The run identity the daemon gives every hosted child. */
 const RUN_ID = "run-1";
@@ -383,6 +386,149 @@ test("daemon: factory wires the command and events", () => {
 function stateCommand(args: string[]): string[] {
   return process.platform === "win32" ? args.slice(1) : args;
 }
+
+test("daemon: session_tree re-attaches the gate to the branch it lands on", async () => {
+  const pi = new MockPi();
+  factory(pi as never);
+  const owed = [{
+    type: "custom", customType: COMMS_ACK_STATE,
+    data: {
+      messageId: "m1", toAgentId: "pi-test", toNodeId: "n1",
+      from: { agentId: "ann" }, kind: "message", sequence: 1,
+      acknowledged: false, presented: true,
+    },
+  }];
+  const branch = { entries: [] as Array<Record<string, unknown>> };
+  const ctx = {
+    sessionManager: {
+      getEntries: () => branch.entries,
+      getBranch: () => branch.entries,
+    },
+    ui: { notify: () => {} },
+  };
+  await withEnv({ XDG_STATE_HOME: scratchDir() }, async () => {
+    try {
+      for (const handler of pi.sessionStarters) {
+        try {
+          await handler({ reason: "startup" }, ctx);
+        } catch {
+          continue;
+        }
+      }
+      assertEq(await pi.fire("tool_call", { toolName: "bash" }, ctx), undefined,
+        "a branch owing nothing admits ordinary work");
+
+      // The switch lands on a branch that still owes an acknowledgement: the
+      // ledger rebuilds from the branch it landed on, not from the one it left.
+      branch.entries = owed;
+      await pi.fire("session_tree", { reason: "tree" }, ctx);
+      const blocked = await pi.fire("tool_call", { toolName: "bash" }, ctx);
+      assertEq(blocked?.block, true,
+        "the landed branch's obligation is owed again");
+      assert(String(blocked?.reason).includes("owed: m1"),
+        "and the refusal names the id that branch holds");
+
+      branch.entries = [];
+      await pi.fire("session_tree", { reason: "tree" }, ctx);
+      assertEq(await pi.fire("tool_call", { toolName: "bash" }, ctx), undefined,
+        "switching away releases work again");
+    } finally {
+      for (const handler of pi.shutdownHandlers) {
+        await handler({ reason: "quit" });
+      }
+    }
+  });
+});
+
+test("daemon: a tree switch aborts the hold the branch it left was waiting on", async () => {
+  const log = join(scratchDir(), "tree-switch-wait.log");
+  const gate = join(scratchDir(), "tree-switch-gate");
+  writeFileSync(gate, "");
+  const env = {
+    XDG_STATE_HOME: scratchDir(),
+    PI_COMMS_AGENT_ID: "pi-test",
+    PI_COMMS_BIN: stub(),
+    STUB_LOG: log,
+    STUB_STATE: join(scratchDir(), "tree-switch-state.json"),
+    // The first hold never answers on its own: the gate keeps that one call
+    // in flight until the switch is what ends it.
+    STUB_GATE: gate,
+    STUB_GATE_ON: "wait",
+    STUB_ANSWERS: JSON.stringify({
+      wait: [{
+        stdout: { status: "timed-out", messages: [], cursor: { sequence: 4 } },
+      }],
+    }),
+  };
+  await withEnv(env, async () => {
+    class ReceiverPi extends MockPi {
+      override async exec(
+        file: string,
+        args: string[],
+        options: Parameters<typeof execProcess>[2] = {},
+      ): Promise<ExeResult> {
+        if (file === env.PI_COMMS_BIN || args[0] === env.PI_COMMS_BIN) {
+          return execProcess(file, args, options);
+        }
+        return super.exec(file, args);
+      }
+    }
+    const pi = new ReceiverPi();
+    factory(pi as never);
+    const branch = { entries: [] as Array<Record<string, unknown>> };
+    const ctx = {
+      sessionManager: {
+        getEntries: () => branch.entries,
+        getBranch: () => branch.entries,
+      },
+      ui: { notify: () => {} },
+    };
+    try {
+      for (const handler of pi.sessionStarters) {
+        try {
+          await handler({ reason: "startup" }, ctx);
+        } catch {
+          continue;
+        }
+      }
+      // The receiver took the mailbox; its argv is on record and the gate
+      // holds that call, so the answer 4 is still to come from a branch this
+      // session is about to leave.
+      await waitFor(() => recorded(log).some((line) => line[4] === "wait"),
+        "the receiver is holding the mailbox", 10000);
+
+      // The branch landed on has read up to 2. The stale hold must not answer
+      // for it, and the listener must not mistake its running child for one
+      // that belongs here: only a stop and a fresh start can produce the
+      // second argv below.
+      branch.entries = [{
+        type: "custom", customType: COMMS_CURSOR,
+        data: { mailbox: "@pi-test", sequence: 2 },
+      }];
+      await pi.fire("session_tree", { reason: "tree" }, ctx);
+      await waitFor(
+        () => recorded(log).filter((line) => line[4] === "wait").length >= 2,
+        "the landed branch opens its own hold", 10000);
+      const holds = recorded(log).filter((line) => line[4] === "wait");
+      assertEq(holds.length, 2,
+        "the switch stopped the hold it left and started exactly one more");
+      assert(holds[0].every((arg) => arg !== "--after=2"),
+        "the hold it left had read nothing on this branch");
+      assert(holds[1].includes("--after=2"),
+        "the landed branch resumes its own cursor");
+      assert(holds[1].includes("--agent") && holds[1].includes("pi-test"),
+        "and it holds this session's own mailbox");
+    } finally {
+      try {
+        for (const handler of pi.shutdownHandlers) {
+          await handler({ reason: "quit" });
+        }
+      } finally {
+        rmSync(gate, { force: true });
+      }
+    }
+  });
+});
 
 class MockPi {
   readonly commands = new Map<string, unknown>();
