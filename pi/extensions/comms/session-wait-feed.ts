@@ -60,7 +60,8 @@ export class SessionWaitFeed {
 		if (page.state !== undefined) this.runState = page.state;
 		if (this.runState === "busy") this.busy = true;
 		for (const event of page.events ?? []) {
-			if (event.type === "activity") this.active = true;
+			if (event.type === "activity" && event.kind !== "user")
+				this.active = true;
 			const line = SessionWaitFeed.line(event);
 			if (line) this.lines.push(line);
 		}

@@ -375,6 +375,16 @@ test("SessionWaitFeed: the result keeps the newest lines when it overflows", () 
 	assert(text.length <= 400, "the result fits its bound");
 });
 
+test("SessionWaitFeed: the caller's own prompt never settles a wait", () => {
+	const feed = new SessionWaitFeed("pi-a", () => {}, 0);
+	feed.add({ state: "idle", events: [{ type: "activity", kind: "user",
+		entryId: "m1", text: "go" }] });
+	assert(!feed.settled(), "a prompt alone is not a reply");
+	feed.add({ state: "idle", events: [{ type: "activity", kind: "assistant",
+		entryId: "m2", text: "done" }] });
+	assert(feed.settled(), "the reply settles it");
+});
+
 test("comms_sessions: the argv carries the peer when one is named", async () => {
 	const env = invocation({ status: "ok", sessions: [] });
 	await withEnv(env, async () => {

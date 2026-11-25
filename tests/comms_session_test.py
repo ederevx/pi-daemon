@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "pi", "lib"))
 
 from pi_daemon.comms.session_wire import (  # noqa: E402
-    ACTIVITY_EVENTS, SessionWire, wait_key)
+    SessionWire, wait_key)
 from pi_daemon.config import ServiceConfig  # noqa: E402
 from pi_daemon.sessions.error import SessionError  # noqa: E402
 from pi_daemon.transcripts.error import CatalogError  # noqa: E402
@@ -90,6 +90,7 @@ class FakeCatalog:
     def __init__(self):
         self.asked = []
         self.activities = {}
+        self.page = 50
         self.resolved = {FILE: {"sessionId": "sess-1", "file": FILE,
                                "cwd": "/home/a"}}
 
@@ -114,17 +115,27 @@ class FakeCatalog:
         events = self.activities.get(file, [])
         return events[-1]["entryId"] if events else None
 
-    def activity(self, file, cursor, text_chars, page):
-        self.asked.append(("activity", file, cursor, text_chars, page))
+    def activity(self, file, cursor, text_chars, page=None):
+        self.asked.append(("activity", file, cursor, text_chars))
         events = self.activities.get(file, [])
         if cursor is not None:
             if cursor not in [event["entryId"] for event in events]:
                 raise CatalogError("bad-cursor")
             events = [event for event in events
                       if event["entryId"] > cursor]
-        return {"events": events[:page], "next":
-                events[0]["entryId"] if events else cursor,
-                "hasMore": len(events) > page}
+        # The real catalog reads whole entries and yields what each one
+        # says; a row whose kind is not set says nothing at all.
+        grouped = []
+        for event in events:
+            if grouped and grouped[-1][0] == event["entryId"]:
+                grouped[-1][1].append(event)
+            else:
+                grouped.append((event["entryId"], [event]))
+        read = grouped[:page or self.page]
+        return {"events": [event for _id, group in read for event in group
+                            if event.get("kind")],
+                "next": read[-1][0] if read else cursor,
+                "hasMore": len(grouped) > len(read)}
 
 
 class FakeTranscripts:
@@ -372,9 +383,10 @@ class WaitTests(WireCase):
         sessions = FakeSessions()
         sessions.seals["pi-a"] = {"verdict": "exited", "cause": "exit"}
         wire = self.wire(sessions)
+        self.transcripts._catalog.page = 20
         self.transcripts._catalog.activities[FILE] = [
             {"entryId": f"m{index:02d}", "kind": "tool_call", "text": "ls"}
-            for index in range(ACTIVITY_EVENTS + 1)]
+            for index in range(21)]
         plan = wire.wait_plan(None, {"name": "pi-a", "cursor":
                                      {"name": "pi-a", "activity": None,
                                       "stateSeq": 3}})
@@ -406,6 +418,50 @@ class WaitTests(WireCase):
         self.assertTrue(reply["events"][0].get("elided"))
         self.assertEqual(reply["cursor"]["activity"], "m01")
         self.assertEqual(reply["status"], "ended")
+
+    def test_an_entry_moves_whole_so_its_tool_call_is_never_lost(self):
+        wire = self.wire(comms_feed_page_bytes=560)
+        self.transcripts._catalog.activities[FILE] = [
+            {"entryId": "m1", "kind": "assistant", "text": "a" * 200},
+            {"entryId": "m1", "kind": "tool_call", "text": "b" * 200},
+            {"entryId": "m2", "kind": "user", "text": "go"}]
+        plan = wire.wait_plan(None, {"name": "pi-a",
+                                     "cursor": self.held(3)})
+        reply, _wake = plan["probe"](False)
+        # The reply and the tool call it carried are one entry: the page
+        # takes both or neither, and the cursor never names half of one.
+        self.assertEqual([event["kind"] for event in reply["events"]],
+                         ["assistant", "tool_call"])
+        self.assertEqual(reply["cursor"]["activity"], "m1")
+        self.assertTrue(reply["more"])
+        plan = wire.wait_plan(None, {"name": "pi-a",
+                                     "cursor": reply["cursor"]})
+        page, _wake = plan["probe"](False)
+        self.assertEqual([event["kind"] for event in page["events"]],
+                         ["user"])
+        self.assertFalse(page["more"])
+
+    def test_entries_with_nothing_to_report_never_pin_the_cursor(self):
+        wire = self.wire()
+        self.transcripts._catalog.page = 20
+        self.transcripts._catalog.activities[FILE] = [
+            {"entryId": f"n{index:02d}", "kind": None}
+            for index in range(25)] + [
+            {"entryId": "n99", "kind": "user", "text": "go"}]
+        plan = wire.wait_plan(None, {"name": "pi-a",
+                                     "cursor": self.held(3)})
+        reply, _wake = plan["probe"](False)
+        # An empty page that moved the cursor is news: it answers instead
+        # of polling to the hold's bound.
+        self.assertEqual(reply["status"], "ok")
+        self.assertEqual(reply["events"], [])
+        self.assertTrue(reply["more"])
+        self.assertEqual(reply["cursor"]["activity"], "n19")
+        plan = wire.wait_plan(None, {"name": "pi-a",
+                                     "cursor": reply["cursor"]})
+        page, _wake = plan["probe"](False)
+        self.assertEqual([event["text"] for event in page["events"]],
+                         ["go"])
 
     def test_activity_is_read_from_the_conversation(self):
         wire = self.wire()

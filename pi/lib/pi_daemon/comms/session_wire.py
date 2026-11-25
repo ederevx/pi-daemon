@@ -14,8 +14,19 @@ from ..sessions.error import SessionError
 from ..transcripts.catalog import CatalogError
 from ..transport.rpc_codec import INVALID_PARAMS, RpcError
 
-ACTIVITY_EVENTS = 20
 PATH_LIMIT = 4096
+
+
+def _by_entry(events):
+    """Activity events grouped by the entry they came from, in order."""
+    grouped = []
+    for event in events:
+        candidate = dict(event, type="activity")
+        if grouped and grouped[-1][0] == event["entryId"]:
+            grouped[-1][1].append(candidate)
+        else:
+            grouped.append((event["entryId"], [candidate]))
+    return grouped
 
 
 def wait_key(key):
@@ -113,7 +124,7 @@ class SessionWire:
             page = self._wait_page(plan)
         except SessionError:
             return self._gone(plan), None
-        if page["events"] or page["status"] == "ended" or \
+        if page["events"] or page["more"] or page["status"] == "ended" or \
                 plan["cursor"] is None:
             return page, None
         if expired:
@@ -162,39 +173,30 @@ class SessionWire:
         if not file:
             return since, False
         budget = self._config.feed_page_bytes
+        chars = self._config.comms_feed_text_chars
         try:
-            page = self._catalog().activity(
-                file, since, self._config.comms_feed_text_chars,
-                ACTIVITY_EVENTS)
+            page = self._catalog().activity(file, since, chars)
         except CatalogError:
             events.append({"type": "activity", "kind": "gap"})
-            page = self._catalog().activity(
-                file, None, self._config.comms_feed_text_chars,
-                ACTIVITY_EVENTS)
-        used = len(json.dumps(events))
-        cursor, admitted = since, 0
-        last = len(page["events"])
-        for index, event in enumerate(page["events"]):
-            candidate = dict(event, type="activity")
-            size = len(json.dumps(candidate))
-            if used + size > budget:
-                # An entry admitted already, or room taken by a state event,
-                # leaves this one to a page of its own: it keeps its text
-                # there, where eliding it would lose it for good.
-                if admitted or len(json.dumps([candidate])) <= budget:
+            page = self._catalog().activity(file, None, chars)
+        cursor = since
+        entries = _by_entry(page["events"])
+        for index, (entry_id, group) in enumerate(entries):
+            if len(json.dumps(events + group)) > budget:
+                # An entry moves whole: the cursor names entries, so a part
+                # left behind could never be read again.
+                if index or len(json.dumps(group)) <= budget:
                     return cursor, True
                 # Not even an empty page could carry it. Name it without
                 # its text, so the cursor always moves: an entry no page
                 # can carry must never hold a sealed run's ending back.
-                candidate = {"type": "activity", "kind": event.get("kind"),
-                             "entryId": event["entryId"], "elided": True}
-            events.append(candidate)
-            admitted += 1
-            cursor = event["entryId"]
-            used = len(json.dumps(events))
-            if used >= budget:
-                return cursor, index + 1 < last or page["hasMore"]
-        return cursor, page["hasMore"]
+                group = [{"type": "activity", "kind": group[0].get("kind"),
+                          "entryId": entry_id, "elided": True}]
+            events.extend(group)
+            cursor = entry_id
+            if len(json.dumps(events)) >= budget:
+                return cursor, index + 1 < len(entries) or page["hasMore"]
+        return page["next"] or cursor, page["hasMore"]
 
     def _gone(self, plan):
         """A session that left nothing behind is over, not an error."""

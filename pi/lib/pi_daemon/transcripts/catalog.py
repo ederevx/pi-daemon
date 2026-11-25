@@ -86,13 +86,13 @@ class ConversationCatalog:
         entries = reader.conversation()
         return entries[-1]["id"] if entries else None
 
-    def activity(self, file, since=None, chars=2000, limit=50):
+    def activity(self, file, since=None, chars=2000, limit=None):
         """The events after `since`, one page, in append order."""
         reader = pi_transcript.TranscriptReader(self._index, file)
         reader.refresh()
         try:
-            page = reader.entries(since=since or None, limit=limit,
-                                  fields="full")
+            page = reader.entries(since=since or None,
+                                  limit=limit or self._page, fields="full")
         except KeyError:
             raise CatalogError("bad-cursor") from None
         events = []

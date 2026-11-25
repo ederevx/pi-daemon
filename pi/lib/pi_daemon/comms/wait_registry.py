@@ -67,7 +67,7 @@ class WaitRegistry:
         A reply ends the wait and is written where it came from. A `retry`
         instant asks to be looked at again without a signal; `None` waits
         for one. Nothing here knows what a reply means, so a mailbox wait
-        and a feed wait are the same entry.
+        and a session wait are the same entry.
         """
         now = self._clock()
         with self._condition:
