@@ -20,7 +20,6 @@ from .peer_operations import PeerOperations
 from .peer_link_error import PeerLinkError
 from .peer_session import PeerSession
 from .session import CommsSession
-from .session_wire import feed_key
 from .spawn_ledger import (ENV_AGENT_ID, ENV_HOST, ENV_NODE_ID,
                            ENV_PARENT_AGENT_ID, ENV_PARENT_NODE_ID, ENV_PORT,
                            ENV_SPAWN_ID, SPAWNED)
@@ -104,10 +103,6 @@ class CommsService:
         if self._sessions_wire is None:
             raise CommsError(METHOD_UNAVAILABLE)
         return self._sessions_wire.feed_plan(sender, params)
-
-    def signal_feed(self, keys):
-        """A run produced output or ended: wake the feeds reading it."""
-        self._waits.signal({feed_key(key) for key in keys})
 
     def capabilities(self):
         """The additive capability names a greeting may carry."""

@@ -32,8 +32,8 @@
 #                                         host it here
 #   session input NAME TEXT               type into a hosted session
 #   session stop NAME                     end one hosted session
-#   session feed NAME [--cursor JSON] [--include A,B] [--timeout-ms MS]
-#                                         one page of output and activity,
+#   session feed NAME [--cursor JSON] [--timeout-ms MS]
+#                                         one page of activity and state,
 #                                         or held until the next page
 #   spawn [--agent-id ID] [--name NAME] [--env K=V]... DIR -- ARGV...
 #         [--task TEXT]
@@ -477,8 +477,6 @@ def _run_session(command, options):
             params["cursor"] = json.loads(options.cursor)
         except ValueError:
             raise Declined("--cursor takes the cursor object as JSON")
-    if options.include is not None:
-        params["include"] = [part for part in options.include.split(",") if part]
     for name, value in (("timeoutMs", options.timeout_ms),
                         ("maxBytes", options.max_bytes)):
         if value is not None:
@@ -660,8 +658,6 @@ def _parser():
     feed = sessions.add_parser("feed", help="one page of a session's life")
     feed.add_argument("name", metavar="NAME")
     feed.add_argument("--cursor", metavar="JSON")
-    feed.add_argument("--include", metavar="A,B",
-                      help="output, activity or state")
     feed.add_argument("--timeout-ms", type=int, metavar="MS")
     feed.add_argument("--max-bytes", type=int, metavar="N")
 

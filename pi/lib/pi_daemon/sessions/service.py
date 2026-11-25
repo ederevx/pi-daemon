@@ -7,7 +7,6 @@ import time
 from ..wire import NO_SESSION
 from .error import SessionError
 from .identity import ProcessIdentity
-from .terminal_text import TerminalText
 
 PROJECTED = ("state", "run", "seq", "opened", "changed", "ended", "history",
              "file", "child_pid", "open")
@@ -43,7 +42,6 @@ class SessionService:
         self._reload_lock = threading.Lock()
         # A conversation is hosted once: two opens must not mint two runs.
         self._open_lock = threading.Lock()
-        self._text = TerminalText()
 
     # -- hosting -----------------------------------------------------------
 
@@ -188,24 +186,6 @@ class SessionService:
             return {"status": "hosted", "name": record.name,
                     "state": record.state(), "dir": record.dir,
                     "file": file, "created": created}
-
-    def output(self, name, offset, limit):
-        """One page of what a run printed, from a byte offset, as text."""
-        canonical = self._store.resolve(name)
-        if canonical is None:
-            raise SessionError(NO_SESSION)
-        tail = self._relay.tail(self._store.get(canonical).id)
-        if tail is None:
-            raise SessionError(NO_SESSION)
-        page = tail.read(offset, limit)
-        text, consumed = self._text.render(page["data"])
-        return {"generation": tail.generation,
-                "offset": page["offset"],
-                "next": page["offset"] + consumed,
-                "text": text,
-                "skipped": page["skipped"],
-                "end": page["end"],
-                "ended": page["ended"]}
 
     def key(self, name):
         """The relay key one name resolves to, live or not."""

@@ -2,15 +2,16 @@
 """The session wire over stub domains: what it asks, and what it answers.
 
 The wire owns no state, so every question here goes to a stub that records
-it: a sessions stub for what a run is doing and printing, and a transcripts
-stub for what a catalog lists and what one conversation did. The tests hold
-the projection (list, conversations, open), the feed's page shape (output,
-activity, state, reset, ended, budget), and the refusals a caller must get
-before anything is read.
+it: a sessions stub for what a run is doing, and a transcripts stub for
+what a catalog lists and what one conversation did. The tests hold the
+projection (list, conversations, open), the feed's page shape (activity,
+state, ended, budget), and the refusals a caller must get before anything
+is read.
 """
 
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
@@ -24,10 +25,6 @@ from pi_daemon.transcripts.error import CatalogError  # noqa: E402
 from pi_daemon.transport.rpc_codec import INVALID_PARAMS, RpcError  # noqa: E402
 
 FILE = "/home/a/.pi/agent/sessions/-home-a/2026-01-01T00-00-00_s1.jsonl"
-# A run's generation is the store's opaque id, which is text: a cursor taken
-# from a page carries that string back verbatim.
-GEN_A = "3f2a1c9d8e7b6a5f4c3d2e1f0a9b8c7d"
-GEN_B = "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b"
 
 
 def config(**overrides):
@@ -42,7 +39,6 @@ class FakeSessions:
         self.views = [{"name": "pi-a", "state": "busy", "dir": "/home/a",
                        "attached": True, "clients": 1, "file": FILE,
                        "phase": None}]
-        self.outputs = {}
         self.states = {}
         self.seals = {}
         self.opened = []
@@ -73,16 +69,6 @@ class FakeSessions:
                 "record": {"state": "busy", "seq": self.states.get(name, 3),
                            "ended": self.seals.get(name), "history": []},
                 "hosted": True}
-
-    def output(self, name, offset, limit):
-        if name not in self.outputs:
-            raise SessionError("no-session")
-        tail = self.outputs[name]
-        chunk = tail["text"][offset:offset + limit]
-        return {"generation": tail.get("generation", GEN_A),
-                "offset": offset, "next": offset + len(chunk),
-                "text": chunk, "skipped": 0,
-                "end": len(tail["text"]), "ended": tail.get("ended")}
 
     def open(self, file, dir_=None):
         self.opened.append((file, dir_))
@@ -297,162 +283,92 @@ class FeedTests(WireCase):
         reply, wake = plan["probe"](False)
         return plan, reply, wake
 
+    def held(self, state_seq):
+        """A cursor with nothing new behind it."""
+        return {"name": "pi-a", "activity": None,
+                "stateSeq": state_seq}
+
     def test_the_first_page_needs_no_cursor_and_answers_at_once(self):
-        sessions = self.sessions_for({"text": "hello"})
-        wire = self.wire(sessions)
-        plan, reply, wake = self.page(
-            wire, {"name": "pi-a", "include": ["output", "state"]})
+        wire = self.wire()
+        plan, reply, wake = self.page(wire, {"name": "pi-a"})
         self.assertEqual(plan["timeout"], 0.0)
         self.assertIsNone(wake)
         self.assertEqual(plan["key"], feed_key("k-a"))
         self.assertEqual(reply["status"], "ok")
-        types = [event["type"] for event in reply["events"]]
-        self.assertEqual(types, ["output", "state"])
-        self.assertEqual(reply["events"][0]["text"], "hello")
-        self.assertEqual(reply["cursor"]["output"], 5)
-        self.assertEqual(reply["cursor"]["stateSeq"], 3)
+        self.assertEqual([event["type"] for event in reply["events"]],
+                         ["state"])
+        self.assertEqual(reply["cursor"], {"name": "pi-a", "activity": None,
+                                           "stateSeq": 3})
 
-    def test_a_page_with_nothing_new_waits_for_a_signal(self):
-        wire = self.wire(self.sessions_for({"text": "hello"}))
-        plan = wire.feed_plan(None, {"name": "pi-a"})
-        cursor = {"name": "pi-a", "generation": GEN_A, "output": 5,
-                  "activity": None, "stateSeq": 3}
-        reply, wake = plan["probe"](False)
-        self.assertIsNotNone(reply)
-        plan = wire.feed_plan(None, {"name": "pi-a", "cursor": cursor,
-                                     "include": ["output"]})
+    def test_a_page_with_nothing_new_looks_again_after_the_poll(self):
+        plan = self.wire().feed_plan(None, {"name": "pi-a",
+                                            "cursor": self.held(3)})
         reply, wake = plan["probe"](False)
         self.assertIsNone(reply)
-        self.assertGreater(wake, 0.0)
-        # The settle window bounds a fresh-looking tail, the poll window a
-        # state-only one.
-        plan = wire.feed_plan(None, {"name": "pi-a", "cursor": cursor,
-                                     "include": ["state"]})
-        _reply, poll = plan["probe"](False)
-        self.assertGreater(poll, wake)
+        self.assertAlmostEqual(wake - time.monotonic(),
+                               config().comms_feed_poll, delta=0.2)
 
     def test_a_deadline_answers_a_page_that_found_nothing(self):
-        wire = self.wire(self.sessions_for({"text": "hello"}))
-        cursor = {"name": "pi-a", "generation": GEN_A, "output": 5,
-                  "activity": None, "stateSeq": 3}
-        plan = wire.feed_plan(None, {"name": "pi-a", "cursor": cursor,
-                                     "include": ["state"]})
+        plan = self.wire().feed_plan(None, {"name": "pi-a",
+                                            "cursor": self.held(3)})
         reply, wake = plan["probe"](True)
         self.assertIsNone(wake)
         self.assertEqual(reply["status"], "timed-out")
         self.assertEqual(reply["events"], [])
 
-    def test_a_restarted_run_is_announced_and_read_from_its_start(self):
-        wire = self.wire(self.sessions_for({"text": "again",
-                                            "generation": GEN_B}))
-        cursor = {"name": "pi-a", "generation": GEN_A, "output": 9,
-                  "activity": None, "stateSeq": 3}
-        plan = wire.feed_plan(None, {"name": "pi-a", "cursor": cursor,
-                                     "include": ["output"]})
-        reply, _wake = plan["probe"](False)
-        self.assertEqual(reply["events"][0]["type"], "reset")
-        self.assertEqual(reply["events"][0]["generation"], GEN_B)
-        self.assertEqual(reply["events"][1]["text"], "again")
-
-    def test_an_ended_run_says_so_once_its_tail_is_read(self):
-        wire = self.wire(self.sessions_for({"text": "bye", "ended": "exit"}))
-        plan = wire.feed_plan(None, {"name": "pi-a",
-                                     "include": ["output"]})
-        reply, _wake = plan["probe"](False)
-        self.assertEqual(reply["status"], "ended")
-        self.assertEqual(reply["events"][-1],
-                         {"type": "ended", "reason": "exit"})
-
-    def test_an_activity_only_watch_still_learns_the_run_ended(self):
-        sessions = self.sessions_for({"text": "bye"})
+    def test_an_ended_run_says_so_on_a_page_with_nothing_to_read(self):
+        sessions = FakeSessions()
         sessions.seals["pi-a"] = {"verdict": "exited", "cause": "exit"}
-        wire = self.wire(sessions)
-        plan = wire.feed_plan(None, {"name": "pi-a",
-                                     "include": ["activity"]})
+        plan = self.wire(sessions).feed_plan(None, {"name": "pi-a",
+                                                    "cursor": self.held(3)})
         reply, wake = plan["probe"](False)
         self.assertIsNone(wake)
         self.assertEqual(reply["status"], "ended")
         self.assertEqual(reply["events"], [{"type": "ended",
                                              "reason": "exit"}])
 
-    def test_an_activity_only_watch_never_ends_before_its_activity(self):
-        sessions = self.sessions_for({"text": "bye"})
+    def test_a_page_with_activity_left_never_declares_the_run_ended(self):
+        sessions = FakeSessions()
         sessions.seals["pi-a"] = {"verdict": "exited", "cause": "exit"}
         wire = self.wire(sessions)
         self.transcripts._catalog.activities[FILE] = [
             {"entryId": f"m{index:02d}", "kind": "tool_call", "text": "ls"}
             for index in range(ACTIVITY_EVENTS + 1)]
-        plan = wire.feed_plan(None, {"name": "pi-a",
-                                     "include": ["activity"]})
+        plan = wire.feed_plan(None, {"name": "pi-a"})
         reply, _wake = plan["probe"](False)
         self.assertEqual(reply["status"], "ok")
         self.assertTrue(reply["more"])
         self.assertNotIn("ended", [event["type"] for event in reply["events"]])
-        plan = wire.feed_plan(None, {"name": "pi-a", "cursor": reply["cursor"],
-                                     "include": ["activity"]})
+        plan = wire.feed_plan(None, {"name": "pi-a",
+                                     "cursor": reply["cursor"]})
         page, _wake = plan["probe"](False)
         self.assertEqual(page["status"], "ended")
         self.assertEqual(page["events"][-1], {"type": "ended",
                                                "reason": "exit"})
 
     def test_an_entry_too_large_for_the_page_never_hides_the_ending(self):
-        sessions = self.sessions_for({"text": "bye"})
+        sessions = FakeSessions()
         sessions.seals["pi-a"] = {"verdict": "exited", "cause": "exit"}
         wire = self.wire(sessions)
         self.transcripts._catalog.activities[FILE] = [
             {"entryId": "m00", "kind": "tool_call", "text": "x" * 500},
             {"entryId": "m01", "kind": "tool_call", "text": "ls"}]
-        plan = wire.feed_plan(None, {"name": "pi-a", "maxBytes": 120,
-                                     "include": ["activity"]})
+        plan = wire.feed_plan(None, {"name": "pi-a", "maxBytes": 120})
         reply, _wake = plan["probe"](False)
         # The entry no page could carry still names itself and moves the
         # cursor, and the same page drains the rest and ends.
-        self.assertEqual(reply["events"][0]["entryId"], "m00")
-        self.assertTrue(reply["events"][0].get("elided"))
+        self.assertEqual(reply["events"][1]["entryId"], "m00")
+        self.assertTrue(reply["events"][1].get("elided"))
         self.assertEqual(reply["cursor"]["activity"], "m01")
         self.assertEqual(reply["status"], "ended")
 
-    def test_output_never_costs_an_activity_entry_its_text(self):
-        sessions = self.sessions_for({"text": "o" * 40})
-        wire = self.wire(sessions)
-        entry = {"entryId": "m00", "kind": "tool_call", "text": "y" * 178}
-        self.transcripts._catalog.activities[FILE] = [entry]
-        plan = wire.feed_plan(None, {"name": "pi-a", "maxBytes": 300,
-                                     "include": ["output", "activity"]})
-        reply, _wake = plan["probe"](False)
-        # The page held output and had no room left, so the entry waits for
-        # the page after it instead of arriving stripped of its text.
-        self.assertFalse(any(event.get("elided")
-                             for event in reply["events"]))
-        self.assertTrue(reply["more"])
-        plan = wire.feed_plan(None, {"name": "pi-a", "maxBytes": 300,
-                                     "cursor": reply["cursor"],
-                                     "include": ["output", "activity"]})
-        page, _wake = plan["probe"](False)
-        carried = [event for event in page["events"]
-                   if event.get("entryId") == "m00"]
-        self.assertEqual(carried[0].get("text"), entry["text"])
-        self.assertNotIn("elided", carried[0])
-
-    def test_a_partial_page_never_declares_the_run_ended(self):
-        sessions = self.sessions_for({"text": "z" * 400, "ended": "exit"})
-        wire = self.wire(sessions)
-        plan = wire.feed_plan(None, {"name": "pi-a", "maxBytes": 120,
-                                     "include": ["output"]})
-        reply, _wake = plan["probe"](False)
-        self.assertEqual(reply["status"], "ok")
-        self.assertEqual([event["type"] for event in reply["events"]],
-                         ["output"])
-        self.assertLess(reply["cursor"]["output"], 400)
-
     def test_activity_is_read_from_the_conversation(self):
-        sessions = self.sessions_for({"text": ""})
-        wire = self.wire(sessions)
+        wire = self.wire()
         self.transcripts._catalog.activities[FILE] = [
             {"entryId": "m1", "kind": "tool_call", "text": "ls"},
         ]
         plan = wire.feed_plan(None, {"name": "pi-a",
-                                     "include": ["activity"]})
+                                     "cursor": self.held(3)})
         reply, _wake = plan["probe"](False)
         self.assertEqual(reply["events"], [
             {"type": "activity", "entryId": "m1", "kind": "tool_call",
@@ -460,13 +376,12 @@ class FeedTests(WireCase):
         self.assertEqual(reply["cursor"]["activity"], "m1")
 
     def test_a_page_never_outgrows_its_byte_budget(self):
-        sessions = self.sessions_for({"text": "x" * 400})
-        wire = self.wire(sessions)
+        wire = self.wire()
         self.transcripts._catalog.activities[FILE] = [
             {"entryId": f"m{index}", "kind": "tool_call", "text": "y" * 200}
             for index in range(10)]
         plan = wire.feed_plan(None, {"name": "pi-a", "maxBytes": 900,
-                                     "include": ["activity"]})
+                                     "cursor": self.held(3)})
         reply, _wake = plan["probe"](False)
         self.assertLessEqual(len(reply["events"]), 4)
         self.assertTrue(reply["more"])
@@ -486,49 +401,32 @@ class FeedTests(WireCase):
         self.refused(self.wire().feed_plan, None, {"name": "nope"})
 
     def test_a_cursor_belongs_to_one_session(self):
-        wire = self.wire(self.sessions_for({"text": "x"}))
+        wire = self.wire()
         self.refused(wire.feed_plan, None, {
             "name": "pi-a", "cursor": {"name": "pi-b"}})
 
     def test_a_malformed_cursor_is_refused(self):
-        wire = self.wire(self.sessions_for({"text": "x"}))
+        wire = self.wire()
         self.refused(wire.feed_plan, None, {
-            "name": "pi-a", "cursor": {"name": "pi-a", "output": -1}})
+            "name": "pi-a", "cursor": {"name": "pi-a", "stateSeq": -1}})
         self.refused(wire.feed_plan, None, {
             "name": "pi-a", "cursor": {"name": "pi-a", "activity": 4}})
 
-    def test_a_generation_that_is_not_a_run_s_id_is_refused(self):
-        wire = self.wire(self.sessions_for({"text": "x"}))
-        for generation in (1, True, "", "g" * 129, "a\x00b"):
-            self.refused(wire.feed_plan, None, {
-                "name": "pi-a",
-                "cursor": {"name": "pi-a", "generation": generation}})
-
     def test_a_page_s_own_cursor_can_be_fed_back(self):
-        # The defect v2.9.162 fixes: a page that carried output names the
-        # run's generation as text, and the daemon that emitted it refused
-        # that same cursor as "must be a number".
-        wire = self.wire(self.sessions_for({"text": "hello"}))
-        _plan, page, _wake = self.page(
-            wire, {"name": "pi-a", "include": ["output", "state"]})
-        self.assertEqual(page["cursor"]["generation"], GEN_A)
+        wire = self.wire()
+        self.transcripts._catalog.activities[FILE] = [
+            {"entryId": "m1", "kind": "tool_call", "text": "ls"}]
+        _plan, page, _wake = self.page(wire, {"name": "pi-a"})
+        self.assertEqual(page["cursor"]["activity"], "m1")
         plan = wire.feed_plan(None, {"name": "pi-a",
-                                     "cursor": page["cursor"],
-                                     "include": ["output", "state"]})
+                                     "cursor": page["cursor"]})
         reply, _wake = plan["probe"](True)
         self.assertIsNotNone(reply)
         self.assertEqual(reply["events"], [])
         self.assertEqual(reply["status"], "timed-out")
 
-    def test_include_names_the_three_sources(self):
-        wire = self.wire(self.sessions_for({"text": "x"}))
-        self.refused(wire.feed_plan, None, {"name": "pi-a",
-                                            "include": ["stdout"]})
-        self.refused(wire.feed_plan, None, {"name": "pi-a", "include": []})
-
     def test_a_hold_is_clamped_to_the_advertised_maximum(self):
-        wire = self.wire(self.sessions_for({"text": "x"}),
-                         comms_wait_max=0.5)
+        wire = self.wire(comms_wait_max=0.5)
         cursor = {"name": "pi-a"}
         plan = wire.feed_plan(None, {"name": "pi-a", "cursor": cursor,
                                      "timeoutMs": 600000})
@@ -539,11 +437,6 @@ class FeedTests(WireCase):
                                 comms_frame_margin=512).feed_page_bytes,
                          1536)
         self.assertEqual(config().feed_page_bytes, 16384)
-
-    def sessions_for(self, output):
-        sessions = FakeSessions()
-        sessions.outputs["pi-a"] = output
-        return sessions
 
 
 if __name__ == "__main__":

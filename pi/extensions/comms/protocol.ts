@@ -135,7 +135,6 @@ export interface CommsInputParams {
 /** `comms_feed`: one page of a session's output, activity and state. */
 export interface CommsFeedParams {
 	name: string;
-	include?: Array<"output" | "activity" | "state">;
 	/** The previous page's cursor; its absence asks for the tail now. */
 	cursor?: unknown;
 	timeoutMs?: number;
@@ -267,9 +266,6 @@ export class CommsArgv {
 	static feed(params: CommsFeedParams): string[] {
 		const argv = [...CommsArgv.at(params.node), "session", "feed",
 			params.name];
-		if (params.include && params.include.length) {
-			argv.push(`--include=${params.include.join(",")}`);
-		}
 		if (params.cursor !== undefined) {
 			argv.push(`--cursor=${JSON.stringify(params.cursor)}`);
 		}

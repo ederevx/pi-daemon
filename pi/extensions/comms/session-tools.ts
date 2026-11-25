@@ -5,7 +5,7 @@
  * `/resume` would offer there; `comms_reach` opens one — adopting the live
  * run, or hosting the conversation on that node — and ends one;
  * `comms_input` types into a hosted run; `comms_feed` reads one page of
- * what a run is doing and printing, or holds for the next page.
+ * what a run is doing, or holds for the next page.
  *
  * A feed is one of pi's blocking waits: it publishes the waiting state,
  * streams elapsed time through the tool's update channel, and yields when
@@ -59,7 +59,6 @@ interface FeedEvent {
 	entryId?: string;
 	state?: string;
 	reason?: string;
-	skipped?: number;
 	elided?: boolean;
 }
 
@@ -189,25 +188,13 @@ export class CommsSessionTools {
 			name: CommsSessionTools.FEED,
 			label: "comms feed",
 			description:
-				"Read what a session is doing and printing, over agent-comms: " +
-				"one page of output, activity and state, or - with a `cursor` " +
-				"from the previous page - a hold until the next page is ready. " +
-				"Watching never counts as a viewer, so it never changes how the " +
-				"run renders. `include` picks output, activity or state; " +
+				"Read what a session is doing, over agent-comms: one page of " +
+				"activity and state, or - with a `cursor` from the previous " +
+				"page - a hold until the next page is ready. Watching never " +
+				"counts as a viewer, so it never changes how the run renders. " +
 				"`timeoutMs` bounds a hold.",
 			parameters: Type.Object({
 				name: Type.String({ description: "The hosted session's name." }),
-				include: Type.Optional(Type.Array(
-					Type.Union([
-						Type.Literal("output"),
-						Type.Literal("activity"),
-						Type.Literal("state"),
-					]),
-					{
-						minItems: 1,
-						description: "What to read: output, activity, state.",
-					},
-				)),
 				cursor: Type.Optional(Type.Unknown({
 					description: "The previous page's cursor; omit for the tail.",
 				})),
@@ -354,15 +341,12 @@ export class CommsSessionTools {
 		};
 	}
 
-	/** A feed page as model text: the output as it printed, then one line
-	 *  per activity event, and the cursor that continues from here. */
+	/** A feed page as model text: one line per activity event, the state
+	 *  when it moves, and the cursor that continues from here. */
 	private static pageText(page: FeedPage, name: string): string {
 		const lines: string[] = [];
 		for (const event of page.events ?? []) {
 			switch (event.type) {
-				case "output":
-					if (event.text) lines.push(event.text);
-					break;
 				case "activity":
 					lines.push(`· ${event.kind ?? "activity"}` +
 						(event.entryId ? ` ${event.entryId}` : "") +
@@ -370,9 +354,6 @@ export class CommsSessionTools {
 					break;
 				case "state":
 					lines.push(`state: ${event.state ?? "unknown"}`);
-					break;
-				case "reset":
-					lines.push("(the run restarted; output is read from its start)");
 					break;
 				case "ended":
 					lines.push(`ended: ${event.reason ?? "gone"}`);
@@ -383,7 +364,7 @@ export class CommsSessionTools {
 		}
 		if (!lines.length) {
 			lines.push(page.status === "timed-out"
-				? `${name}: no new output or activity`
+				? `${name}: no new activity`
 				: `${name}: ${page.status ?? "ok"}`);
 		}
 		lines.push(`[${page.status ?? "ok"}` +

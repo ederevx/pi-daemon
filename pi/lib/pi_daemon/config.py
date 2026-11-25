@@ -45,7 +45,6 @@ RANGES = {
     "comms_feed_page_bytes": 0,
     "comms_feed_text_chars": 0,
     "comms_session_page": 0,
-    "relay_tail_bytes": 0,
 }
 
 
@@ -77,10 +76,6 @@ class ServiceConfig:
     default_rows: int = 40
     master_chunk_bytes: int = 65536
     relay_buffer_bytes: int = 262144
-    # What a feed reads: the run's last output, kept beside the viewers so
-    # watching it never counts as a viewer and never costs one its bytes.
-    relay_tail_bytes: int = 65536
-    relay_ended_tails: int = 32
     relay_tick: float = 0.05
     # A repaint nudge holds the off-size this long: pi's redraw follows the
     # change event, and two changes in one instant coalesce into none.
@@ -115,7 +110,6 @@ class ServiceConfig:
     comms_waits_per_connection: int = 1
     comms_spawn_records: int = 1024
     comms_feed_page_bytes: int = 16384
-    comms_feed_settle: float = 0.25
     comms_feed_poll: float = 1.0
     comms_feed_text_chars: int = 2000
     comms_session_page: int = 50

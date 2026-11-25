@@ -17,18 +17,11 @@ from ..transport.rpc_codec import INVALID_PARAMS, RpcError
 FEED = "comms.session.feed"
 CONTROL = ("comms.session.open", "comms.session.input",
            "comms.session.stop")
-INCLUDE = ("output", "activity", "state")
-# An output page reads this fraction of its budget as bytes: one non-ASCII
-# byte can cost six in an escaped frame, and a page must fit one frame.
-ESCAPE_FACTOR = 6
 ACTIVITY_EVENTS = 20
 # A page keeps at least this much room, so an activity entry that cannot fit
 # in it still names itself: a caller's smaller maxBytes is raised to it.
 PAGE_FLOOR = 256
 PATH_LIMIT = 4096
-# A run's generation is the store's opaque id for one run; a cursor carries
-# it back verbatim, so it is text, bounded, and never a number.
-GENERATION_LIMIT = 128
 
 
 def feed_key(key):
@@ -129,65 +122,31 @@ class SessionWire:
         if expired:
             page["status"] = "timed-out"
             return page, None
-        wait = (self._config.comms_feed_settle if "output" in plan["include"]
-                else self._config.comms_feed_poll)
-        return None, time.monotonic() + wait
+        return None, time.monotonic() + self._config.comms_feed_poll
 
     def _feed_page(self, plan):
         name = plan["name"]
         cursor = plan["cursor"] or {}
-        include = plan["include"]
         budget = plan["max_bytes"]
         events = []
         state = self._sessions.run_state(name)
         record = state["record"]
-        generation = cursor.get("generation")
-        output = None
-        next_output = cursor.get("output") or 0
-        if "output" in include:
-            output = self._sessions.output(name, next_output,
-                                           max(1, budget // ESCAPE_FACTOR))
-            if generation is not None and \
-                    output["generation"] != generation:
-                events.append({"type": "reset",
-                               "generation": output["generation"]})
-                output = self._sessions.output(name, 0,
-                                               max(1, budget // ESCAPE_FACTOR))
-            generation = output["generation"]
-            next_output = output["next"]
-            if output["text"] or output["skipped"]:
-                events.append({"type": "output", "offset": output["offset"],
-                               "text": output["text"],
-                               "skipped": output["skipped"]})
-        ended = None
-        if output is not None:
-            if output["ended"] is not None and output["next"] >= output["end"]:
-                ended = output["ended"]
-        else:
-            # A run that has ended says so without being read for output:
-            # a watcher reading only activity would otherwise hold until its
-            # deadline on every page and never learn the run is over.
-            ended = seal_reason(record.get("ended"))
-        if "state" in include and cursor.get("stateSeq") != record.get("seq"):
+        if cursor.get("stateSeq") != record.get("seq"):
             events.append({"type": "state", "state": record.get("state"),
                            "seq": record.get("seq")})
-        next_activity, more = cursor.get("activity"), False
-        if "activity" in include:
-            next_activity, more = self._activity(
-                name, cursor.get("activity"), events, budget)
+        next_activity, more = self._activity(
+            name, cursor.get("activity"), events, budget)
         # Like a page that stops short of the tail, a page with activity
         # still to read never declares the run over: a watcher that stops
         # on `ended` would lose the rest. The next page says it.
-        if more:
-            ended = None
+        ended = None if more else seal_reason(record.get("ended"))
         if ended:
             events.append({"type": "ended", "reason": ended})
         return {"status": "ended" if ended else "ok",
                 "nodeId": self._node_id, "name": name,
-                "generation": generation, "state": record.get("state"),
+                "state": record.get("state"),
                 "events": events,
-                "cursor": {"name": name, "generation": generation,
-                           "output": next_output, "activity": next_activity,
+                "cursor": {"name": name, "activity": next_activity,
                            "stateSeq": record.get("seq")},
                 "more": more}
 
@@ -212,9 +171,9 @@ class SessionWire:
             candidate = dict(event, type="activity")
             size = len(json.dumps(candidate))
             if used + size > budget:
-                # An entry admitted already, or room taken by output or
-                # state, leaves this one to a page of its own: it keeps its
-                # text there, where eliding it would lose it for good.
+                # An entry admitted already, or room taken by a state event,
+                # leaves this one to a page of its own: it keeps its text
+                # there, where eliding it would lose it for good.
                 if admitted or len(json.dumps([candidate])) <= budget:
                     return cursor, True
                 # Not even an empty page could carry it. Name it without
@@ -231,9 +190,9 @@ class SessionWire:
         return cursor, page["hasMore"]
 
     def _gone(self, plan):
-        """A session that left no tail behind is over, not an error."""
+        """A session that left nothing behind is over, not an error."""
         return {"status": "ended", "nodeId": self._node_id,
-                "name": plan["name"], "generation": None, "state": None,
+                "name": plan["name"], "state": None,
                 "events": [{"type": "ended", "reason": "gone"}],
                 "cursor": dict(plan["cursor"] or {}, name=plan["name"]),
                 "more": False}
@@ -242,24 +201,11 @@ class SessionWire:
 
     def _feed_params(self, params):
         name = self._name(params)
-        include = params.get("include")
-        if include is None:
-            file = self._sessions.recorded_file(name)
-            include = ("activity", "state") if file else ("output", "state")
-        elif isinstance(include, list) and include:
-            if not all(isinstance(item, str) and item in INCLUDE
-                       for item in include):
-                raise RpcError(INVALID_PARAMS,
-                               "include names output, activity or state")
-            include = tuple(dict.fromkeys(include))
-        else:
-            raise RpcError(INVALID_PARAMS, "include must be a list")
         timeout = self._millis(params.get("timeoutMs"))
         limit = self._bytes(params.get("maxBytes"))
         budget = self._config.feed_page_bytes
         return {"name": name,
                 "cursor": self._cursor(params.get("cursor"), name),
-                "include": include,
                 "timeout": self._config.comms_wait_max if timeout is None
                 else min(timeout, self._config.comms_wait_max),
                 "max_bytes": budget if limit is None else
@@ -271,20 +217,12 @@ class SessionWire:
         if not isinstance(value, dict) or value.get("name") != name:
             raise RpcError(INVALID_PARAMS, "a cursor belongs to one session")
         cursor = {"name": name}
-        generation = value.get("generation")
-        if generation is not None and (
-                not isinstance(generation, str) or not generation
-                or len(generation) > GENERATION_LIMIT
-                or "\x00" in generation):
-            raise RpcError(INVALID_PARAMS,
-                           "cursor.generation must be a run's generation")
-        cursor["generation"] = generation
-        for field, kind in (("output", int), ("stateSeq", int)):
+        for field in ("output", "stateSeq"):
             entry = value.get(field)
             if entry is None:
                 cursor[field] = None
                 continue
-            if isinstance(entry, bool) or not isinstance(entry, kind) or \
+            if isinstance(entry, bool) or not isinstance(entry, int) or \
                     entry < 0:
                 raise RpcError(INVALID_PARAMS,
                                f"cursor.{field} must be a number")

@@ -155,35 +155,33 @@ test("comms_input: the text travels exactly as given", async () => {
 	});
 });
 
-test("comms_feed: a first page prints the output and its cursor", async () => {
+test("comms_feed: a first page prints the activity and its cursor", async () => {
 	const page = {
 		status: "ok",
 		name: "pi-a",
 		events: [
-			{ type: "output", offset: 0, text: "hello\n", skipped: 0 },
 			{ type: "state", state: "busy", seq: 3 },
 			{ type: "activity", kind: "tool_call", entryId: "m1" },
 			{ type: "ended", reason: "exit" },
 		],
-		cursor: { name: "pi-a", output: 6, activity: "m1", stateSeq: 3 },
+		cursor: { name: "pi-a", activity: "m1", stateSeq: 3 },
 		more: false,
 	};
 	const env = invocation(page);
 	await withEnv(env, async () => {
 		const result = await call("comms_feed", { name: "pi-a",
-			include: ["output", "activity"], timeoutMs: 2000, maxBytes: 4096 });
+			timeoutMs: 2000, maxBytes: 4096 });
 		assert(!result.isError, "not an error");
 		const text = result.content[0].text as string;
-		assert(text.startsWith("hello\n"), "the output leads");
+		assert(text.startsWith("state: busy"), "the state leads");
 		assert(text.includes("· tool_call m1"), "one line per activity");
-		assert(text.includes("state: busy"), "the state line");
 		assert(text.includes("ended: exit"), "the ended line");
-		assert(text.includes('"output":6'), "the continuing cursor");
+		assert(text.includes('"activity":"m1"'), "the continuing cursor");
 		assertEq(recorded(env.STUB_LOG)[0].join(" "),
 			"--format json --agent pi-test session feed pi-a " +
-			"--include=output,activity --timeout-ms=2000 --max-bytes=4096",
+			"--timeout-ms=2000 --max-bytes=4096",
 			"the first-page argv");
-		assertEq((result.structuredContent as any).cursor.output, 6,
+		assertEq((result.structuredContent as any).cursor.activity, "m1",
 			"the cursor is structured");
 	});
 });
@@ -196,13 +194,12 @@ test("comms_feed: a page that found nothing is a page, not a failure", async () 
 		const result = await call("comms_feed", { name: "pi-a" });
 		assert(!result.isError, "an empty hold is not an error");
 		assert((result.content[0].text as string)
-			.includes("no new output or activity"), "says what it found");
+			.includes("no new activity"), "says what it found");
 	});
 });
 
 test("comms_feed: the cursor is sent as JSON and only a hold waits", async () => {
-	const cursor = { name: "pi-a", generation: "3f2a1c9d8e7b6a5f4c3d2e1f0a9b8c7d",
-		output: 6, activity: "m1", stateSeq: 3 };
+	const cursor = { name: "pi-a", activity: "m1", stateSeq: 3 };
 	const env = invocation({ status: "timed-out", events: [], cursor }, 3);
 	const states: boolean[] = [];
 	await withEnv(env, async () => {

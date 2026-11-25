@@ -2,13 +2,11 @@
 
 import threading
 
-from .terminal_tail import TerminalTail
-
 
 class RelaySession:
     """Buffers belong to viewers; the child owns the terminal."""
 
-    def __init__(self, key, generation, child, limit, tail_limit=0):
+    def __init__(self, key, generation, child, limit):
         self.key = key
         self.generation = generation
         self.child = child
@@ -20,8 +18,6 @@ class RelaySession:
         self.closing = False
         self.deadline = None
         self.eof = False
-        self.reason = None
-        self.tail = TerminalTail(generation, tail_limit)
         self.done = threading.Event()
 
     def viewer_count(self):
@@ -42,12 +38,7 @@ class RelaySession:
             _close(connection)
 
     def broadcast(self, data):
-        """Fan out one chunk, dropping viewers that cannot keep up.
-
-        The run's own tail takes it first: a feed reads there and is never
-        a viewer, so it neither costs a viewer its bytes nor counts as one.
-        """
-        self.tail.append(data)
+        """Fan out one chunk, dropping viewers that cannot keep up."""
         if not self.viewers:
             self.backlog += data
             if len(self.backlog) > self.limit:
