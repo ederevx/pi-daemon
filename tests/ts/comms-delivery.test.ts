@@ -1427,8 +1427,8 @@ test("delivery: a cancelled queued acquire does not pass the turn to its success
 		const cRelease = await c;
 		assert(turnedC, "the turn reaches the successor only after the release");
 		cRelease();
-		await sleep(900);
-		assertEq(delivery.active(), false, "the resumed receiver stopped itself");
+		await waitFor(() => !delivery.active(),
+			"the resumed receiver stopped itself", 10000);
 	});
 });
 
