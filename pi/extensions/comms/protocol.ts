@@ -132,13 +132,14 @@ export interface CommsInputParams {
 	node?: string;
 }
 
-/** `comms_feed`: one page of a session's output, activity and state. */
-export interface CommsFeedParams {
+/** `comms_session_wait`: hold on a session until it settles, streaming what
+ *  it does. */
+export interface CommsSessionWaitParams {
 	name: string;
-	/** The previous page's cursor; its absence asks for the tail now. */
+	/** The cursor comms_input or an earlier wait returned; its absence starts
+	 *  the wait now. */
 	cursor?: unknown;
 	timeoutMs?: number;
-	maxBytes?: number;
 	node?: string;
 }
 
@@ -263,17 +264,14 @@ export class CommsArgv {
 			`--text=${params.text}`];
 	}
 
-	static feed(params: CommsFeedParams): string[] {
-		const argv = [...CommsArgv.at(params.node), "session", "feed",
+	static sessionWait(params: CommsSessionWaitParams): string[] {
+		const argv = [...CommsArgv.at(params.node), "session", "wait",
 			params.name];
 		if (params.cursor !== undefined) {
 			argv.push(`--cursor=${JSON.stringify(params.cursor)}`);
 		}
 		if (params.timeoutMs !== undefined) {
 			argv.push(`--timeout-ms=${params.timeoutMs}`);
-		}
-		if (params.maxBytes !== undefined) {
-			argv.push(`--max-bytes=${params.maxBytes}`);
 		}
 		return argv;
 	}

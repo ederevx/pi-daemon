@@ -129,8 +129,12 @@ class TranscriptsTest(unittest.TestCase):
         self.assertTrue(page["hasMore"])
         rest = self.call("transcript-entries", transcriptId=handle,
                          since=page["next"])
-        self.assertEqual([entry["id"] for entry in rest["entries"]], ["m3"])
+        self.assertEqual([entry["id"] for entry in rest["entries"]],
+                         ["m3"])
         self.assertFalse(rest["hasMore"])
+
+    def test_head_names_the_newest_entry(self):
+        self.assertEqual(self.service.catalog().head(self.file), "m3")
 
     def test_a_cursor_that_names_no_entry_is_a_bad_cursor(self):
         handle = self.open_handle()

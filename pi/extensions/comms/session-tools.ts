@@ -4,13 +4,13 @@
  * `comms_sessions` lists what a node hosts and which conversations
  * `/resume` would offer there; `comms_reach` opens one — adopting the live
  * run, or hosting the conversation on that node — and ends one;
- * `comms_input` types into a hosted run; `comms_feed` reads one page of
- * what a run is doing, or holds for the next page.
+ * `comms_input` types into a hosted run; `comms_session_wait` holds on one
+ * until it settles, streaming what it does.
  *
- * A feed is one of pi's blocking waits: it publishes the waiting state,
- * streams elapsed time through the tool's update channel, and yields when
- * a caller abort or a queued message arrives. It is read-only, so it never
- * takes the mailbox lease the receiver owns.
+ * A session wait is one of pi's blocking waits: it publishes the waiting
+ * state, streams the session's activity through the tool's update channel,
+ * and yields when a caller abort or a queued message arrives. It is
+ * read-only, so it never takes the mailbox lease the receiver owns.
  */
 
 import { resolve } from "node:path";
@@ -24,11 +24,12 @@ import { CommsCli, type CommsOutcome } from "./client.ts";
 import {
 	CommsArgv,
 	CommsExit,
-	type CommsFeedParams,
 	type CommsInputParams,
 	type CommsReachParams,
+	type CommsSessionWaitParams,
 	type CommsSessionsParams,
 } from "./protocol.ts";
+import { SessionWaitFeed, type SessionWaitPage } from "./session-wait-feed.ts";
 
 /** One tool's answer, already rendered for pi. */
 interface SessionToolResult {
@@ -38,7 +39,7 @@ interface SessionToolResult {
 	isError?: boolean;
 }
 
-/** The feed's streamed tool-window update. */
+/** The wait's streamed tool-window update. */
 type ToolUpdate = (update: {
 	content: Array<{ type: "text"; text: string }>;
 	details: Record<string, unknown>;
@@ -46,40 +47,26 @@ type ToolUpdate = (update: {
 
 /** What the composition may wire in; all of it is optional. */
 export interface CommsSessionOptions {
-	/** Publishes "waiting" for a held feed; the tool restores on exit. */
+	/** Publishes "waiting" for a session wait; the tool restores on exit. */
 	setWaitState?: (waiting: boolean) => void;
 	waitUpdateMs?: number;
 }
 
-/** One event as a feed page carries it. */
-interface FeedEvent {
-	type?: string;
-	text?: string;
-	kind?: string;
-	entryId?: string;
-	state?: string;
-	reason?: string;
-	elided?: boolean;
-}
-
-/** One feed page. */
-interface FeedPage {
-	status?: string;
-	name?: string;
-	nodeId?: string;
-	state?: string;
-	events?: FeedEvent[];
+/** How one call's chain of held pages ended. */
+interface WaitEnd {
+	status: string;
 	cursor?: unknown;
-	more?: boolean;
+	nodeId?: string;
+	failed?: CommsOutcome;
 }
 
 export class CommsSessionTools {
 	static readonly SESSIONS = "comms_sessions";
 	static readonly REACH = "comms_reach";
 	static readonly INPUT = "comms_input";
-	static readonly FEED = "comms_feed";
+	static readonly WAIT = "comms_session_wait";
 
-	/** The feed's live-update cadence, presentational only. */
+	/** The wait's live-update cadence, presentational only. */
 	private static readonly UPDATE_MS = 250;
 	private static readonly MAX_TEXT = 60000;
 
@@ -185,34 +172,36 @@ export class CommsSessionTools {
 		});
 
 		pi.registerTool({
-			name: CommsSessionTools.FEED,
-			label: "comms feed",
+			name: CommsSessionTools.WAIT,
+			label: "comms session wait",
 			description:
-				"Read what a session is doing, over agent-comms: one page of " +
-				"activity and state, or - with a `cursor` from the previous " +
-				"page - a hold until the next page is ready. Watching never " +
-				"counts as a viewer, so it never changes how the run renders. " +
-				"`timeoutMs` bounds a hold.",
+				"Wait on a hosted session over agent-comms, streaming what it " +
+				"does - its prompts, replies, tool calls and results, read from " +
+				"its conversation - until it settles (its turn ends: idle or " +
+				"waiting), its run ends, or `timeoutMs` passes (the service's " +
+				"own wait limit when omitted). Without a `cursor` the wait " +
+				"starts now; pass the cursor `comms_input` returned to see the " +
+				"turn that input starts, or a previous wait's to continue. A " +
+				"caller abort or a queued message ends it early with what it " +
+				"saw and the cursor.",
 			parameters: Type.Object({
 				name: Type.String({ description: "The hosted session's name." }),
 				cursor: Type.Optional(Type.Unknown({
-					description: "The previous page's cursor; omit for the tail.",
+					description: "The cursor `comms_input` or an earlier wait " +
+						"returned; omit to start now.",
 				})),
 				timeoutMs: Type.Optional(Type.Integer({
 					minimum: 0,
-					description: "Bound the hold, in milliseconds.",
-				})),
-				maxBytes: Type.Optional(Type.Integer({
-					minimum: 1,
-					description: "Bound the page, in bytes (at least 256).",
+					description: "Bound the whole wait; the service's own wait " +
+						"limit when omitted.",
 				})),
 				node: Type.Optional(Type.String({
-					description: "Watch that peer's session.",
+					description: "Wait on that peer's session.",
 				})),
 			}),
 			annotations: { readOnlyHint: true, openWorldHint: true },
 			execute: async (_id, params, signal, update, ctx) =>
-				this.feed(params as CommsFeedParams, signal, update, ctx),
+				this.wait(params as CommsSessionWaitParams, signal, update, ctx),
 		});
 	}
 
@@ -264,15 +253,15 @@ export class CommsSessionTools {
 		return CommsSessionTools.result(outcome);
 	}
 
-	/** One page, or a hold for the next one, streamed while it waits. */
-	private async feed(
-		params: CommsFeedParams,
+	/** Hold on one session until it settles, streaming what it does. */
+	private async wait(
+		params: CommsSessionWaitParams,
 		signal: AbortSignal | undefined,
 		onUpdate: ToolUpdate | undefined,
 		ctx: ExtensionToolContext | undefined,
 	): Promise<SessionToolResult> {
-		// A steer already queued ends the hold now: the message it carries
-		// is the answer, and the page can be read after it.
+		// A steer already queued ends the wait now: the message it carries
+		// is the answer, and a later wait continues from the cursor.
 		if (ctx?.hasPendingMessages?.()) {
 			return CommsSessionTools.stopped("yield");
 		}
@@ -280,9 +269,19 @@ export class CommsSessionTools {
 		const controller = new AbortController();
 		const onCallerAbort = () => controller.abort();
 		signal?.addEventListener("abort", onCallerAbort, { once: true });
-		const updateMs = this.options.waitUpdateMs
-			?? CommsSessionTools.UPDATE_MS;
 		const startedAt = performance.now();
+		const feed = new SessionWaitFeed(params.name, (text) => {
+			try {
+				onUpdate?.({
+					content: [{ type: "text", text }],
+					details: {
+						waitedMs: Math.round(performance.now() - startedAt),
+					},
+				});
+			} catch {
+				// The host callback must never break the wait.
+			}
+		}, startedAt);
 		let yielded = false;
 		const tick = setInterval(() => {
 			if (ctx?.hasPendingMessages?.()) {
@@ -290,103 +289,106 @@ export class CommsSessionTools {
 				controller.abort();
 				return;
 			}
-			onUpdate?.({
-				content: [{
-					type: "text",
-					text: `Watching ${params.name} ` +
-						`(${Math.round((performance.now() - startedAt) / 1000)}s)`,
-				}],
-				details: {
-					waitedMs: Math.round(performance.now() - startedAt),
-				},
-			});
-		}, updateMs);
-		let outcome: CommsOutcome;
-		// Only a hold is a wait: a first page answers at once, so the
-		// session's published state never flickers for it.
-		const holds = params.cursor !== undefined;
-		if (holds) this.options.setWaitState?.(true);
+			feed.publish();
+		}, this.options.waitUpdateMs ?? CommsSessionTools.UPDATE_MS);
+		// Every call holds, so every call is a wait.
+		this.options.setWaitState?.(true);
+		let end: WaitEnd = { status: "stopped" };
 		try {
-			outcome = await this.cli.run(
-				CommsSessionTools.FEED, CommsArgv.feed(params),
-				{ signal: controller.signal });
+			end = await this.follow(params, feed, controller.signal, startedAt);
 		} finally {
 			clearInterval(tick);
+			feed.close();
 			signal?.removeEventListener("abort", onCallerAbort);
-			if (holds) this.options.setWaitState?.(false);
+			this.options.setWaitState?.(false);
 		}
-		if (yielded) return CommsSessionTools.stopped("yield");
-		if (signal?.aborted) return CommsSessionTools.stopped("abort");
-		const page = outcome.answer as FeedPage | undefined;
-		// A hold that found nothing is an empty page, not a failure: it
-		// carries the cursor that continues from here.
-		const empty = outcome.exitCode === CommsExit.TIMED_OUT;
-		if (!page || (outcome.exitCode !== CommsExit.OK && !empty)) {
-			return CommsSessionTools.failure(outcome);
+		if (yielded) return CommsSessionTools.stopped("yield", feed, end.cursor);
+		if (signal?.aborted) {
+			return CommsSessionTools.stopped("abort", feed, end.cursor);
+		}
+		if (end.failed) {
+			return CommsSessionTools.failure(end.failed, feed, end.cursor);
 		}
 		return {
 			content: [{
 				type: "text",
-				text: CommsSessionTools.pageText(page, params.name),
+				text: feed.result(end.status, end.cursor,
+					CommsSessionTools.MAX_TEXT),
 			}],
-			structuredContent: page,
+			structuredContent: {
+				status: end.status, name: params.name,
+				nodeId: end.nodeId, state: feed.state, cursor: end.cursor,
+			},
 			details: {
-				command: outcome.command,
-				exitCode: outcome.exitCode,
-				status: page.status,
-				more: page.more === true,
-				cursor: page.cursor,
+				status: end.status,
+				state: feed.state,
+				cursor: end.cursor,
 				waitedMs: Math.round(performance.now() - startedAt),
 			},
 		};
 	}
 
-	/** A feed page as model text: one line per activity event, the state
-	 *  when it moves, and the cursor that continues from here. */
-	private static pageText(page: FeedPage, name: string): string {
-		const lines: string[] = [];
-		for (const event of page.events ?? []) {
-			switch (event.type) {
-				case "activity":
-					lines.push(`· ${event.kind ?? "activity"}` +
-						(event.entryId ? ` ${event.entryId}` : "") +
-						(event.elided ? " (elided: too large for a page)" : ""));
-					break;
-				case "state":
-					lines.push(`state: ${event.state ?? "unknown"}`);
-					break;
-				case "ended":
-					lines.push(`ended: ${event.reason ?? "gone"}`);
-					break;
-				default:
-					break;
+	/** Page after page until the session settles, ends, or the bound passes:
+	 *  each page is one held request, answered as soon as there is news. */
+	private async follow(
+		params: CommsSessionWaitParams,
+		feed: SessionWaitFeed,
+		signal: AbortSignal,
+		startedAt: number,
+	): Promise<WaitEnd> {
+		let cursor = params.cursor;
+		let nodeId: string | undefined;
+		let deadline = params.timeoutMs === undefined
+			? undefined : startedAt + params.timeoutMs;
+		for (;;) {
+			const timeoutMs = deadline === undefined ? undefined
+				: Math.max(0, Math.round(deadline - performance.now()));
+			const outcome = await this.cli.run(CommsSessionTools.WAIT,
+				CommsArgv.sessionWait({ ...params, cursor, timeoutMs }),
+				{ signal });
+			if (signal.aborted) return { status: "stopped", cursor, nodeId };
+			const page = outcome.answer as SessionWaitPage | undefined;
+			// A hold that found nothing is a page, not a failure.
+			if (!page || (outcome.exitCode !== CommsExit.OK &&
+					outcome.exitCode !== CommsExit.TIMED_OUT)) {
+				return { status: "failed", cursor, nodeId, failed: outcome };
+			}
+			cursor = page.cursor;
+			nodeId = page.nodeId;
+			// The serving node's own limit bounds a wait that named none.
+			deadline ??= startedAt + (page.maxWaitMs ?? 0);
+			feed.add(page);
+			feed.publish();
+			if (page.status === "ended") {
+				return { status: "ended", cursor, nodeId };
+			}
+			if (!page.more && feed.settled()) {
+				return { status: "settled", cursor, nodeId };
+			}
+			if (performance.now() >= deadline) {
+				return { status: "timed-out", cursor, nodeId };
 			}
 		}
-		if (!lines.length) {
-			lines.push(page.status === "timed-out"
-				? `${name}: no new activity`
-				: `${name}: ${page.status ?? "ok"}`);
-		}
-		lines.push(`[${page.status ?? "ok"}` +
-			`${page.more ? ", more" : ""}] ` +
-			`cursor: ${JSON.stringify(page.cursor ?? null)}`);
-		const text = lines.join("\n");
-		return text.length > CommsSessionTools.MAX_TEXT
-			? `${text.slice(0, CommsSessionTools.MAX_TEXT)}\n… truncated`
-			: text;
 	}
 
 	/** An early stop: nothing taken, nothing lost. */
-	private static stopped(stoppedBy: "yield" | "abort"): SessionToolResult {
+	private static stopped(
+		stoppedBy: "yield" | "abort",
+		feed?: SessionWaitFeed,
+		cursor?: unknown,
+	): SessionToolResult {
+		const head = stoppedBy === "yield"
+			? "comms_session_wait yielded: a message is queued; read it now."
+			: "comms_session_wait aborted: nothing was taken from the run.";
 		return {
 			content: [{
 				type: "text",
-				text: stoppedBy === "yield"
-					? "comms_feed yielded: a message was already queued; read it now."
-					: "comms_feed aborted: nothing was taken from the run.",
+				text: feed ? `${head}\n` +
+					feed.result(stoppedBy, cursor, CommsSessionTools.MAX_TEXT)
+					: head,
 			}],
-			structuredContent: { status: "yielded", stoppedBy },
-			details: { stoppedBy },
+			structuredContent: { status: "yielded", stoppedBy, cursor },
+			details: { stoppedBy, cursor },
 		};
 	}
 
@@ -430,7 +432,11 @@ export class CommsSessionTools {
 			: text;
 	}
 
-	private static failure(outcome: CommsOutcome): SessionToolResult {
+	private static failure(
+		outcome: CommsOutcome,
+		feed?: SessionWaitFeed,
+		cursor?: unknown,
+	): SessionToolResult {
 		const head = outcome.missingBinary
 			? `pi-comms not found at ${outcome.missingBinary}`
 			: `pi-comms ${outcome.command} failed: exit ${outcome.exitCode} ` +
@@ -440,6 +446,10 @@ export class CommsSessionTools {
 		if (outcome.answer !== undefined) {
 			lines.push(CommsSessionTools.answer(outcome.answer));
 		}
+		if (feed) {
+			lines.push(feed.result("failed", cursor,
+				CommsSessionTools.MAX_TEXT));
+		}
 		return {
 			content: [{ type: "text", text: lines.join("\n") }],
 			isError: true,
@@ -448,6 +458,7 @@ export class CommsSessionTools {
 				argv: outcome.argv,
 				exitCode: outcome.exitCode,
 				answer: outcome.answer,
+				cursor,
 			},
 		};
 	}

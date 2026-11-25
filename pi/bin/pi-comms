@@ -32,9 +32,9 @@
 #                                         host it here
 #   session input NAME TEXT               type into a hosted session
 #   session stop NAME                     end one hosted session
-#   session feed NAME [--cursor JSON] [--timeout-ms MS]
-#                                         one page of activity and state,
-#                                         or held until the next page
+#   session wait NAME [--cursor JSON] [--timeout-ms MS]
+#                                         hold until the session moves, then
+#                                         report what it did
 #   spawn [--agent-id ID] [--name NAME] [--env K=V]... DIR -- ARGV...
 #         [--task TEXT]
 #                                         launch another agent; every
@@ -100,7 +100,7 @@ TIMEOUT = -32004
 
 SUCCESS = ("accepted", "queued", "spawned", "ok", "live", "hosted", "ended")
 # Held methods answer after their own hold: the socket deadline grows by it.
-HELD = frozenset({"comms.wait", "comms.session.feed"})
+HELD = frozenset({"comms.wait", "comms.session.wait"})
 DECLINED = ("undeliverable", "cursor-expired", "failed", "request-conflict",
             "unknown")
 
@@ -477,11 +477,9 @@ def _run_session(command, options):
             params["cursor"] = json.loads(options.cursor)
         except ValueError:
             raise Declined("--cursor takes the cursor object as JSON")
-    for name, value in (("timeoutMs", options.timeout_ms),
-                        ("maxBytes", options.max_bytes)):
-        if value is not None:
-            params[name] = value
-    return command.call("comms.session.feed", params)
+    if options.timeout_ms is not None:
+        params["timeoutMs"] = options.timeout_ms
+    return command.call("comms.session.wait", params)
 
 
 def _run_peer(command, options):
@@ -655,11 +653,10 @@ def _parser():
     typing.add_argument("--text", help="the text, escapes not interpreted")
     stopping = sessions.add_parser("stop", help="end one hosted session")
     stopping.add_argument("name", metavar="NAME")
-    feed = sessions.add_parser("feed", help="one page of a session's life")
-    feed.add_argument("name", metavar="NAME")
-    feed.add_argument("--cursor", metavar="JSON")
-    feed.add_argument("--timeout-ms", type=int, metavar="MS")
-    feed.add_argument("--max-bytes", type=int, metavar="N")
+    waiting = sessions.add_parser("wait", help="hold until a session moves")
+    waiting.add_argument("name", metavar="NAME")
+    waiting.add_argument("--cursor", metavar="JSON")
+    waiting.add_argument("--timeout-ms", type=int, metavar="MS")
 
     peer = commands.add_parser("peer", help="peer administration")
     peers = peer.add_subparsers(dest="peer_command", metavar="<action>")

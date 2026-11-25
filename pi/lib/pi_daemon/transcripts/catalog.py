@@ -79,6 +79,13 @@ class ConversationCatalog:
 
     # -- activity ----------------------------------------------------------
 
+    def head(self, file):
+        """The newest entry's id: where a reader that wants only news starts."""
+        reader = pi_transcript.TranscriptReader(self._index, file)
+        reader.refresh()
+        entries = reader.conversation()
+        return entries[-1]["id"] if entries else None
+
     def activity(self, file, since=None, chars=2000, limit=50):
         """The events after `since`, one page, in append order."""
         reader = pi_transcript.TranscriptReader(self._index, file)

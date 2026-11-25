@@ -98,17 +98,17 @@ class CommsService:
         return self._sessions_wire.handlers(
             self._config.comms_session_control)
 
-    def feed_plan(self, sender, params):
-        """One validated held feed, ready for the wait registry."""
+    def wait_plan(self, sender, params):
+        """One validated held session wait, ready for the wait registry."""
         if self._sessions_wire is None:
             raise CommsError(METHOD_UNAVAILABLE)
-        return self._sessions_wire.feed_plan(sender, params)
+        return self._sessions_wire.wait_plan(sender, params)
 
     def capabilities(self):
         """The additive capability names a greeting may carry."""
         if self._sessions_wire is None:
             return []
-        return ["session.reach.v1", "session.feed.v1"]
+        return ["session.reach.v1", "session.wait.v1"]
 
     def begin_shutdown(self):
         """No new wait is registered while the pending ones are answered."""
@@ -330,9 +330,7 @@ class CommsService:
                 "methods": self._operations.methods(sender),
                 "capabilities": self.capabilities(),
                 "limits": {"maxWaitMs": int(self._config.comms_wait_max
-                                            * 1000),
-                           "feedPageBytes":
-                               self._config.feed_page_bytes}}
+                                            * 1000)}}
 
     def forward(self, node_id, agent_id, method, params, timeout=None):
         """One call over a connection opened as the calling agent."""

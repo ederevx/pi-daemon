@@ -52,9 +52,7 @@ class CommsSession:
                        # A forwarded call may spend one peer round trip here
                        # before the destination's own hold begins.
                        "forwardMs": int(
-                           self._config.comms_peer_request_timeout * 1000),
-                       "feedPageBytes":
-                           self._config.feed_page_bytes},
+                           self._config.comms_peer_request_timeout * 1000)},
         }
 
     def methods(self, sender=None):
@@ -70,8 +68,8 @@ class CommsSession:
                                                   False)}
         if method == "comms.wait":
             return self._wait(request)
-        if method == "comms.session.feed":
-            return self._feed(request)
+        if method == "comms.session.wait":
+            return self._session_wait(request)
         handler = self._handlers.get(method)
         if handler is None:
             raise LookupError(method)
@@ -149,9 +147,10 @@ class CommsSession:
                            str(exc.code)) from None
         return None
 
-    def _feed(self, request):
-        """Register a held feed. A request without a cursor answers at once."""
-        plan = self._operations.feed_plan(self._agent,
+    def _session_wait(self, request):
+        """Register a held session wait. A request without a cursor answers
+        at once."""
+        plan = self._operations.wait_plan(self._agent,
                                           self._params(request))
         try:
             self._waits.begin(self, request.get("id"), plan["key"],

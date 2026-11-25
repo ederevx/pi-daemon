@@ -8,7 +8,7 @@ calling agent, and closes when the answer arrives.
 from .peer_link_error import PeerLinkError
 
 # Held methods answer after their own hold, so the deadline grows by it.
-HELD = frozenset({"comms.wait", "comms.session.feed"})
+HELD = frozenset({"comms.wait", "comms.session.wait"})
 CLOSED = "channel-closed"
 
 

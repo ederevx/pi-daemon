@@ -224,7 +224,7 @@ class SessionTests(unittest.TestCase):
         self.assertIsInstance(answer["conversations"], list)
 
     def test_an_unknown_session_is_refused_by_the_wire_that_owns_it(self):
-        for arguments in (("session", "feed", "ghost"),
+        for arguments in (("session", "wait", "ghost"),
                           ("session", "open", "--name", "ghost"),
                           ("session", "stop", "ghost")):
             completed = self.fixture.run(*arguments)
@@ -242,9 +242,9 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 5, completed.stderr)
         self.assertIn("text is required", completed.stderr)
 
-    def test_a_feed_cursor_belongs_to_one_session(self):
+    def test_a_wait_cursor_belongs_to_one_session(self):
         completed = self.fixture.run(
-            "session", "feed", "ghost", "--cursor",
+            "session", "wait", "ghost", "--cursor",
             json.dumps({"name": "other"}))
         self.assertEqual(completed.returncode, 5, completed.stderr)
         self.assertIn("one session", completed.stderr)

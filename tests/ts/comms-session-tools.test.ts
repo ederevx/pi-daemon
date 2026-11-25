@@ -3,9 +3,9 @@
  *
  * The tools are a thin argv surface over `pi/bin/pi-comms session ...`, so
  * the tests drive them against the stub CLI: each one's argv is checked,
- * and the feed's hold is checked through its own options — the waiting
- * state it publishes, the update it streams, and the two ways it stops
- * early without running a command.
+ * and the session wait's own chain of holds is checked page by page — what
+ * it streams, the waiting state it publishes, and the ways it ends early
+ * without running a command.
  */
 
 import { join, resolve } from "node:path";
@@ -17,6 +17,7 @@ import { CommsArgv } from "../../pi/extensions/comms/protocol.ts";
 import {
 	CommsSessionTools,
 } from "../../pi/extensions/comms/session-tools.ts";
+import { SessionWaitFeed } from "../../pi/extensions/comms/session-wait-feed.ts";
 import { execProcess, recorded, stub } from "./comms-stub.ts";
 
 /** Minimal ExtensionAPI stand-in, as the other extension tests use. */
@@ -43,6 +44,21 @@ function invocation(
 		STUB_STDERR: "",
 		STUB_EXIT: String(exit),
 		...extra,
+	};
+}
+
+/** One `session` answer per held page, as the stub hands them out. */
+function scripted(
+	...answers: Array<{ page: Record<string, unknown>; exit?: number }>
+): Record<string, string> {
+	return {
+		STUB_STATE: join(scratchDir(),
+			`stub-state-${Math.random().toString(16).slice(2)}.json`),
+		STUB_ANSWERS: JSON.stringify({
+			session: answers.map(({ page, exit }) => ({
+				stdout: page, exit: exit ?? 0,
+			})),
+		}),
 	};
 }
 
@@ -155,101 +171,190 @@ test("comms_input: the text travels exactly as given", async () => {
 	});
 });
 
-test("comms_feed: a first page prints the activity and its cursor", async () => {
-	const page = {
-		status: "ok",
-		name: "pi-a",
-		events: [
-			{ type: "state", state: "busy", seq: 3 },
-			{ type: "activity", kind: "tool_call", entryId: "m1" },
-			{ type: "ended", reason: "exit" },
-		],
-		cursor: { name: "pi-a", activity: "m1", stateSeq: 3 },
-		more: false,
-	};
-	const env = invocation(page);
+test("comms_session_wait: a wait without a cursor starts now and holds from the page's cursor", async () => {
+	const first = { status: "ok", name: "pi-a", state: "busy", events: [],
+		cursor: { name: "pi-a", activity: null, stateSeq: 1 }, more: false,
+		maxWaitMs: 60000 };
+	const second = { status: "ended", name: "pi-a", state: "idle",
+		events: [{ type: "ended", reason: "exit" }],
+		cursor: { name: "pi-a", activity: "m1", stateSeq: 2 }, more: false };
+	const env = invocation(undefined, 0,
+		scripted({ page: first }, { page: second }));
 	await withEnv(env, async () => {
-		const result = await call("comms_feed", { name: "pi-a",
-			timeoutMs: 2000, maxBytes: 4096 });
+		const result = await call("comms_session_wait", { name: "pi-a" });
 		assert(!result.isError, "not an error");
-		const text = result.content[0].text as string;
-		assert(text.startsWith("state: busy"), "the state leads");
-		assert(text.includes("· tool_call m1"), "one line per activity");
-		assert(text.includes("ended: exit"), "the ended line");
-		assert(text.includes('"activity":"m1"'), "the continuing cursor");
-		assertEq(recorded(env.STUB_LOG)[0].join(" "),
-			"--format json --agent pi-test session feed pi-a " +
-			"--timeout-ms=2000 --max-bytes=4096",
-			"the first-page argv");
-		assertEq((result.structuredContent as any).cursor.activity, "m1",
-			"the cursor is structured");
+		const calls = recorded(env.STUB_LOG);
+		assertEq(calls[0].join(" "),
+			"--format json --agent pi-test session wait pi-a",
+			"a wait without a cursor starts now");
+		assert(calls[1].includes(`--cursor=${JSON.stringify(first.cursor)}`),
+			"the second hold continues from the page");
+		assert(calls[1].some((arg) => arg.startsWith("--timeout-ms=")),
+			"bounded by the service's own limit");
+		assertEq(result.structuredContent.status, "ended", "the run ended");
 	});
 });
 
-test("comms_feed: a page that found nothing is a page, not a failure", async () => {
-	const page = { status: "timed-out", name: "pi-a", events: [],
-		cursor: { name: "pi-a" }, more: false };
-	const env = invocation(page, 3);
-	await withEnv(env, async () => {
-		const result = await call("comms_feed", { name: "pi-a" });
-		assert(!result.isError, "an empty hold is not an error");
-		assert((result.content[0].text as string)
-			.includes("no new activity"), "says what it found");
-	});
-});
-
-test("comms_feed: the cursor is sent as JSON and only a hold waits", async () => {
+test("comms_session_wait: a given cursor is sent as JSON on the first hold", async () => {
 	const cursor = { name: "pi-a", activity: "m1", stateSeq: 3 };
-	const env = invocation({ status: "timed-out", events: [], cursor }, 3);
-	const states: boolean[] = [];
+	const env = invocation(undefined, 0, scripted({ page: {
+		status: "ended", name: "pi-a", state: "idle",
+		events: [{ type: "ended", reason: "exit" }], cursor, more: false } }));
 	await withEnv(env, async () => {
-		await call("comms_feed", { name: "pi-a", cursor },
-			{ setWaitState: (waiting: boolean) => states.push(waiting) });
+		const result = await call("comms_session_wait",
+			{ name: "pi-a", cursor });
 		assertEq(recorded(env.STUB_LOG)[0].join(" "),
-			`--format json --agent pi-test session feed pi-a ` +
+			`--format json --agent pi-test session wait pi-a ` +
 			`--cursor=${JSON.stringify(cursor)}`, "the cursor argv");
-		assertEq(states.join(","), "true,false",
-			"a hold publishes and restores the waiting state");
+		assert(!result.isError, "not an error");
 	});
 });
 
-test("comms_feed: a first page never publishes a waiting state", async () => {
-	const states: boolean[] = [];
-	const env = invocation({ status: "ok", events: [], cursor: {} });
+test("comms_session_wait: the session settling ends the wait with what it did", async () => {
+	const busy = { status: "ok", name: "pi-a", state: "busy",
+		events: [
+			{ type: "activity", kind: "user", entryId: "m1",
+				text: "run the tests" },
+			{ type: "activity", kind: "assistant", entryId: "m2",
+				text: "on it" },
+			{ type: "activity", kind: "tool_call", entryId: "m3",
+				tool: "bash", args: '{"cmd":"ls"}' },
+			{ type: "activity", kind: "tool_result", entryId: "m4",
+				tool: "bash", text: "a.txt" },
+		],
+		cursor: { name: "pi-a", activity: "m4", stateSeq: 1 }, more: false,
+		maxWaitMs: 60000 };
+	const idle = { status: "ok", name: "pi-a", state: "idle",
+		events: [{ type: "state", state: "idle", seq: 2 }],
+		cursor: { name: "pi-a", activity: "m4", stateSeq: 2 }, more: false };
+	const env = invocation(undefined, 0,
+		scripted({ page: busy }, { page: idle }));
 	await withEnv(env, async () => {
-		await call("comms_feed", { name: "pi-a" },
-			{ setWaitState: (waiting: boolean) => states.push(waiting) });
-		assertEq(states.length, 0, "no waiting state for a read");
+		const result = await call("comms_session_wait", { name: "pi-a" });
+		const text = result.content[0].text as string;
+		assert(text.includes("pi-a settled: idle"), "the status line");
+		assert(text.includes("user: run the tests"), "the prompt");
+		assert(text.includes("assistant: on it"), "the reply");
+		assert(text.includes("→ bash"), "the tool call");
+		assert(text.includes("← bash: a.txt"), "the tool result");
+		assertEq(result.structuredContent.status, "settled", "settled");
 	});
 });
 
-test("comms_feed: a queued message ends the hold before it runs", async () => {
+test("comms_session_wait: an idle session that does nothing holds until the deadline", async () => {
+	const idle = { status: "timed-out", name: "pi-a", state: "idle",
+		events: [], cursor: { name: "pi-a", activity: null, stateSeq: 1 },
+		more: false };
+	const env = invocation(undefined, 0, scripted(
+		{ page: idle, exit: 3 }, { page: idle, exit: 3 }));
+	await withEnv(env, async () => {
+		const result = await call("comms_session_wait",
+			{ name: "pi-a", timeoutMs: 1 });
+		assert(!result.isError, "a wait that ran out is not an error");
+		assertEq(result.structuredContent.status, "timed-out", "timed out");
+	});
+});
+
+test("comms_session_wait: an ended run ends the wait", async () => {
+	const env = invocation(undefined, 0, scripted({ page: {
+		status: "ended", name: "pi-a", state: "idle",
+		events: [{ type: "ended", reason: "died" }],
+		cursor: { name: "pi-a", activity: null, stateSeq: 1 },
+		more: false } }));
+	await withEnv(env, async () => {
+		const result = await call("comms_session_wait", { name: "pi-a" });
+		assert((result.content[0].text as string).includes("ended: died"),
+			"the ending is reported");
+		assertEq(result.structuredContent.status, "ended", "ended");
+	});
+});
+
+test("comms_session_wait: activity streams to the window while it holds", async () => {
+	const busy = { status: "ok", name: "pi-a", state: "busy",
+		events: [
+			{ type: "activity", kind: "user", entryId: "m1",
+				text: "run the tests" },
+		],
+		cursor: { name: "pi-a", activity: "m1", stateSeq: 1 }, more: false,
+		maxWaitMs: 60000 };
+	const idle = { status: "ok", name: "pi-a", state: "idle",
+		events: [{ type: "state", state: "idle", seq: 2 }],
+		cursor: { name: "pi-a", activity: "m1", stateSeq: 2 }, more: false };
+	const env = invocation(undefined, 0, {
+		...scripted({ page: busy }, { page: idle }), STUB_DELAY: "0.1" });
+	const seen: string[] = [];
+	await withEnv(env, async () => {
+		await call("comms_session_wait", { name: "pi-a" },
+			{ waitUpdateMs: 20 },
+			{ onUpdate: (update) => seen.push(update.content[0].text) });
+		assert(seen.some((text) => text.includes("user: run the tests")),
+			"the prompt reached the window");
+		assert(seen.every((text) => text.split("\n").length <= 10),
+			"within the collapsed preview");
+	});
+});
+
+test("comms_session_wait: the whole call publishes and restores the waiting state", async () => {
+	const states: boolean[] = [];
+	const env = invocation(undefined, 0, scripted({ page: {
+		status: "ended", name: "pi-a", state: "idle",
+		events: [{ type: "ended", reason: "exit" }],
+		cursor: { name: "pi-a", activity: null, stateSeq: 1 },
+		more: false } }));
+	await withEnv(env, async () => {
+		await call("comms_session_wait", { name: "pi-a" },
+			{ setWaitState: (waiting: boolean) => states.push(waiting) });
+		assertEq(states.join(","), "true,false",
+			"published and restored");
+	});
+});
+
+test("comms_session_wait: a queued message ends the wait before it runs", async () => {
 	const env = invocation({ status: "ok" });
 	await withEnv(env, async () => {
-		const result = await call("comms_feed", { name: "pi-a", cursor: {} },
+		const result = await call("comms_session_wait", { name: "pi-a" },
 			{}, { ctx: { hasPendingMessages: () => true } });
 		assertEq(result.structuredContent.stoppedBy, "yield", "yielded");
 		assertEq(recorded(env.STUB_LOG).length, 0, "the CLI never ran");
 	});
 });
 
-test("comms_feed: an aborted call never starts its hold", async () => {
+test("comms_session_wait: a message queued mid-wait yields with the cursor so far", async () => {
+	const cursor = { name: "pi-a", activity: null, stateSeq: 1 };
+	const env = invocation(undefined, 0, {
+		...scripted({ page: { status: "ok", name: "pi-a", state: "busy",
+			events: [], cursor, more: false, maxWaitMs: 60000 } }),
+		STUB_DELAY: "1" });
+	let queued = false;
+	await withEnv(env, async () => {
+		const timer = setTimeout(() => { queued = true; }, 150);
+		const result = await call("comms_session_wait",
+			{ name: "pi-a", cursor }, { waitUpdateMs: 20 },
+			{ ctx: { hasPendingMessages: () => queued } });
+		clearTimeout(timer);
+		assertEq(result.structuredContent.stoppedBy, "yield", "yielded");
+		assertEq(JSON.stringify(result.structuredContent.cursor),
+			JSON.stringify(cursor), "the cursor so far");
+	});
+});
+
+test("comms_session_wait: an aborted call never starts its hold", async () => {
 	const env = invocation({ status: "ok" });
 	const controller = new AbortController();
 	controller.abort();
 	await withEnv(env, async () => {
-		const result = await call("comms_feed", { name: "pi-a" },
+		const result = await call("comms_session_wait", { name: "pi-a" },
 			{}, { signal: controller.signal });
 		assertEq(result.structuredContent.stoppedBy, "abort", "aborted");
 		assertEq(recorded(env.STUB_LOG).length, 0, "the CLI never ran");
 	});
 });
 
-test("comms_feed: a refusal is one tool error naming the exit", async () => {
+test("comms_session_wait: a refusal is one tool error naming the exit", async () => {
 	const env = invocation({ error: "no-session", code: -32602 }, 5,
 		{ STUB_STDERR: "pi-comms: no-session [code -32602]\n" });
 	await withEnv(env, async () => {
-		const result = await call("comms_feed", { name: "ghost" });
+		const result = await call("comms_session_wait", { name: "ghost" });
 		assert(result.isError, "a refusal is an error");
 		const text = result.content[0].text as string;
 		assert(text.includes("exit 5"), "names the exit code");
@@ -257,18 +362,17 @@ test("comms_feed: a refusal is one tool error naming the exit", async () => {
 	});
 });
 
-test("comms_feed: a streamed update reports the elapsed time", async () => {
-	const env = invocation({ status: "ok", events: [], cursor: {} }, 0,
-		{ STUB_DELAY: "0.4" });
-	const updates: Array<{ details: Record<string, unknown> }> = [];
-	await withEnv(env, async () => {
-		await call("comms_feed", { name: "pi-a", cursor: {} },
-			{ waitUpdateMs: 50 },
-			{ onUpdate: (update) => updates.push(update) });
-		assert(updates.length > 0, "the window saw progress");
-		assert(typeof updates[updates.length - 1].details.waitedMs === "number",
-			"with the time it waited");
-	});
+test("SessionWaitFeed: the result keeps the newest lines when it overflows", () => {
+	const feed = new SessionWaitFeed("pi-a", () => {}, 0);
+	feed.add({ state: "idle", events: Array.from({ length: 6 },
+		(_value, index) => ({ type: "activity", kind: "assistant",
+			entryId: `m${index}`, text: `line ${index} ${"x".repeat(60)}` })) });
+	const text = feed.result("settled", { name: "pi-a" }, 400);
+	assert(text.includes("earlier lines omitted"),
+		"the dropped lines are counted");
+	assert(text.includes("line 5"), "the newest line is kept");
+	assert(!text.includes("line 0 "), "the oldest line went first");
+	assert(text.length <= 400, "the result fits its bound");
 });
 
 test("comms_sessions: the argv carries the peer when one is named", async () => {
@@ -281,9 +385,9 @@ test("comms_sessions: the argv carries the peer when one is named", async () => 
 	});
 });
 
-test("CommsArgv: a feed without options sends only its name", () => {
-	assertEq(CommsArgv.feed({ name: "pi-a" }).join(" "),
-		"session feed pi-a", "the minimal feed argv");
+test("CommsArgv: a session wait without options sends only its name", () => {
+	assertEq(CommsArgv.sessionWait({ name: "pi-a" }).join(" "),
+		"session wait pi-a", "the minimal wait argv");
 	assertEq(CommsArgv.reach({ name: "pi-a", node: "rog" }).join(" "),
 		"--at=rog session open --name=pi-a", "reach names its peer");
 });

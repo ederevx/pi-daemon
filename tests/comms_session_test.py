@@ -4,7 +4,7 @@
 The wire owns no state, so every question here goes to a stub that records
 it: a sessions stub for what a run is doing, and a transcripts stub for
 what a catalog lists and what one conversation did. The tests hold the
-projection (list, conversations, open), the feed's page shape (activity,
+projection (list, conversations, open), the wait's page shape (activity,
 state, ended, budget), and the refusals a caller must get before anything
 is read.
 """
@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "pi", "lib"))
 
 from pi_daemon.comms.session_wire import (  # noqa: E402
-    ACTIVITY_EVENTS, SessionWire, feed_key)
+    ACTIVITY_EVENTS, SessionWire, wait_key)
 from pi_daemon.config import ServiceConfig  # noqa: E402
 from pi_daemon.sessions.error import SessionError  # noqa: E402
 from pi_daemon.transcripts.error import CatalogError  # noqa: E402
@@ -109,10 +109,17 @@ class FakeCatalog:
     def entry(self, file):
         return self.resolved.get(file)
 
+    def head(self, file):
+        self.asked.append(("head", file))
+        events = self.activities.get(file, [])
+        return events[-1]["entryId"] if events else None
+
     def activity(self, file, cursor, text_chars, page):
         self.asked.append(("activity", file, cursor, text_chars, page))
         events = self.activities.get(file, [])
         if cursor is not None:
+            if cursor not in [event["entryId"] for event in events]:
+                raise CatalogError("bad-cursor")
             events = [event for event in events
                       if event["entryId"] > cursor]
         return {"events": events[:page], "next":
@@ -252,6 +259,29 @@ class ControlTests(WireCase):
     def test_input_needs_text(self):
         self.refused(self.wire().input, None, {"name": "pi-a"})
 
+    def test_input_returns_the_cursor_taken_before_it_typed(self):
+        seen = []
+        sessions = FakeSessions()
+        sessions.input = lambda name, text: (
+            seen.append("typed"), {"name": name, "bytes": len(text)})[1]
+        wire = self.wire(sessions)
+        catalog = self.transcripts._catalog
+        catalog.activities[FILE] = [
+            {"entryId": "m1", "kind": "tool_call", "text": "ls"}]
+        head = catalog.head
+        catalog.head = lambda file: (seen.append("head"), head(file))[1]
+        answer = wire.input(None, {"name": "pi-a", "text": "hi\r"})
+        self.assertEqual(seen, ["head", "typed"])
+        self.assertEqual(answer["cursor"], {"name": "pi-a", "stateSeq": None,
+                                            "activity": "m1"})
+
+    def test_input_without_a_catalog_still_types(self):
+        wire = self.wire()
+        self.transcripts._catalog = None
+        answer = wire.input(None, {"name": "pi-a", "text": "x"})
+        self.assertEqual(answer["cursor"]["activity"], None)
+        self.assertEqual(self.sessions.inputs, [("pi-a", "x")])
+
     def test_stop_names_the_session(self):
         answer = self.wire().stop(None, {"name": "pi-a"})
         self.assertEqual(self.sessions.stopped, ["pi-a"])
@@ -276,10 +306,10 @@ class ControlTests(WireCase):
                           "comms.session.list"])
 
 
-class FeedTests(WireCase):
+class WaitTests(WireCase):
 
     def page(self, wire, params):
-        plan = wire.feed_plan(None, params)
+        plan = wire.wait_plan(None, params)
         reply, wake = plan["probe"](False)
         return plan, reply, wake
 
@@ -288,38 +318,49 @@ class FeedTests(WireCase):
         return {"name": "pi-a", "activity": None,
                 "stateSeq": state_seq}
 
-    def test_the_first_page_needs_no_cursor_and_answers_at_once(self):
+    def test_a_wait_without_a_cursor_answers_at_once_from_the_newest_entry(self):
         wire = self.wire()
+        self.transcripts._catalog.activities[FILE] = [
+            {"entryId": "m1", "kind": "tool_call", "text": "ls"}]
         plan, reply, wake = self.page(wire, {"name": "pi-a"})
         self.assertEqual(plan["timeout"], 0.0)
         self.assertIsNone(wake)
-        self.assertEqual(plan["key"], feed_key("k-a"))
+        self.assertEqual(plan["key"], wait_key("k-a"))
         self.assertEqual(reply["status"], "ok")
-        self.assertEqual([event["type"] for event in reply["events"]],
-                         ["state"])
-        self.assertEqual(reply["cursor"], {"name": "pi-a", "activity": None,
+        self.assertEqual(reply["events"], [])
+        self.assertEqual(reply["cursor"], {"name": "pi-a", "activity": "m1",
                                            "stateSeq": 3})
+        self.assertEqual(reply["maxWaitMs"], 60000)
+        self.assertEqual(self.transcripts._catalog.asked[0], ("head", FILE))
 
-    def test_a_page_with_nothing_new_looks_again_after_the_poll(self):
-        plan = self.wire().feed_plan(None, {"name": "pi-a",
-                                            "cursor": self.held(3)})
+    def test_a_wait_with_nothing_new_looks_again_after_the_poll(self):
+        plan = self.wire().wait_plan(None, {"name": "pi-a",
+                                           "cursor": self.held(3)})
         reply, wake = plan["probe"](False)
         self.assertIsNone(reply)
         self.assertAlmostEqual(wake - time.monotonic(),
                                config().comms_feed_poll, delta=0.2)
 
     def test_a_deadline_answers_a_page_that_found_nothing(self):
-        plan = self.wire().feed_plan(None, {"name": "pi-a",
-                                            "cursor": self.held(3)})
+        plan = self.wire().wait_plan(None, {"name": "pi-a",
+                                           "cursor": self.held(3)})
         reply, wake = plan["probe"](True)
         self.assertIsNone(wake)
         self.assertEqual(reply["status"], "timed-out")
         self.assertEqual(reply["events"], [])
 
-    def test_an_ended_run_says_so_on_a_page_with_nothing_to_read(self):
+    def test_a_state_change_answers_a_hold(self):
+        plan = self.wire().wait_plan(None, {"name": "pi-a",
+                                           "cursor": self.held(2)})
+        reply, wake = plan["probe"](False)
+        self.assertIsNone(wake)
+        self.assertEqual(reply["events"], [{"type": "state", "state": "busy",
+                                            "seq": 3}])
+
+    def test_a_wait_learns_the_run_ended_from_its_seal(self):
         sessions = FakeSessions()
         sessions.seals["pi-a"] = {"verdict": "exited", "cause": "exit"}
-        plan = self.wire(sessions).feed_plan(None, {"name": "pi-a",
+        plan = self.wire(sessions).wait_plan(None, {"name": "pi-a",
                                                     "cursor": self.held(3)})
         reply, wake = plan["probe"](False)
         self.assertIsNone(wake)
@@ -334,12 +375,14 @@ class FeedTests(WireCase):
         self.transcripts._catalog.activities[FILE] = [
             {"entryId": f"m{index:02d}", "kind": "tool_call", "text": "ls"}
             for index in range(ACTIVITY_EVENTS + 1)]
-        plan = wire.feed_plan(None, {"name": "pi-a"})
+        plan = wire.wait_plan(None, {"name": "pi-a", "cursor":
+                                     {"name": "pi-a", "activity": None,
+                                      "stateSeq": 3}})
         reply, _wake = plan["probe"](False)
         self.assertEqual(reply["status"], "ok")
         self.assertTrue(reply["more"])
         self.assertNotIn("ended", [event["type"] for event in reply["events"]])
-        plan = wire.feed_plan(None, {"name": "pi-a",
+        plan = wire.wait_plan(None, {"name": "pi-a",
                                      "cursor": reply["cursor"]})
         page, _wake = plan["probe"](False)
         self.assertEqual(page["status"], "ended")
@@ -349,16 +392,18 @@ class FeedTests(WireCase):
     def test_an_entry_too_large_for_the_page_never_hides_the_ending(self):
         sessions = FakeSessions()
         sessions.seals["pi-a"] = {"verdict": "exited", "cause": "exit"}
-        wire = self.wire(sessions)
+        wire = self.wire(sessions, comms_feed_page_bytes=200)
         self.transcripts._catalog.activities[FILE] = [
             {"entryId": "m00", "kind": "tool_call", "text": "x" * 500},
             {"entryId": "m01", "kind": "tool_call", "text": "ls"}]
-        plan = wire.feed_plan(None, {"name": "pi-a", "maxBytes": 120})
+        plan = wire.wait_plan(None, {"name": "pi-a", "cursor":
+                                     {"name": "pi-a", "activity": None,
+                                      "stateSeq": 3}})
         reply, _wake = plan["probe"](False)
         # The entry no page could carry still names itself and moves the
         # cursor, and the same page drains the rest and ends.
-        self.assertEqual(reply["events"][1]["entryId"], "m00")
-        self.assertTrue(reply["events"][1].get("elided"))
+        self.assertEqual(reply["events"][0]["entryId"], "m00")
+        self.assertTrue(reply["events"][0].get("elided"))
         self.assertEqual(reply["cursor"]["activity"], "m01")
         self.assertEqual(reply["status"], "ended")
 
@@ -367,7 +412,7 @@ class FeedTests(WireCase):
         self.transcripts._catalog.activities[FILE] = [
             {"entryId": "m1", "kind": "tool_call", "text": "ls"},
         ]
-        plan = wire.feed_plan(None, {"name": "pi-a",
+        plan = wire.wait_plan(None, {"name": "pi-a",
                                      "cursor": self.held(3)})
         reply, _wake = plan["probe"](False)
         self.assertEqual(reply["events"], [
@@ -375,21 +420,46 @@ class FeedTests(WireCase):
              "text": "ls"}])
         self.assertEqual(reply["cursor"]["activity"], "m1")
 
-    def test_a_page_never_outgrows_its_byte_budget(self):
+    def test_a_vanished_cursor_reads_the_new_conversation_from_its_start(self):
         wire = self.wire()
+        self.transcripts._catalog.activities[FILE] = [
+            {"entryId": "m1", "kind": "tool_call", "text": "ls"}]
+        cursor = {"name": "pi-a", "activity": "gone", "stateSeq": 3}
+        plan = wire.wait_plan(None, {"name": "pi-a", "cursor": cursor})
+        reply, _wake = plan["probe"](False)
+        self.assertEqual(reply["events"][0], {"type": "activity",
+                                              "kind": "gap"})
+        self.assertEqual(reply["cursor"]["activity"], "m1")
+
+    def test_a_session_without_a_conversation_waits_on_its_state_alone(self):
+        sessions = FakeSessions()
+        sessions.live["pi-z"] = {"id": "k-z", "file": None}
+        wire = self.wire(sessions)
+        plan = wire.wait_plan(None, {"name": "pi-z",
+                                     "cursor": {"name": "pi-z",
+                                                "stateSeq": 2}})
+        reply, wake = plan["probe"](False)
+        self.assertIsNone(wake)
+        self.assertEqual(reply["events"], [{"type": "state",
+                                            "state": "busy", "seq": 3}])
+        self.assertEqual([event for event in self.transcripts._catalog.asked
+                          if event[0] in ("head", "activity")], [])
+
+    def test_a_page_never_outgrows_its_byte_budget(self):
+        wire = self.wire(comms_feed_page_bytes=900)
         self.transcripts._catalog.activities[FILE] = [
             {"entryId": f"m{index}", "kind": "tool_call", "text": "y" * 200}
             for index in range(10)]
-        plan = wire.feed_plan(None, {"name": "pi-a", "maxBytes": 900,
+        plan = wire.wait_plan(None, {"name": "pi-a",
                                      "cursor": self.held(3)})
         reply, _wake = plan["probe"](False)
         self.assertLessEqual(len(reply["events"]), 4)
         self.assertTrue(reply["more"])
         self.assertLess(reply["cursor"]["activity"], "m9")
 
-    def test_a_feed_for_a_session_that_left_ends_instead_of_failing(self):
+    def test_a_wait_on_a_session_that_left_ends_instead_of_failing(self):
         wire = self.wire(FakeSessions())
-        plan = wire.feed_plan(None, {"name": "pi-a", "cursor":
+        plan = wire.wait_plan(None, {"name": "pi-a", "cursor":
                                      {"name": "pi-a"}})
         self.sessions.live.clear()
         reply, _wake = plan["probe"](False)
@@ -398,18 +468,18 @@ class FeedTests(WireCase):
                                            "reason": "gone"}])
 
     def test_an_unknown_session_is_refused_before_any_hold(self):
-        self.refused(self.wire().feed_plan, None, {"name": "nope"})
+        self.refused(self.wire().wait_plan, None, {"name": "nope"})
 
     def test_a_cursor_belongs_to_one_session(self):
         wire = self.wire()
-        self.refused(wire.feed_plan, None, {
+        self.refused(wire.wait_plan, None, {
             "name": "pi-a", "cursor": {"name": "pi-b"}})
 
     def test_a_malformed_cursor_is_refused(self):
         wire = self.wire()
-        self.refused(wire.feed_plan, None, {
+        self.refused(wire.wait_plan, None, {
             "name": "pi-a", "cursor": {"name": "pi-a", "stateSeq": -1}})
-        self.refused(wire.feed_plan, None, {
+        self.refused(wire.wait_plan, None, {
             "name": "pi-a", "cursor": {"name": "pi-a", "activity": 4}})
 
     def test_a_page_s_own_cursor_can_be_fed_back(self):
@@ -418,7 +488,7 @@ class FeedTests(WireCase):
             {"entryId": "m1", "kind": "tool_call", "text": "ls"}]
         _plan, page, _wake = self.page(wire, {"name": "pi-a"})
         self.assertEqual(page["cursor"]["activity"], "m1")
-        plan = wire.feed_plan(None, {"name": "pi-a",
+        plan = wire.wait_plan(None, {"name": "pi-a",
                                      "cursor": page["cursor"]})
         reply, _wake = plan["probe"](True)
         self.assertIsNotNone(reply)
@@ -428,7 +498,7 @@ class FeedTests(WireCase):
     def test_a_hold_is_clamped_to_the_advertised_maximum(self):
         wire = self.wire(comms_wait_max=0.5)
         cursor = {"name": "pi-a"}
-        plan = wire.feed_plan(None, {"name": "pi-a", "cursor": cursor,
+        plan = wire.wait_plan(None, {"name": "pi-a", "cursor": cursor,
                                      "timeoutMs": 600000})
         self.assertEqual(plan["timeout"], 0.5)
 

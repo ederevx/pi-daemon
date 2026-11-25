@@ -1,4 +1,4 @@
-"""The session wire: reach, type into, stop and watch a hosted session.
+"""The session wire: reach, type into, stop and wait on a hosted session.
 
 Every method here is named `comms.session.*`, so `comms.remote` forwards it
 unchanged and the node that hosts the session is the one that validates and
@@ -14,19 +14,13 @@ from ..sessions.error import SessionError
 from ..transcripts.catalog import CatalogError
 from ..transport.rpc_codec import INVALID_PARAMS, RpcError
 
-FEED = "comms.session.feed"
-CONTROL = ("comms.session.open", "comms.session.input",
-           "comms.session.stop")
 ACTIVITY_EVENTS = 20
-# A page keeps at least this much room, so an activity entry that cannot fit
-# in it still names itself: a caller's smaller maxBytes is raised to it.
-PAGE_FLOOR = 256
 PATH_LIMIT = 4096
 
 
-def feed_key(key):
-    """The registry key a feed waits under, apart from a mailbox name."""
-    return ("feed", key)
+def wait_key(key):
+    """The registry key a session wait holds under, apart from a mailbox."""
+    return ("session", key)
 
 
 def seal_reason(seal):
@@ -88,32 +82,35 @@ class SessionWire:
         text = self._text(params.get("text"), "text")
         if text is None:
             raise RpcError(INVALID_PARAMS, "text is required")
+        # Taken before the text is typed, so a wait from it sees the turn
+        # this input starts however soon the run answers.
+        cursor = self._start(name)
         answer = self._call(self._sessions.input, name, text)
-        return dict(answer, status="ok", nodeId=self._node_id)
+        return dict(answer, status="ok", nodeId=self._node_id, cursor=cursor)
 
     def stop(self, _sender, params):
         name = self._name(params)
         answer = self._call(self._sessions.stop, name)
         return dict(answer, status="ok", nodeId=self._node_id)
 
-    # -- watching one ------------------------------------------------------
+    # -- waiting on one ----------------------------------------------------
 
-    def feed_plan(self, _sender, params):
-        """One validated feed, as the held registry needs it."""
-        plan = self._feed_params(params)
+    def wait_plan(self, _sender, params):
+        """One validated session wait, as the held registry needs it."""
+        plan = self._wait_params(params)
         key = self._sessions.key(plan["name"])
         if key is None:
             raise RpcError(INVALID_PARAMS, "no-session")
 
         def probe(expired):
-            return self._feed_probe(plan, expired)
+            return self._wait_probe(plan, expired)
 
-        return {"key": feed_key(key), "probe": probe,
+        return {"key": wait_key(key), "probe": probe,
                 "timeout": 0.0 if plan["cursor"] is None else plan["timeout"]}
 
-    def _feed_probe(self, plan, expired):
+    def _wait_probe(self, plan, expired):
         try:
-            page = self._feed_page(plan)
+            page = self._wait_page(plan)
         except SessionError:
             return self._gone(plan), None
         if page["events"] or page["status"] == "ended" or \
@@ -124,37 +121,47 @@ class SessionWire:
             return page, None
         return None, time.monotonic() + self._config.comms_feed_poll
 
-    def _feed_page(self, plan):
+    def _wait_page(self, plan):
         name = plan["name"]
-        cursor = plan["cursor"] or {}
-        budget = plan["max_bytes"]
-        events = []
-        state = self._sessions.run_state(name)
-        record = state["record"]
-        if cursor.get("stateSeq") != record.get("seq"):
-            events.append({"type": "state", "state": record.get("state"),
-                           "seq": record.get("seq")})
-        next_activity, more = self._activity(
-            name, cursor.get("activity"), events, budget)
-        # Like a page that stops short of the tail, a page with activity
-        # still to read never declares the run over: a watcher that stops
-        # on `ended` would lose the rest. The next page says it.
+        # The state is read first, so activity is at least as fresh as it.
+        record = self._sessions.run_state(name)["record"]
+        cursor = plan["cursor"]
+        events, more = [], False
+        if cursor is None:
+            # A wait starts now: what the run did before it is not news.
+            since = self._start(name)["activity"]
+        else:
+            if cursor["stateSeq"] != record.get("seq"):
+                events.append({"type": "state", "state": record.get("state"),
+                               "seq": record.get("seq")})
+            since, more = self._activity(name, cursor["activity"], events)
+        # A page with activity still to read never declares the run over: a
+        # waiter that stops on `ended` would lose the rest. The next page
+        # says it.
         ended = None if more else seal_reason(record.get("ended"))
         if ended:
             events.append({"type": "ended", "reason": ended})
         return {"status": "ended" if ended else "ok",
                 "nodeId": self._node_id, "name": name,
-                "state": record.get("state"),
-                "events": events,
-                "cursor": {"name": name, "activity": next_activity,
+                "state": record.get("state"), "events": events,
+                "cursor": {"name": name, "activity": since,
                            "stateSeq": record.get("seq")},
-                "more": more}
+                "more": more,
+                "maxWaitMs": int(self._config.comms_wait_max * 1000)}
 
-    def _activity(self, name, since, events, budget):
+    def _start(self, name):
+        """A cursor at the newest entry: a wait from it sees only news."""
+        file = self._sessions.recorded_file(name)
+        catalog = self._transcripts.catalog()
+        return {"name": name, "stateSeq": None,
+                "activity": catalog.head(file) if file and catalog else None}
+
+    def _activity(self, name, since, events):
         """Activity events that fit the page; returns its cursor and `more`."""
         file = self._sessions.recorded_file(name)
         if not file:
             return since, False
+        budget = self._config.feed_page_bytes
         try:
             page = self._catalog().activity(
                 file, since, self._config.comms_feed_text_chars,
@@ -199,17 +206,13 @@ class SessionWire:
 
     # -- validation --------------------------------------------------------
 
-    def _feed_params(self, params):
+    def _wait_params(self, params):
         name = self._name(params)
         timeout = self._millis(params.get("timeoutMs"))
-        limit = self._bytes(params.get("maxBytes"))
-        budget = self._config.feed_page_bytes
         return {"name": name,
                 "cursor": self._cursor(params.get("cursor"), name),
                 "timeout": self._config.comms_wait_max if timeout is None
-                else min(timeout, self._config.comms_wait_max),
-                "max_bytes": budget if limit is None else
-                min(max(limit, PAGE_FLOOR), budget)}
+                else min(timeout, self._config.comms_wait_max)}
 
     def _cursor(self, value, name):
         if value is None:
@@ -217,16 +220,14 @@ class SessionWire:
         if not isinstance(value, dict) or value.get("name") != name:
             raise RpcError(INVALID_PARAMS, "a cursor belongs to one session")
         cursor = {"name": name}
-        for field in ("output", "stateSeq"):
-            entry = value.get(field)
-            if entry is None:
-                cursor[field] = None
-                continue
-            if isinstance(entry, bool) or not isinstance(entry, int) or \
-                    entry < 0:
-                raise RpcError(INVALID_PARAMS,
-                               f"cursor.{field} must be a number")
-            cursor[field] = entry
+        entry = value.get("stateSeq")
+        if entry is None:
+            cursor["stateSeq"] = None
+        elif isinstance(entry, bool) or not isinstance(entry, int) or \
+                entry < 0:
+            raise RpcError(INVALID_PARAMS, "cursor.stateSeq must be a number")
+        else:
+            cursor["stateSeq"] = entry
         activity = value.get("activity")
         if activity is not None and not isinstance(activity, str):
             raise RpcError(INVALID_PARAMS, "cursor.activity must be an id")
@@ -298,15 +299,6 @@ class SessionWire:
             return None
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise RpcError(INVALID_PARAMS, "limit must be a positive integer")
-        return value
-
-    @staticmethod
-    def _bytes(value):
-        if value is None:
-            return None
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise RpcError(INVALID_PARAMS,
-                           "maxBytes must be a positive integer")
         return value
 
     @staticmethod

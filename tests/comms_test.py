@@ -1262,9 +1262,9 @@ class RecordingSession:
 class WaitRegistryTests(StoreCase):
     """The registry over probes: it schedules, answers and refuses them.
 
-    A probe is what a connection's wait or feed hands the registry, so these
-    tests hold the scheduling instead of the mailbox: the store only has to
-    answer the probe the way `comms.replay` or a feed page would.
+    A probe is what a connection's wait hands the registry, so these tests
+    hold the scheduling instead of the mailbox: the store only has to answer
+    the probe the way `comms.replay` or a session wait page would.
     """
 
     def setUp(self):

@@ -72,14 +72,14 @@ class CommsOperations:
         """Every method a connection as this sender answers, in one place."""
         methods = set(self.handlers(sender)) | SESSION_METHODS
         if self._service.session_handlers():
-            # A feed is held like a wait, so the wire always lists it here
-            # and the connection answers it through the registry.
-            methods.add("comms.session.feed")
+            # A session wait is held like a mailbox wait, so the wire always
+            # lists it here and the connection answers it through the registry.
+            methods.add("comms.session.wait")
         return sorted(methods)
 
-    def feed_plan(self, sender, params):
-        """The held feed one request names, validated by its owner."""
-        return self._service.feed_plan(sender, params)
+    def wait_plan(self, sender, params):
+        """The held session wait one request names, validated by its owner."""
+        return self._service.wait_plan(sender, params)
 
     def capabilities(self):
         """The additive capability names a greeting may carry."""
